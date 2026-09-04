@@ -27,11 +27,10 @@ type ChunkerConfig struct {
 }
 
 // DefaultChunkerConfig returns production-tuned defaults.
-// WHY these values (from Apna Kiro architecture):
-// 500-800 tokens: Large enough for context, small enough for precise retrieval
-// 100 token overlap: Prevents losing context at chunk boundaries
-// A question about "consistent hashing" might span two chunks —
-// overlap ensures both chunks contain enough context to be retrieved.
+// WHY these values (Byte by Byte AI + Apna Kiro):
+// 500-800 tokens: Large enough for context, small enough for precise retrieval.
+// 100 token overlap: Prevents losing context at chunk boundaries.
+// Course taught: overlap ensures boundary concepts are not cut off.
 func DefaultChunkerConfig() ChunkerConfig {
 	return ChunkerConfig{
 		TargetSize: 600,
@@ -42,12 +41,162 @@ func DefaultChunkerConfig() ChunkerConfig {
 }
 
 // TextChunker splits text into overlapping chunks.
-// Preserves sentence boundaries — never cuts mid-sentence.
-// WHY sentence boundary preservation:
-// A chunk ending mid-sentence loses meaning.
-// "Sharding distributes data across multiple" — incomplete, useless for retrieval.
+// Uses recursive splitting: paragraph -> line -> sentence -> word.
+//
+// WHY recursive splitting (Byte by Byte AI course):
+// Simple sentence splitting cuts mid-concept.
+// Recursive approach tries larger boundaries first so semantic
+// units (paragraphs, sections) stay together when possible.
+// This is exactly how LangChain RecursiveCharacterTextSplitter works.
 type TextChunker struct {
-	cfg ChunkerConfig
+	cfg        ChunkerConfig
+	separators []string
+}
+
+// NewTextChunker creates a new chunker.
+func NewTextChunker(cfg ChunkerConfig) *TextChunker {
+	return &TextChunker{
+		cfg: cfg,
+		// Priority: largest semantic unit first
+		// WHY this order: paragraph > line > sentence > word
+		// Matches LangChain RecursiveCharacterTextSplitter default separators
+		separators: []string{"\n\n", "\n", ". ", "! ", "? ", " "},
+	}
+}
+
+// Chunk splits text into overlapping chunks.
+func (c *TextChunker) Chunk(text string) []TextChunk {
+	text = cleanText(text)
+	if text == "" {
+		return nil
+	}
+	pieces := c.recursiveSplit(text, c.separators)
+	if len(pieces) == 0 {
+		return nil
+	}
+	return c.mergeIntoChunks(pieces)
+}
+
+// recursiveSplit splits text using the first separator that produces
+// pieces within target size. Falls back to next separator if needed.
+//
+// Mental execution:
+// text="A\n\nB\n\nC", separators=["\n\n","\n",". "]
+// Try \n\n -> ["A","B","C"] each fits -> done
+//
+// text="Very long paragraph..."
+// Try \n\n -> still too large -> try \n -> still too large
+// Try ". " -> ["sentence1","sentence2"] fits -> done
+func (c *TextChunker) recursiveSplit(text string, separators []string) []string {
+	if len(separators) == 0 {
+		return c.splitBySize(text)
+	}
+	sep := separators[0]
+	parts := strings.Split(text, sep)
+	var result []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if estimateTokens(part) <= c.cfg.MaxSize {
+			result = append(result, part)
+		} else {
+			result = append(result, c.recursiveSplit(part, separators[1:])...)
+		}
+	}
+	return result
+}
+
+// mergeIntoChunks combines pieces into chunks with overlap.
+//
+// WHY overlap (Byte by Byte AI - "form of" example):
+// If a concept spans chunk boundary, overlap ensures both chunks
+// contain enough context to be retrieved by semantic search.
+func (c *TextChunker) mergeIntoChunks(pieces []string) []TextChunk {
+	var chunks []TextChunk
+	chunkIndex, charPos := 0, 0
+	i := 0
+	for i < len(pieces) {
+		var current []string
+		tokenCount, j := 0, i
+		for j < len(pieces) {
+			pt := estimateTokens(pieces[j])
+			if tokenCount+pt > c.cfg.MaxSize && len(current) > 0 {
+				break
+			}
+			current = append(current, pieces[j])
+			tokenCount += pt
+			j++
+			if tokenCount >= c.cfg.TargetSize {
+				break
+			}
+		}
+		chunkText := strings.TrimSpace(strings.Join(current, " "))
+		if chunkText != "" && tokenCount >= c.cfg.MinSize/2 {
+			chunks = append(chunks, TextChunk{
+				Text: chunkText, Index: chunkIndex,
+				StartChar: charPos, EndChar: charPos + len(chunkText),
+				TokenCount: tokenCount,
+			})
+			chunkIndex++
+			charPos += len(chunkText)
+		}
+		overlapTokens, overlapStart := 0, j-1
+		for overlapStart > i && overlapTokens < c.cfg.Overlap {
+			overlapTokens += estimateTokens(pieces[overlapStart])
+			overlapStart--
+		}
+		nextStart := overlapStart + 1
+		if nextStart <= i {
+			nextStart = i + 1
+		}
+		i = nextStart
+	}
+	return chunks
+}
+
+// splitBySize splits text into pieces of max size (last resort).
+func (c *TextChunker) splitBySize(text string) []string {
+	words := strings.Fields(text)
+	var pieces []string
+	var current []string
+	tokens := 0
+	for _, word := range words {
+		wt := estimateTokens(word)
+		if tokens+wt > c.cfg.MaxSize && len(current) > 0 {
+			pieces = append(pieces, strings.Join(current, " "))
+			current, tokens = nil, 0
+		}
+		current = append(current, word)
+		tokens += wt
+	}
+	if len(current) > 0 {
+		pieces = append(pieces, strings.Join(current, " "))
+	}
+	return pieces
+}
+
+// GetStats returns statistics about the chunks.
+func (c *TextChunker) GetStats(chunks []TextChunk) map[string]interface{} {
+	if len(chunks) == 0 {
+		return map[string]interface{}{"total": 0}
+	}
+	total, minT, maxT := 0, chunks[0].TokenCount, chunks[0].TokenCount
+	for _, ch := range chunks {
+		total += ch.TokenCount
+		if ch.TokenCount < minT {
+			minT = ch.TokenCount
+		}
+		if ch.TokenCount > maxT {
+			maxT = ch.TokenCount
+		}
+	}
+	return map[string]interface{}{
+		"total": len(chunks), "avg_tokens": total / len(chunks),
+		"min_tokens": minT, "max_tokens": maxT,
+	}
+}
 }
 
 // NewTextChunker creates a new chunker with given config.
