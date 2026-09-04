@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -17,7 +18,7 @@ import (
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/config"
-	"ai_avengers/backend/internal/context"
+	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/db"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/expert"
