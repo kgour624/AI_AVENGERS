@@ -1,7 +1,10 @@
 package training
 
+// Chunker upgraded to recursive splitting strategy.
+// Inspired by LangChain RecursiveCharacterTextSplitter (Byte by Byte AI course).
+// Priority: \n\n (paragraph) -> \n (line) -> sentence -> word
+
 import (
-	"regexp"
 	"strings"
 	"unicode"
 )
