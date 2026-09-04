@@ -103,30 +103,37 @@ Instructor: %s
 Transcript:
 %s
 
-Extract the instructor's reasoning charter — their decision-making rules, opinions, and principles.
+Extract the instructor's reasoning charter.
 
-CRITICAL RULE: Every principle MUST include a BECAUSE clause explaining WHY.
-This is non-negotiable. If you cannot find the reason, do not include the rule.
+CRITICAL: Every principle MUST include BECAUSE clause.
+BAD:  "Never use microservices for small teams"
+GOOD: "Never use microservices for small teams BECAUSE operational overhead exceeds velocity when team < 10"
 
-NOT acceptable: "Never use microservices for small teams"
-ACCEPTABLE: "Never use microservices for small teams BECAUSE operational overhead exceeds development velocity when team < 10 people"
+FEW-SHOT EXAMPLES of correct output format:
 
-Extract:
-1. Strong opinions with reasoning ("I believe X BECAUSE Y")
-2. Never/Always rules with reasoning ("Never do X BECAUSE it causes Y")
-3. Decision rules with context ("When X, do Y BECAUSE Z")
-4. Anti-patterns with explanation ("Avoid X BECAUSE it leads to Y")
-5. Trade-off principles ("Choose X over Y when Z BECAUSE W")
-
-Format as plain text with clear sections:
+Example 1 (System Design Expert):
 ## Core Principles
-## Decision Rules  
-## Anti-Patterns
-## Trade-offs
+- Always design for the scale you have, not the scale you imagine BECAUSE premature optimization wastes 80%% of engineering time
+- Prefer boring technology over exciting technology BECAUSE boring tech has known failure modes and battle-tested solutions
 
-Write in first person as if the instructor is speaking.
-Be specific and technical. Include numbers where the instructor mentioned them.
-Do NOT include generic advice. Only what this specific instructor taught.`,
+## Decision Rules
+- When team < 10 people, use monolith BECAUSE microservices operational overhead exceeds feature velocity
+- When read:write ratio > 10:1, add read replicas BECAUSE writes are the bottleneck, not reads
+
+## Anti-Patterns
+- Avoid distributed transactions BECAUSE they introduce 2-phase commit complexity and reduce availability
+
+Example 2 (Database Expert):
+## Core Principles
+- Always index foreign keys BECAUSE unindexed FK lookups cause full table scans on joins
+- Never SELECT * in production BECAUSE it fetches unnecessary columns and breaks when schema changes
+
+## Decision Rules
+- When data > 1TB, consider sharding BECAUSE single-node PostgreSQL struggles beyond 1TB with write-heavy workloads
+
+---
+Now extract from the transcript above.
+Write in first person. Only what THIS instructor taught. Include numbers where mentioned.`,
 		expertName, transcript)
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
