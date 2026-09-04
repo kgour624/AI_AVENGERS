@@ -14,11 +14,21 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"ai_avengers/backend/internal/auth"
+	"ai_avengers/backend/internal/chat"
+	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/config"
+	"ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/db"
+	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/memory"
+	"ai_avengers/backend/internal/message"
 	"ai_avengers/backend/internal/middleware"
 	"ai_avengers/backend/internal/ml"
+	"ai_avengers/backend/internal/orchestrator"
+	"ai_avengers/backend/internal/project"
+	"ai_avengers/backend/internal/rating"
 	"ai_avengers/backend/internal/response"
 )
 
