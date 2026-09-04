@@ -3,6 +3,7 @@ package decision
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/google/uuid"
@@ -320,5 +321,4 @@ func min(a, b int) int {
 	return b
 }
 
-// regexp import needed for gate3
-var regexp = struct{ MustCompile func(string) interface{} }{}
+
