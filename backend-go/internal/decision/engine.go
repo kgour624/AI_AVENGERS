@@ -291,7 +291,7 @@ func (e *Engine) checkNecessity(ctx context.Context, question, projectSummary, t
 User wants to implement: %s
 
 Is this premature for this project? Reply with only YES or NO.`,
-		projectSummary[:min(300, len(projectSummary))], term)
+		projectSummary[:minInt(300, len(projectSummary))], term)
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
