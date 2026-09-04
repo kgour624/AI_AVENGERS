@@ -1,0 +1,203 @@
+package memory
+
+import (
+	"context"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/ml"
+)
+
+// Manager is the single interface for all memory operations.
+// Coordinates L1 (Redis), L2 (PostgreSQL), and L3 (event log).
+//
+// Usage pattern:
+// 1. Before turn: GetProjectContext() — load what experts know
+// 2. After turn: RecordTurn() — update all three levels
+//
+// WHY single Manager:
+// Callers don't need to know which level stores what.
+// Manager decides: hot data → L1, group data → L2, all events → L3.
+type Manager struct {
+	l1     *L1Store
+	l2     *L2Store
+	l3     *L3Store
+	logger *zap.Logger
+}
+
+// NewManager creates a new memory manager.
+func NewManager(
+	db *pgxpool.Pool,
+	redisClient *redis.Client,
+	mlClient *ml.SidecarClient,
+	logger *zap.Logger,
+) *Manager {
+	return &Manager{
+		l1:     NewL1Store(redisClient, logger),
+		l2:     NewL2Store(db, mlClient, logger),
+		l3:     NewL3Store(db, logger),
+		logger: logger,
+	}
+}
+
+// ProjectContext holds all memory loaded for a turn.
+type ProjectContext struct {
+	L1Memory       *L1Memory  // Hot: this expert's recent decisions
+	L2Entries      []L2Entry  // Group: all experts' relevant decisions
+	L1CacheHit     bool       // Was L1 from cache or rebuilt?
+}
+
+// GetProjectContext loads all relevant memory for an expert's turn.
+// Called by Context Assembler before every LLM call.
+//
+// Mental execution:
+// Expert: DB Expert, Project: E-Commerce, Query: "should I shard?"
+// 1. L1 Get — DB Expert's last 5 decisions for this project (Redis, <1ms)
+// 2. L2 Search — all experts' decisions related to "sharding" (pgvector, ~5ms)
+// Result: DB Expert knows SD Expert said "use PostgreSQL" at turn 8
+func (m *Manager) GetProjectContext(
+	ctx context.Context,
+	projectID uuid.UUID,
+	expertID uuid.UUID,
+	query string,
+) (*ProjectContext, error) {
+	// L1: always fast
+	l1, err := m.l1.Get(ctx, projectID, expertID)
+	if err != nil {
+		m.logger.Warn("L1 get failed", zap.Error(err))
+		l1 = &L1Memory{ProjectID: projectID, ExpertID: expertID}
+	}
+
+	// L2: semantic search for relevant project context
+	l2, err := m.l2.SearchByQuery(ctx, projectID, query, 8)
+	if err != nil {
+		m.logger.Warn("L2 search failed", zap.Error(err))
+		l2 = []L2Entry{}
+	}
+
+	return &ProjectContext{
+		L1Memory:   l1,
+		L2Entries:  l2,
+		L1CacheHit: l1.LastUpdated != time.Time{},
+	}, nil
+}
+
+// RecordTurn updates all memory levels after a completed turn.
+// Called async after response is sent to client.
+//
+// WHY async: Memory update should not block the response.
+// If memory update fails, the response was already sent — log and continue.
+func (m *Manager) RecordTurn(
+	ctx context.Context,
+	projectID uuid.UUID,
+	expertID uuid.UUID,
+	clientID uuid.UUID,
+	chatID uuid.UUID,
+	messageID uuid.UUID,
+	turnNumber int,
+	userMessage string,
+	assistantResponse string,
+	decisionMode string,
+	importance int,
+) {
+	// Only record high-importance turns in L1/L2
+	// WHY threshold 3: Low-importance turns (clarifications, small details)
+	// don't need to be in memory. Saves space and keeps memory relevant.
+	if importance >= 3 {
+		// Update L1 (async, non-blocking)
+		go func() {
+			bgCtx := context.Background()
+			_ = m.l1.Append(bgCtx, projectID, expertID, L1Decision{
+				Content:    userMessage[:min(200, len(userMessage))],
+				Reasoning:  assistantResponse[:min(300, len(assistantResponse))],
+				TurnNumber: turnNumber,
+				MemoryType: decisionMode,
+				Importance: importance,
+			})
+		}()
+
+		// Update L2 (async, non-blocking)
+		go func() {
+			bgCtx := context.Background()
+			_ = m.l2.Append(bgCtx, L2Entry{
+				ProjectID:     projectID,
+				ExpertID:      expertID,
+				MemoryType:    "decision",
+				Content:       userMessage[:min(500, len(userMessage))],
+				Context:       assistantResponse[:min(500, len(assistantResponse))],
+				TurnReference: turnNumber,
+				Importance:    importance,
+			})
+		}()
+	}
+
+	// L3: always record every turn (append-only log)
+	go func() {
+		bgCtx := context.Background()
+		expertIDPtr := &expertID
+		chatIDPtr := &chatID
+		msgIDPtr := &messageID
+		_ = m.l3.Append(bgCtx, L3Event{
+			ProjectID: projectID,
+			ExpertID:  expertIDPtr,
+			ClientID:  clientID,
+			ChatID:    chatIDPtr,
+			MessageID: msgIDPtr,
+			EventType: EventResponseGenerated,
+			EventData: map[string]interface{}{
+				"turn_number":   turnNumber,
+				"decision_mode": decisionMode,
+				"importance":    importance,
+			},
+			Reasoning:    assistantResponse[:min(200, len(assistantResponse))],
+			DecisionMade: decisionMode,
+		})
+	}()
+}
+
+// RecordViolation logs a China Wall violation to L3.
+func (m *Manager) RecordViolation(
+	ctx context.Context,
+	projectID uuid.UUID,
+	expertID uuid.UUID,
+	clientID uuid.UUID,
+	violationType string,
+	details string,
+) {
+	go func() {
+		bgCtx := context.Background()
+		expertIDPtr := &expertID
+		_ = m.l3.Append(bgCtx, L3Event{
+			ProjectID: projectID,
+			ExpertID:  expertIDPtr,
+			ClientID:  clientID,
+			EventType: EventChinaWallViolation,
+			EventData: map[string]interface{}{
+				"violation_type": violationType,
+				"details":        details,
+			},
+			Reasoning: details,
+		})
+	}()
+}
+
+// GetTimeline returns project event timeline for UI.
+func (m *Manager) GetTimeline(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]L3EventRecord, error) {
+	return m.l3.GetProjectTimeline(ctx, projectID, limit, offset)
+}
+
+// GetViolations returns China Wall violations for admin panel.
+func (m *Manager) GetViolations(ctx context.Context, limit int) ([]L3EventRecord, error) {
+	return m.l3.GetViolations(ctx, limit)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
