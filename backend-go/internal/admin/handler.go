@@ -1,8 +1,8 @@
 package admin
 
 import (
+	"context"
 	"io"
-	"net/http"
 	"path/filepath"
 	"strings"
 
@@ -154,13 +154,12 @@ func (h *Handler) IngestTranscript(c *gin.Context) {
 
 	// Start background ingestion
 	// WHY goroutine: Ingestion takes minutes. Client gets job ID immediately.
-	// Client polls GET /admin/experts/:id/jobs to check progress.
+	// WHY context.Background(): Request context cancels when HTTP response is sent.
+	// Background context keeps ingestion running after response.
 	go func() {
-		ctx := c.Request.Context()
-		// Use background context so it survives request completion
-		ctx = context.Background()
+		bgCtx := context.Background()
 		_, err := h.ingestion.IngestTranscript(
-			ctx, jobID, expertID, expertName,
+			bgCtx, jobID, expertID, expertName,
 			string(content), header.Filename,
 		)
 		if err != nil {
@@ -196,7 +195,4 @@ func (h *Handler) GetIngestionJobs(c *gin.Context) {
 	response.OK(c, jobs)
 }
 
-// context import needed for background goroutine
-var context = struct {
-	Background func() interface{}
-}{}
+
