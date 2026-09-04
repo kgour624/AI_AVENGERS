@@ -1,0 +1,447 @@
+package message
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/chat"
+	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/memory"
+	"ai_avengers/backend/internal/ml"
+	"ai_avengers/backend/internal/orchestrator"
+	"ai_avengers/backend/internal/response"
+)
+
+// SendMessageRequest is the input for sending a message.
+type SendMessageRequest struct {
+	Message   string      `json:"message" binding:"required"`
+	ExpertIDs []string    `json:"expert_ids" binding:"required,min=1"`
+}
+
+// SSEEvent types for streaming
+const (
+	SSEThinking   = "thinking"
+	SSEChunk      = "chunk"
+	SSEComplete   = "complete"
+	SSESynthesis  = "synthesis"
+	SSEDone       = "done"
+	SSEError      = "error"
+)
+
+// Handler handles message sending with SSE streaming.
+//
+// WHY SSE over WebSocket:
+// SSE is one-directional (server -> client) which is all we need.
+// Simpler than WebSocket, works over HTTP/1.1, auto-reconnect built-in.
+// Architecture doc locked decision: SSE for streaming.
+type Handler struct {
+	chatSvc      *chat.Service
+	orchestrator *orchestrator.Orchestrator
+	gateway      *gateway.ModelGateway
+	mlClient     *ml.SidecarClient
+	memManager   *memory.Manager
+	logger       *zap.Logger
+}
+
+// NewHandler creates a new message handler.
+func NewHandler(
+	chatSvc *chat.Service,
+	orch *orchestrator.Orchestrator,
+	gw *gateway.ModelGateway,
+	mlClient *ml.SidecarClient,
+	memManager *memory.Manager,
+	logger *zap.Logger,
+) *Handler {
+	return &Handler{
+		chatSvc:      chatSvc,
+		orchestrator: orch,
+		gateway:      gw,
+		mlClient:     mlClient,
+		memManager:   memManager,
+		logger:       logger,
+	}
+}
+
+// Send POST /chats/:id/messages
+// Streams response via SSE.
+//
+// Flow:
+// 1. Validate request
+// 2. Save user message to DB
+// 3. Get turn number
+// 4. Stream SSE: "thinking" events while processing
+// 5. Run orchestrator (parallel experts)
+// 6. Stream SSE: expert responses one by one
+// 7. Stream SSE: synthesis if multiple experts
+// 8. Save assistant messages to DB
+// 9. Update memory async
+// 10. Stream SSE: "done"
+//
+// Mental execution:
+// Client sends: "How should I design the user table?"
+// SSE stream:
+//   data: {"type":"thinking","expert":"DB Expert","gate":1}
+//   data: {"type":"thinking","expert":"DB Expert","gate":5}
+//   data: {"type":"chunk","expert":"DB Expert","content":"Use UUID..."}
+//   data: {"type":"complete","expert":"DB Expert","mode":"ADVISE"}
+//   data: {"type":"done"}
+func (h *Handler) Send(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	chatID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid chat ID")
+		return
+	}
+
+	// Parse request — support both JSON and multipart (file upload)
+	var req SendMessageRequest
+	var fileContent string
+
+	contentType := c.GetHeader("Content-Type")
+	if strings.Contains(contentType, "multipart/form-data") {
+		req.Message = c.PostForm("message")
+		expertIDsStr := c.PostForm("expert_ids")
+		if err := json.Unmarshal([]byte(expertIDsStr), &req.ExpertIDs); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", "expert_ids must be JSON array")
+			return
+		}
+		// Handle file upload
+		if file, header, err := c.Request.FormFile("file"); err == nil {
+			defer file.Close()
+			if header.Size < 1*1024*1024 { // Max 1MB for context
+				if content, err := io.ReadAll(file); err == nil {
+					fileContent = fmt.Sprintf("\n\n[Attached file: %s]\n%s",
+						header.Filename, string(content))
+				}
+			}
+		}
+	} else {
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+	}
+
+	if req.Message == "" {
+		response.BadRequest(c, "INVALID_INPUT", "message is required")
+		return
+	}
+
+	// Parse expert IDs
+	var expertIDs []uuid.UUID
+	for _, idStr := range req.ExpertIDs {
+		id, err := uuid.Parse(idStr)
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", fmt.Sprintf("invalid expert ID: %s", idStr))
+			return
+		}
+		expertIDs = append(expertIDs, id)
+	}
+
+	// Verify chat ownership
+	ch, err := h.chatSvc.GetByID(c.Request.Context(), chatID, clientID)
+	if err != nil {
+		response.NotFound(c, "chat")
+		return
+	}
+
+	// Get turn number
+	turnNumber, err := h.chatSvc.GetNextTurnNumber(c.Request.Context(), chatID)
+	if err != nil {
+		response.InternalError(c)
+		return
+	}
+
+	// Append file content to message if present
+	fullMessage := req.Message
+	if fileContent != "" {
+		fullMessage += fileContent
+	}
+
+	// Save user message
+	userMsgID, err := h.chatSvc.SaveMessage(c.Request.Context(), chat.Message{
+		ChatID:     chatID,
+		Role:       "user",
+		Content:    fullMessage,
+		TurnNumber: turnNumber,
+	})
+	if err != nil {
+		h.logger.Error("save user message failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	_ = userMsgID
+
+	// Increment message count
+	_ = h.chatSvc.IncrementMessageCount(c.Request.Context(), chatID)
+
+	// Set SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // Disable nginx buffering
+
+	// Stream processing
+	c.Stream(func(w io.Writer) bool {
+		// Send thinking event
+		sendSSE(w, SSEThinking, map[string]interface{}{
+			"message": "Processing your request...",
+			"experts": len(expertIDs),
+		})
+
+		// Run orchestrator
+		orchestratorReq := orchestrator.OrchestratorRequest{
+			ProjectID:  ch.ProjectID,
+			ClientID:   clientID,
+			ChatID:     chatID,
+			Message:    fullMessage,
+			ExpertIDs:  expertIDs,
+			TurnNumber: turnNumber,
+		}
+
+		orchestratorResp, err := h.orchestrator.Process(c.Request.Context(), orchestratorReq)
+		if err != nil {
+			h.logger.Error("orchestrator failed", zap.Error(err))
+			sendSSE(w, SSEError, map[string]string{"message": "Processing failed"})
+			sendSSE(w, SSEDone, nil)
+			return false
+		}
+
+		// Stream each expert response
+		for _, expertResp := range orchestratorResp.ExpertResponses {
+			// Send complete expert response
+			sendSSE(w, SSEComplete, map[string]interface{}{
+				"expert_id":   expertResp.ExpertID,
+				"expert_name": expertResp.ExpertName,
+				"domain":      expertResp.Domain,
+				"mode":        expertResp.Mode,
+				"content":     expertResp.Content,
+				"citations":   expertResp.Citations,
+				"confidence":  expertResp.Confidence,
+				"gate_stopped": expertResp.GateStopped,
+				"warning":     expertResp.Warning,
+				"questions":   expertResp.Questions,
+			})
+
+			// Save assistant message to DB (async)
+			go h.saveAssistantMessage(context.Background(), chatID, expertResp, turnNumber)
+		}
+
+		// Send synthesis if multiple experts
+		if orchestratorResp.Synthesis != nil {
+			sendSSE(w, SSESynthesis, orchestratorResp.Synthesis)
+		}
+
+		// Update chat index async
+		go h.indexTurn(context.Background(), chatID, fullMessage, orchestratorResp, turnNumber)
+
+		// Generate rolling summary every 10 turns
+		if turnNumber%10 == 0 {
+			go h.generateRollingSummary(context.Background(), chatID, turnNumber)
+		}
+
+		sendSSE(w, SSEDone, map[string]interface{}{
+			"turn_number":  turnNumber,
+			"duration_ms":  orchestratorResp.DurationMs,
+		})
+
+		return false // Stop streaming
+	})
+}
+
+// saveAssistantMessage saves an expert's response to the messages table.
+func (h *Handler) saveAssistantMessage(
+	ctx context.Context,
+	chatID uuid.UUID,
+	resp orchestrator.ExpertResponse,
+	turnNumber int,
+) {
+	if resp.Error != "" {
+		return // Don't save failed responses
+	}
+
+	expertID := resp.ExpertID
+	_, err := h.chatSvc.SaveMessage(ctx, chat.Message{
+		ChatID:       chatID,
+		Role:         "assistant",
+		Content:      resp.Content,
+		TurnNumber:   turnNumber,
+		ExpertID:     &expertID,
+		DecisionMode: string(resp.Mode),
+		Confidence:   resp.Confidence,
+	})
+	if err != nil {
+		h.logger.Warn("save assistant message failed",
+			zap.String("expert", resp.ExpertName),
+			zap.Error(err),
+		)
+	}
+	_ = h.chatSvc.IncrementMessageCount(ctx, chatID)
+}
+
+// indexTurn creates a chat_index entry for semantic search.
+// Uses cheap LLM to generate one-line summary and extract topic.
+func (h *Handler) indexTurn(
+	ctx context.Context,
+	chatID uuid.UUID,
+	userMessage string,
+	orchestratorResp *orchestrator.OrchestratorResponse,
+	turnNumber int,
+) {
+	if len(orchestratorResp.ExpertResponses) == 0 {
+		return
+	}
+
+	// Build combined turn text for summarization
+	firstResp := orchestratorResp.ExpertResponses[0]
+	turnText := fmt.Sprintf("User: %s\nAssistant: %s",
+		userMessage[:minInt(200, len(userMessage))],
+		firstResp.Content[:minInt(300, len(firstResp.Content))],
+	)
+
+	// Generate summary via cheap LLM
+	prompt := fmt.Sprintf(`Summarize this conversation turn in one line (max 100 chars).
+Also identify the main topic.
+
+%s
+
+Return JSON: {"summary": "...", "topic": "...", "importance": 1-5}`, turnText)
+
+	resp, err := h.gateway.Call(ctx, gateway.LLMRequest{
+		Model:       gateway.ModelCheap,
+		UserPrompt:  prompt,
+		MaxTokens:   100,
+		Temperature: 0.1,
+		UseCache:    false,
+	})
+
+	summary := userMessage[:minInt(100, len(userMessage))]
+	topic := "general"
+	importance := 3
+
+	if err == nil {
+		var result struct {
+			Summary    string `json:"summary"`
+			Topic      string `json:"topic"`
+			Importance int    `json:"importance"`
+		}
+		clean := strings.TrimSpace(resp.Content)
+		clean = strings.TrimPrefix(clean, "```json")
+		clean = strings.TrimPrefix(clean, "```")
+		clean = strings.TrimSuffix(clean, "```")
+		clean = strings.TrimSpace(clean)
+		start := strings.Index(clean, "{")
+		end := strings.LastIndex(clean, "}")
+		if start != -1 && end != -1 {
+			if err := json.Unmarshal([]byte(clean[start:end+1]), &result); err == nil {
+				if result.Summary != "" {
+					summary = result.Summary
+				}
+				if result.Topic != "" {
+					topic = result.Topic
+				}
+				if result.Importance >= 1 && result.Importance <= 5 {
+					importance = result.Importance
+				}
+			}
+		}
+	}
+
+	// Generate embedding for semantic search
+	var embedding []float32
+	if emb, err := h.mlClient.EmbedSingle(ctx, summary); err == nil {
+		embedding = emb
+	}
+
+	// Save to chat_index
+	_ = h.chatSvc.IndexTurn(ctx, chatID, uuid.New(), turnNumber, summary, topic, importance, embedding)
+}
+
+// generateRollingSummary generates a rolling summary every 10 turns.
+// WHY rolling summary (Arpit Bhiyani + Byte by Byte AI):
+// Context window is finite. Summary compresses history.
+// Prevents lost-in-middle problem for long conversations.
+func (h *Handler) generateRollingSummary(ctx context.Context, chatID uuid.UUID, turnNumber int) {
+	// Get last 10 chat index entries
+	rows, err := h.chatSvc.GetDB().Query(ctx,
+		`SELECT one_line_summary, topic, turn_number
+		 FROM chat_index
+		 WHERE chat_id=$1
+		 ORDER BY turn_number DESC
+		 LIMIT 10`,
+		chatID,
+	)
+	if err != nil {
+		return
+	}
+	defer rows.Close()
+
+	var summaries []string
+	for rows.Next() {
+		var s, topic string
+		var turn int
+		if err := rows.Scan(&s, &topic, &turn); err != nil {
+			continue
+		}
+		summaries = append(summaries, fmt.Sprintf("Turn %d [%s]: %s", turn, topic, s))
+	}
+
+	if len(summaries) == 0 {
+		return
+	}
+
+	prompt := fmt.Sprintf(`Summarize this conversation history in 3-5 sentences.
+Capture: main topics, key decisions, current project state.
+
+%s
+
+Summary:`, strings.Join(summaries, "\n"))
+
+	resp, err := h.gateway.Call(ctx, gateway.LLMRequest{
+		Model:       gateway.ModelCheap,
+		UserPrompt:  prompt,
+		MaxTokens:   300,
+		Temperature: 0.3,
+	})
+	if err != nil {
+		return
+	}
+
+	turnStart := turnNumber - 9
+	if turnStart < 1 {
+		turnStart = 1
+	}
+	_ = h.chatSvc.SaveRollingSummary(ctx, chatID, resp.Content, turnStart, turnNumber)
+}
+
+// sendSSE writes a single SSE event to the response writer.
+func sendSSE(w io.Writer, eventType string, data interface{}) {
+	var payload string
+	if data != nil {
+		b, err := json.Marshal(map[string]interface{}{
+			"type": eventType,
+			"data": data,
+		})
+		if err == nil {
+			payload = string(b)
+		}
+	} else {
+		payload = fmt.Sprintf(`{"type":"%s"}`, eventType)
+	}
+	fmt.Fprintf(w, "data: %s\n\n", payload)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
