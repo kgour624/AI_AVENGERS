@@ -47,7 +47,7 @@ func NewIngestionPipeline(
 		ml:         mlClient,
 		gateway:    gw,
 		chunker:    NewTextChunker(DefaultChunkerConfig()),
-		topics:     NewTopicExtractor(gw, logger),
+		topics:     NewTopicExtractor(gw, mlClient, logger),
 		charters:   NewCharterExtractor(gw, logger),
 		capability: NewCapabilityBuilder(gw, logger),
 		logger:     logger,
