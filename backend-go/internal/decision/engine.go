@@ -314,7 +314,10 @@ Is this premature for this project? Reply with only YES or NO.`,
 	return nil
 }
 
-func min(a, b int) int {
+// neverRulePattern compiled once at package level for performance.
+var neverRulePattern = regexp.MustCompile(`never\s+(\w+(?:\s+\w+){0,5})`)
+
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
