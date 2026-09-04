@@ -177,12 +177,22 @@ func buildRouter(
 	projectSvc := project.NewService(postgres.Pool, logger)
 	chatSvc := chat.NewService(postgres.Pool, logger)
 	ratingSvc := rating.NewService(postgres.Pool, memManager, logger)
+	repoSvc := repo.NewService(
+		postgres.Pool, mlClient,
+		cfg.Security.EncryptionKey,
+		"", "", // GitHub OAuth (set via env)
+		"", "", // GitLab OAuth (set via env)
+		"",     // Base URL
+		logger,
+	)
 
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
 	messageHandler := message.NewHandler(chatSvc, orch, modelGateway, mlClient, memManager, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, logger)
+	repoHandler := repo.NewHandler(repoSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, logger)
 
 	// Health check
 	router.GET("/health", func(c *gin.Context) {
