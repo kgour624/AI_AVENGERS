@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
+	adminpkg "ai_avengers/backend/internal/admin"
 	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
@@ -30,6 +31,7 @@ import (
 	"ai_avengers/backend/internal/orchestrator"
 	"ai_avengers/backend/internal/project"
 	"ai_avengers/backend/internal/rating"
+	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
 )
 
