@@ -389,4 +389,14 @@ func parseJSONDecision(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)
 }
 
+// neverRulePattern compiled once at package level for performance.
+var neverRulePattern = regexp.MustCompile(`never\s+(\w+(?:\s+\w+){0,5})`)
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 
