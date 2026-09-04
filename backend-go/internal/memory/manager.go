@@ -112,8 +112,8 @@ func (m *Manager) RecordTurn(
 		go func() {
 			bgCtx := context.Background()
 			_ = m.l1.Append(bgCtx, projectID, expertID, L1Decision{
-				Content:    userMessage[:min(200, len(userMessage))],
-				Reasoning:  assistantResponse[:min(300, len(assistantResponse))],
+				Content:    userMessage[:minInt(200, len(userMessage))],
+				Reasoning:  assistantResponse[:minInt(300, len(assistantResponse))],
 				TurnNumber: turnNumber,
 				MemoryType: decisionMode,
 				Importance: importance,
@@ -127,8 +127,8 @@ func (m *Manager) RecordTurn(
 				ProjectID:     projectID,
 				ExpertID:      expertID,
 				MemoryType:    "decision",
-				Content:       userMessage[:min(500, len(userMessage))],
-				Context:       assistantResponse[:min(500, len(assistantResponse))],
+				Content:       userMessage[:minInt(500, len(userMessage))],
+				Context:       assistantResponse[:minInt(500, len(assistantResponse))],
 				TurnReference: turnNumber,
 				Importance:    importance,
 			})
