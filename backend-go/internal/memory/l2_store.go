@@ -72,21 +72,22 @@ func (s *L2Store) Append(ctx context.Context, entry L2Entry) error {
 	return err
 }
 
-// SearchByQuery finds relevant L2 entries using semantic search.
-// Used by Context Assembler to load project context for a new expert.
+// SearchByQuery finds relevant L2 entries using HYBRID search.
+// Combines semantic search + keyword fallback.
 //
-// Mental execution:
-// Client switches from System Design expert to DB expert.
-// DB expert calls SearchByQuery("database schema decisions")
-// Returns: [{"SD expert decided PostgreSQL at turn 8"}, {"sharding deferred at turn 15"}]
-// DB expert now knows project context without client repeating everything.
+// WHY hybrid for L2 (Byte by Byte AI course):
+// Course taught: keyword-based indexing catches exact matches.
+// "What did expert say about PostgreSQL?" — keyword match is better.
+// "What decisions were made about scaling?" — semantic is better.
+// Hybrid covers both cases.
 func (s *L2Store) SearchByQuery(ctx context.Context, projectID uuid.UUID, query string, limit int) ([]L2Entry, error) {
 	embedding, err := s.ml.EmbedSingle(ctx, query)
 	if err != nil {
-		// Fallback to recent entries if embedding fails
-		return s.GetRecent(ctx, projectID, limit)
+		// Embedding failed — fall back to keyword search
+		return s.searchByKeyword(ctx, projectID, query, limit)
 	}
 
+	// Semantic search
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, expert_id, memory_type, content,
 		        COALESCE(context,''), COALESCE(turn_reference,0), importance, created_at
@@ -97,7 +98,51 @@ func (s *L2Store) SearchByQuery(ctx context.Context, projectID uuid.UUID, query 
 		projectID, pgvector.NewVector(embedding), limit,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("L2 search failed: %w", err)
+		return s.searchByKeyword(ctx, projectID, query, limit)
+	}
+	defer rows.Close()
+
+	entries, err := scanL2Rows(rows)
+	if err != nil {
+		return nil, err
+	}
+
+	// If semantic search returned few results, supplement with keyword search
+	if len(entries) < limit/2 {
+		kwEntries, kwErr := s.searchByKeyword(ctx, projectID, query, limit-len(entries))
+		if kwErr == nil {
+			// Deduplicate by ID
+			seen := make(map[uuid.UUID]bool)
+			for _, e := range entries {
+				seen[e.ID] = true
+			}
+			for _, e := range kwEntries {
+				if !seen[e.ID] {
+					entries = append(entries, e)
+				}
+			}
+		}
+	}
+
+	return entries, nil
+}
+
+// searchByKeyword searches L2 using PostgreSQL full-text search.
+// Used as fallback when semantic search returns few results.
+func (s *L2Store) searchByKeyword(ctx context.Context, projectID uuid.UUID, query string, limit int) ([]L2Entry, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT id, project_id, expert_id, memory_type, content,
+		        COALESCE(context,''), COALESCE(turn_reference,0), importance, created_at
+		 FROM project_memory_l2
+		 WHERE project_id=$1
+		   AND is_superseded=FALSE
+		   AND content_tsv @@ plainto_tsquery('english', $2)
+		 ORDER BY importance DESC, created_at DESC
+		 LIMIT $3`,
+		projectID, query, limit,
+	)
+	if err != nil {
+		return s.GetRecent(ctx, projectID, limit)
 	}
 	defer rows.Close()
 	return scanL2Rows(rows)
