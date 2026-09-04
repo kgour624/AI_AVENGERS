@@ -151,18 +151,182 @@ func buildRouter(
 	modelGateway *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
 ) *gin.Engine {
-	router := gin.New() // Don't use gin.Default() — we add our own middleware
+	router := gin.New()
 
-	// Middleware order matters:
-	// 1. Recovery — catch panics from ALL subsequent middleware
-	// 2. RequestID — set before logging
-	// 3. Logger — log with request ID
-	// 4. CORS — before auth
-	// 5. RateLimit — before auth (reject early)
+	// Middleware order: Recovery -> RequestID -> Logger -> RateLimit
 	router.Use(middleware.RecoveryMiddleware(logger))
 	router.Use(middleware.RequestIDMiddleware())
 	router.Use(middleware.LoggerMiddleware(logger))
 	router.Use(middleware.RateLimitMiddleware(redisClient.Client, cfg.RateLimit.PerIP, logger))
+
+	// Initialize services
+	memManager := memory.NewManager(postgres.Pool, redisClient.Client, mlClient, logger)
+	chinawallEnforcer := chinawall.NewEnforcer(cfg.ChinaWall, modelGateway, mlClient, logger)
+	decisionEngine := decision.NewEngine(postgres.Pool, modelGateway, chinawallEnforcer, logger)
+	contextAssembler := appcontext.NewAssembler(
+		postgres.Pool, mlClient, memManager,
+		cfg.Context.MaxTokens, cfg.Context.RecentMessages,
+		cfg.Context.SemanticTopK, cfg.Context.CourseChunksTopK,
+		logger,
+	)
+	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, logger)
+
+	projectSvc := project.NewService(postgres.Pool, logger)
+	chatSvc := chat.NewService(postgres.Pool, logger)
+	ratingSvc := rating.NewService(postgres.Pool, memManager, logger)
+
+	projectHandler := project.NewHandler(projectSvc, logger)
+	chatHandler := chat.NewHandler(chatSvc, logger)
+	messageHandler := message.NewHandler(chatSvc, orch, modelGateway, mlClient, memManager, logger)
+	ratingHandler := rating.NewHandler(ratingSvc, logger)
+	expertHandler := expert.NewHandler(postgres.Pool, logger)
+
+	// Health check
+	router.GET("/health", func(c *gin.Context) {
+		health := map[string]string{"status": "ok", "version": "1.0.0"}
+		if err := postgres.HealthCheck(c.Request.Context()); err != nil {
+			health["postgres"] = "unhealthy"
+			health["status"] = "degraded"
+		} else {
+			health["postgres"] = "healthy"
+		}
+		if err := redisClient.HealthCheck(c.Request.Context()); err != nil {
+			health["redis"] = "unhealthy"
+		} else {
+			health["redis"] = "healthy"
+		}
+		if err := mlClient.HealthCheck(c.Request.Context()); err != nil {
+			health["ml_sidecar"] = "unhealthy"
+		} else {
+			health["ml_sidecar"] = "healthy"
+		}
+		response.OK(c, health)
+	})
+
+	v1 := router.Group("/api/v1")
+
+	// Auth routes
+	authGroup := v1.Group("/auth")
+	{
+		authGroup.POST("/register", handleRegister(authService))
+		authGroup.POST("/login", handleLogin(authService))
+		authGroup.POST("/admin/login", handleAdminLogin(authService))
+		authGroup.POST("/refresh", handleRefresh(jwtService))
+		authGroup.POST("/logout", middleware.AuthMiddleware(jwtService, logger), handleLogout(jwtService))
+	}
+
+	// Protected routes
+	protected := v1.Group("")
+	protected.Use(middleware.AuthMiddleware(jwtService, logger))
+	{
+		// Expert routes
+		experts := protected.Group("/experts")
+		{
+			experts.GET("", expertHandler.ListActive)
+			experts.GET("/:id", expertHandler.GetByID)
+			experts.GET("/:id/topics", expertHandler.GetTopics)
+		}
+
+		// Project routes
+		projects := protected.Group("/projects")
+		{
+			projects.POST("", projectHandler.Create)
+			projects.GET("", projectHandler.List)
+			projects.GET("/:id", projectHandler.GetByID)
+			projects.PATCH("/:id", projectHandler.Update)
+			projects.DELETE("/:id", projectHandler.Delete)
+			projects.POST("/:id/experts", projectHandler.AddExpert)
+			projects.DELETE("/:id/experts/:expertId", projectHandler.RemoveExpert)
+			projects.POST("/:id/chats", projectHandler.CreateChat)
+			projects.GET("/:id/chats", projectHandler.ListChats)
+			projects.GET("/:id/memory", handleGetProjectMemory(memManager))
+			projects.GET("/:id/timeline", handleGetProjectTimeline(memManager))
+		}
+
+		// Chat routes
+		chats := protected.Group("/chats")
+		{
+			chats.GET("/:id", chatHandler.GetByID)
+			chats.PATCH("/:id", chatHandler.Update)
+			chats.DELETE("/:id", chatHandler.Archive)
+			chats.POST("/:id/messages", messageHandler.Send)
+			chats.GET("/:id/messages", chatHandler.ListMessages)
+		}
+
+		// Message routes
+		messages := protected.Group("/messages")
+		{
+			messages.POST("/:id/rate", ratingHandler.Rate)
+		}
+	}
+
+	// Admin routes
+	adminGroup := v1.Group("/admin")
+	adminGroup.Use(middleware.AuthMiddleware(jwtService, logger))
+	adminGroup.Use(middleware.AdminMiddleware())
+	{
+		adminGroup.GET("/experts", stubHandler("admin_list_experts"))
+		adminGroup.POST("/experts", stubHandler("admin_create_expert"))
+		adminGroup.PATCH("/experts/:id", stubHandler("admin_update_expert"))
+		adminGroup.POST("/experts/:id/ingest", stubHandler("admin_ingest_transcript"))
+		adminGroup.GET("/experts/:id/jobs", stubHandler("admin_ingestion_jobs"))
+		adminGroup.GET("/clients", stubHandler("admin_list_clients"))
+		adminGroup.PATCH("/clients/:id", stubHandler("admin_update_client"))
+		adminGroup.GET("/stats", stubHandler("admin_stats"))
+		adminGroup.GET("/violations", handleAdminViolations(memManager))
+		adminGroup.GET("/ratings", stubHandler("admin_ratings"))
+		adminGroup.GET("/settings", stubHandler("admin_settings"))
+		adminGroup.PATCH("/settings/:key", stubHandler("admin_update_setting"))
+	}
+
+	return router
+}
+
+// handleGetProjectMemory GET /projects/:id/memory
+func handleGetProjectMemory(memManager *memory.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		projectID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid project ID")
+			return
+		}
+		events, err := memManager.GetTimeline(c.Request.Context(), projectID, 20, 0)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, events)
+	}
+}
+
+// handleGetProjectTimeline GET /projects/:id/timeline
+func handleGetProjectTimeline(memManager *memory.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		projectID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid project ID")
+			return
+		}
+		events, err := memManager.GetTimeline(c.Request.Context(), projectID, 50, 0)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, events)
+	}
+}
+
+// handleAdminViolations GET /admin/violations
+func handleAdminViolations(memManager *memory.Manager) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		violations, err := memManager.GetViolations(c.Request.Context(), 100)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, violations)
+	}
+}
 
 	// Health check — no auth required
 	router.GET("/health", func(c *gin.Context) {
