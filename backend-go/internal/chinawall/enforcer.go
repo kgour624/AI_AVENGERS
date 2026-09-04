@@ -272,7 +272,7 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 			chunkID, _ := uuid.Parse(chunkIDStr)
 			citations = append(citations, Citation{
 				ChunkID: chunkID,
-				Text:    chunk.Text[:min(200, len(chunk.Text))],
+				Text:    chunk.Text[:minInt(200, len(chunk.Text))],
 				Score:   chunk.RerankScore,
 			})
 		}
