@@ -384,14 +384,9 @@ Is this premature for this project? Reply with only YES or NO.`,
 	return nil
 }
 
-// neverRulePattern compiled once at package level for performance.
-var neverRulePattern = regexp.MustCompile(`never\s+(\w+(?:\s+\w+){0,5})`)
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+// parseJSONDecision is a helper to unmarshal JSON for decision engine.
+func parseJSONDecision(data []byte, v interface{}) error {
+	return json.Unmarshal(data, v)
 }
 
 
