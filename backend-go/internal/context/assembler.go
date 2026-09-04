@@ -247,53 +247,101 @@ func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, que
 	return entries, nil
 }
 
-// getCourseChunks retrieves and reranks course chunks for a question.
+// getCourseChunks retrieves and reranks course chunks using HYBRID search.
+// Hybrid = vector similarity + keyword match combined.
+//
+// WHY hybrid search (Byte by Byte AI course):
+// Course taught two indexing methods:
+// 1. Vector-based: captures semantic meaning ("database partitioning" matches "sharding")
+// 2. Keyword-based: captures exact terms ("PostgreSQL" exact match)
+// Hybrid combines both: better recall than either alone.
+//
+// Algorithm:
+// Step 1: Vector search -> top 15 candidates (semantic)
+// Step 2: Keyword search -> top 10 candidates (exact)
+// Step 3: Merge + deduplicate
+// Step 4: Rerank merged set -> top K
 func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int) ([]chinawall.CourseChunk, error) {
-	// Step 1: Semantic search — get top 20 candidates
+	// Step 1: Vector search
 	embedding, err := a.ml.EmbedSingle(ctx, question)
 	if err != nil {
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}
 
-	rows, err := a.db.Query(ctx,
+	vectorRows, err := a.db.Query(ctx,
 		`SELECT id, chunk_text, COALESCE(topic,'')
 		 FROM course_chunks
 		 WHERE expert_id=$1
 		 ORDER BY embedding <=> $2
-		 LIMIT 20`,
+		 LIMIT 15`,
 		expertID, pgvector.NewVector(embedding),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("chunk search failed: %w", err)
+		return nil, fmt.Errorf("vector search failed: %w", err)
 	}
-	defer rows.Close()
+	defer vectorRows.Close()
 
 	type rawChunk struct {
 		ID    uuid.UUID
 		Text  string
 		Topic string
 	}
-	var rawChunks []rawChunk
-	var texts []string
-	for rows.Next() {
+
+	seen := make(map[uuid.UUID]bool)
+	var candidates []rawChunk
+
+	for vectorRows.Next() {
 		var c rawChunk
-		if err := rows.Scan(&c.ID, &c.Text, &c.Topic); err != nil {
+		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic); err != nil {
 			continue
 		}
-		rawChunks = append(rawChunks, c)
-		texts = append(texts, c.Text)
+		if !seen[c.ID] {
+			seen[c.ID] = true
+			candidates = append(candidates, c)
+		}
 	}
 
-	if len(rawChunks) == 0 {
+	// Step 2: Keyword search (full-text)
+	// WHY: Exact terms like "PostgreSQL", "Kafka", "Redis" may not be
+	// captured well by semantic search alone.
+	keywordRows, err := a.db.Query(ctx,
+		`SELECT id, chunk_text, COALESCE(topic,'')
+		 FROM course_chunks
+		 WHERE expert_id=$1
+		   AND chunk_text_tsv @@ plainto_tsquery('english', $2)
+		 LIMIT 10`,
+		expertID, question,
+	)
+	if err == nil {
+		defer keywordRows.Close()
+		for keywordRows.Next() {
+			var c rawChunk
+			if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic); err != nil {
+				continue
+			}
+			if !seen[c.ID] {
+				seen[c.ID] = true
+				candidates = append(candidates, c)
+			}
+		}
+	}
+	// Keyword search failure is non-fatal — vector results still usable
+
+	if len(candidates) == 0 {
 		return nil, nil
 	}
 
-	// Step 2: Rerank — get top K with scores
+	// Step 3: Rerank merged candidates
+	texts := make([]string, len(candidates))
+	for i, c := range candidates {
+		texts[i] = c.Text
+	}
+
 	reranked, err := a.ml.Rerank(ctx, question, texts, limit)
 	if err != nil {
 		// Fallback: return top K without reranking
 		var chunks []chinawall.CourseChunk
-		for i, c := range rawChunks {
+		for i, c := range candidates {
 			if i >= limit {
 				break
 			}
@@ -304,16 +352,12 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		return chunks, nil
 	}
 
-	// Build final chunks with rerank scores
 	var chunks []chinawall.CourseChunk
 	for _, r := range reranked {
-		if r.Index < len(rawChunks) {
-			c := rawChunks[r.Index]
+		if r.Index < len(candidates) {
+			c := candidates[r.Index]
 			chunks = append(chunks, chinawall.CourseChunk{
-				ID:          c.ID,
-				Text:        c.Text,
-				Topic:       c.Topic,
-				RerankScore: r.Score,
+				ID: c.ID, Text: c.Text, Topic: c.Topic, RerankScore: r.Score,
 			})
 		}
 	}
