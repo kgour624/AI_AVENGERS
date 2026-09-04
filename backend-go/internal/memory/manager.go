@@ -195,7 +195,9 @@ func (m *Manager) GetViolations(ctx context.Context, limit int) ([]L3EventRecord
 	return m.l3.GetViolations(ctx, limit)
 }
 
-func min(a, b int) int {
+// minInt returns the smaller of two ints.
+// Named minInt to avoid conflict with Go 1.21+ builtin min.
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
