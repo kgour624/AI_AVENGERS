@@ -264,6 +264,12 @@ func buildVectorLiteral(v []float32) string {
 	return sb.String()
 }
 
+// GetDB returns the database pool.
+// Used by message handler for direct queries.
+func (s *Service) GetDB() *pgxpool.Pool {
+	return s.db
+}
+
 // Handler handles HTTP requests for chats.
 type Handler struct {
 	svc    *Service
