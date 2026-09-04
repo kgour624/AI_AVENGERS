@@ -153,7 +153,7 @@ func (m *Manager) RecordTurn(
 				"decision_mode": decisionMode,
 				"importance":    importance,
 			},
-			Reasoning:    assistantResponse[:min(200, len(assistantResponse))],
+			Reasoning:    assistantResponse[:minInt(200, len(assistantResponse))],
 			DecisionMade: decisionMode,
 		})
 	}()
