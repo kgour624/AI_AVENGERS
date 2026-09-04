@@ -339,7 +339,7 @@ func isHeadingOrTransition(s string) bool {
 	return false
 }
 
-func min(a, b int) int {
+func minInt(a, b int) int {
 	if a < b {
 		return a
 	}
