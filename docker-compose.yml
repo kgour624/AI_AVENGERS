@@ -1,0 +1,103 @@
+version: '3.9'
+
+services:
+  # ============================================================
+  # Go Backend API
+  # ============================================================
+  api:
+    build:
+      context: ./backend-go
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_HOST=0.0.0.0
+      - SERVER_PORT=8080
+      - SERVER_ENV=development
+      - DATABASE_URL=postgres://avengers:avengers_pass@postgres:5432/ai_avengers?sslmode=disable
+      - REDIS_URL=redis://redis:6379
+      - ML_SIDECAR_URL=http://ml-sidecar:8001
+      - JWT_SECRET=${JWT_SECRET}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ml-sidecar:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - avengers-network
+
+  # ============================================================
+  # Python ML Sidecar
+  # WHY separate service: ML models are large, Python-native.
+  # Stateless — can scale independently from API.
+  # ============================================================
+  ml-sidecar:
+    build:
+      context: ./ml-sidecar
+      dockerfile: Dockerfile
+    ports:
+      - "8001:8001"
+    volumes:
+      - ml-models:/root/.cache/huggingface  # Cache downloaded models
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    networks:
+      - avengers-network
+
+  # ============================================================
+  # PostgreSQL with pgvector
+  # ============================================================
+  postgres:
+    image: pgvector/pgvector:pg15
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=avengers
+      - POSTGRES_PASSWORD=avengers_pass
+      - POSTGRES_DB=ai_avengers
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U avengers -d ai_avengers"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - avengers-network
+
+  # ============================================================
+  # Redis
+  # Used for: L1 memory, JWT refresh tokens, rate limiting
+  # ============================================================
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes  # Persistence
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - avengers-network
+
+volumes:
+  postgres-data:
+  redis-data:
+  ml-models:  # Persist downloaded model weights
+
+networks:
+  avengers-network:
+    driver: bridge
