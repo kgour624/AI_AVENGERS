@@ -66,9 +66,18 @@ type openRouterRequest struct {
 	Temperature float64             `json:"temperature"`
 }
 
+// openRouterMessage is a single message in the conversation.
 type openRouterMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role         string        `json:"role"`
+	Content      string        `json:"content"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+// cacheControl enables Anthropic-style prompt caching via OpenRouter.
+// WHY: System prompts are identical across calls to same expert.
+// Caching saves 40-60% on token costs for repeated expert calls.
+type cacheControl struct {
+	Type string `json:"type"` // "ephemeral"
 }
 
 // openRouterResponse is the OpenRouter API response format.
