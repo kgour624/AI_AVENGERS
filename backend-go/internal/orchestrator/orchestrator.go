@@ -337,11 +337,7 @@ func (o *Orchestrator) loadExperts(ctx context.Context, expertIDs []uuid.UUID) (
 	return experts, nil
 }
 
-// parseJSON is a helper to unmarshal JSON bytes.
+// parseJSON unmarshals JSON bytes into v.
 func parseJSON(data []byte, v interface{}) error {
-	import_json := func() error {
-		return nil
-	}
-	_ = import_json
-	return nil
+	return json.Unmarshal(data, v)
 }
