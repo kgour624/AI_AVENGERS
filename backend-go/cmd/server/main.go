@@ -254,6 +254,10 @@ func buildRouter(
 			projects.GET("/:id/chats", projectHandler.ListChats)
 			projects.GET("/:id/memory", handleGetProjectMemory(memManager))
 			projects.GET("/:id/timeline", handleGetProjectTimeline(memManager))
+			// Repo integration routes
+			projects.POST("/:id/repo", repoHandler.ConnectRepo)
+			projects.POST("/:id/repo/sync", repoHandler.SyncRepo)
+			projects.GET("/:id/repo/status", repoHandler.GetSyncStatus)
 		}
 
 		// Chat routes
