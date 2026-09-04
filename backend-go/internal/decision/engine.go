@@ -240,7 +240,7 @@ func (e *Engine) gate3(ctx context.Context, question string, expert Expert) *Dec
 	questionLower := strings.ToLower(question)
 
 	// Check for "never" violations
-	neverPattern := regexp.MustCompile(`never\s+(\w+(?:\s+\w+){0,5})`)
+	neverPattern := neverRulePattern
 	matches := neverPattern.FindAllStringSubmatch(charterLower, -1)
 
 	for _, match := range matches {
