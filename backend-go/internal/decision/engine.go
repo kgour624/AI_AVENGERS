@@ -155,11 +155,19 @@ func (e *Engine) Process(
 }
 
 // gate1 checks if we have enough information to answer.
-// Uses clarification charter to ask targeted questions.
+// Uses double-check pattern:
+// 1. Fast keyword check (free) — catches obvious vague questions
+// 2. LLM check (cheap) — only if keyword check flags vagueness
+//
+// WHY LLM for vagueness (Byte by Byte AI course):
+// Course taught: zero-shot prompting with structured output.
+// "Is this question specific enough? Return JSON: {clear: bool, missing: [...]}"
+// Keyword matching alone misses nuanced vagueness.
+// LLM double-check only runs when needed — avoids cost on clear questions.
 func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 	questionLower := strings.ToLower(question)
 
-	// Check if question is too vague
+	// Fast check: obvious vague indicators
 	vagueIndicators := []string{"how do i", "what should i", "best way", "recommend", "suggest"}
 	isVague := false
 	for _, indicator := range vagueIndicators {
@@ -169,7 +177,9 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 		}
 	}
 
-	if !isVague {
+	// Only proceed to LLM check if keyword check flagged AND question is short
+	// WHY length check: Long questions usually have enough context
+	if !isVague || len(question) >= 80 {
 		return nil // Question is specific enough
 	}
 
@@ -184,17 +194,76 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 		}
 	}
 
-	// Only ask if we have specific questions AND question is short (< 50 chars)
-	// WHY length check: Long questions usually have enough context
-	if len(clarificationQs) > 0 && len(question) < 50 {
+	if len(clarificationQs) > 0 {
 		return &DecisionResult{
 			Mode:        ModeASK,
-			Questions:   clarificationQs[:min(3, len(clarificationQs))],
+			Questions:   clarificationQs[:minInt(3, len(clarificationQs))],
 			GateStopped: 1,
 			Content:     "I need more information to give you an accurate answer.",
 		}
 	}
 
+	return nil
+}
+
+// gate1WithLLM is the enhanced version using LLM for vagueness detection.
+// Called when keyword check is inconclusive.
+// Uses zero-shot structured output (Byte by Byte AI course pattern).
+func (e *Engine) gate1WithLLM(ctx context.Context, question string, expert Expert) *DecisionResult {
+	prompt := fmt.Sprintf(`Is this question specific enough to answer accurately?
+
+Question: "%s"
+Expert domain: %s
+
+Return JSON only: {"clear": true/false, "missing": ["what info is missing"]}
+If clear=true, missing should be empty.`, question, expert.Domain)
+
+	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
+		Model:       gateway.ModelCheap,
+		UserPrompt:  prompt,
+		MaxTokens:   100,
+		Temperature: 0.1,
+		UseCache:    true,
+	})
+	if err != nil {
+		return nil // On error, don't block
+	}
+
+	// Parse response
+	var result struct {
+		Clear   bool     `json:"clear"`
+		Missing []string `json:"missing"`
+	}
+
+	clean := strings.TrimSpace(resp.Content)
+	clean = strings.TrimPrefix(clean, "```json")
+	clean = strings.TrimPrefix(clean, "```")
+	clean = strings.TrimSuffix(clean, "```")
+	clean = strings.TrimSpace(clean)
+
+	start := strings.Index(clean, "{")
+	end := strings.LastIndex(clean, "}")
+	if start == -1 || end == -1 {
+		return nil
+	}
+
+	if err := parseJSONDecision([]byte(clean[start:end+1]), &result); err != nil {
+		return nil
+	}
+
+	if !result.Clear && len(result.Missing) > 0 {
+		// Build clarification questions from missing info
+		var questions []string
+		for _, m := range result.Missing {
+			questions = append(questions, "What is your "+m+"?")
+		}
+		return &DecisionResult{
+			Mode:        ModeASK,
+			Questions:   questions[:minInt(3, len(questions))],
+			GateStopped: 1,
+			Content:     "I need more information to give you an accurate answer.",
+		}
+	}
 	return nil
 }
 
