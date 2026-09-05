@@ -552,6 +552,7 @@ func handleLogin(svc *auth.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		setRefreshCookie(c, tokens.RefreshToken, svc.RefreshExpiryDays())
 		response.OK(c, buildAuthResponse(user, tokens))
 	}
 }
