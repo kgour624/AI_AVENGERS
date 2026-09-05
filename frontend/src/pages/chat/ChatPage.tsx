@@ -4,6 +4,7 @@ import { useLoaderData, useRevalidator } from 'react-router-dom'
 import { getChat, getMessages } from '@/api/chats'
 import { getProjectExperts } from '@/api/projects'
 import type { ChatLoaderData } from '@/types/project'
+import type { ExpertResponse as ExpertResponseType } from '@/types/expert'
 import { useSSEStream } from '@/hooks/useSSEStream'
 import { useStreamStore } from '@/stores/streamStore'
 import { MessageInput } from '@/components/chat/MessageInput'
@@ -133,7 +134,7 @@ export default function ChatPage() {
               // This cast reflects that: by the time an entry exists in
               // this array at all, it came from a 'complete' event.
               partial.expertId ? (
-                <ExpertResponse key={partial.expertId} response={partial as import('@/types/expert').ExpertResponse} isStreaming />
+                <ExpertResponse key={partial.expertId} response={partial as ExpertResponseType} isStreaming />
               ) : (
                 <p key={i} className="text-xs text-text-disabled">Malformed response - missing expertId</p>
               )
