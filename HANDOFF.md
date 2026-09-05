@@ -601,6 +601,103 @@ typecheck && npm run build`, and fix whatever that surfaces.
 
 ---
 
+## \ud83d\udea8 CONSOLIDATED BACKEND BLOCKER LIST (Phases 1-5, 2026-09-05)
+
+> **IMPORTANT: none of these have been fixed. No backend (`backend-go/`)
+> source file has been modified at any point during the frontend
+> implementation work in this document (Phases 1-5) - every item below
+> was found by *reading* backend source to verify frontend assumptions
+> against it, never by editing it. This section exists purely to give
+> whoever picks up backend work a single place to look, instead of
+> hunting through 5 separate phase sections above.**
+
+### Blocker 1 - `cmd/server/main.go` almost certainly does not compile
+
+Contains **two complete, conflicting `buildRouter` function bodies**
+concatenated in the same file, with the same package-level function
+names (`handleGetProjectMemory`, `handleGetProjectTimeline`,
+`handleAdminListExperts`, `handleAdminGetStats`, and many more)
+declared twice. Go does not allow duplicate function declarations in
+one package. The first copy wires real handlers
+(`projectHandler.GetByID`, `repoHandler.ConnectRepo`, etc.); the second
+copy is entirely `stubHandler(...)` calls that look like an earlier,
+incomplete draft that was never deleted. **Fix**: delete the second
+(stub) `buildRouter` definition and every duplicate function it
+contains, keeping only the first (real-handler) version.
+**Severity: blocks the backend from running at all.**
+
+### Blocker 2 - Repo OAuth connect flow is unreachable
+
+`repo.Service.GetOAuthURL` exists and `NewService` even constructs a
+correct OAuth callback `RedirectURL` (`/api/v1/repo/callback/{provider}`),
+but neither an OAuth-initiation route (`GET /repo/oauth/:provider`) nor
+the callback route itself is registered anywhere in `buildRouter` (checked
+both copies). Only `POST /projects/:id/repo` (requires the client to
+already possess a plaintext `access_token`), `POST /projects/:id/repo/sync`,
+and `GET /projects/:id/repo/status` are reachable. There is also no
+callback *handler function* written anywhere in `internal/repo/` to
+receive the OAuth code even if the route were registered.
+**Fix**: register `GET /repo/oauth/:provider` \u2192 `repoHandler.GetOAuthURL`,
+write and register a callback handler that calls `Service.ExchangeCode`
+then `Service.ConnectRepo`, and decide whether the frontend's current
+PAT-based flow (built in Phase 5, see `frontend/src/components/project/
+RepoConnectModal.tsx`) should be kept as a fallback or removed once
+OAuth works. **Severity: OAuth repo-connect literally cannot function
+until this is done; PAT-based connect works today as a workaround.**
+
+### Blocker 3 - `AdminSettings` has no safe generic edit path (design constraint, not a code bug)
+
+`GET/PATCH /admin/settings` operate on an arbitrary JSONB `value` per
+row, and the 4 known setting keys (`china_wall`, `context`, `models`,
+`cost_budget`) each have a *different* internal shape (per the seed
+`INSERT` in `AI_AVENGERS_SYSTEM_ARCHITECTURE.md` section 5). This isn't
+a bug to fix in the existing endpoint, but it does block building a
+safe settings UI without either (a) bespoke validation/forms per known
+key on the frontend, or (b) the backend adding per-key typed
+validation server-side. **Fix**: pick one of those two approaches
+before attempting `AdminSettings` again.
+
+### CORRECTION to an earlier claim in this document (Phase 4 section above)
+
+Phase 4's section above states *"there is no timeline/L3-event handler
+or route anywhere in that file [project/service.go] at all"* and treats
+`ProjectTimeline` as blocked by a fully-missing endpoint. **This was an
+incomplete finding** - it was based on reading only
+`internal/project/service.go`. Re-checking `cmd/server/main.go`
+directly (done while compiling this consolidated list) shows the
+first (real) `buildRouter` copy DOES register:
+```go
+projects.GET("/:id/timeline", handleGetProjectTimeline(memManager))
+```
+with a real handler that calls `memManager.GetTimeline(ctx, projectID, 50, 0)`
+(confirmed via `internal/memory/manager.go`'s real `GetTimeline` method).
+The endpoint **is reachable** - it just has **hardcoded pagination**
+(`limit=50, offset=0`, no query-string params accepted at all), which
+is actually a *different*, smaller gap than "doesn't exist." **This
+means `ProjectTimeline.tsx` (built and ready since Phase 2, still
+unwired in `ProjectPage.tsx`) can likely be wired up now** - the only
+remaining open question is whether always-first-50-events is
+acceptable for v1, not whether the endpoint exists. Flagged here so
+the earlier phase sections are not read as still-accurate without this
+correction. **Frontend action available now**: wire
+`GET /api/v1/projects/:id/timeline` into `ProjectPage.tsx` via
+`ProjectTimeline.tsx` - Phase 6 candidate.
+
+### Non-blocking backend observations (lower severity, worth knowing)
+
+- `AdminStats.avgRating` is returned as a formatted **string**
+  (`fmt.Sprintf("%.2f", ...)`), not a JSON number - already handled
+  correctly on the frontend (`api/admin.ts`), noted here only so a
+  future backend refactor to a real number doesn't silently break the
+  frontend type without anyone noticing the coupling.
+- `AdminHandler.IngestTranscript` validates file **size** only
+  (50MB), never file type/extension server-side - frontend-side
+  `.txt`/`.md` filtering (Phase 4) is UX only, not a real security
+  boundary. Not urgent, but worth deciding if server-side type
+  validation should be added.
+
+---
+
 ## Anti-Patterns Found and Fixed
 
 *Will be updated as implementation progresses.*
