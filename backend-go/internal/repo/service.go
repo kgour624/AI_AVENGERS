@@ -741,16 +741,131 @@ func NewHandler(svc *Service, logger *zap.Logger) *Handler {
 	return &Handler{svc: svc, logger: logger}
 }
 
-// GetOAuthURL GET /repo/oauth/:provider
+// GetOAuthURL GET /repo/oauth/:provider?project_id=<uuid>
+// Returns the OAuth authorization URL. Frontend redirects user there.
+//
+// Mental execution:
+// Client calls GET /repo/oauth/github?project_id=abc-123
+// -> state UUID generated
+// -> state stored in Redis: oauth_state:{state} = "github:abc-123"
+// -> returns {url: "https://github.com/login/oauth/authorize?...", state: "..."}
+// -> frontend redirects browser to url
 func (h *Handler) GetOAuthURL(c *gin.Context) {
 	provider := c.Param("provider")
+	projectID := c.Query("project_id")
+	if projectID == "" {
+		response.BadRequest(c, "MISSING_PROJECT_ID", "project_id query param required")
+		return
+	}
+	if _, err := uuid.Parse(projectID); err != nil {
+		response.BadRequest(c, "INVALID_PROJECT_ID", "project_id must be a valid UUID")
+		return
+	}
+
 	state := uuid.New().String() // CSRF protection
-	oauthURL, err := h.svc.GetOAuthURL(provider, state)
+	oauthURL, err := h.svc.GetOAuthURL(c.Request.Context(), provider, state, projectID)
 	if err != nil {
 		response.BadRequest(c, "INVALID_PROVIDER", err.Error())
 		return
 	}
 	response.OK(c, map[string]string{"url": oauthURL, "state": state})
+}
+
+// OAuthCallback GET /repo/callback/:provider?code=...&state=...
+// Called by GitHub/GitLab after user authorizes the app.
+// No JWT — this is a browser redirect from the OAuth provider.
+//
+// Mental execution:
+// GitHub redirects: GET /repo/callback/github?code=abc&state=xyz
+// 1. Look up state in Redis -> "github:project-uuid" (CSRF check)
+// 2. Delete state from Redis (one-time use)
+// 3. Exchange code for access token
+// 4. ConnectRepo with the token
+// 5. Start background sync
+// 6. Return JSON {status: connected} — frontend navigates
+func (h *Handler) OAuthCallback(c *gin.Context) {
+	provider := c.Param("provider")
+	code := c.Query("code")
+	state := c.Query("state")
+
+	if code == "" || state == "" {
+		response.BadRequest(c, "MISSING_PARAMS", "code and state are required")
+		return
+	}
+
+	// Validate state (CSRF check)
+	stateValue, err := h.svc.redis.Get(c.Request.Context(), oauthStateKey(state)).Result()
+	if err != nil {
+		// State not found or expired
+		response.BadRequest(c, "INVALID_STATE", "OAuth state invalid or expired. Please try again.")
+		return
+	}
+
+	// Delete state — one-time use
+	_ = h.svc.redis.Del(c.Request.Context(), oauthStateKey(state))
+
+	// Parse state value: "provider:projectID"
+	parts := strings.SplitN(stateValue, ":", 2)
+	if len(parts) != 2 || parts[0] != provider {
+		response.BadRequest(c, "INVALID_STATE", "OAuth state provider mismatch")
+		return
+	}
+	projectID, err := uuid.Parse(parts[1])
+	if err != nil {
+		response.BadRequest(c, "INVALID_STATE", "OAuth state contains invalid project ID")
+		return
+	}
+
+	// Exchange code for access token
+	accessToken, err := h.svc.ExchangeCode(c.Request.Context(), provider, code)
+	if err != nil {
+		h.logger.Error("OAuth code exchange failed",
+			zap.String("provider", provider),
+			zap.Error(err),
+		)
+		response.BadRequest(c, "OAUTH_EXCHANGE_FAILED", "Failed to exchange OAuth code. Please try again.")
+		return
+	}
+
+	// We don't have clientID here (no JWT) — look it up from the project
+	// WHY: OAuth callback has no JWT. We trust the state param (CSRF validated)
+	// to identify the project, and we look up the project owner.
+	var clientID uuid.UUID
+	err = h.svc.db.QueryRow(c.Request.Context(),
+		`SELECT client_id FROM projects WHERE id=$1 AND deleted_at IS NULL`,
+		projectID,
+	).Scan(&clientID)
+	if err != nil {
+		response.NotFound(c, "project")
+		return
+	}
+
+	// Connect repo with the obtained token
+	// repo_url and default_branch will be fetched during sync
+	// For now store a placeholder URL — sync will update it
+	connID, err := h.svc.ConnectRepo(
+		c.Request.Context(), projectID, clientID,
+		provider, "", accessToken, "main",
+	)
+	if err != nil {
+		h.logger.Error("ConnectRepo failed after OAuth", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	// Start background sync
+	_ = h.svc.SyncRepo(c.Request.Context(), connID)
+
+	h.logger.Info("OAuth repo connected",
+		zap.String("provider", provider),
+		zap.String("project_id", projectID.String()),
+	)
+
+	response.OK(c, map[string]interface{}{
+		"status":        "connected",
+		"connection_id": connID,
+		"project_id":    projectID,
+	})
 }
 
 // ConnectRepo POST /projects/:id/repo
