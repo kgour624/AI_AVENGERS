@@ -23,6 +23,11 @@ export const projectRoute = { element: <ProjectPage />, loader }
  * isn't "the contract is unclear", it's "the endpoint does not exist
  * yet" - wiring it up would mean calling a URL that 404s. Logged as a
  * concrete backend TODO in HANDOFF.md, not a frontend gap.
+ *
+ * PHASE 5 UPDATE: RepoStatus now takes projectId (not the full Project
+ * object) - it fetches its own live sync status via useRepoSyncStatus
+ * rather than reading the parent's static repo fields, since sync
+ * progress has no representation on the Project object at all.
  */
 export default function ProjectPage() {
   const { project } = useLoaderData() as { project: Project }
@@ -42,7 +47,7 @@ export default function ProjectPage() {
       </div>
 
       <div className="mt-6">
-        <RepoStatus project={project} />
+        <RepoStatus projectId={project.id} />
       </div>
 
       <Outlet />
