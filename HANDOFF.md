@@ -786,4 +786,204 @@ ai_avengers/
 
 ---
 
-*Last updated: 2026-09-04*
+## 🔬 COMPLETE END-TO-END AUDIT — 2026-09-05
+
+> **Performed by:** System Design Architect  
+> **Method:** Full codebase mental execution — every file read, every call site traced, every DB query cross-checked against schema, every type verified end-to-end.  
+> **Scope:** Backend (Go), Frontend (React/TS), Database (PostgreSQL migrations), ML Sidecar, Architecture doc compliance.
+
+---
+
+### AUDIT RESULT SUMMARY
+
+| Layer | Status | Notes |
+|---|---|---|
+| Database schema (migrations 001-003) | ✅ CORRECT | All tables, indexes, constraints match architecture doc |
+| ML Sidecar (Python) | ✅ CORRECT | FastAPI + bge embeddings + reranker — correct |
+| Memory L1 (Redis) | ✅ CORRECT | Key pattern `l1:{project}:{expert}`, TTL 24h, FIFO eviction, rebuild on miss — correct |
+| Memory L2 (PostgreSQL + pgvector) | ✅ CORRECT | Hybrid search (vector + FTS fallback), supersede logic — correct |
+| Memory L3 (append-only log) | ✅ CORRECT | Immutable, no update/delete, timeline + violations queries — correct |
+| China Wall (4 layers) | ✅ CORRECT | Layer 1 reranker threshold, Layer 2 CoT coverage, Layer 3 citations, Layer 4 strip — correct |
+| Decision Engine (5 gates) | ✅ CORRECT | Gate 1-5 sequence, retry logic, warning passthrough — correct |
+| Context Assembler | ✅ CORRECT | Budget allocation, rolling summary, L2 memory, recent msgs, semantic history, course chunks — correct |
+| Orchestrator (parallel goroutines) | ✅ CORRECT | WaitGroup + buffered channel + 30s timeout, synthesis — correct |
+| Ingestion Pipeline | ✅ CORRECT | Chunk → topic → charter → embed → store → capability → stats — correct |
+| Rating + chunk boost | ✅ CORRECT | boost_factor clamped 0.5-1.5, expert avg_rating recalc — correct |
+| SSE streaming (message handler) | ✅ CORRECT | thinking → complete → synthesis → done events, async memory update — correct |
+| Chat service | ✅ CORRECT | turn number, message save, index turn, rolling summary trigger — correct |
+| Project service | ✅ CORRECT | CRUD, expert management, ownership checks — correct |
+| Auth service | ✅ CORRECT | bcrypt cost 12, TOTP, JWT, Redis refresh tokens — correct |
+| Admin handler | ⚠️ DEAD CODE | Two handler structs in admin package — see Bug 2 below |
+| **Backend compile** | 🔴 FAILS | Duplicate buildRouter — see Bug 1 below |
+| **messages table** | 🔴 SCHEMA GAP | warning_text + clarifying_questions missing — see Bug 3 |
+| **OAuth routes** | 🔴 MISSING | GET /repo/oauth/:provider + callback not registered — see Bug 4 |
+| **GET /me endpoint** | 🔴 MISSING | No profile endpoint — see Bug 5 |
+| Frontend build | ⚠️ UNVERIFIED | No npm install/build/typecheck run — manual trace only |
+| Frontend types | ✅ CORRECT | PublicExpert/Expert split, ExpertTopic optional fields, Message.gateStopped — correct |
+| Frontend SSE | ✅ CORRECT | Rolling buffer fix, fetch() not EventSource, partial frame bug fixed — correct |
+| Frontend state | ✅ CORRECT | StreamStore setError added, immutable Map updates — correct |
+| Frontend routing | ✅ CORRECT | AuthGuard → AdminGuard nesting, lazy admin subtree — correct |
+| Frontend API layer | ✅ CORRECT | Single-flight refresh, retry guard, casing bridge — correct |
+
+---
+
+### 🔴 BUG 1 — `cmd/server/main.go` — DUPLICATE `buildRouter` — BACKEND DOES NOT COMPILE
+
+**Status:** CONFIRMED REAL (was in HANDOFF, now verified by reading every line)  
+**Severity:** CRITICAL — backend cannot start at all
+
+**Exact problem:**  
+File contains two complete `buildRouter` function bodies concatenated in the same file:
+- **First body** (real): Uses `expertHandler.ListActive`, `projectHandler.Create`, `repoHandler.ConnectRepo`, `adminHandler.ListExperts`, etc. — correct real handlers.
+- **Second body** (stub draft): Uses `handleListExperts(postgres)`, `handleCreateProject(postgres)`, etc. — old stub functions never deleted.
+
+Go does not allow duplicate function declarations in one package. Additionally:
+- `handleGetProjectMemory` declared twice (real handler taking `*memory.Manager`, stub taking `*db.Pool`)
+- `handleGetProjectTimeline` declared twice (same issue)
+- Second `buildRouter` body is orphaned code outside any function — syntax error
+
+**Fix needed:** Delete the entire second `buildRouter` body and all duplicate stub function declarations. Keep only the first (real-handler) version. Also add missing routes during fix (Bug 4, Bug 5).
+
+---
+
+### 🟡 BUG 2 — `admin` package — DEAD CODE (two handler structs)
+
+**Status:** NEW — not in previous HANDOFF  
+**Severity:** MEDIUM — compiles fine, but dead code causes confusion
+
+**Exact problem:**  
+`admin/admin_handler.go` defines `AdminHandler` struct with `NewAdminHandler(db, gw, ml, logger)` — this is what `main.go` uses.  
+`admin/handler.go` defines a separate `Handler` struct with `NewHandler(expertSvc, ingestion, logger)` — this is NEVER called from `main.go`.  
+Both files define `ListExperts`, `CreateExpert`, `UpdateExpert`, `IngestTranscript`, `GetIngestionJobs` — different implementations on different structs. The `handler.go` version is dead code.
+
+**Fix needed:** Delete `admin/handler.go` entirely. `admin/admin_handler.go` is the correct, complete implementation.
+
+---
+
+### 🔴 BUG 3 — `messages` table — `warning_text` + `clarifying_questions` COLUMNS MISSING
+
+**Status:** CONFIRMED REAL (was in HANDOFF, now verified against schema)  
+**Severity:** HIGH — data permanently lost on page reload
+
+**Exact problem:**  
+`001_initial_schema.up.sql` messages table has NO `warning_text` or `clarifying_questions` columns.  
+`chat/service.go` `SaveMessage` INSERT does not include these fields.  
+`message/handler.go` `saveAssistantMessage` does not save `resp.Warning` or `resp.Questions`.  
+Result: Gate 3 WARN text and Gate 1 ASK clarifying questions are streamed to client via SSE but never persisted. On page reload, permanently gone.
+
+**Fix needed:**
+1. Migration 004: `ALTER TABLE messages ADD COLUMN warning_text TEXT; ADD COLUMN clarifying_questions JSONB DEFAULT '[]';`
+2. `chat/service.go` Message struct: add `WarningText string` and `ClarifyingQuestions []string`
+3. `chat/service.go` SaveMessage: include these fields in INSERT
+4. `message/handler.go` saveAssistantMessage: pass `resp.Warning` and `resp.Questions`
+
+---
+
+### 🔴 BUG 4 — Repo OAuth Routes NOT REGISTERED
+
+**Status:** CONFIRMED REAL (was in HANDOFF, now verified)  
+**Severity:** HIGH — OAuth flow cannot work
+
+**Exact problem:**  
+`repo/service.go` has `GetOAuthURL` and `ExchangeCode` methods.  
+`repo/service.go` (Handler section) has `GetOAuthURL` HTTP handler written.  
+But `main.go` first `buildRouter` does NOT register:
+- `GET /api/v1/repo/oauth/:provider` → `repoHandler.GetOAuthURL`
+- `GET /api/v1/repo/callback/:provider` → OAuth callback (no handler written)
+
+Only PAT-based connect works today (`POST /projects/:id/repo` with `access_token` in body).
+
+**Fix needed (during Bug 1 fix):**
+1. Register `GET /api/v1/repo/oauth/:provider` → `repoHandler.GetOAuthURL` in protected routes
+2. Write `OAuthCallback` handler in `repo/service.go` that calls `ExchangeCode` then `ConnectRepo`
+3. Register `GET /api/v1/repo/callback/:provider` → `repoHandler.OAuthCallback`
+
+---
+
+### 🔴 BUG 5 — `GET /me` Endpoint MISSING
+
+**Status:** CONFIRMED REAL (was in HANDOFF, now verified)  
+**Severity:** HIGH — frontend cannot restore full session after page reload
+
+**Exact problem:**  
+No `GET /api/v1/auth/me` endpoint exists anywhere in `main.go` or any handler file.  
+Frontend `useAuth.ts` uses a JWT-decode stopgap (`utils/jwt.ts`) to recover `role` from the access token after reload — but `fullName` and `email` cannot be recovered this way.  
+`auth/service.go` has `getUserByEmail` but no `GetMe(userID)` method.
+
+**Fix needed:**
+1. Add `GetMe(ctx, userID uuid.UUID) (*User, error)` to `auth/service.go`
+2. Add `handleGetMe(authService)` handler in `main.go`
+3. Register `GET /api/v1/auth/me` in protected routes
+
+---
+
+### 🟡 BUG 6 — `rating/handler.go` `logToL3` uses WRONG event type
+
+**Status:** NEW — not in previous HANDOFF  
+**Severity:** LOW — functional but semantically wrong
+
+**Exact problem:**  
+`rating/handler.go` `logToL3` calls `s.memManager.RecordViolation(...)` which logs with `EventType: EventChinaWallViolation`. A rating is NOT a China Wall violation. Every rating appears in the admin violations list — polluting violation data.
+
+**Fix needed:** Add `RecordRating` method to `memory.Manager` that calls `l3.Append` with `EventType: EventRatingRecorded` directly.
+
+---
+
+### 🟡 BUG 7 — `chat/service.go` `IndexTurn` uses SQL string interpolation for vector
+
+**Status:** NEW — not in previous HANDOFF  
+**Severity:** MEDIUM — SQL injection risk + fragile
+
+**Exact problem:**  
+```go
+vecStr := buildVectorLiteral(embedding)
+_, err := s.db.Exec(ctx,
+    fmt.Sprintf(`INSERT INTO chat_index ... VALUES ($1,$2,$3,$4,$5,$6,'%s'::vector)`, vecStr),
+    chatID, messageID, turnNumber, summary, topic, importance,
+)
+```
+String interpolation for the vector literal. Should use `pgvector.NewVector(embedding)` as a `$7` parameter like `l2_store.go` does correctly.
+
+**Fix needed:** Use `pgvector.NewVector(embedding)` as `$7` parameter, remove `buildVectorLiteral` and `fmt.Sprintf`.
+
+---
+
+### ✅ WHAT IS CORRECT (verified, not bugs)
+
+- L1/L2/L3 memory system: matches architecture doc exactly
+- China Wall 4 layers: all implemented correctly
+- 5-gate decision engine: correct sequence, retry logic, warning passthrough
+- Parallel goroutines for experts: WaitGroup + buffered channel + 30s timeout
+- Rolling summary every 10 turns: `turnNumber%10 == 0` trigger correct
+- Hybrid search (vector + FTS): Migration 002 adds tsvector, L2Store uses both
+- Prompt caching: `cache_control: {type: ephemeral}` in model gateway
+- Chunk boost self-learning: `boost_factor` clamped 0.5-1.5, updated on rating
+- WHY principle in charters: charter extractor prompt explicitly asks for WHY in every rule
+- Append-only L3: no UPDATE/DELETE on master_event_log
+- TOTP for admin: `totp.Validate` in AdminLogin
+- SSE streaming: correct headers, `X-Accel-Buffering: no`
+- Context budget management: token budget allocation with percentages
+- Recursive text chunker: `\n\n → \n → sentence → word` priority
+- Frontend SSE partial frame bug: fixed with rolling buffer
+- Frontend refresh token race: single-flight `refreshPromise`
+- Frontend infinite retry loop: `_retry` flag guard
+- Frontend StreamStore `setError`: added
+- Frontend `PublicExpert`/`Expert` split: correct
+- Frontend `Message.gateStopped`: added
+- Frontend virtualized message list: `@tanstack/react-virtual` with dynamic height
+
+---
+
+### 📋 PRIORITY FIX ORDER
+
+1. **Bug 1** — Fix `cmd/server/main.go` (delete stub body, add missing routes) — BLOCKS EVERYTHING
+2. **Bug 2** — Delete `admin/handler.go` dead code — CLEANUP
+3. **Bug 3** — Migration 004 + SaveMessage update — DATA INTEGRITY
+4. **Bug 5** — Add `GET /me` endpoint — FRONTEND SESSION RESTORE
+5. **Bug 4** — Register OAuth routes + write callback handler — OAUTH FLOW
+6. **Bug 6** — Fix `logToL3` event type — ADMIN PANEL ACCURACY
+7. **Bug 7** — Fix vector string interpolation in `IndexTurn` — SQL SAFETY
+
+---
+
+*Last updated: 2026-09-05 (Complete audit)*
