@@ -1,0 +1,24 @@
+# Development Dockerfile — Vite dev server with HMR
+# Used by docker-compose.yml (development)
+# NOT used in production (use Dockerfile instead)
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dependencies first (cached layer)
+# Source code is mounted as volume — not copied here
+COPY package.json package-lock.json* ./
+RUN npm ci --silent
+
+# WHY not COPY . . here:
+# docker-compose.yml mounts ./frontend:/app as a volume.
+# Source changes on host are reflected instantly in container.
+# This enables Vite HMR (Hot Module Replacement).
+
+EXPOSE 3000
+
+# --host 0.0.0.0: Listen on all interfaces (required in Docker)
+# Without this, Vite only listens on 127.0.0.1 inside container
+# and the port mapping 3000:3000 would not work.
+CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
