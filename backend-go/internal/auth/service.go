@@ -254,6 +254,34 @@ func (s *AuthService) VerifyAndEnableTOTP(ctx context.Context, userID uuid.UUID,
 	return nil
 }
 
+// GetMe returns the authenticated user's public profile.
+// Called by GET /auth/me after JWT is validated by AuthMiddleware.
+// Returns only safe fields — never hashed_password or totp_secret.
+//
+// WHY by userID not email:
+// AuthMiddleware already validated the JWT and extracted userID.
+// Querying by userID is a direct primary key lookup — O(1).
+// Querying by email would require an index scan — unnecessary.
+func (s *AuthService) GetMe(ctx context.Context, userID uuid.UUID) (*User, error) {
+	var user User
+	err := s.db.QueryRow(ctx,
+		`SELECT id, email, full_name, role, is_active
+		 FROM users
+		 WHERE id = $1 AND deleted_at IS NULL`,
+		userID,
+	).Scan(&user.ID, &user.Email, &user.FullName, &user.Role, &user.IsActive)
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			return nil, ErrUserNotFound
+		}
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
+	if !user.IsActive {
+		return nil, ErrUserInactive
+	}
+	return &user, nil
+}
+
 // getUserByEmail fetches a user by email.
 // Returns ErrUserNotFound if not found.
 func (s *AuthService) getUserByEmail(ctx context.Context, email string) (*User, error) {
