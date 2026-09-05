@@ -73,7 +73,11 @@ baseAPI.interceptors.request.use((config: InternalAxiosRequestConfig) => {
 // single-flight refresh with a one-shot retry guard.
 let refreshPromise: Promise<string> | null = null
 
-async function performRefresh(): Promise<string> {
+// Exported (not just used internally by the interceptor below) because
+// useAuth's bootstrap flow (src/hooks/useAuth.ts) also needs to attempt
+// a silent refresh on app mount, before any request has even 401'd -
+// e.g. immediately after a hard page reload when accessToken is null.
+export async function refreshSession(): Promise<string> {
   // Deliberately a raw axios call, NOT baseAPI - using baseAPI here
   // would re-enter this same interceptor chain if refresh itself 401s.
   const response = await axios.post<{ data: { access_token: string } }>(
@@ -112,7 +116,7 @@ baseAPI.interceptors.response.use(
       // Single-flight: only the first caller in a burst actually hits
       // the network; everyone else awaits the same promise.
       if (!refreshPromise) {
-        refreshPromise = performRefresh().finally(() => {
+        refreshPromise = refreshSession().finally(() => {
           refreshPromise = null
         })
       }

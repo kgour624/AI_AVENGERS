@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { User } from '@/types/auth'
+import { decodeJWT } from '@/utils/jwt'
 
 /**
  * Auth store - client state, NOT server state (no TanStack Query here).
@@ -43,7 +44,18 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   clearAuth: () => set({ user: null, accessToken: null }),
 
-  isAdmin: () => get().user?.role === 'admin',
+  // WHY fall back to decoding the JWT: see utils/jwt.ts header comment.
+  // After a silent refresh (hard page reload), `user` is null but
+  // `accessToken` is set - if we only checked user.role, a legitimate
+  // admin would be denied access to /admin routes until some other
+  // code path happened to populate `user`, which nothing currently does
+  // since there is no GET /me endpoint in the documented API surface.
+  isAdmin: () => {
+    const { user, accessToken } = get()
+    if (user) return user.role === 'admin'
+    if (!accessToken) return false
+    return decodeJWT(accessToken)?.role === 'admin'
+  },
 
   isAuthenticated: () => get().accessToken !== null,
 }))
