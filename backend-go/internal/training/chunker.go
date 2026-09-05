@@ -198,31 +198,8 @@ func (c *TextChunker) GetStats(chunks []TextChunk) map[string]interface{} {
 	}
 }
 
-// NewTextChunker creates a new chunker with given config.
-func NewTextChunker(cfg ChunkerConfig) *TextChunker {
-	return &TextChunker{cfg: cfg}
-}
-
-// Chunk splits text into overlapping chunks with sentence boundary preservation.
-//
-// Mental execution:
-// Input: "Sharding distributes data. Consistent hashing ensures even distribution.
-//
-//	Virtual nodes prevent hotspots."
-//
-// Step 1: Split into sentences
-// Step 2: Accumulate sentences until target size reached
-// Step 3: When target reached, save chunk
-// Step 4: Start next chunk with overlap (last N tokens from previous chunk)
-// Step 5: Repeat until all sentences processed
-func (c *TextChunker) Chunk(text string) []TextChunk {
-	// Clean text first
-	text = cleanText(text)
-	if text == "" {
-		return nil
-	}
-
-	// Split into sentences
+// estimateTokens estimates token count — duplicate section removed above this line.
+// Split into sentences (continued below — this is the original single definition)
 	sentences := splitSentences(text)
 	if len(sentences) == 0 {
 		return nil
