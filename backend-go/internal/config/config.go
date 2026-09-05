@@ -80,6 +80,18 @@ type SecurityConfig struct {
 	EncryptionKey string // 32 bytes for AES-256
 }
 
+// OAuthConfig holds OAuth2 credentials for GitHub and GitLab repo integration.
+// All fields are optional — empty means OAuth is disabled, PAT-only mode.
+// WHY optional: PAT-based connect works without OAuth.
+// OAuth is an enhancement, not a requirement for core functionality.
+type OAuthConfig struct {
+	GitHubClientID     string
+	GitHubClientSecret string
+	GitLabClientID     string
+	GitLabClientSecret string
+	BaseURL            string // e.g. https://api.yourdomain.com
+}
+
 type RateLimitConfig struct {
 	PerIP   int
 	PerUser int
