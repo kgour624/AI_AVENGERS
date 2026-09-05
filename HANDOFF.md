@@ -539,6 +539,68 @@ typecheck && npm run build`, and fix whatever that surfaces.
 
 ---
 
+## Frontend Phase 5 — Advanced Features (2026-09-05)
+
+> Continues from Phase 1-4 above. Same rule: only actually-implemented,
+> code-reviewed work is marked done; no build/test run was performed.
+
+### \u26a0\ufe0f TWO CRITICAL BACKEND FINDINGS - surfaced here prominently, not buried
+
+1. **`cmd/server/main.go` appears to contain two complete, conflicting
+   `buildRouter` function bodies concatenated together**, with the same
+   package-level function names (`handleGetProjectMemory`,
+   `handleGetProjectTimeline`, `handleAdminListExperts`, etc. and many
+   more) declared twice in the same file. Go does not allow duplicate
+   function declarations in one package - **this file almost certainly
+   fails to compile as currently committed.** The first copy wires
+   real handlers (`projectHandler.GetByID`, `repoHandler.ConnectRepo`,
+   etc.); the second copy is entirely `stubHandler(...)` calls that
+   look like an earlier, incomplete draft that was never removed.
+   **Action needed, urgently**: someone needs to delete the second
+   (stub) `buildRouter` definition and every duplicate function it
+   contains, keeping only the first (real-handler) version. This
+   frontend work was built against the first version's routes/behavior
+   since it's clearly the intended final state, but **this must be
+   fixed before the backend can run at all**, independent of any
+   frontend work.
+2. **The OAuth-initiation and OAuth-callback routes for repo
+   connection are completely unregistered.** `repo.Service.GetOAuthURL`
+   exists and `repo.Service.NewService` even constructs the correct
+   `RedirectURL` for a callback (`/api/v1/repo/callback/{provider}`),
+   but neither that callback route nor a `GET /repo/oauth/:provider`
+   initiation route appears anywhere in `buildRouter`'s route
+   registration (checked both copies - neither has it). Only
+   `POST /projects/:id/repo` (which requires the client to already
+   possess a plaintext `access_token`), `POST /projects/:id/repo/sync`,
+   and `GET /projects/:id/repo/status` are reachable. **This means the
+   "Connect Repository" OAuth flow implied by
+   `FRONTEND_SYSTEM_DESIGN.md`'s wireframe cannot work today** - the
+   frontend was built against a Personal-Access-Token flow instead
+   (see below), which is the only thing that can honestly work against
+   the real, reachable API. **Action needed**: either register the
+   OAuth routes and wire `repoHandler.GetOAuthURL` + a callback
+   handler (which doesn't exist in the handler file either and would
+   need to be written), or officially adopt PAT-based connection as
+   the permanent design and update the design doc's wireframe/copy to
+   match reality instead of implying OAuth.
+
+### Verified complete
+
+| File | Status | Notes |
+|---|---|---|
+| `frontend/src/api/repo.ts` | ✅ | Built against the real, reachable routes only (PAT-based `connectRepo`, `syncRepo`, `getRepoSyncStatus`). `RepoSyncStatus` modeled as a discriminated union matching `GetSyncStatus`'s real two-shape return (`{connected:false}` vs the full object) |
+| `frontend/src/components/project/RepoConnectModal.tsx` | ✅ | PAT input (masked, cleared from state immediately on success), explicitly tells the user OAuth isn't available rather than implying it works. Chains `syncRepo()` after `connectRepo()` - confirmed from source that `ConnectRepo` alone never starts a sync |
+| `frontend/src/hooks/useRepoSyncStatus.ts` | ✅ | Polls (confirmed via source: `SyncRepo` runs in a detached goroutine with no push mechanism, same pattern as Phase 4's ingestion polling) |
+| `frontend/src/components/project/RepoStatus.tsx` | ✅ rewritten | Phase 2's version was fully static (no working `onConnect`, read only `Project`'s stale repo fields). Now takes `projectId` and polls live status - `Project` has no field for sync progress at all |
+
+### NOT done (Phase 5/6 boundary, and real blockers)
+
+- Full CapabilityCard "polish" (deeper integration into ExpertsPage, e.g. an expert detail page showing all topics) was not pursued further this phase - the component itself was already built and fixed in Phase 4's correction pass; there was no additional wireframe-backed work identified beyond what exists.
+- OAuth flow cannot be completed frontend-side until the backend gaps above are fixed - this is now a hard blocker, not a nice-to-have, for anyone wanting the wireframe's literal OAuth-button experience.
+- No automated tests (consistent with the project-wide gap already listed).
+
+---
+
 ## Anti-Patterns Found and Fixed
 
 *Will be updated as implementation progresses.*
