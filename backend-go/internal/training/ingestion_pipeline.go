@@ -122,8 +122,8 @@ func (p *IngestionPipeline) IngestTranscript(
 	if err != nil {
 		p.logger.Warn("charter extraction failed, using default", zap.Error(err))
 		charter = &Charter{
-			ReasoningCharter:     defaultReasoning(expertName),
-			ClarificationCharter: defaultClarification(),
+			ReasoningCharter:     defaultReasoningCharter(expertName),
+			ClarificationCharter: defaultClarificationCharter(),
 		}
 	}
 	p.logger.Info("charter extraction complete")
