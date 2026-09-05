@@ -420,6 +420,43 @@ typecheck && npm run build`, and fix whatever that surfaces.
 
 ---
 
+## Frontend Phase 2 — Core UI Components & Auth (2026-09-05)
+
+> Continues from "Frontend Phase 1 — Foundation" above. Same rule
+> applies: only what was actually implemented and reviewed in this
+> session is marked done, nothing is claimed as verified by an actual
+> build/test run (still no Node toolchain access in this session).
+
+### Verified complete
+
+| File | Status | Notes |
+|---|---|---|
+| `frontend/src/types/expert.ts` | ✅ fixed | `getModeBadgeConfig` was missing `bgClass` (needed by section 9's real MODE_CONFIG) — caught before building Badge.tsx on top of it |
+| `frontend/src/components/ui/{Button,Input,Badge,Card,Modal,Skeleton,Tooltip,ScrollArea}.tsx` | ✅ | Modal implements a real closing animation using the ref+useEffect+onAnimationEnd pattern from Transcripts/Frontend, not a naive `if (!isOpen) return null` |
+| `frontend/index.html` | ✅ updated | Added `#modal-container` div — Modal.tsx portals into it and throws a clear error if missing, rather than silently rendering nothing |
+| `frontend/src/pages/auth/{LoginPage,RegisterPage}.tsx` | ✅ | Real forms wired to `api/auth.ts` + `authStore`, client-side validation, loading/error states |
+| `frontend/src/utils/errors.ts` | ✅ | `handleAPIError` per section 14 |
+| `frontend/src/components/expert/{ExpertCard,ExpertBadge,ExpertPicker,CapabilityCard}.tsx` | ✅ | Wired into `ExpertsPage` (replaces Phase 1 raw-div stub) |
+| `frontend/src/components/project/{ProjectCard,ProjectTimeline,RepoStatus}.tsx` | ✅ | ProjectCard + RepoStatus wired into `ProjectsPage`/`ProjectPage`. **ProjectTimeline built but NOT wired in yet** — see gap below |
+| `frontend/src/utils/format.ts` | ✅ | `formatRelativeTime`, `formatCostUsd` |
+| `frontend/src/components/chat/CitationChip.tsx` | ✅ | Standalone — does not depend on streamStore/SSE, safe to build in Phase 2 ahead of the rest of chat/ |
+
+### NOT done (explicitly out of scope for Phase 2, deferred to Phase 3)
+
+- `components/chat/{MessageInput,ExpertResponse,SynthesisPanel,RatingWidget,StreamingIndicator}.tsx` — all depend on live `streamStore`/`useSSEStream` wiring, which is Phase 3 scope ("Chat Interface & SSE wiring").
+- `ChatPage.tsx` still only renders a flat list of raw message divs (Phase 1 stub) — will be rewired once the chat/ components above exist.
+- Admin panel pages (`AdminDashboard`, `AdminExperts`, etc.) are still Phase 1 placeholder text — Phase 4/5 scope per the phase breakdown.
+
+### Gaps found in the design docs during Phase 2 (documented in code comments, summarized here)
+
+1. **No `chatCount` field anywhere** in `Project`'s type or the backend's `projects` table, but the "Projects Page (Home)" wireframe (section 10) shows "Chats: 12" per card. `ProjectCard` omits this line rather than fabricating a field with no data source. **Action needed**: either add a `chat_count` (or similar aggregate) to the project list API response, or remove that line from the wireframe spec.
+2. **No domain→color mapping is specified** for the colored dots shown next to expert names in the main-interface wireframes (section 1, 10) — domain is backend free text, not an enum, so there's no principled way to assign fixed colors per domain. `ExpertBadge` derives a stable color from a hash of `expertId` instead of guessing a domain mapping that doesn't exist in the spec.
+3. **`CapabilityCard.tsx` had no wireframe** in the design doc, only a filename listed in section 3's tree. Built directly against `expert_capabilities` table columns (section 5 of the architecture doc) instead of inventing UI with no backing spec.
+4. **`GET /projects/:id/timeline` pagination contract is unconfirmed** — this file (further up) describes it as "paginated" with no cursor/page-size shape given anywhere. `ProjectTimeline.tsx` component exists and is ready, but is deliberately NOT wired into `ProjectPage` yet, to avoid guessing an API contract and shipping a call against an unconfirmed shape. **Action needed**: confirm the real pagination shape (cursor-based? offset/limit?) against `backend-go/internal/project/service.go`, then wire it in.
+5. **`RepoStatus`'s connected state has no wireframe** — only the disconnected ("Not connected [Connect Repository]") state is shown in section 10. The connected-state UI was inferred minimally from `Project`'s actual `repoProvider`/`repoUrl`/`repoLastSync` fields rather than inventing elements (e.g. a sync-progress bar) with no backing data.
+
+---
+
 ## Anti-Patterns Found and Fixed
 
 *Will be updated as implementation progresses.*
