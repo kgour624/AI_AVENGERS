@@ -180,6 +180,15 @@ func Load() (*Config, error) {
 		},
 	}
 
+	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
+	if raw := v.GetString("CORS_ALLOWED_ORIGINS"); raw != "" {
+		for _, o := range strings.Split(raw, ",") {
+			if o = strings.TrimSpace(o); o != "" {
+				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
+			}
+		}
+	}
+
 	// Validate required fields — fail fast
 	if err := cfg.validate(); err != nil {
 		return nil, err
