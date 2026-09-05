@@ -100,6 +100,7 @@ func (s *JWTService) IssueTokenPair(ctx context.Context, userID uuid.UUID, email
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ExpiresAt:    accessExpiry,
+		UserID:       userID,
 	}, nil
 }
 
