@@ -270,13 +270,17 @@ func (h *Handler) saveAssistantMessage(
 
 	expertID := resp.ExpertID
 	_, err := h.chatSvc.SaveMessage(ctx, chat.Message{
-		ChatID:       chatID,
-		Role:         "assistant",
-		Content:      resp.Content,
-		TurnNumber:   turnNumber,
-		ExpertID:     &expertID,
-		DecisionMode: string(resp.Mode),
-		Confidence:   resp.Confidence,
+		ChatID:              chatID,
+		Role:                "assistant",
+		Content:             resp.Content,
+		TurnNumber:          turnNumber,
+		ExpertID:            &expertID,
+		DecisionMode:        string(resp.Mode),
+		Confidence:          resp.Confidence,
+		// Persist Gate 3 WARN text and Gate 1 ASK questions
+		// so they survive page reloads (Bug 3 fix)
+		WarningText:         resp.Warning,
+		ClarifyingQuestions: resp.Questions,
 	})
 	if err != nil {
 		h.logger.Warn("save assistant message failed",
