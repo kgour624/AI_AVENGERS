@@ -134,15 +134,29 @@ func (s *Service) IncrementMessageCount(ctx context.Context, chatID uuid.UUID) e
 }
 
 // SaveMessage saves a message to the database.
+// Includes warning_text and clarifying_questions so Gate 3 WARN
+// and Gate 1 ASK data survive page reloads.
+//
+// Mental execution:
+// msg.ClarifyingQuestions = ["What scale?", "What team size?"]
+// pgx marshals []string -> '["What scale?","What team size?"]'::jsonb
+// On read: pgx unmarshals jsonb -> []string automatically
 func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, error) {
+	// Ensure clarifying_questions is never nil (DB default is '[]')
+	if msg.ClarifyingQuestions == nil {
+		msg.ClarifyingQuestions = []string{}
+	}
+
 	var id uuid.UUID
 	err := s.db.QueryRow(ctx,
 		`INSERT INTO messages
-			(chat_id, role, content, turn_number, expert_id, decision_mode, confidence)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(chat_id, role, content, turn_number, expert_id, decision_mode,
+			 confidence, warning_text, clarifying_questions)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
 		msg.ExpertID, msg.DecisionMode, msg.Confidence,
+		msg.WarningText, msg.ClarifyingQuestions,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)
