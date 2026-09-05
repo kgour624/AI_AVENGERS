@@ -149,15 +149,17 @@ func (s *Service) updateChunkBoosts(ctx context.Context, messageID uuid.UUID, sc
 }
 
 // logToL3 records the rating event in the master event log.
+// WHY RecordRating not RecordViolation:
+// A rating is client feedback, not a China Wall violation.
+// Using RecordViolation was polluting the admin violations list.
 func (s *Service) logToL3(
 	ctx context.Context,
 	projectID, expertID, clientID, chatID, messageID uuid.UUID,
 	req RateRequest,
 ) {
-	s.memManager.RecordViolation(
-		ctx, projectID, expertID, clientID,
-		"rating_recorded",
-		fmt.Sprintf("score=%d feedback_type=%s", req.Score, req.FeedbackType),
+	s.memManager.RecordRating(
+		ctx, projectID, expertID, clientID, chatID, messageID,
+		req.Score, req.FeedbackType,
 	)
 }
 
