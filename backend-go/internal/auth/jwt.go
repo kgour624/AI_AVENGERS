@@ -37,6 +37,9 @@ type TokenPair struct {
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token"`
 	ExpiresAt    time.Time `json:"expires_at"`
+	// UserID is set internally so handlers can fetch the User record.
+	// json:"-" means it is never serialized into the API response.
+	UserID       uuid.UUID `json:"-"`
 }
 
 // JWTService handles token generation and validation.
