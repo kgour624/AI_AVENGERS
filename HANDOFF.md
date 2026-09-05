@@ -786,6 +786,41 @@ ai_avengers/
 
 ---
 
+## 🐳 DOCKER GAPS FIXED — 2026-09-05
+
+| Gap | Fix | Files |
+|---|---|---|
+| Gap 1: Frontend not dockerized | `frontend/Dockerfile` (prod multi-stage), `frontend/Dockerfile.dev` (dev HMR), `frontend/nginx.frontend.conf` | new files |
+| Gap 2: Migrations not auto-run | `migrate` service in both compose files, `backend-go/Dockerfile` now builds `./migrate` binary + copies `migrations/` dir | `docker-compose.yml`, `docker-compose.prod.yml`, `backend-go/Dockerfile` |
+| Gap 3: Hardcoded postgres password | `${POSTGRES_PASSWORD:-avengers_pass}` in dev, `${POSTGRES_PASSWORD}` in prod | `docker-compose.yml` |
+
+**How to run now:**
+```bash
+# Development
+cp backend-go/.env.example .env
+# Fill: JWT_SECRET, OPENROUTER_API_KEY, ENCRYPTION_KEY
+docker-compose up -d
+# Migrations run automatically before api starts
+# Frontend: http://localhost:3000
+# API: http://localhost:8080
+# Health: http://localhost:8080/health
+
+# Production
+cp .env.prod.example .env
+# Fill all required values
+docker-compose -f docker-compose.prod.yml up -d
+```
+
+**Service startup order (both envs):**
+```
+postgres (healthy) -> migrate (completed) -> api (started)
+redis (healthy)    ->                     -> api
+ml-sidecar         ->                     -> api
+                                          -> frontend -> nginx
+```
+
+---
+
 ## 🔬 COMPLETE END-TO-END AUDIT — 2026-09-05
 
 > **Performed by:** System Design Architect  
