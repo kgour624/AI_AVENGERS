@@ -287,23 +287,6 @@ func (s *Service) SaveRollingSummary(
 	return err
 }
 
-// buildVectorLiteral converts float32 slice to PostgreSQL vector literal.
-func buildVectorLiteral(v []float32) string {
-	if len(v) == 0 {
-		return "[0.0]"
-	}
-	var sb strings.Builder
-	sb.WriteString("[")
-	for i, f := range v {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString(fmt.Sprintf("%f", f))
-	}
-	sb.WriteString("]")
-	return sb.String()
-}
-
 // GetDB returns the database pool.
 // Used by message handler for direct queries.
 func (s *Service) GetDB() *pgxpool.Pool {
