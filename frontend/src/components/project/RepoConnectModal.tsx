@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useRevalidator } from 'react-router-dom'
 import { connectRepo, syncRepo } from '@/api/repo'
 import { Modal } from '@/components/ui/Modal'
 import { Input } from '@/components/ui/Input'
@@ -26,6 +27,14 @@ import { Button } from '@/components/ui/Button'
  * this component only called connectRepo, the connection would sit at
  * "pending" forever with no follow-up call ever made - it needs a
  * distinct fetch to SyncRepo to actually start syncing.
+ *
+ * PHASE 6 BUG FIX (same class of bug fixed in ProjectExpertManager.tsx
+ * this same commit): previously called
+ * queryClient.invalidateQueries({queryKey: ['projects', projectId]}),
+ * which is a no-op since ProjectPage sources `project` from a router
+ * loader, not a useQuery. Replaced with revalidator.revalidate().
+ * The repo/status invalidation (a real useQuery, from
+ * useRepoSyncStatus.ts) is correct and kept as-is.
  */
 export interface RepoConnectModalProps {
   isOpen: boolean
@@ -35,6 +44,7 @@ export interface RepoConnectModalProps {
 
 export function RepoConnectModal({ isOpen, onClose, projectId }: RepoConnectModalProps) {
   const queryClient = useQueryClient()
+  const revalidator = useRevalidator()
   const [provider, setProvider] = useState<'github' | 'gitlab'>('github')
   const [repoUrl, setRepoUrl] = useState('')
   const [accessToken, setAccessToken] = useState('')
@@ -53,7 +63,7 @@ export function RepoConnectModal({ isOpen, onClose, projectId }: RepoConnectModa
       await syncRepo(projectId)
     },
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['projects', projectId] })
+      revalidator.revalidate()
       queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'repo', 'status'] })
       setAccessToken('') // WHY clear this specifically on success (not repoUrl/branch): don't leave a secret token sitting in component state any longer than necessary once it's served its purpose.
       onClose()

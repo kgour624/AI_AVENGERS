@@ -1,8 +1,8 @@
 import { useState } from 'react'
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
+import { useRevalidator } from 'react-router-dom'
 import { addProjectExpert, removeProjectExpert } from '@/api/projects'
 import { getExperts } from '@/api/experts'
-import { useQuery } from '@tanstack/react-query'
 import type { ProjectExpert } from '@/types/project'
 import { ExpertBadge } from '@/components/expert/ExpertBadge'
 import { Button } from '@/components/ui/Button'
@@ -12,19 +12,27 @@ import { Modal } from '@/components/ui/Modal'
  * Source: FRONTEND_SYSTEM_DESIGN.md section 10 ("Experts in this
  * project" panel: badges + [+ Add Expert] button).
  *
- * Cross-questioned: after addProjectExpert succeeds, what does the UI
- * show? Per the correction commit earlier this phase, AddExpert's real
- * response is just {status}, no expert data - so this component
- * cannot optimistically render the newly-added expert from the
- * mutation's own response. Instead it invalidates the project detail
- * query (which includes .experts) so the badge list refetches and
- * shows the real, server-confirmed state - slightly slower to update
- * than an optimistic UI, but correct rather than guessing at what the
- * new ProjectExpert row would contain (addedAt, isActive, etc. that
- * this component has no way to know client-side).
+ * PHASE 6 BUG FIX (found during final QA audit of cache invalidation
+ * consistency across the codebase): this component's onSuccess used
+ * to call queryClient.invalidateQueries({queryKey: ['projects', projectId]}),
+ * expecting that to refresh the `experts` prop after add/remove. That
+ * was a SILENT NO-OP - ProjectPage.tsx gets `project` (and therefore
+ * `experts`) from a React Router LOADER via useLoaderData(), not
+ * from any useQuery call. There is no TanStack Query cache entry
+ * keyed ['projects', projectId] for anything to invalidate - nothing
+ * in the app is subscribed to that key for project detail data. The
+ * badge list would never actually update after adding or removing an
+ * expert without a full page reload, despite the mutation succeeding
+ * and no error being shown - the worst kind of bug, silently wrong
+ * rather than loudly broken.
+ *
+ * Fix: use useRevalidator() (React Router's mechanism for re-running
+ * the current route's loader) instead, matching the exact pattern
+ * ChatPage.tsx already uses correctly for the same class of problem
+ * (SSE completion needing to refresh loader-sourced data).
  */
 export function ProjectExpertManager({ projectId, experts }: { projectId: string; experts: ProjectExpert[] }) {
-  const queryClient = useQueryClient()
+  const revalidator = useRevalidator()
   const [isModalOpen, setIsModalOpen] = useState(false)
 
   const { data: allExperts } = useQuery({
@@ -33,18 +41,14 @@ export function ProjectExpertManager({ projectId, experts }: { projectId: string
     enabled: isModalOpen, // WHY only fetch when the modal opens: no reason to load the full expert catalog on every project page view if the user never opens the add-expert modal.
   })
 
-  function invalidateProject() {
-    queryClient.invalidateQueries({ queryKey: ['projects', projectId] })
-  }
-
   const addMutation = useMutation({
     mutationFn: (expertId: string) => addProjectExpert(projectId, expertId),
-    onSuccess: invalidateProject,
+    onSuccess: () => revalidator.revalidate(),
   })
 
   const removeMutation = useMutation({
     mutationFn: (expertId: string) => removeProjectExpert(projectId, expertId),
-    onSuccess: invalidateProject,
+    onSuccess: () => revalidator.revalidate(),
   })
 
   const addedIds = new Set(experts.map((e) => e.expertId))
