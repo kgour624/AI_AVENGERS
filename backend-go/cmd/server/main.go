@@ -95,7 +95,7 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
-	// Build router
+	// Build router — single call, single definition
 	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient)
 
 	// Build HTTP server
@@ -144,6 +144,12 @@ func main() {
 }
 
 // buildRouter creates the Gin router with all routes and middleware.
+// ONE definition only — the stub draft has been deleted.
+//
+// WHY gin.New() not gin.Default():
+// gin.Default() adds Logger and Recovery middleware automatically.
+// We use our own structured zap logger and recovery middleware.
+// gin.New() gives us full control over middleware order.
 func buildRouter(
 	cfg *config.Config,
 	logger *zap.Logger,
@@ -157,12 +163,13 @@ func buildRouter(
 	router := gin.New()
 
 	// Middleware order: Recovery -> RequestID -> Logger -> RateLimit
+	// WHY this order: Recovery must be first to catch panics from all other middleware.
 	router.Use(middleware.RecoveryMiddleware(logger))
 	router.Use(middleware.RequestIDMiddleware())
 	router.Use(middleware.LoggerMiddleware(logger))
 	router.Use(middleware.RateLimitMiddleware(redisClient.Client, cfg.RateLimit.PerIP, logger))
 
-	// Initialize services
+	// Initialize core services
 	memManager := memory.NewManager(postgres.Pool, redisClient.Client, mlClient, logger)
 	chinawallEnforcer := chinawall.NewEnforcer(cfg.ChinaWall, modelGateway, mlClient, logger)
 	decisionEngine := decision.NewEngine(postgres.Pool, modelGateway, chinawallEnforcer, logger)
@@ -174,18 +181,20 @@ func buildRouter(
 	)
 	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, logger)
 
+	// Initialize domain services
 	projectSvc := project.NewService(postgres.Pool, logger)
 	chatSvc := chat.NewService(postgres.Pool, logger)
 	ratingSvc := rating.NewService(postgres.Pool, memManager, logger)
 	repoSvc := repo.NewService(
 		postgres.Pool, mlClient,
 		cfg.Security.EncryptionKey,
-		"", "", // GitHub OAuth (set via env)
-		"", "", // GitLab OAuth (set via env)
-		"",     // Base URL
+		cfg.OAuth.GitHubClientID, cfg.OAuth.GitHubClientSecret,
+		cfg.OAuth.GitLabClientID, cfg.OAuth.GitLabClientSecret,
+		cfg.OAuth.BaseURL,
 		logger,
 	)
 
+	// Initialize HTTP handlers
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
 	messageHandler := message.NewHandler(chatSvc, orch, modelGateway, mlClient, memManager, logger)
@@ -194,7 +203,9 @@ func buildRouter(
 	repoHandler := repo.NewHandler(repoSvc, logger)
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, logger)
 
-	// Health check
+	// ============================================================
+	// Health check — no auth required
+	// ============================================================
 	router.GET("/health", func(c *gin.Context) {
 		health := map[string]string{"status": "ok", "version": "1.0.0"}
 		if err := postgres.HealthCheck(c.Request.Context()); err != nil {
@@ -205,6 +216,7 @@ func buildRouter(
 		}
 		if err := redisClient.HealthCheck(c.Request.Context()); err != nil {
 			health["redis"] = "unhealthy"
+			health["status"] = "degraded"
 		} else {
 			health["redis"] = "healthy"
 		}
@@ -218,7 +230,9 @@ func buildRouter(
 
 	v1 := router.Group("/api/v1")
 
-	// Auth routes
+	// ============================================================
+	// Auth routes — no JWT required
+	// ============================================================
 	authGroup := v1.Group("/auth")
 	{
 		authGroup.POST("/register", handleRegister(authService))
@@ -228,11 +242,25 @@ func buildRouter(
 		authGroup.POST("/logout", middleware.AuthMiddleware(jwtService, logger), handleLogout(jwtService))
 	}
 
-	// Protected routes
+	// OAuth callback — no JWT (browser redirect from GitHub/GitLab)
+	// WHY public: OAuth provider redirects browser here with ?code=...
+	// The browser has no JWT at this point — it's a fresh redirect.
+	v1.GET("/repo/callback/:provider", repoHandler.OAuthCallback)
+
+	// ============================================================
+	// Protected routes — JWT required
+	// ============================================================
 	protected := v1.Group("")
 	protected.Use(middleware.AuthMiddleware(jwtService, logger))
 	{
-		// Expert routes
+		// GET /auth/me — session restore after page reload
+		// WHY needed: access token is in-memory only (XSS mitigation).
+		// After hard reload, frontend has no user data. This endpoint
+		// lets it restore fullName + email + role from the server
+		// using the refresh token cookie.
+		protected.GET("/auth/me", handleGetMe(authService))
+
+		// Expert routes (read-only for clients)
 		experts := protected.Group("/experts")
 		{
 			experts.GET("", expertHandler.ListActive)
@@ -248,17 +276,23 @@ func buildRouter(
 			projects.GET("/:id", projectHandler.GetByID)
 			projects.PATCH("/:id", projectHandler.Update)
 			projects.DELETE("/:id", projectHandler.Delete)
+
 			projects.POST("/:id/experts", projectHandler.AddExpert)
 			projects.DELETE("/:id/experts/:expertId", projectHandler.RemoveExpert)
 			projects.POST("/:id/chats", projectHandler.CreateChat)
 			projects.GET("/:id/chats", projectHandler.ListChats)
 			projects.GET("/:id/memory", handleGetProjectMemory(memManager))
 			projects.GET("/:id/timeline", handleGetProjectTimeline(memManager))
-			// Repo integration routes
+
+			// Repo integration
 			projects.POST("/:id/repo", repoHandler.ConnectRepo)
 			projects.POST("/:id/repo/sync", repoHandler.SyncRepo)
 			projects.GET("/:id/repo/status", repoHandler.GetSyncStatus)
 		}
+
+		// OAuth initiation — protected so we know which user is connecting
+		// WHY protected: we need clientID to associate the connection
+		protected.GET("/repo/oauth/:provider", repoHandler.GetOAuthURL)
 
 		// Chat routes
 		chats := protected.Group("/chats")
@@ -277,7 +311,9 @@ func buildRouter(
 		}
 	}
 
-	// Admin routes
+	// ============================================================
+	// Admin routes — JWT + admin role required
+	// ============================================================
 	adminGroup := v1.Group("/admin")
 	adminGroup.Use(middleware.AuthMiddleware(jwtService, logger))
 	adminGroup.Use(middleware.AdminMiddleware())
@@ -299,7 +335,12 @@ func buildRouter(
 	return router
 }
 
+// ============================================================
+// Inline route handlers
+// ============================================================
+
 // handleGetProjectMemory GET /projects/:id/memory
+// Returns L2 project memory entries for the timeline UI.
 func handleGetProjectMemory(memManager *memory.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		projectID, err := uuid.Parse(c.Param("id"))
@@ -317,6 +358,7 @@ func handleGetProjectMemory(memManager *memory.Manager) gin.HandlerFunc {
 }
 
 // handleGetProjectTimeline GET /projects/:id/timeline
+// Returns L3 master event log for a project (paginated, first 50).
 func handleGetProjectTimeline(memManager *memory.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		projectID, err := uuid.Parse(c.Param("id"))
@@ -333,147 +375,30 @@ func handleGetProjectTimeline(memManager *memory.Manager) gin.HandlerFunc {
 	}
 }
 
-// handleAdminViolations GET /admin/violations
-func handleAdminViolations(memManager *memory.Manager) gin.HandlerFunc {
+// handleGetMe GET /auth/me
+// Returns the authenticated user's profile.
+// WHY needed: access token is in-memory only (XSS mitigation).
+// After hard page reload, frontend has no user data.
+// This endpoint restores fullName + email + role from the server.
+func handleGetMe(svc *auth.AuthService) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		violations, err := memManager.GetViolations(c.Request.Context(), 100)
+		userID := c.MustGet("user_id").(uuid.UUID)
+		user, err := svc.GetMe(c.Request.Context(), userID)
 		if err != nil {
-			response.InternalError(c)
+			response.Unauthorized(c, "User not found")
 			return
 		}
-		response.OK(c, violations)
+		response.OK(c, map[string]interface{}{
+			"id":        user.ID,
+			"email":     user.Email,
+			"full_name": user.FullName,
+			"role":      user.Role,
+		})
 	}
-}
-
-	// Health check — no auth required
-	router.GET("/health", func(c *gin.Context) {
-		health := map[string]string{
-			"status":  "ok",
-			"version": "1.0.0",
-		}
-
-		// Check dependencies
-		if err := postgres.HealthCheck(c.Request.Context()); err != nil {
-			health["postgres"] = "unhealthy"
-			health["status"] = "degraded"
-		} else {
-			health["postgres"] = "healthy"
-		}
-
-		if err := redisClient.HealthCheck(c.Request.Context()); err != nil {
-			health["redis"] = "unhealthy"
-			health["status"] = "degraded"
-		} else {
-			health["redis"] = "healthy"
-		}
-
-		if err := mlClient.HealthCheck(c.Request.Context()); err != nil {
-			health["ml_sidecar"] = "unhealthy"
-		} else {
-			health["ml_sidecar"] = "healthy"
-		}
-
-		response.OK(c, health)
-	})
-
-	// API v1 routes
-	v1 := router.Group("/api/v1")
-
-	// Auth routes — no JWT required
-	authGroup := v1.Group("/auth")
-	{
-		authGroup.POST("/register", handleRegister(authService))
-		authGroup.POST("/login", handleLogin(authService))
-		authGroup.POST("/admin/login", handleAdminLogin(authService))
-		authGroup.POST("/refresh", handleRefresh(jwtService))
-		authGroup.POST("/logout", middleware.AuthMiddleware(jwtService, logger), handleLogout(jwtService))
-	}
-
-	// Protected routes — JWT required
-	protected := v1.Group("")
-	protected.Use(middleware.AuthMiddleware(jwtService, logger))
-	{
-		// Expert routes (read-only for clients)
-		experts := protected.Group("/experts")
-		{
-			experts.GET("", handleListExperts(postgres))
-			experts.GET("/:id", handleGetExpert(postgres))
-			experts.GET("/:id/topics", handleGetExpertTopics(postgres))
-		}
-
-		// Project routes
-		projects := protected.Group("/projects")
-		{
-			projects.POST("", handleCreateProject(postgres))
-			projects.GET("", handleListProjects(postgres))
-			projects.GET("/:id", handleGetProject(postgres))
-			projects.PATCH("/:id", handleUpdateProject(postgres))
-			projects.DELETE("/:id", handleDeleteProject(postgres))
-			projects.POST("/:id/experts", handleAddExpertToProject(postgres))
-			projects.DELETE("/:id/experts/:expertId", handleRemoveExpertFromProject(postgres))
-			projects.POST("/:id/chats", handleCreateChat(postgres))
-			projects.GET("/:id/chats", handleListChats(postgres))
-			projects.GET("/:id/memory", handleGetProjectMemory(postgres))
-			projects.GET("/:id/timeline", handleGetProjectTimeline(postgres))
-		}
-
-		// Chat routes
-		chats := protected.Group("/chats")
-		{
-			chats.GET("/:id", handleGetChat(postgres))
-			chats.PATCH("/:id", handleUpdateChat(postgres))
-			chats.DELETE("/:id", handleArchiveChat(postgres))
-			chats.POST("/:id/messages", handleSendMessage(postgres, modelGateway, mlClient, logger))
-			chats.GET("/:id/messages", handleListMessages(postgres))
-		}
-
-		// Message routes
-		messages := protected.Group("/messages")
-		{
-			messages.POST("/:id/rate", handleRateMessage(postgres))
-		}
-	}
-
-	// Admin routes — JWT + admin role required
-	admin := v1.Group("/admin")
-	admin.Use(middleware.AuthMiddleware(jwtService, logger))
-	admin.Use(middleware.AdminMiddleware())
-	{
-		admin.GET("/experts", handleAdminListExperts(postgres))
-		admin.POST("/experts", handleAdminCreateExpert(postgres))
-		admin.PATCH("/experts/:id", handleAdminUpdateExpert(postgres))
-		admin.POST("/experts/:id/ingest", handleAdminIngestTranscript(postgres, mlClient, modelGateway))
-		admin.GET("/experts/:id/jobs", handleAdminGetIngestionJobs(postgres))
-		admin.GET("/clients", handleAdminListClients(postgres))
-		admin.PATCH("/clients/:id", handleAdminUpdateClient(postgres))
-		admin.GET("/stats", handleAdminGetStats(postgres, modelGateway))
-		admin.GET("/violations", handleAdminGetViolations(postgres))
-		admin.GET("/ratings", handleAdminGetRatings(postgres))
-		admin.GET("/settings", handleAdminGetSettings(postgres))
-		admin.PATCH("/settings/:key", handleAdminUpdateSetting(postgres))
-	}
-
-	return router
-}
-
-// buildLogger creates a zap logger with the given level.
-func buildLogger(level string) (*zap.Logger, error) {
-	var zapLevel zapcore.Level
-	if err := zapLevel.UnmarshalText([]byte(level)); err != nil {
-		zapLevel = zapcore.InfoLevel
-	}
-
-	cfg := zap.NewProductionConfig()
-	cfg.Level = zap.NewAtomicLevelAt(zapLevel)
-	cfg.EncoderConfig.TimeKey = "timestamp"
-	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
-
-	return cfg.Build()
 }
 
 // ============================================================
-// Route handlers — stubs for Phase 1
-// Full implementation in Phase 3-4
+// Auth handlers
 // ============================================================
 
 func handleRegister(svc *auth.AuthService) gin.HandlerFunc {
@@ -620,49 +545,17 @@ func handleLogout(jwtService *auth.JWTService) gin.HandlerFunc {
 	}
 }
 
-// Stub handlers — return 501 until implemented in later phases
-func stubHandler(name string) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		response.OK(c, map[string]string{"status": "not_implemented", "handler": name})
+// buildLogger creates a zap logger with the given level.
+func buildLogger(level string) (*zap.Logger, error) {
+	var zapLevel zapcore.Level
+	if err := zapLevel.UnmarshalText([]byte(level)); err != nil {
+		zapLevel = zapcore.InfoLevel
 	}
-}
 
-func handleListExperts(db *db.Pool) gin.HandlerFunc          { return stubHandler("list_experts") }
-func handleGetExpert(db *db.Pool) gin.HandlerFunc            { return stubHandler("get_expert") }
-func handleGetExpertTopics(db *db.Pool) gin.HandlerFunc      { return stubHandler("get_expert_topics") }
-func handleCreateProject(db *db.Pool) gin.HandlerFunc        { return stubHandler("create_project") }
-func handleListProjects(db *db.Pool) gin.HandlerFunc         { return stubHandler("list_projects") }
-func handleGetProject(db *db.Pool) gin.HandlerFunc           { return stubHandler("get_project") }
-func handleUpdateProject(db *db.Pool) gin.HandlerFunc        { return stubHandler("update_project") }
-func handleDeleteProject(db *db.Pool) gin.HandlerFunc        { return stubHandler("delete_project") }
-func handleAddExpertToProject(db *db.Pool) gin.HandlerFunc   { return stubHandler("add_expert") }
-func handleRemoveExpertFromProject(db *db.Pool) gin.HandlerFunc { return stubHandler("remove_expert") }
-func handleCreateChat(db *db.Pool) gin.HandlerFunc           { return stubHandler("create_chat") }
-func handleListChats(db *db.Pool) gin.HandlerFunc            { return stubHandler("list_chats") }
-func handleGetProjectMemory(db *db.Pool) gin.HandlerFunc     { return stubHandler("project_memory") }
-func handleGetProjectTimeline(db *db.Pool) gin.HandlerFunc   { return stubHandler("project_timeline") }
-func handleGetChat(db *db.Pool) gin.HandlerFunc              { return stubHandler("get_chat") }
-func handleUpdateChat(db *db.Pool) gin.HandlerFunc           { return stubHandler("update_chat") }
-func handleArchiveChat(db *db.Pool) gin.HandlerFunc          { return stubHandler("archive_chat") }
-func handleListMessages(db *db.Pool) gin.HandlerFunc         { return stubHandler("list_messages") }
-func handleRateMessage(db *db.Pool) gin.HandlerFunc          { return stubHandler("rate_message") }
-func handleAdminListExperts(db *db.Pool) gin.HandlerFunc     { return stubHandler("admin_list_experts") }
-func handleAdminCreateExpert(db *db.Pool) gin.HandlerFunc    { return stubHandler("admin_create_expert") }
-func handleAdminUpdateExpert(db *db.Pool) gin.HandlerFunc    { return stubHandler("admin_update_expert") }
-func handleAdminListClients(db *db.Pool) gin.HandlerFunc     { return stubHandler("admin_list_clients") }
-func handleAdminUpdateClient(db *db.Pool) gin.HandlerFunc    { return stubHandler("admin_update_client") }
-func handleAdminGetViolations(db *db.Pool) gin.HandlerFunc   { return stubHandler("admin_violations") }
-func handleAdminGetRatings(db *db.Pool) gin.HandlerFunc      { return stubHandler("admin_ratings") }
-func handleAdminGetSettings(db *db.Pool) gin.HandlerFunc     { return stubHandler("admin_settings") }
-func handleAdminUpdateSetting(db *db.Pool) gin.HandlerFunc   { return stubHandler("admin_update_setting") }
+	cfg := zap.NewProductionConfig()
+	cfg.Level = zap.NewAtomicLevelAt(zapLevel)
+	cfg.EncoderConfig.TimeKey = "timestamp"
+	cfg.EncoderConfig.EncodeTime = zapcore.ISO8601TimeEncoder
 
-func handleSendMessage(db *db.Pool, gw *gateway.ModelGateway, ml *ml.SidecarClient, logger *zap.Logger) gin.HandlerFunc {
-	return stubHandler("send_message")
-}
-func handleAdminIngestTranscript(db *db.Pool, ml *ml.SidecarClient, gw *gateway.ModelGateway) gin.HandlerFunc {
-	return stubHandler("admin_ingest_transcript")
-}
-func handleAdminGetIngestionJobs(db *db.Pool) gin.HandlerFunc { return stubHandler("admin_ingestion_jobs") }
-func handleAdminGetStats(db *db.Pool, gw *gateway.ModelGateway) gin.HandlerFunc {
-	return stubHandler("admin_stats")
+	return cfg.Build()
 }
