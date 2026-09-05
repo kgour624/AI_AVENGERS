@@ -1,0 +1,29 @@
+# Environment files — NEVER commit these
+.env
+.env.local
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Go
+backend-go/server
+backend-go/migrate
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Python
+ml-sidecar/__pycache__/
+ml-sidecar/*.pyc
+ml-sidecar/.venv/

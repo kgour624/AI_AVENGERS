@@ -1,0 +1,20 @@
+# Don't send these to Docker build context
+.env
+.env.*
+!.env.example
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+
+# Test files
+*_test.go
+tests/
+
+# Docs
+*.md
