@@ -412,13 +412,26 @@ func handleGetMe(svc *auth.AuthService) gin.HandlerFunc {
 // buildAuthResponse builds the response structure the frontend expects.
 // Frontend api/auth.ts destructures: { user, tokenPair }
 // Frontend TokenPair type: { accessToken: string, expiresInSeconds: number }
+// buildAuthResponse builds the response the frontend expects.
+// Verified against:
+//   - frontend/src/types/auth.ts User interface
+//   - frontend/src/types/auth.ts TokenPair interface
+//   - backend-go/api/openapi.yaml AuthResponse schema
+//
+// Mental execution:
+//   user.FullName = "Kiran Nogia"
+//   -> map key "full_name"
+//   -> base.ts camelizeKeys()
+//   -> frontend receives "fullName"
+//   -> User.fullName = "Kiran Nogia" ✅
 func buildAuthResponse(user *auth.User, tokens *auth.TokenPair) map[string]interface{} {
 	return map[string]interface{}{
 		"user": map[string]interface{}{
-			"id":        user.ID,
-			"email":     user.Email,
-			"full_name": user.FullName,
-			"role":      user.Role,
+			"id":           user.ID,
+			"email":        user.Email,
+			"full_name":    user.FullName,
+			"role":         user.Role,
+			"totp_enabled": user.TOTPEnabled,
 		},
 		"token_pair": map[string]interface{}{
 			"access_token":       tokens.AccessToken,
