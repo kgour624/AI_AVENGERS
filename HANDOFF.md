@@ -457,6 +457,42 @@ typecheck && npm run build`, and fix whatever that surfaces.
 
 ---
 
+## Frontend Phase 3 — Chat Interface & SSE Wiring (2026-09-05)
+
+> Continues from Phase 1/2 above. Same rule: only actually-implemented,
+> code-reviewed work is marked done; no build/test run was performed
+> (still no Node toolchain in this session - manual tracing only).
+
+### Verified complete
+
+| File | Status | Notes |
+|---|---|---|
+| `frontend/src/components/chat/StreamingIndicator.tsx` | ✅ | Does NOT show per-expert gate progress ("Gate 3/5") despite the wireframe - see gap #1 below |
+| `frontend/src/components/chat/SynthesisPanel.tsx` | ✅ | Contradictions render with explicit "YOU DECIDE" callout per the product's own "never silently pick a winner" principle |
+| `frontend/src/components/chat/RatingWidget.tsx` | ✅ | Only accepts a persisted `messageId` - never rendered against a live in-flight response, by design (see gap #2) |
+| `frontend/src/utils/parseCitations.ts` | ✅ | Splits inline `[CHUNK_xxx]` tokens out of markdown content before rendering - see gap #3 |
+| `frontend/src/components/chat/CodeBlock.tsx` | ✅ | prism-react-renderer wired as react-markdown's code override, with a language fallback |
+| `frontend/src/components/chat/ExpertResponse.tsx` | ✅ | Core value-prop component per section 9. Handles response.error (partial expert failure), ASK-mode questions list, gateStopped explainer |
+| `frontend/src/components/chat/MessageInput.tsx` | ✅ | Expert multi-select, drag+drop file (single file, matches SendMessageOptions exactly), auto-resize textarea capped at 200px, Cmd/Ctrl+Enter to send |
+| `frontend/src/types/project.ts` (`Message.gateStopped`) | ✅ fixed | Was missing despite the real `gate_stopped` column existing - added |
+| `frontend/src/utils/adaptMessage.ts` | ✅ | Explicit adapter, persisted `Message` → `ExpertResponse` shape, rather than unifying the two types (which would hide real information-loss between them) |
+| `frontend/src/pages/chat/ChatPage.tsx` | ✅ | Full wiring: message history + live stream + synthesis + error state + MessageInput. Revalidates loader data on stream completion, then clears streamStore (in that order - reversed order would flash-hide the completed turn) |
+
+### Gaps found in the design docs during Phase 3
+
+1. **`StreamingIndicator` cannot show real per-expert gate progress.** The wireframe (section 10) shows "Gate 3/5" and a per-expert progress bar, but the documented `SSEEvent`'s `'thinking'` payload (section 8) only carries `{ message: string, experts: number }` - no per-expert id or gate number anywhere. Rendered a generic pulse indicator instead of fabricating fake-precise numbers that would mislead users. **Action needed**: if per-expert gate progress is wanted, the backend's `'thinking'` SSE event needs `expertId` + `gateNumber` fields added (`internal/message/handler.go`).
+2. **Rating is scoped to persisted messages only**, never live in-flight responses - `ExpertResponse` (the live SSE type) has no `messageId` field anywhere, and fabricating one to satisfy `RatingWidget`'s prop shape would let a rating silently fail or attach to nothing. This is a deliberate, documented scope decision (see `RatingWidget.tsx` and `ExpertResponse.tsx` header comments), not a missing feature to add later without a design decision on how the live response would even get an id before it's saved.
+3. **Citation tokens are embedded inline in markdown prose**, confirmed via the backend's own China Wall regex (`AI_AVENGERS_SYSTEM_ARCHITECTURE.md` section 8) - `[CHUNK_xxx]` sits inside the content string itself, not as separate structured data. `utils/parseCitations.ts` splits on this before markdown rendering. **Known limitation, documented in the file itself**: a citation token that falls mid-list-item or mid-code-fence would break that markdown block's continuity, since each text/citation segment is parsed as an independent markdown fragment. Accepted as a reasonable tradeoff given the backend's generation prompt (section 11) attaches citations at sentence boundaries in practice - revisit if that assumption changes.
+4. **Real backend data-loss gap** (not a frontend issue, but discovered while building the adapter): `ExpertResponse.warning` (Gate 3 WARN text) and `ExpertResponse.questions` (Gate 1 ASK clarifying questions) have **no corresponding column** in the `messages` table (`AI_AVENGERS_SYSTEM_ARCHITECTURE.md` section 5). Once a turn completes and the page reloads, a WARN message's warning text and an ASK message's questions are permanently gone - only `content`/`decisionMode`/`citations`/`confidence`/`gateStopped` survive. **Action needed**: add `warning_text` and `clarifying_questions` columns to `messages`, or accept this as permanent (in which case the design doc's wireframes showing warnings on historical messages are misleading and should be corrected).
+
+### NOT done (deferred to Phase 4/5)
+
+- Admin panel pages remain Phase 1 placeholder text (Phase 4/5 scope).
+- `ProjectTimeline` still not wired into `ProjectPage` - `GET /projects/:id/timeline`'s pagination contract remains unconfirmed (carried over from Phase 2).
+- No automated tests exist for any Phase 1-3 code (consistent with the project-wide "Automated tests" item already listed under "What's NOT Implemented" above).
+
+---
+
 ## Anti-Patterns Found and Fixed
 
 *Will be updated as implementation progresses.*
