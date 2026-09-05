@@ -1,0 +1,66 @@
+/* WHY OKLCH: Perceptually uniform lightness.
+   Transcript (CSS-simplified.md) taught: HSL lightness is not
+   human-perception based. OKLCH gives consistent perceived brightness
+   across hues - critical for the 5 response-mode colors below, which
+   must all read as equally "loud" regardless of hue.
+   Source: FRONTEND_SYSTEM_DESIGN.md section 4. */
+
+:root {
+  /* Response Mode Colors */
+  --color-advise: oklch(65% 0.15 145); /* Green */
+  --color-ask: oklch(65% 0.15 220); /* Blue */
+  --color-warn: oklch(70% 0.18 60); /* Yellow */
+  --color-pushback: oklch(68% 0.18 40); /* Orange */
+  --color-refuse: oklch(60% 0.2 25); /* Red */
+
+  /* Hover states using relative colors (transcript pattern) */
+  --color-advise-hover: oklch(from var(--color-advise) calc(l - 8%) c h);
+  --color-ask-hover: oklch(from var(--color-ask) calc(l - 8%) c h);
+  --color-warn-hover: oklch(from var(--color-warn) calc(l - 8%) c h);
+  --color-pushback-hover: oklch(from var(--color-pushback) calc(l - 8%) c h);
+  --color-refuse-hover: oklch(from var(--color-refuse) calc(l - 8%) c h);
+
+  /* Surface colors - dark theme */
+  --surface-base: oklch(12% 0.01 270); /* Darkest bg */
+  --surface-raised: oklch(16% 0.01 270); /* Card bg */
+  --surface-overlay: oklch(20% 0.01 270); /* Modal bg */
+  --surface-border: oklch(25% 0.01 270); /* Borders */
+
+  /* Text */
+  --text-primary: oklch(95% 0.01 270); /* Main text */
+  --text-secondary: oklch(65% 0.01 270); /* Muted text */
+  --text-disabled: oklch(40% 0.01 270); /* Disabled */
+
+  /* Brand */
+  --color-brand: oklch(65% 0.2 270); /* Purple */
+  --color-brand-hover: oklch(from var(--color-brand) calc(l - 8%) c h);
+
+  /* Semantic */
+  --color-success: var(--color-advise);
+  --color-warning: var(--color-warn);
+  --color-error: var(--color-refuse);
+  --color-info: var(--color-ask);
+
+  /* Spacing scale */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Border radius */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-full: 9999px;
+
+  /* Shadows */
+  --shadow-sm: 0 1px 3px oklch(0% 0 0 / 0.3);
+  --shadow-md: 0 4px 12px oklch(0% 0 0 / 0.4);
+}
+
+body {
+  background-color: var(--surface-base);
+  color: var(--text-primary);
+}
