@@ -2,6 +2,7 @@ import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData } from 'react-router-dom'
 import { getProjects } from '@/api/projects'
 import type { Project } from '@/types/project'
+import { ProjectCard } from '@/components/project/ProjectCard'
 
 /**
  * Co-located loader pattern. Source: FRONTEND_SYSTEM_DESIGN.md section 5
@@ -27,10 +28,7 @@ export default function ProjectsPage() {
       ) : (
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => (
-            <div key={p.id} className="rounded-lg border border-surface-border bg-surface-raised p-4">
-              <p className="font-medium text-text-primary">{p.name}</p>
-              <p className="mt-1 text-sm text-text-secondary">Experts: {p.experts.length}</p>
-            </div>
+            <ProjectCard key={p.id} project={p} />
           ))}
         </div>
       )}
