@@ -436,7 +436,15 @@ func handleRegister(svc *auth.AuthService) gin.HandlerFunc {
 			return
 		}
 
-		response.Created(c, tokens)
+		// Fetch user record to return alongside tokens
+		// Frontend expects: { user: {...}, tokenPair: { accessToken, expiresInSeconds } }
+		user, err := svc.GetMe(c.Request.Context(), tokens.UserID)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+
+		response.Created(c, buildAuthResponse(user, tokens))
 	}
 }
 
