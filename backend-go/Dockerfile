@@ -9,10 +9,11 @@ RUN go mod download
 # Copy source
 COPY . .
 
-# Build
+# Build both binaries in one layer
 # CGO_ENABLED=0: Static binary, no C dependencies
 # -ldflags "-s -w": Strip debug info, reduce binary size
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o server ./cmd/server/main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o server ./cmd/server/main.go && \
+    CGO_ENABLED=0 GOOS=linux go build -ldflags "-s -w" -o migrate ./cmd/migrate/main.go
 
 # ============================================================
 # Final image — minimal
@@ -24,7 +25,12 @@ RUN apk --no-cache add ca-certificates tzdata
 
 WORKDIR /app
 
+# Copy both binaries
 COPY --from=builder /app/server .
+COPY --from=builder /app/migrate .
+
+# Copy migrations directory so migrate binary can find them
+COPY migrations/ ./migrations/
 
 # Non-root user for security
 RUN addgroup -S avengers && adduser -S avengers -G avengers
