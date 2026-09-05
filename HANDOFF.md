@@ -698,6 +698,36 @@ correction. **Frontend action available now**: wire
 
 ---
 
+## Frontend Phase 6 — Polish & Deploy (2026-09-05)
+
+> Continues from Phase 1-5 above. Same rule: only actually-implemented,
+> code-reviewed work is marked done; no build/test run was performed
+> (still no Node toolchain in this session - all verification below is
+> manual code tracing and cross-file auditing).
+
+### Verified complete
+
+| File | Status | Notes |
+|---|---|---|
+| `frontend/src/api/memory.ts` + `ProjectPage.tsx` timeline wiring | ✅ | `ProjectTimeline.tsx` (built since Phase 2) finally wired in - endpoint was incorrectly believed missing in Phases 2-4, corrected earlier this session (see consolidated blocker list above) |
+| `frontend/src/components/layout/AppErrorBoundary.tsx` | ✅ | Named in FRONTEND_SYSTEM_DESIGN.md section 14 but never actually implemented in any prior phase - built now, wraps the entire app in main.tsx outside QueryClientProvider |
+| `frontend/src/pages/chat/ChatPage.tsx` | ✅ rewritten | Message history virtualized with @tanstack/react-virtual per section 12's explicit call-out ("100+ messages") - dynamic per-row height measurement (rows have real variable height: markdown, code blocks, citations) plus a "stay near bottom" scroll tracker so auto-scroll doesn't yank the view away from a user reading history during a live stream |
+
+### Bugs found and fixed during final QA audit (not new features - real, silent bugs in Phase 4/5 work)
+
+**`ProjectExpertManager.tsx` and `RepoConnectModal.tsx` both had a silent no-op cache invalidation bug.** Both called `queryClient.invalidateQueries({queryKey: ['projects', projectId]})` after a successful mutation, intending to refresh the project's expert list / repo connection state. This did **nothing** - `ProjectPage.tsx` sources `project` from a React Router **loader** (`useLoaderData()`), never from a `useQuery` call, so there was no cache entry under that key for anything to invalidate. Concretely: adding or removing a project expert, or connecting a repo, would silently succeed on the backend while the UI showed stale data until a full manual page reload - no error, no visible sign anything was wrong. Fixed both to call `useRevalidator().revalidate()` instead (React Router's real mechanism for re-running a loader), matching the pattern `ChatPage.tsx` already used correctly. **This was found by auditing every mutation's `onSuccess` handler against where its target data actually comes from (loader vs query) - a check worth repeating any time a new mutation is added that touches loader-sourced data.**
+
+As a control check, `ChatList.tsx`'s equivalent invalidation (`['projects', projectId, 'chats']` after creating a chat) was verified to be **correct** - its own `getChats` call is a real `useQuery` with a matching key, so that one actually works. Not every invalidation in the codebase was broken, only the two that pointed at loader-sourced data.
+
+### NOT done (real remaining gaps, honestly listed)
+
+- No automated tests exist anywhere in the frontend (consistent with the project-wide gap listed under "What's NOT Implemented" at the top of this file).
+- No actual `npm install`/`build`/`typecheck`/`lint` run has been performed at any point across all 6 phases - every single verification in this document is manual code tracing and cross-file auditing. **This is the single most important open action item for whoever picks this up**: run the actual toolchain and fix whatever it surfaces, since manual tracing - however careful - cannot catch every category of bug a real compiler/linter would (e.g. subtle type mismatches, unused imports, actual runtime behavior under load).
+- Rate limiting, cost monitoring dashboards beyond what AdminDashboard already shows, and load testing (all listed in the architecture doc's own Phase 6 backend scope) are backend-side concerns, not frontend gaps - out of scope for this document's frontend-only work.
+- The two backend blockers in the consolidated list above (duplicate `buildRouter`, missing OAuth routes) remain unfixed - frontend Phase 6 work does not depend on either being fixed to be internally complete, but the app cannot actually run end-to-end (login → chat → response) until Blocker 1 is resolved, since the backend itself won't start.
+
+---
+
 ## Anti-Patterns Found and Fixed
 
 *Will be updated as implementation progresses.*
