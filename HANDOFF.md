@@ -148,17 +148,107 @@ Dockerfile        — Python container
 
 ## What's NOT Implemented (Future Work)
 
-- Frontend (React) — Design complete ✅ See `AI_AVENGERS_FRONTEND_DESIGN.md`. Implementation pending.
+- Frontend (React) — Phase 1 (Foundation) implemented, see "Frontend Phase 1" section below. Phases 2+ pending.
 - Voice input
 - Streaming token-by-token (currently full response per expert)
 - Fine-tuning pipeline (rating data collection is ready)
 - Multi-region deployment
 - CI/CD pipeline
-- Automated tests
+- Automated tests (frontend and backend)
 
 ---
 
-*Last updated: 2026-09-04 — All 6 phases complete*
+## Frontend Phase 1 — Foundation (2026-09-05)
+
+> Design doc referenced: `docs/FRONTEND_SYSTEM_DESIGN.md`.
+> **This section reflects only what was actually implemented and
+> reviewed in this session — not a repeat of the file's earlier
+> "all complete" claim, which the per-component tables above already
+> contradict for backend Phases 2-6.**
+
+### Verified complete
+
+| File | Status | Notes |
+|---|---|---|
+| `frontend/package.json`, `vite.config.ts`, `tsconfig*.json`, `tailwind.config.ts`, `postcss.config.js`, `index.html` | ✅ | React 18 + TS strict + Vite + Tailwind scaffold |
+| `frontend/src/design-system/{tokens,typography,animations}.css` | ✅ | OKLCH tokens match section 4 exactly |
+| `frontend/src/types/{api,expert,project,memory,auth}.ts` | ✅ | Matches section 13 interfaces + backend schema (section 5) |
+| `frontend/src/utils/casing.ts` | ✅ | New — not in the design doc. Required to bridge snake_case backend JSON to camelCase frontend types (see "Gaps found" below) |
+| `frontend/src/utils/{cn,jwt}.ts` | ✅ | jwt.ts is a new stopgap file, see gaps below |
+| `frontend/src/stores/{authStore,uiStore,streamStore}.ts` | ✅ | authStore has no persist middleware by design (in-memory only) |
+| `frontend/src/api/{base,auth,experts,projects,chats,messages,admin,queryKeys}.ts` | ✅ | base.ts fixes a refresh-token race condition and an infinite-retry-loop bug present in the design doc's illustrative snippet (documented inline) |
+| `frontend/src/hooks/{useSSEStream,useAuth}.ts` | ✅ | useSSEStream fixes a partial-SSE-frame bug in the doc's snippet (documented inline). useAuth is new, not in the doc — needed for silent session restore on reload |
+| `frontend/src/components/layout/{AuthGuard,AdminGuard,AppShell,Sidebar,Header,RouteError}.tsx` | ✅ | AdminGuard is a new file, split out from the doc's single AuthGuard concept, for defense-in-depth clarity |
+| `frontend/src/pages/**` (Login, Register, Projects, Project, Chat, Experts, Admin x5) | ✅ stubs | Loader + minimal render only. Full UI (MessageInput, ExpertResponse, SynthesisPanel, CitationChip, etc. from section 9) is Phase 2, NOT done |
+| `frontend/src/App.tsx` | ✅ | Full route tree per section 5, including lazy-loaded /admin subtree |
+
+### NOT verified (no toolchain access in this session)
+
+No `npm install` / `npm run build` / `npm run typecheck` was actually
+run — this session had no Node.js execution environment available.
+All verification was done by manual code tracing (import paths cross-
+checked file-by-file, TypeScript syntax reviewed by hand). **Do not
+treat this as equivalent to a passing build.** First thing anyone
+picking this up should do: `cd frontend && npm install && npm run
+typecheck && npm run build`, and fix whatever that surfaces.
+
+### Gaps found in the design docs during implementation
+
+1. **Casing mismatch**: `FRONTEND_SYSTEM_DESIGN.md` section 13's
+   TypeScript interfaces are camelCase; `AI_AVENGERS_SYSTEM_ARCHITECTURE.md`
+   section 15's example JSON response is snake_case. No conversion step
+   was shown anywhere. Added `utils/casing.ts` + wired into
+   `api/base.ts` interceptors. **Action needed**: confirm with the
+   actual Go backend (check `internal/response/response.go` and any
+   JSON struct tags) whether responses are really snake_case — if the
+   Go backend actually already returns camelCase (e.g. via custom
+   `json:"foo"` tags), this bridge is unnecessary and should be removed
+   rather than left in as dead code.
+2. **No `GET /me` endpoint** documented anywhere in either doc's API
+   surface, but `accessToken` is deliberately never persisted (XSS
+   mitigation). Without `/me`, there is no way to fully repopulate
+   `User` (fullName, email) after a page reload — only `role` can be
+   recovered by decoding the JWT client-side (`utils/jwt.ts`, a
+   stopgap). **Action needed**: add `GET /api/v1/me` to the backend
+   and API design doc, then replace the JWT-decode stopgap in
+   `authStore.isAdmin()` with a real profile fetch in `useAuthBootstrap`.
+3. **StreamStore interface incomplete**: section 6 lists the
+   `StreamStore` interface without a `setError` method, but section 8's
+   own `useSSEStream` snippet calls `setError(chatId, ...)`. Added the
+   method to `streamStore.ts`.
+4. **SSE event schema conflict between the two docs**: the backend
+   architecture doc's API section (section 15) shows a `chunk`-type
+   token-streaming SSE example, but this very file's own "What's NOT
+   Implemented" list (above) says token-by-token streaming is not
+   implemented, and `FRONTEND_SYSTEM_DESIGN.md`'s own `SSEEvent` union
+   (section 8) has no `chunk` variant. Treated the frontend doc's union
+   (`thinking`/`complete`/`synthesis`/`done`/`error`) as the correct
+   current contract, since it's consistent with "not implemented yet."
+   **Action needed**: if/when token streaming is implemented backend-
+   side, the SSEEvent union and `useSSEStream`'s switch in `applyEvent`
+   need a `chunk` case added — currently absent by design, not by
+   oversight.
+5. **Partial SSE frame bug** in the design doc's `useSSEStream`
+   illustrative snippet: it parses `JSON.parse` on every line split
+   from a single `decoder.decode()` call per `read()`, with no
+   buffering across reads. TCP chunk boundaries don't align with SSE
+   frame boundaries, so this would silently drop real events under a
+   "malformed JSON — skip" comment. Fixed with a rolling line buffer.
+6. **Refresh-token race + infinite retry loop** in `api/base.ts`'s
+   illustrative snippet (section 7): no single-flight guard on
+   concurrent 401s, no retry-attempt guard. Both fixed; see inline
+   comments in `frontend/src/api/base.ts`.
+
+### Known follow-up (not yet fixed)
+
+- `frontend/src/api/admin.ts`'s `ingestTranscript` assumes the backend
+  accepts `multipart/form-data` with a `file` field — this matches the
+  Admin Panel section 11 wireframe ("Drag & drop transcript here") but
+  has not been cross-checked against `backend-go/internal/admin/admin_handler.go`'s
+  actual multipart field name. Verify before wiring up the real upload
+  UI in Phase 2.
+- `eslintrc` config was not added in this session — `npm run lint`
+  will fail with "no ESLint configuration found" until one is added.
 
 ---
 
