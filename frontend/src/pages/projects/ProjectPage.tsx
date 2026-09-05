@@ -1,36 +1,42 @@
 import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData, Outlet } from 'react-router-dom'
 import { getProject } from '@/api/projects'
+import { getProjectTimeline } from '@/api/memory'
 import type { Project } from '@/types/project'
+import type { L3Event } from '@/types/memory'
 import { RepoStatus } from '@/components/project/RepoStatus'
 import { ChatList } from '@/components/project/ChatList'
 import { ProjectExpertManager } from '@/components/project/ProjectExpertManager'
+import { ProjectTimeline } from '@/components/project/ProjectTimeline'
 
+/**
+ * PHASE 6 CORRECTION: ProjectTimeline is now wired in. This was
+ * blocked in Phases 2-4 by an incorrect finding (documented and
+ * corrected in HANDOFF.md's consolidated blocker list) that the
+ * timeline endpoint didn't exist at all - re-checking main.go directly
+ * showed it IS registered and reachable, just with hardcoded
+ * limit=50/offset=0 and no pagination params. Fetched in parallel
+ * with the project itself, consistent with the "parallel loader
+ * fetch" pattern used everywhere else in this codebase (ChatPage,
+ * ExpertsPage) - Promise.all rather than a sequential await, since
+ * neither fetch depends on the other's result.
+ */
 async function loader({ params, request }: LoaderFunctionArgs) {
   const projectId = params.projectId as string
-  const project = await getProject(projectId, { signal: request.signal })
-  return { project }
+  const signal = request.signal
+
+  const [project, timeline] = await Promise.all([
+    getProject(projectId, { signal }),
+    getProjectTimeline(projectId, { signal }),
+  ])
+
+  return { project, timeline }
 }
 
 export const projectRoute = { element: <ProjectPage />, loader }
 
-/**
- * WHY ProjectTimeline is STILL not wired in here (carried over from
- * Phase 2/3, now confirmed rather than just suspected): read the full
- * backend-go/internal/project/service.go source in Phase 4's
- * correction pass - there is no timeline/L3-event handler or route in
- * that file at all, not even an unconfirmed-pagination one. This
- * isn't "the contract is unclear", it's "the endpoint does not exist
- * yet" - wiring it up would mean calling a URL that 404s. Logged as a
- * concrete backend TODO in HANDOFF.md, not a frontend gap.
- *
- * PHASE 5 UPDATE: RepoStatus now takes projectId (not the full Project
- * object) - it fetches its own live sync status via useRepoSyncStatus
- * rather than reading the parent's static repo fields, since sync
- * progress has no representation on the Project object at all.
- */
 export default function ProjectPage() {
-  const { project } = useLoaderData() as { project: Project }
+  const { project, timeline } = useLoaderData() as { project: Project; timeline: L3Event[] }
 
   return (
     <div className="p-6">
@@ -44,6 +50,11 @@ export default function ProjectPage() {
 
       <div className="mt-6">
         <ChatList projectId={project.id} />
+      </div>
+
+      <div className="mt-6">
+        <p className="mb-1 text-sm font-medium text-text-secondary">Recent Activity</p>
+        <ProjectTimeline events={timeline} />
       </div>
 
       <div className="mt-6">
