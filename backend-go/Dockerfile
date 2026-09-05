@@ -5,17 +5,17 @@ WORKDIR /app
 # Install git — needed by go mod tidy to fetch some dependencies
 RUN apk --no-cache add git
 
-# Copy go.mod first (go.sum may not exist yet)
-# WHY go mod tidy not go mod download:
-# go mod download requires go.sum to already exist.
-# go mod tidy generates go.sum from go.mod — works even when
-# go.sum is missing. Safe to run when go.sum exists too.
+# Copy go.mod first (layer cache: only re-download if go.mod changes)
 COPY go.mod ./
 COPY go.sum* ./
-RUN go mod tidy
 
-# Copy source
+# Copy ALL source files before go mod tidy
+# WHY: go mod tidy reads .go files to find actual imports.
+# Without source, tidy resolves nothing and go.sum stays empty.
 COPY . .
+
+# Now tidy can see all imports and generate complete go.sum
+RUN go mod tidy
 
 # Build both binaries in one layer
 # CGO_ENABLED=0: Static binary, no C dependencies
