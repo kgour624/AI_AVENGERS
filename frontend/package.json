@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "typecheck": "tsc -b --noEmit"
+    "typecheck": "tsc -b --noEmit",
+    "generate": "openapi-typescript ../backend-go/api/openapi.yaml --output src/types/generated.ts"
   },
   "dependencies": {
     "react": "^18.3.1",
@@ -25,14 +26,6 @@
     "prism-react-renderer": "^2.4.0",
     "date-fns": "^3.6.0"
   },
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview",
-    "lint": "eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0",
-    "typecheck": "tsc -b --noEmit",
-    "generate": "openapi-typescript ../backend-go/api/openapi.yaml --output src/types/generated.ts"
-  },
   "devDependencies": {
     "@types/react": "^18.3.9",
     "@types/react-dom": "^18.3.0",
@@ -43,6 +36,7 @@
     "eslint": "^8.57.1",
     "eslint-plugin-react-hooks": "^4.6.2",
     "eslint-plugin-react-refresh": "^0.4.12",
+    "openapi-typescript": "^7.4.0",
     "postcss": "^8.4.47",
     "tailwindcss": "^3.4.13",
     "typescript": "^5.6.2",
