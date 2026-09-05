@@ -596,28 +596,43 @@ func handleAdminLogin(svc *auth.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		setRefreshCookie(c, tokens.RefreshToken, svc.RefreshExpiryDays())
 		response.OK(c, buildAuthResponse(user, tokens))
 	}
 }
 
 func handleRefresh(jwtService *auth.JWTService) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		var req struct {
-			RefreshToken string `json:"refresh_token" binding:"required"`
+		// Read refresh token from httpOnly cookie (primary)
+		// Fall back to request body (for non-browser clients / testing)
+		//
+		// WHY cookie first:
+		// Browser sends cookie automatically via withCredentials:true.
+		// refreshSession() in base.ts sends empty body {} — cookie carries the token.
+		refreshToken, err := c.Cookie(refreshTokenCookieName)
+		if err != nil || refreshToken == "" {
+			// Cookie missing — try body (non-browser clients)
+			var req struct {
+				RefreshToken string `json:"refresh_token"`
+			}
+			_ = c.ShouldBindJSON(&req)
+			refreshToken = req.RefreshToken
 		}
-		if err := c.ShouldBindJSON(&req); err != nil {
-			response.BadRequest(c, "INVALID_INPUT", err.Error())
+
+		if refreshToken == "" {
+			response.BadRequest(c, "MISSING_TOKEN", "refresh token required (cookie or body)")
 			return
 		}
 
-		claims, err := jwtService.ValidateRefreshToken(c.Request.Context(), req.RefreshToken)
+		claims, err := jwtService.ValidateRefreshToken(c.Request.Context(), refreshToken)
 		if err != nil {
+			clearRefreshCookie(c)
 			response.Unauthorized(c, "Invalid or expired refresh token")
 			return
 		}
 
-		// Revoke old refresh token
-		_ = jwtService.RevokeRefreshToken(c.Request.Context(), req.RefreshToken)
+		// Revoke old refresh token (rotation)
+		_ = jwtService.RevokeRefreshToken(c.Request.Context(), refreshToken)
 
 		// Issue new token pair
 		tokens, err := jwtService.IssueTokenPair(c.Request.Context(), claims.UserID, claims.Email, claims.Role)
@@ -626,21 +641,32 @@ func handleRefresh(jwtService *auth.JWTService) gin.HandlerFunc {
 			return
 		}
 
-		response.OK(c, tokens)
+		// Rotate cookie — new refresh token replaces old
+		setRefreshCookie(c, tokens.RefreshToken, jwtService.RefreshExpiryDays())
+
+		// Return only new access token — refresh token is in cookie
+		response.OK(c, map[string]interface{}{
+			"access_token":       tokens.AccessToken,
+			"expires_in_seconds": int(time.Until(tokens.ExpiresAt).Seconds()),
+		})
 	}
 }
 
 func handleLogout(jwtService *auth.JWTService) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Revoke refresh token from cookie
+		if refreshToken, err := c.Cookie(refreshTokenCookieName); err == nil && refreshToken != "" {
+			_ = jwtService.RevokeRefreshToken(c.Request.Context(), refreshToken)
+		}
+		// Also try body (non-browser clients)
 		var req struct {
 			RefreshToken string `json:"refresh_token"`
 		}
-		_ = c.ShouldBindJSON(&req)
-
-		if req.RefreshToken != "" {
+		if _ = c.ShouldBindJSON(&req); req.RefreshToken != "" {
 			_ = jwtService.RevokeRefreshToken(c.Request.Context(), req.RefreshToken)
 		}
 
+		clearRefreshCookie(c)
 		response.OK(c, map[string]string{"message": "logged out"})
 	}
 }
