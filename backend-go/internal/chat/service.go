@@ -179,7 +179,10 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 	rows, err := s.db.Query(ctx,
 		`SELECT id, chat_id, role, content, turn_number,
 		        expert_id, COALESCE(decision_mode,''), COALESCE(confidence,0),
-		        COALESCE(tokens_used,0), COALESCE(cost_usd,0), created_at
+		        COALESCE(tokens_used,0), COALESCE(cost_usd,0),
+		        COALESCE(warning_text,''),
+		        COALESCE(clarifying_questions,'[]'::jsonb),
+		        created_at
 		 FROM messages
 		 WHERE chat_id=$1
 		 ORDER BY turn_number ASC
@@ -194,12 +197,22 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 	var messages []Message
 	for rows.Next() {
 		var m Message
+		var clarifyingJSON []byte
 		if err := rows.Scan(
 			&m.ID, &m.ChatID, &m.Role, &m.Content, &m.TurnNumber,
 			&m.ExpertID, &m.DecisionMode, &m.Confidence,
-			&m.TokensUsed, &m.CostUSD, &m.CreatedAt,
+			&m.TokensUsed, &m.CostUSD,
+			&m.WarningText, &clarifyingJSON,
+			&m.CreatedAt,
 		); err != nil {
 			continue
+		}
+		// Unmarshal clarifying_questions JSONB -> []string
+		if len(clarifyingJSON) > 0 {
+			_ = json.Unmarshal(clarifyingJSON, &m.ClarifyingQuestions)
+		}
+		if m.ClarifyingQuestions == nil {
+			m.ClarifyingQuestions = []string{}
 		}
 		messages = append(messages, m)
 	}
