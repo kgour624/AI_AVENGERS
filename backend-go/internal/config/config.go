@@ -289,6 +289,9 @@ func (c *Config) applyDefaults() {
 	if c.Context.CourseChunksTopK == 0 {
 		c.Context.CourseChunksTopK = 5
 	}
+	if c.OAuth.BaseURL == "" {
+		c.OAuth.BaseURL = "http://localhost:8080"
+	}
 	if c.RateLimit.PerIP == 0 {
 		c.RateLimit.PerIP = 100
 	}
