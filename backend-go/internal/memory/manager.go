@@ -185,6 +185,43 @@ func (m *Manager) RecordViolation(
 	}()
 }
 
+// RecordRating logs a rating event to L3.
+// WHY separate from RecordViolation:
+// A rating is client feedback, not a China Wall violation.
+// Using RecordViolation for ratings polluted the admin violations list.
+// Separate method ensures correct EventType in master_event_log.
+func (m *Manager) RecordRating(
+	ctx context.Context,
+	projectID uuid.UUID,
+	expertID uuid.UUID,
+	clientID uuid.UUID,
+	chatID uuid.UUID,
+	messageID uuid.UUID,
+	score int,
+	feedbackType string,
+) {
+	go func() {
+		bgCtx := context.Background()
+		expertIDPtr := &expertID
+		chatIDPtr := &chatID
+		msgIDPtr := &messageID
+		_ = m.l3.Append(bgCtx, L3Event{
+			ProjectID: projectID,
+			ExpertID:  expertIDPtr,
+			ClientID:  clientID,
+			ChatID:    chatIDPtr,
+			MessageID: msgIDPtr,
+			EventType: EventRatingRecorded,
+			EventData: map[string]interface{}{
+				"score":         score,
+				"feedback_type": feedbackType,
+			},
+			Reasoning:    fmt.Sprintf("Client rated response %d/5", score),
+			DecisionMade: feedbackType,
+		})
+	}()
+}
+
 // GetTimeline returns project event timeline for UI.
 func (m *Manager) GetTimeline(ctx context.Context, projectID uuid.UUID, limit, offset int) ([]L3EventRecord, error) {
 	return m.l3.GetProjectTimeline(ctx, projectID, limit, offset)
