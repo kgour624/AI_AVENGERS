@@ -148,7 +148,7 @@ Dockerfile        — Python container
 
 ## What's NOT Implemented (Future Work)
 
-- Frontend (React) — to be provided separately
+- Frontend (React) — Design complete ✅ See `AI_AVENGERS_FRONTEND_DESIGN.md`. Implementation pending.
 - Voice input
 - Streaming token-by-token (currently full response per expert)
 - Fine-tuning pipeline (rating data collection is ready)
