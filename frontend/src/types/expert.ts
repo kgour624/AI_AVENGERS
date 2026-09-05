@@ -10,31 +10,66 @@ export type ResponseMode = 'ASK' | 'WARN' | 'PUSH_BACK' | 'REFUSE' | 'ADVISE'
 /** Which of the 5 gates stopped processing. 0 means it reached Gate 5 (generated). */
 export type GateStopped = 0 | 1 | 2 | 3 | 4 | 5
 
-export interface Expert {
+/**
+ * PHASE 4 CORRECTION: verified against the real
+ * backend-go/internal/expert/handler.go ExpertPublic struct (the
+ * public GET /experts and GET /experts/:id endpoint, used by
+ * api/experts.ts::getExperts/getExpert). It does NOT return
+ * isActive, isTraining, or totalRatings at all - only the admin-only
+ * endpoint (GetIn ListExperts, admin_handler.go) returns those.
+ * Phase 1's Expert type assumed every one of these fields exists on
+ * every expert response - they would have silently been `undefined`
+ * at runtime on the public endpoints despite compiling cleanly.
+ *
+ * Split into a base `PublicExpert` (matches ExpertPublic exactly) and
+ * `Expert` which extends it with the admin-only fields as optional -
+ * so admin/experts.ts's getAdminExperts can still populate them, but
+ * api/experts.ts's getExperts/getExpert (public) don't fabricate
+ * fields the backend never sends.
+ */
+export interface PublicExpert {
   id: string
   name: string
   slug: string
   domain: string
   description: string
-  avatarUrl?: string
   totalChunks: number
   totalTopics: number
   avgDepthLevel: number
   avgRating: number
-  totalRatings: number
-  isActive: boolean
-  isTraining: boolean
   createdAt: string
 }
 
+export interface Expert extends PublicExpert {
+  avatarUrl?: string
+  totalRatings?: number
+  isActive?: boolean
+  isTraining?: boolean
+}
+
+/**
+ * PHASE 4 CORRECTION: verified against expert/handler.go's real
+ * GetTopics query - `SELECT topic, depth_level, chunk_count,
+ * complexity_ceiling FROM expert_capabilities`. There is NO
+ * can_handle/cannot_handle/example_questions in this SELECT despite
+ * those columns existing in the expert_capabilities table (per
+ * AI_AVENGERS_SYSTEM_ARCHITECTURE.md section 5) - the handler simply
+ * never selects them. CapabilityCard.tsx (Phase 2) was built assuming
+ * these arrays would always be populated; they will always be empty
+ * from the real public endpoint today. Made them explicitly optional
+ * with a documented reason, rather than required fields that are
+ * always empty in practice (which would be misleading about what the
+ * type guarantees).
+ */
 export interface ExpertTopic {
   topic: string
   depthLevel: 1 | 2 | 3 | 4 | 5
   chunkCount: number
   complexityCeiling: 'basic' | 'intermediate' | 'advanced' | 'expert' | 'master'
-  canHandle: string[]
-  cannotHandle: string[]
-  exampleQuestions: string[]
+  /** NOT returned by the current GET /experts/:id/topics handler - see comment above. Backend gap, not a frontend rendering choice. */
+  canHandle?: string[]
+  cannotHandle?: string[]
+  exampleQuestions?: string[]
 }
 
 export interface Citation {
