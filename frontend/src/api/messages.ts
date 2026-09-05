@@ -7,12 +7,22 @@ import { baseAPI } from './base'
  * responses need raw fetch() + ReadableStream, which axios does not
  * support natively. Only the (non-streaming) rating endpoint belongs
  * in this axios-based file.
+ *
+ * PHASE 4 CORRECTION: RateRequest below was incomplete - verified
+ * against the real backend-go/internal/rating/handler.go RateRequest
+ * struct, which also has codeExecuted/executionSuccess/errorMessage
+ * fields (used when a code suggestion was actually run by the client
+ * and failed/succeeded). Added them as optional so RatingWidget (which
+ * only ever sends score today) keeps compiling unchanged, but a future
+ * "code execution feedback" feature has real fields to send against.
  */
-
 export interface RateRequest {
   score: 1 | 2 | 3 | 4 | 5
   feedback?: string
   feedbackType?: 'accepted' | 'rejected' | 'modified' | 'ignored'
+  codeExecuted?: boolean
+  executionSuccess?: boolean
+  errorMessage?: string
 }
 
 export const rateMessage = (messageId: string, rating: RateRequest) =>

@@ -1,6 +1,6 @@
 import { baseAPI } from './base'
 import type { ApiResponse } from '@/types/api'
-import type { Project, ProjectExpert } from '@/types/project'
+import type { Project } from '@/types/project'
 
 export interface CreateProjectRequest {
   name: string
@@ -26,8 +26,18 @@ export const getProjectExperts = (projectId: string, options?: { signal?: AbortS
     .then((res) => res.data.data!.experts)
 
 export const addProjectExpert = (projectId: string, expertId: string) =>
+  // WHY the response type is just {status}, not ProjectExpert: verified
+  // against backend-go/internal/project/service.go's AddExpert handler,
+  // which responds with `response.OK(c, map[string]string{"status": "expert added"})`
+  // - no expert data comes back. Phase 1's version assumed a
+  // ProjectExpert object would be returned, which was never true;
+  // callers (Phase 4's project-expert-management UI) must refetch the
+  // project (getProjectExperts) to see the updated list, not read the
+  // add call's response.
   baseAPI
-    .post<ApiResponse<ProjectExpert>>(`/api/v1/projects/${projectId}/experts`, { expertId })
+    .post<ApiResponse<{ status: string }>>(`/api/v1/projects/${projectId}/experts`, {
+      expertId,
+    })
     .then((res) => res.data.data!)
 
 export const removeProjectExpert = (projectId: string, expertId: string) =>
