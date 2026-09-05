@@ -41,9 +41,10 @@ type DecisionResult struct {
 	Content     string
 	Citations   []chinawall.Citation
 	Confidence  float64
-	GateStopped int    // 0 = reached Gate 5 successfully
-	Warning     string // Set when Gate 3 triggers WARN but continues
+	GateStopped int      // 0 = reached Gate 5 successfully
+	Warning     string   // Set when Gate 3 triggers WARN but continues
 	Questions   []string // Set when Gate 1 triggers ASK
+	Reason      string   // Set when Gate 5 refuses (China Wall reason)
 }
 
 // Engine implements the 5-gate decision system.

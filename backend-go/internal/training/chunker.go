@@ -197,7 +197,6 @@ func (c *TextChunker) GetStats(chunks []TextChunk) map[string]interface{} {
 		"min_tokens": minT, "max_tokens": maxT,
 	}
 }
-}
 
 // NewTextChunker creates a new chunker with given config.
 func NewTextChunker(cfg ChunkerConfig) *TextChunker {
