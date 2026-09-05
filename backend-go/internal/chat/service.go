@@ -29,18 +29,24 @@ type Chat struct {
 
 // Message is a single message in a chat.
 type Message struct {
-	ID           uuid.UUID  `json:"id"`
-	ChatID       uuid.UUID  `json:"chat_id"`
-	Role         string     `json:"role"`
-	Content      string     `json:"content"`
-	TurnNumber   int        `json:"turn_number"`
-	ExpertID     *uuid.UUID `json:"expert_id,omitempty"`
-	DecisionMode string     `json:"decision_mode,omitempty"`
-	Citations    interface{} `json:"citations,omitempty"`
-	Confidence   float64    `json:"confidence,omitempty"`
-	TokensUsed   int        `json:"tokens_used,omitempty"`
-	CostUSD      float64    `json:"cost_usd,omitempty"`
-	CreatedAt    time.Time  `json:"created_at"`
+	ID                   uuid.UUID  `json:"id"`
+	ChatID               uuid.UUID  `json:"chat_id"`
+	Role                 string     `json:"role"`
+	Content              string     `json:"content"`
+	TurnNumber           int        `json:"turn_number"`
+	ExpertID             *uuid.UUID `json:"expert_id,omitempty"`
+	DecisionMode         string     `json:"decision_mode,omitempty"`
+	Citations            interface{} `json:"citations,omitempty"`
+	Confidence           float64    `json:"confidence,omitempty"`
+	TokensUsed           int        `json:"tokens_used,omitempty"`
+	CostUSD              float64    `json:"cost_usd,omitempty"`
+	// WarningText is the Gate 3 WARN reasoning text.
+	// NULL/empty means no charter warning was triggered.
+	WarningText          string     `json:"warning_text,omitempty"`
+	// ClarifyingQuestions is the Gate 1 ASK question list.
+	// Empty means no clarification was needed.
+	ClarifyingQuestions  []string   `json:"clarifying_questions,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
 }
 
 // ErrNotFound is returned when a chat is not found.
