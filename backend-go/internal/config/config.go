@@ -12,18 +12,19 @@ import (
 // Values are loaded from environment variables.
 // No defaults for secrets — fail fast if missing.
 type Config struct {
-	Server    ServerConfig
-	Database  DatabaseConfig
-	Redis     RedisConfig
-	JWT       JWTConfig
-	LLM       LLMConfig
-	ML        MLConfig
-	ChinaWall ChinaWallConfig
-	Context   ContextConfig
-	Security  SecurityConfig
-	OAuth     OAuthConfig
-	RateLimit RateLimitConfig
-	Log       LogConfig
+	Server              ServerConfig
+	Database            DatabaseConfig
+	Redis               RedisConfig
+	JWT                 JWTConfig
+	LLM                 LLMConfig
+	ML                  MLConfig
+	ChinaWall           ChinaWallConfig
+	Context             ContextConfig
+	Security            SecurityConfig
+	OAuth               OAuthConfig
+	RateLimit           RateLimitConfig
+	Log                 LogConfig
+	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
 }
 
 type ServerConfig struct {
