@@ -78,14 +78,26 @@ let refreshPromise: Promise<string> | null = null
 // a silent refresh on app mount, before any request has even 401'd -
 // e.g. immediately after a hard page reload when accessToken is null.
 export async function refreshSession(): Promise<string> {
-  // Deliberately a raw axios call, NOT baseAPI - using baseAPI here
-  // would re-enter this same interceptor chain if refresh itself 401s.
-  const response = await axios.post<{ data: { access_token: string } }>(
+  // Deliberately a raw axios call, NOT baseAPI.
+  // WHY: using baseAPI would re-enter this interceptor chain if refresh
+  // itself 401s, causing an infinite loop.
+  //
+  // Body is intentionally empty {}.
+  // WHY: refresh token travels as an httpOnly cookie (set by backend
+  // on login). withCredentials:true makes the browser send it
+  // automatically. JavaScript never touches the refresh token.
+  //
+  // Response shape: { success, data: { access_token, expires_in_seconds }, meta }
+  // (refresh token is NOT in response body — it's rotated in the cookie)
+  const res = await axios.post<{
+    success: boolean
+    data: { access_token: string; expires_in_seconds: number }
+  }>(
     `${import.meta.env.VITE_API_URL}/api/v1/auth/refresh`,
     {},
     { withCredentials: true }
   )
-  const newToken = camelizeKeys<{ accessToken: string }>(response.data.data).accessToken
+  const newToken = res.data.data.access_token
   useAuthStore.getState().setAccessToken(newToken)
   return newToken
 }
