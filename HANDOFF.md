@@ -974,15 +974,23 @@ String interpolation for the vector literal. Should use `pgvector.NewVector(embe
 
 ---
 
-### 📋 PRIORITY FIX ORDER
+### ✅ ALL BUGS FIXED — 2026-09-05
 
-1. **Bug 1** — Fix `cmd/server/main.go` (delete stub body, add missing routes) — BLOCKS EVERYTHING
-2. **Bug 2** — Delete `admin/handler.go` dead code — CLEANUP
-3. **Bug 3** — Migration 004 + SaveMessage update — DATA INTEGRITY
-4. **Bug 5** — Add `GET /me` endpoint — FRONTEND SESSION RESTORE
-5. **Bug 4** — Register OAuth routes + write callback handler — OAUTH FLOW
-6. **Bug 6** — Fix `logToL3` event type — ADMIN PANEL ACCURACY
-7. **Bug 7** — Fix vector string interpolation in `IndexTurn` — SQL SAFETY
+| Bug | Fix | Files Changed |
+|---|---|---|
+| Bug 1 — Duplicate buildRouter | Deleted entire stub body, kept real-handler version | `cmd/server/main.go` |
+| Bug 2 — Dead code admin handlers | Deleted `admin/handler.go` + `admin/expert_service.go` | deleted |
+| Bug 3 — warning_text + clarifying_questions missing | Migration 004 + SaveMessage + ListMessages + saveAssistantMessage | `migrations/004_*`, `chat/service.go`, `message/handler.go` |
+| Bug 4 — OAuth routes missing | Added GET /repo/oauth/:provider + GET /repo/callback/:provider + OAuthCallback handler + Redis state CSRF | `cmd/server/main.go`, `repo/service.go` |
+| Bug 5 — GET /me missing | Added GetMe to AuthService + handleGetMe handler + route | `auth/service.go`, `cmd/server/main.go` |
+| Bug 6 — logToL3 wrong event type | Added RecordRating to Manager, updated rating handler | `memory/manager.go`, `rating/handler.go` |
+| Bug 7 — Vector string interpolation | Replaced buildVectorLiteral with pgvector.NewVector parameter | `chat/service.go` |
+
+**Additional fixes during bug resolution:**
+- `config/config.go`: Added `OAuthConfig` struct + `OAuth` field in `Config` + env var loading + default BaseURL
+- `repo/service.go`: Added `redis` field to `Service`, updated `NewService` signature, `GetOAuthURL` now stores state in Redis (CSRF), `OAuthCallback` handler written
+- `cmd/server/main.go`: Passes `redisClient.Client` to `repo.NewService`
+- `chat/service.go`: Added `encoding/json` import, `pgvector-go` import, removed `strings` import (unused after buildVectorLiteral deletion)
 
 ---
 
