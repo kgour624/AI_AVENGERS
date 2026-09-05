@@ -1,0 +1,25 @@
+# oapi-codegen configuration
+# Generates Go types from openapi.yaml
+# Run: make generate-go
+
+package: api
+generate:
+  # types-only: generate request/response structs
+  # WHY not 'gin-server': we keep our own Gin handlers.
+  # Generated server stubs would replace our business logic.
+  # Types-only gives compile-time safety without losing control.
+  models: true
+  embedded-spec: false
+  strict-server: false
+  gin-server: false
+  chi-server: false
+  echo-server: false
+  gorilla-server: false
+
+output: internal/api/generated/types.go
+
+# Naming conventions
+output-options:
+  # Use camelCase for Go struct fields (standard Go convention)
+  # openapi.yaml uses camelCase property names already
+  skip-prune: false
