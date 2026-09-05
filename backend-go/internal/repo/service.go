@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/ml"
