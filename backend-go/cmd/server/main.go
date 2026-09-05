@@ -540,7 +540,13 @@ func handleAdminLogin(svc *auth.AuthService) gin.HandlerFunc {
 			return
 		}
 
-		response.OK(c, tokens)
+		user, err := svc.GetMe(c.Request.Context(), tokens.UserID)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+
+		response.OK(c, buildAuthResponse(user, tokens))
 	}
 }
 
