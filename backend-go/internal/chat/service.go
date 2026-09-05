@@ -228,6 +228,11 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 // Called async after each turn.
 // WHY: Chat index enables semantic search in conversation history.
 // Context assembler uses this to find relevant past turns.
+//
+// WHY pgvector.NewVector not string interpolation (Bug 7 fix):
+// String interpolation is SQL injection risk and breaks on NaN/Inf.
+// pgvector.NewVector sends embedding as binary protocol parameter.
+// Same pattern used correctly in l2_store.go.
 func (s *Service) IndexTurn(
 	ctx context.Context,
 	chatID uuid.UUID,
@@ -239,25 +244,25 @@ func (s *Service) IndexTurn(
 	embedding []float32,
 ) error {
 	if len(embedding) == 0 {
-		// Store without embedding if ML sidecar unavailable
+		// ML sidecar unavailable — store with zero vector
+		// WHY not skip: chat_index entry is needed for turn tracking
+		// even without semantic search capability
 		_, err := s.db.Exec(ctx,
 			`INSERT INTO chat_index
-				(chat_id, message_id, turn_number, one_line_summary, topic, importance,
-				 embedding)
-			 VALUES ($1, $2, $3, $4, $5, $6,
-			         '[0.0]'::vector)`,
+				(chat_id, message_id, turn_number, one_line_summary, topic, importance, embedding)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 			chatID, messageID, turnNumber, summary, topic, importance,
+			pgvector.NewVector(make([]float32, 768)), // zero vector
 		)
 		return err
 	}
 
-	// Build pgvector literal
-	vecStr := buildVectorLiteral(embedding)
 	_, err := s.db.Exec(ctx,
-		fmt.Sprintf(`INSERT INTO chat_index
+		`INSERT INTO chat_index
 			(chat_id, message_id, turn_number, one_line_summary, topic, importance, embedding)
-		 VALUES ($1, $2, $3, $4, $5, $6, '%s'::vector)`, vecStr),
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
 		chatID, messageID, turnNumber, summary, topic, importance,
+		pgvector.NewVector(embedding),
 	)
 	return err
 }
