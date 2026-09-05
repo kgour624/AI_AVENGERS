@@ -397,10 +397,11 @@ func handleGetMe(svc *auth.AuthService) gin.HandlerFunc {
 			return
 		}
 		response.OK(c, map[string]interface{}{
-			"id":        user.ID,
-			"email":     user.Email,
-			"full_name": user.FullName,
-			"role":      user.Role,
+			"id":           user.ID,
+			"email":        user.Email,
+			"full_name":    user.FullName,
+			"role":         user.Role,
+			"totp_enabled": user.TOTPEnabled,
 		})
 	}
 }
