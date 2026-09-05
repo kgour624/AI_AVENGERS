@@ -493,6 +493,52 @@ typecheck && npm run build`, and fix whatever that surfaces.
 
 ---
 
+## Frontend Phase 4 — Project & Admin Pages (2026-09-05)
+
+> Continues from Phase 1-3 above. **This phase started with a
+> correction pass**: before building Admin pages, actually read the
+> real Go backend source (`admin_handler.go`, `message/handler.go`,
+> `rating/handler.go`, `project/service.go`, `expert/handler.go`,
+> `response/response.go`) instead of continuing to build against the
+> design docs' illustrative examples alone. This surfaced 7 real bugs
+> in Phase 1-3's assumptions, all fixed before Phase 4 proper began.
+
+### Correction pass - bugs found by reading real backend source
+
+| # | File | Bug | Fix |
+|---|---|---|---|
+| 1 | `api/admin.ts::ingestTranscript` | Sent file under FormData key `"file"` - real handler reads `FormFile("transcript")`. Every real upload would 400. | Fixed to `"transcript"` |
+| 2 | `api/admin.ts::AdminStats` | Entirely invented shape (`totalExperts`, `monthlyCostUsd`, `violationRate7d`) not matching `GetStats` at all | Rewrote to match real shape exactly: nested `experts{total,active}`, raw `violations` count, `avgRating` as a **string** (Go formats it server-side) |
+| 3 | `api/admin.ts::getAdminClients` | Typed as auth `User[]` (has fields the endpoint never returns; missing fields it does return) | New dedicated `AdminClient` type |
+| 4 | `api/projects.ts::addProjectExpert` | Assumed a `ProjectExpert` object comes back | Real handler returns only `{status}` - fixed, callers must refetch |
+| 5 | `api/admin.ts` | `getAdminViolations`/`getAdminRatings` didn't exist despite real endpoints existing | Added both |
+| 6 | `types/expert.ts::Expert` | Assumed `isActive`/`isTraining`/`totalRatings` exist on the **public** expert response | Split into `PublicExpert` (matches real public struct) + `Expert` (admin-only fields optional) |
+| 7 | `types/expert.ts::ExpertTopic` | Assumed `canHandle`/`cannotHandle`/`exampleQuestions` are always populated arrays | Real `GetTopics` query never selects those columns - made optional, fixed `CapabilityCard.tsx`'s unguarded `.length` access that would have thrown `Cannot read properties of undefined` |
+
+### Verified complete (Phase 4 proper)
+
+| File | Status | Notes |
+|---|---|---|
+| `frontend/src/pages/admin/AdminDashboard.tsx` | ✅ | Real data via `getAdminStats`. Labeled "Total LLM cost" (not "/month") since the real counter has no time-boundary reset logic. No fabricated violation-rate percentage (real field is a raw lifetime count with no denominator) |
+| `frontend/src/components/admin/TranscriptUploadModal.tsx` | ✅ | Documents that file-type filtering is client-side UX only - backend only validates size, not extension/MIME |
+| `frontend/src/hooks/useIngestionStatus.ts` | ✅ | Polls (confirmed via source: ingestion runs in a detached goroutine with no push mechanism at all) - stops polling once the job leaves pending/running |
+| `frontend/src/pages/admin/AdminExperts.tsx` | ✅ | List + upload + live ingestion status. "Edit Charter" is a visibly-disabled button (real endpoint exists, UI deferred as its own scope) |
+| `frontend/src/pages/admin/AdminClients.tsx` | ✅ | List + enable/disable toggle, real endpoint |
+| `frontend/src/pages/admin/AdminStats.tsx` | ✅ | Real per-expert rating aggregates + violations list. Does NOT attempt a time-series or per-topic breakdown - confirmed the real `GetRatings` query has no time dimension or topic grouping to chart |
+| `frontend/src/pages/admin/AdminSettings.tsx` | ❌ deliberate placeholder | See "NOT done" below - this is intentional, not an oversight |
+| `frontend/src/components/project/ChatList.tsx` | ✅ | Wired into `ProjectPage`, real create-chat modal |
+| `frontend/src/components/project/ProjectExpertManager.tsx` | ✅ | Add/remove experts, invalidates project query rather than guessing an optimistic entry (real `AddExpert` response has no data to construct one from) |
+
+### NOT done (deliberate, documented, not oversights)
+
+- **`AdminSettings` is a real placeholder, not a rushed page.** Verified `GET/PATCH /admin/settings` operate on an arbitrary JSONB `value` column, and the 4 known setting keys (`china_wall`, `context`, `models`, `cost_budget`) each have a *different* internal shape (per the seed `INSERT` in `AI_AVENGERS_SYSTEM_ARCHITECTURE.md` section 5). A generic "edit raw JSON" textarea would let a typo silently break China Wall enforcement in production with zero client-side validation. **Action needed**: build a bespoke form per known settings key (4 small forms, not 1 generic editor) as its own scoped task.
+- **`ProjectTimeline` remains unwired - now CONFIRMED as a missing backend endpoint, not just an unconfirmed contract.** Re-read the full `backend-go/internal/project/service.go` this phase specifically to check: there is no timeline/L3-event handler or route anywhere in that file. **Action needed**: implement `GET /projects/:id/timeline` backend-side (reading from `master_event_log`, per the architecture doc's own section 5/6) before this can be wired up at all.
+- **"View client projects and usage"** from the Admin Client Management wireframe has no backing data - the real `ListClients` response only has `id/email/fullName/isActive/lastLogin/createdAt`. Omitted rather than faked.
+- Repo connect UI (GitHub/GitLab OAuth flow) - Phase 5 scope.
+- No automated tests (consistent with the project-wide gap already listed above).
+
+---
+
 ## Anti-Patterns Found and Fixed
 
 *Will be updated as implementation progresses.*
