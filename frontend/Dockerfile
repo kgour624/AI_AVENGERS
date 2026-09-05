@@ -8,8 +8,11 @@ WORKDIR /app
 
 # Copy package files first for layer caching
 # WHY: If only source changes (not deps), npm install is skipped
+# npm install works even without package-lock.json
+# WHY not npm ci: npm ci requires package-lock.json to exist.
+# Once package-lock.json is committed, switch back to npm ci.
 COPY package.json package-lock.json* ./
-RUN npm ci --silent
+RUN npm install --silent
 
 # Copy source and build
 COPY . .

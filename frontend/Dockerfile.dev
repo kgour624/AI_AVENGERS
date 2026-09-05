@@ -8,8 +8,11 @@ WORKDIR /app
 
 # Install dependencies first (cached layer)
 # Source code is mounted as volume — not copied here
+# npm install works even without package-lock.json
+# WHY not npm ci: npm ci requires package-lock.json to exist.
+# Once package-lock.json is committed, switch back to npm ci.
 COPY package.json package-lock.json* ./
-RUN npm ci --silent
+RUN npm install --silent
 
 # WHY not COPY . . here:
 # docker-compose.yml mounts ./frontend:/app as a volume.
