@@ -7,8 +7,32 @@ version: '3.9'
 # - Restart policies (auto-recovery)
 # - No exposed ports except through nginx
 # - Health checks with proper intervals
+#
+# Usage:
+#   cp .env.prod.example .env
+#   # Fill in all required values
+#   docker-compose -f docker-compose.prod.yml up -d
 
 services:
+  # ============================================================
+  # Database Migration Runner
+  # Runs once before api. Exits after applying all migrations.
+  # ============================================================
+  migrate:
+    image: ${REGISTRY:-ghcr.io}/ai-avengers/backend:${VERSION:-latest}
+    build:
+      context: ./backend-go
+      dockerfile: Dockerfile
+    command: ["./migrate", "up"]
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: no
+    networks:
+      - avengers-network
+
   # ============================================================
   # Nginx Reverse Proxy
   # WHY nginx: SSL termination, rate limiting, static file serving
@@ -23,6 +47,7 @@ services:
       - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
       - api
+      - frontend
     restart: always
     networks:
       - avengers-network
@@ -48,14 +73,19 @@ services:
       - LOG_LEVEL=info
       - RATE_LIMIT_PER_IP=100
       - RATE_LIMIT_PER_USER=20
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - GITLAB_CLIENT_ID=${GITLAB_CLIENT_ID:-}
+      - GITLAB_CLIENT_SECRET=${GITLAB_CLIENT_SECRET:-}
+      - BASE_URL=${BASE_URL}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     restart: always
-    # Resource limits
-    # WHY: Prevent one service from consuming all server resources
     deploy:
       resources:
         limits:
@@ -69,6 +99,27 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+    networks:
+      - avengers-network
+
+  # ============================================================
+  # Frontend — Built static files served by nginx
+  # WHY separate container not volume:
+  # Immutable container = reproducible builds.
+  # nginx in this container serves static files on port 80.
+  # Main nginx (above) proxies / to this container.
+  # ============================================================
+  frontend:
+    image: ${REGISTRY:-ghcr.io}/ai-avengers/frontend:${VERSION:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: always
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: '0.25'
     networks:
       - avengers-network
 
