@@ -93,6 +93,7 @@ type Service struct {
 	githubOAuth   OAuthConfig
 	gitlabOAuth   OAuthConfig
 	httpClient    *http.Client
+	redis         *redis.Client // for OAuth state CSRF protection
 	logger        *zap.Logger
 }
 
@@ -100,6 +101,7 @@ type Service struct {
 func NewService(
 	db *pgxpool.Pool,
 	mlClient *ml.SidecarClient,
+	redisClient *redis.Client,
 	encryptionKey string,
 	githubClientID, githubClientSecret string,
 	gitlabClientID, gitlabClientSecret string,
@@ -111,6 +113,7 @@ func NewService(
 		mlClient: mlClient,
 		chunker:  training.NewTextChunker(training.DefaultChunkerConfig()),
 		encryptionKey: []byte(encryptionKey),
+		redis:    redisClient,
 		githubOAuth: OAuthConfig{
 			ClientID:     githubClientID,
 			ClientSecret: githubClientSecret,
