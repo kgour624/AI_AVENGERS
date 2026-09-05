@@ -2,9 +2,17 @@ FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies
-COPY go.mod go.sum ./
-RUN go mod download
+# Install git — needed by go mod tidy to fetch some dependencies
+RUN apk --no-cache add git
+
+# Copy go.mod first (go.sum may not exist yet)
+# WHY go mod tidy not go mod download:
+# go mod download requires go.sum to already exist.
+# go mod tidy generates go.sum from go.mod — works even when
+# go.sum is missing. Safe to run when go.sum exists too.
+COPY go.mod ./
+COPY go.sum* ./
+RUN go mod tidy
 
 # Copy source
 COPY . .
