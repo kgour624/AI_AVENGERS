@@ -786,6 +786,38 @@ ai_avengers/
 
 ---
 
+## 📄 OPENAPI CONTRACT SYSTEM — 2026-09-05
+
+**Interface-First implementation. Single source of truth for all API contracts.**
+
+| File | Purpose |
+|---|---|
+| `backend-go/api/openapi.yaml` | Contract definition — every endpoint, request, response |
+| `backend-go/api/oapi-codegen.yaml` | Go generator config |
+| `backend-go/internal/api/generated/types.go` | Auto-generated Go types (run `make generate`) |
+| `frontend/src/types/generated.ts` | Auto-generated TypeScript types (run `make generate`) |
+| `Makefile` | `make generate` — regenerates both sides from spec |
+
+**How to use:**
+```bash
+# After any openapi.yaml change:
+make generate
+git add backend-go/internal/api/generated/types.go frontend/src/types/generated.ts
+git commit -m "chore: regenerate types from openapi.yaml"
+```
+
+**Mismatches found during mental model run (all fixed):**
+1. `buildAuthResponse` missing `totp_enabled` — fixed
+2. `GetMe` not selecting `totp_enabled` from DB — fixed
+3. `handleGetMe` response missing `totp_enabled` — fixed
+4. `GET /projects` list: `experts[]` documented as optional (only `GetByID` loads them)
+5. `GET /experts/:id/topics`: `total` field is string (fmt.Sprintf) — documented in spec
+
+**Next step:** Run `make generate` locally to produce actual generated files.
+Then update `api/auth.ts`, `types/auth.ts` etc. to import from `generated.ts`.
+
+---
+
 ## 🐳 DOCKER GAPS FIXED — 2026-09-05
 
 | Gap | Fix | Files |
