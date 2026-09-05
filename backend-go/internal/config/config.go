@@ -163,6 +163,13 @@ func Load() (*Config, error) {
 		Security: SecurityConfig{
 			EncryptionKey: v.GetString("ENCRYPTION_KEY"),
 		},
+		OAuth: OAuthConfig{
+			GitHubClientID:     v.GetString("GITHUB_CLIENT_ID"),
+			GitHubClientSecret: v.GetString("GITHUB_CLIENT_SECRET"),
+			GitLabClientID:     v.GetString("GITLAB_CLIENT_ID"),
+			GitLabClientSecret: v.GetString("GITLAB_CLIENT_SECRET"),
+			BaseURL:            v.GetString("BASE_URL"),
+		},
 		RateLimit: RateLimitConfig{
 			PerIP:   v.GetInt("RATE_LIMIT_PER_IP"),
 			PerUser: v.GetInt("RATE_LIMIT_PER_USER"),
