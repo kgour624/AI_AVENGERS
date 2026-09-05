@@ -512,6 +512,9 @@ func handleRegister(svc *auth.AuthService) gin.HandlerFunc {
 			return
 		}
 
+		// Set refresh token as httpOnly cookie
+		// WHY before response: cookie header must be set before body is written
+		setRefreshCookie(c, tokens.RefreshToken, svc.RefreshExpiryDays())
 		response.Created(c, buildAuthResponse(user, tokens))
 	}
 }
