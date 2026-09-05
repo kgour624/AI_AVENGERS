@@ -282,6 +282,12 @@ func (s *AuthService) GetMe(ctx context.Context, userID uuid.UUID) (*User, error
 	return &user, nil
 }
 
+// RefreshExpiryDays returns the configured refresh token expiry in days.
+// Used by handlers to set cookie MaxAge.
+func (s *AuthService) RefreshExpiryDays() int {
+	return s.jwt.RefreshExpiryDays()
+}
+
 // getUserByEmail fetches a user by email.
 // Returns ErrUserNotFound if not found.
 func (s *AuthService) getUserByEmail(ctx context.Context, email string) (*User, error) {

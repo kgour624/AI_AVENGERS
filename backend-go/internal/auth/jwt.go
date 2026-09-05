@@ -104,6 +104,11 @@ func (s *JWTService) IssueTokenPair(ctx context.Context, userID uuid.UUID, email
 	}, nil
 }
 
+// RefreshExpiryDays returns the configured refresh token expiry in days.
+func (s *JWTService) RefreshExpiryDays() int {
+	return s.cfg.RefreshExpiryDays
+}
+
 // ParseToken validates and parses a JWT token.
 // Returns Claims if valid, error if invalid or expired.
 func (s *JWTService) ParseToken(tokenString string) (*Claims, error) {
