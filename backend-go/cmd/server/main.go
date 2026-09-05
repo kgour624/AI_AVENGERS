@@ -406,6 +406,28 @@ func handleGetMe(svc *auth.AuthService) gin.HandlerFunc {
 }
 
 // ============================================================
+// Auth helpers
+// ============================================================
+
+// buildAuthResponse builds the response structure the frontend expects.
+// Frontend api/auth.ts destructures: { user, tokenPair }
+// Frontend TokenPair type: { accessToken: string, expiresInSeconds: number }
+func buildAuthResponse(user *auth.User, tokens *auth.TokenPair) map[string]interface{} {
+	return map[string]interface{}{
+		"user": map[string]interface{}{
+			"id":        user.ID,
+			"email":     user.Email,
+			"full_name": user.FullName,
+			"role":      user.Role,
+		},
+		"token_pair": map[string]interface{}{
+			"access_token":       tokens.AccessToken,
+			"expires_in_seconds": int(time.Until(tokens.ExpiresAt).Seconds()),
+		},
+	}
+}
+
+// ============================================================
 // Auth handlers
 // ============================================================
 
