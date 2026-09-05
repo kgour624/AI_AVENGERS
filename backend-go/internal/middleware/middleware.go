@@ -2,6 +2,8 @@ package middleware
 
 import (
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -11,6 +13,56 @@ import (
 
 	"ai_avengers/backend/internal/response"
 )
+
+// CORSMiddleware handles Cross-Origin Resource Sharing.
+// MUST be registered BEFORE auth middleware.
+//
+// WHY before auth:
+// Browser sends OPTIONS preflight with NO Authorization header.
+// If auth middleware runs first -> 401 on OPTIONS -> preflight fails
+// -> browser blocks the actual POST/GET request entirely.
+// CORS middleware must short-circuit OPTIONS before any auth check.
+//
+// WHY CORS is needed:
+// Frontend runs on localhost:3000, backend on localhost:8080.
+// Different ports = different origin = browser enforces CORS.
+// Without this, every API call fails with "Network Error" in browser.
+func CORSMiddleware(allowedOrigins []string) gin.HandlerFunc {
+	allowedSet := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		allowedSet[strings.TrimRight(o, "/")] = true
+	}
+
+	return func(c *gin.Context) {
+		origin := c.GetHeader("Origin")
+
+		// Determine if origin is allowed
+		allowOrigin := ""
+		if allowedSet[origin] {
+			allowOrigin = origin
+		} else if len(allowedOrigins) == 1 && allowedOrigins[0] == "*" {
+			allowOrigin = "*"
+		}
+
+		if allowOrigin != "" {
+			c.Header("Access-Control-Allow-Origin", allowOrigin)
+			c.Header("Access-Control-Allow-Credentials", "true")
+			c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS")
+			c.Header("Access-Control-Allow-Headers",
+				"Origin,Content-Type,Authorization,X-Request-ID,Cache-Control")
+			c.Header("Access-Control-Expose-Headers", "X-Request-ID")
+			c.Header("Access-Control-Max-Age", "86400") // 24h preflight cache
+		}
+
+		// Handle preflight — respond immediately, don't pass to router
+		if c.Request.Method == http.MethodOptions {
+			c.AbortWithStatus(http.StatusNoContent) // 204
+			return
+		}
+
+		c.Next()
+	}
+}
 
 // RequestIDMiddleware adds a unique request ID to every request.
 // Used for tracing requests across logs.
