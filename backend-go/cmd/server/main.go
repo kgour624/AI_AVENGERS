@@ -413,18 +413,50 @@ func handleGetMe(svc *auth.AuthService) gin.HandlerFunc {
 // buildAuthResponse builds the response structure the frontend expects.
 // Frontend api/auth.ts destructures: { user, tokenPair }
 // Frontend TokenPair type: { accessToken: string, expiresInSeconds: number }
+// refreshTokenCookieName is the name of the httpOnly refresh token cookie.
+const refreshTokenCookieName = "refresh_token"
+
+// setRefreshCookie sets the refresh token as an httpOnly cookie.
+//
+// WHY httpOnly:
+// JavaScript cannot read httpOnly cookies.
+// XSS attack cannot steal the refresh token.
+// This is the standard secure pattern for refresh tokens.
+//
+// WHY Path=/api/v1/auth/refresh:
+// Cookie is only sent to the refresh endpoint.
+// Not sent on every API call — reduces attack surface.
+//
+// WHY SameSite=Lax not Strict:
+// Strict blocks cookie on top-level navigation from external links.
+// Lax allows it. Correct for a web app.
+func setRefreshCookie(c *gin.Context, refreshToken string, expiryDays int) {
+	maxAge := expiryDays * 24 * 60 * 60 // seconds
+	c.SetCookie(
+		refreshTokenCookieName,
+		refreshToken,
+		maxAge,
+		"/api/v1/auth/refresh", // Path — only sent to refresh endpoint
+		"",                     // Domain — empty = current domain
+		false,                  // Secure — set true in production (HTTPS)
+		true,                   // HttpOnly — JS cannot read this
+	)
+}
+
+// clearRefreshCookie removes the refresh token cookie on logout.
+func clearRefreshCookie(c *gin.Context) {
+	c.SetCookie(refreshTokenCookieName, "", -1, "/api/v1/auth/refresh", "", false, true)
+}
+
 // buildAuthResponse builds the response the frontend expects.
 // Verified against:
 //   - frontend/src/types/auth.ts User interface
 //   - frontend/src/types/auth.ts TokenPair interface
 //   - backend-go/api/openapi.yaml AuthResponse schema
 //
-// Mental execution:
-//   user.FullName = "Kiran Nogia"
-//   -> map key "full_name"
-//   -> base.ts camelizeKeys()
-//   -> frontend receives "fullName"
-//   -> User.fullName = "Kiran Nogia" ✅
+// NOTE: refresh token is NOT in this response body.
+// It is set as an httpOnly cookie by the caller before calling this.
+// frontend/src/types/auth.ts explicitly documents this design.
 func buildAuthResponse(user *auth.User, tokens *auth.TokenPair) map[string]interface{} {
 	return map[string]interface{}{
 		"user": map[string]interface{}{
