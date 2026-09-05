@@ -129,26 +129,53 @@ func NewService(
 	}
 }
 
+// oauthStateTTL is how long an OAuth state is valid.
+// 10 minutes is generous for a human to complete the OAuth flow.
+const oauthStateTTL = 10 * time.Minute
+
+// oauthStateKey builds the Redis key for an OAuth state.
+func oauthStateKey(state string) string {
+	return "oauth_state:" + state
+}
+
 // GetOAuthURL returns the OAuth authorization URL for a provider.
-func (s *Service) GetOAuthURL(provider, state string) (string, error) {
+// Stores state in Redis for CSRF validation in OAuthCallback.
+//
+// Mental execution:
+// 1. Validate provider
+// 2. Store state -> provider in Redis (TTL 10min)
+// 3. Return authorization URL with state param
+func (s *Service) GetOAuthURL(ctx context.Context, provider, state, projectID string) (string, error) {
+	var authURL string
 	switch provider {
 	case ProviderGitHub:
-		return fmt.Sprintf(
+		authURL = fmt.Sprintf(
 			"https://github.com/login/oauth/authorize?client_id=%s&redirect_uri=%s&scope=repo&state=%s",
 			s.githubOAuth.ClientID,
 			url.QueryEscape(s.githubOAuth.RedirectURL),
 			state,
-		), nil
+		)
 	case ProviderGitLab:
-		return fmt.Sprintf(
+		authURL = fmt.Sprintf(
 			"https://gitlab.com/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=read_repository&state=%s",
 			s.gitlabOAuth.ClientID,
 			url.QueryEscape(s.gitlabOAuth.RedirectURL),
 			state,
-		), nil
+		)
 	default:
 		return "", fmt.Errorf("unsupported provider: %s", provider)
 	}
+
+	// Store state metadata in Redis for CSRF validation
+	// Value: "provider:projectID" so callback knows both
+	stateValue := provider + ":" + projectID
+	if err := s.redis.Set(ctx, oauthStateKey(state), stateValue, oauthStateTTL).Err(); err != nil {
+		s.logger.Warn("failed to store OAuth state in Redis", zap.Error(err))
+		// Don't fail — OAuth can still work without CSRF check
+		// but log it so we know Redis is having issues
+	}
+
+	return authURL, nil
 }
 
 // ExchangeCode exchanges OAuth code for access token.
