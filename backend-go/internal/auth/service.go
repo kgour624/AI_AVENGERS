@@ -265,11 +265,11 @@ func (s *AuthService) VerifyAndEnableTOTP(ctx context.Context, userID uuid.UUID,
 func (s *AuthService) GetMe(ctx context.Context, userID uuid.UUID) (*User, error) {
 	var user User
 	err := s.db.QueryRow(ctx,
-		`SELECT id, email, full_name, role, is_active
+		`SELECT id, email, full_name, role, is_active, totp_enabled
 		 FROM users
 		 WHERE id = $1 AND deleted_at IS NULL`,
 		userID,
-	).Scan(&user.ID, &user.Email, &user.FullName, &user.Role, &user.IsActive)
+	).Scan(&user.ID, &user.Email, &user.FullName, &user.Role, &user.IsActive, &user.TOTPEnabled)
 	if err != nil {
 		if err.Error() == "no rows in result set" {
 			return nil, ErrUserNotFound
