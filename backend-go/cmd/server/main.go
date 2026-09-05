@@ -162,8 +162,16 @@ func buildRouter(
 ) *gin.Engine {
 	router := gin.New()
 
-	// Middleware order: Recovery -> RequestID -> Logger -> RateLimit
-	// WHY this order: Recovery must be first to catch panics from all other middleware.
+	// Middleware order: CORS -> Recovery -> RequestID -> Logger -> RateLimit
+	// WHY CORS is first: OPTIONS preflight has no auth header.
+	// If any other middleware runs before CORS, preflight gets rejected
+	// and browser blocks all API calls.
+	allowedOrigins := cfg.CORSAllowedOrigins
+	if len(allowedOrigins) == 0 {
+		// Default: allow dev frontend. Production sets CORS_ALLOWED_ORIGINS.
+		allowedOrigins = []string{"http://localhost:3000"}
+	}
+	router.Use(middleware.CORSMiddleware(allowedOrigins))
 	router.Use(middleware.RecoveryMiddleware(logger))
 	router.Use(middleware.RequestIDMiddleware())
 	router.Use(middleware.LoggerMiddleware(logger))
