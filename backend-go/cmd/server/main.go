@@ -186,7 +186,7 @@ func buildRouter(
 	chatSvc := chat.NewService(postgres.Pool, logger)
 	ratingSvc := rating.NewService(postgres.Pool, memManager, logger)
 	repoSvc := repo.NewService(
-		postgres.Pool, mlClient,
+		postgres.Pool, mlClient, redisClient.Client,
 		cfg.Security.EncryptionKey,
 		cfg.OAuth.GitHubClientID, cfg.OAuth.GitHubClientSecret,
 		cfg.OAuth.GitLabClientID, cfg.OAuth.GitLabClientSecret,
