@@ -1,23 +1,18 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { QueryClientProvider } from '@tanstack/react-query'
+import { queryClient } from '@/api/queryKeys'
 import { App } from './App'
 import './index.css'
 
-// WHY a single shared QueryClient instance at the root: TanStack Query's
-// caching/deduplication only works if all components share one client.
-// Creating a new one per-render (e.g. inside App) would defeat caching
-// entirely - verified by tracing: if App re-renders and recreates the
-// client, every useQuery would refetch from scratch.
-const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      staleTime: 60 * 1000,
-      retry: 1,
-      refetchOnWindowFocus: false,
-    },
-  },
-})
+// WHY import queryClient from api/queryKeys.ts instead of constructing
+// one here: a client defined inline in this file cannot be imported by
+// non-component code (e.g. a logout handler calling queryClient.clear()
+// from stores/authStore.ts) without creating a SECOND QueryClient
+// instance - which would silently break caching/deduplication, since
+// TanStack Query's cache is scoped per-instance. Caught this by tracing
+// through "what if something outside a component needs the client"
+// before finalizing this file.
 
 const rootEl = document.getElementById('root')
 if (!rootEl) {
