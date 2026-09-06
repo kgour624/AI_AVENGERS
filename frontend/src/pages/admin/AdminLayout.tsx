@@ -1,4 +1,4 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, Link } from 'react-router-dom'
 import { cn } from '@/utils/cn'
 
 const NAV_ITEMS = [
@@ -52,6 +52,13 @@ export function AdminLayout() {
             </NavLink>
           ))}
         </nav>
+
+        <Link
+          to="/"
+          className="mt-4 block border-t border-glass-border pt-3 text-sm text-text-secondary hover:text-text-primary"
+        >
+          {'\u2190'} Back to App
+        </Link>
       </aside>
       <main className="flex-1 overflow-y-auto">
         <Outlet />
