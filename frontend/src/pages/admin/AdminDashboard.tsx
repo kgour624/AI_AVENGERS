@@ -1,6 +1,8 @@
+import { useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { getAdminStats } from '@/api/admin'
+import { isSameDay, format, subDays } from 'date-fns'
+import { getAdminStats, getAdminViolations } from '@/api/admin'
 import { Card } from '@/components/ui/Card'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { formatCostUsd } from '@/utils/format'
@@ -40,6 +42,21 @@ export default function AdminDashboard() {
     queryFn: getAdminStats,
   })
 
+  // ARC-51 S15: real 7-day violations breakdown - see commit message
+  // for why a sparkline/radar chart was NOT added instead.
+  const { data: violations } = useQuery({
+    queryKey: ['admin', 'violations'],
+    queryFn: getAdminViolations,
+  })
+  const violationsByDay = useMemo(() => {
+    const days = Array.from({ length: 7 }, (_, i) => subDays(new Date(), 6 - i))
+    return days.map((d) => ({
+      label: format(d, 'EEE'),
+      count: violations?.filter((v) => isSameDay(new Date(v.createdAt), d)).length ?? 0,
+    }))
+  }, [violations])
+  const maxDayCount = Math.max(1, ...violationsByDay.map((d) => d.count))
+
   if (isLoading) {
     return (
       <div className="grid grid-cols-2 gap-4 p-6 sm:grid-cols-4">
@@ -73,20 +90,28 @@ export default function AdminDashboard() {
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         <Card glow="cyan">
           <p className="text-xs text-text-secondary">Experts</p>
-          <p className="text-2xl font-semibold">{stats.experts.total}</p>
+          <p className="text-2xl font-semibold text-glow-cyan [text-shadow:0_0_16px_var(--glow-cyan)]">
+            {stats.experts.total}
+          </p>
           <p className="text-xs text-text-disabled">{stats.experts.active} active</p>
         </Card>
         <Card glow="cyan">
           <p className="text-xs text-text-secondary">Clients</p>
-          <p className="text-2xl font-semibold">{stats.clients}</p>
+          <p className="text-2xl font-semibold text-glow-cyan [text-shadow:0_0_16px_var(--glow-cyan)]">
+            {stats.clients}
+          </p>
         </Card>
         <Card glow="cyan">
           <p className="text-xs text-text-secondary">Projects</p>
-          <p className="text-2xl font-semibold">{stats.projects}</p>
+          <p className="text-2xl font-semibold text-glow-cyan [text-shadow:0_0_16px_var(--glow-cyan)]">
+            {stats.projects}
+          </p>
         </Card>
         <Card glow="cyan">
           <p className="text-xs text-text-secondary">Total LLM cost</p>
-          <p className="text-2xl font-semibold">{formatCostUsd(stats.llmTotalCost)}</p>
+          <p className="text-2xl font-semibold text-glow-cyan [text-shadow:0_0_16px_var(--glow-cyan)]">
+            {formatCostUsd(stats.llmTotalCost)}
+          </p>
           <p className="text-xs text-text-disabled">{stats.llmTotalCalls} calls</p>
         </Card>
       </div>
@@ -101,6 +126,21 @@ export default function AdminDashboard() {
               some period) the backend doesn't provide. */}
           Total messages: {stats.messages}
         </p>
+
+        {/* Real 7-day breakdown from getAdminViolations() (each entry has
+            a real createdAt) - not fabricated, not a sparkline of the
+            lifetime counter above. */}
+        <div className="mt-3 flex h-12 items-end gap-1.5">
+          {violationsByDay.map((d) => (
+            <div key={d.label} className="flex flex-1 flex-col items-center gap-1">
+              <div
+                className="w-full rounded-t bg-mode-refuse/70"
+                style={{ height: `${(d.count / maxDayCount) * 100}%`, minHeight: d.count > 0 ? 2 : 0 }}
+              />
+              <span className="text-[10px] text-text-disabled">{d.label}</span>
+            </div>
+          ))}
+        </div>
       </Card>
 
       <Card className="mt-4">
