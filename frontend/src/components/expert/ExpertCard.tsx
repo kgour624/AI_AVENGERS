@@ -3,6 +3,7 @@ import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
 import { ExpertAvatar } from '@/components/expert/ExpertAvatar'
+import { cn } from '@/utils/cn'
 
 /**
  * Expert selection/discovery card.
@@ -25,6 +26,23 @@ function depthLabel(avgDepthLevel: number): string {
   if (avgDepthLevel >= 2.5) return 'Advanced'
   if (avgDepthLevel >= 1.5) return 'Intermediate'
   return 'Basic'
+}
+
+function DepthLevelBar({ avgDepthLevel }: { avgDepthLevel: number }) {
+  const filled = Math.round(avgDepthLevel)
+  return (
+    <div className="flex gap-0.5" aria-hidden="true">
+      {Array.from({ length: 5 }).map((_, i) => (
+        <span
+          key={i}
+          className={cn(
+            'h-1.5 w-3 rounded-full transition-colors duration-150 ease-arc',
+            i < filled ? 'bg-glow-cyan shadow-[0_0_6px_var(--glow-cyan)]' : 'bg-surface-border'
+          )}
+        />
+      ))}
+    </div>
+  )
 }
 
 function ratingStars(avgRating: number): string {
@@ -51,9 +69,11 @@ export function ExpertCard({ expert, onViewTopics, onAddToProject, isAdded }: Ex
           <div>
             <p className="font-medium text-text-primary">{expert.name}</p>
             <p className="mt-1 text-sm text-text-secondary">
-              Domain: {expert.domain} | Depth: {depthLabel(expert.avgDepthLevel)} (
-              {expert.avgDepthLevel.toFixed(1)}/5)
+              Domain: {expert.domain} | Depth: {depthLabel(expert.avgDepthLevel)}
             </p>
+            <div className="mt-1">
+              <DepthLevelBar avgDepthLevel={expert.avgDepthLevel} />
+            </div>
           </div>
         </div>
         <Badge variant="brand">{expert.totalTopics} topics</Badge>
@@ -66,7 +86,7 @@ export function ExpertCard({ expert, onViewTopics, onAddToProject, isAdded }: Ex
 
       <div className="mt-4 flex gap-2">
         <Button variant="secondary" size="sm" onClick={() => onViewTopics?.(expert.id)}>
-          View Topics
+          View Capabilities {'\u26a1'}
         </Button>
         {!isAdded && (
           <Button variant="primary" size="sm" onClick={() => onAddToProject?.(expert.id)}>
