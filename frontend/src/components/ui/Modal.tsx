@@ -1,22 +1,25 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect } from 'react'
 import { createPortal } from 'react-dom'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { cn } from '@/utils/cn'
+import { modalSpring } from '@/design-system/motion'
 
 /**
- * Modal with a proper closing animation, using the .modal-closing CSS
- * class defined in design-system/animations.css.
+ * ARC-51 §3 (docs/ARC51_UI_CONTRACT.md): internals replaced with
+ * framer-motion's AnimatePresence + spring transition (modalSpring,
+ * design-system/motion.ts), replacing the previous CSS-keyframe
+ * isClosing/previousIsOpen state machine - AnimatePresence keeps a
+ * component mounted through its exit animation automatically, which
+ * is exactly what that manual ref+state dance existed to work around
+ * before framer-motion was added to this project.
  *
- * WHY the isClosing/previousIsOpen dance (not just `if (!isOpen) return
- * null`): traced through what a naive implementation would do - the
- * moment isOpen flips false, the component unmounts immediately and
- * the .modal-out animation never gets a chance to play (there's
- * nothing left in the DOM to animate). This pattern - track whether
- * we just transitioned from open->closed via a ref, set isClosing,
- * wait for the CSS animation's onAnimationEnd, THEN actually unmount -
- * is the same pattern taught in Transcripts/Frontend/TyeScript
- * Simplified.md's calendar-modal project (use ref for "previous open
- * state", useLayoutEffect so the closing class is applied before
- * paint, only return null once isOpen AND isClosing are both false).
+ * WHY the public prop contract is unchanged (isOpen, onClose,
+ * children, className): every existing caller (CreateProjectModal,
+ * CreateExpertModal, EditCharterModal, EditProjectModal,
+ * RepoConnectModal, TranscriptUploadModal, ExpertTopicsModal, and any
+ * future modal) needed zero changes for this rewrite - verified by
+ * reading each call site before starting, per this project's
+ * Interface-First discipline for UI changes (docs/ARC51_UI_CONTRACT.md §1).
  */
 export interface ModalProps {
   isOpen: boolean
@@ -26,18 +29,11 @@ export interface ModalProps {
 }
 
 export function Modal({ isOpen, onClose, children, className }: ModalProps) {
-  const [isClosing, setIsClosing] = useState(false)
-  const previousIsOpen = useRef(isOpen)
-
-  useEffect(() => {
-    if (!isOpen && previousIsOpen.current) {
-      setIsClosing(true)
-    }
-    previousIsOpen.current = isOpen
-  }, [isOpen])
+  const reduceMotion = useReducedMotion()
 
   // Escape key closes the modal - matches the wireframe's implied
   // keyboard-first interaction model (section 1: "keyboard-first").
+  // Unchanged from the pre-ARC-51 implementation.
   useEffect(() => {
     if (!isOpen) return
     function handleKeyDown(e: KeyboardEvent) {
@@ -46,8 +42,6 @@ export function Modal({ isOpen, onClose, children, className }: ModalProps) {
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
   }, [isOpen, onClose])
-
-  if (!isOpen && !isClosing) return null
 
   const modalContainer = document.getElementById('modal-container')
   if (!modalContainer) {
@@ -58,25 +52,42 @@ export function Modal({ isOpen, onClose, children, className }: ModalProps) {
     throw new Error('#modal-container not found in index.html')
   }
 
+  // Reduced-motion contract (ARC51_UI_CONTRACT.md §3): fall back to an
+  // instant opacity-only transition instead of the spring, rather than
+  // skipping AnimatePresence entirely - it still needs to control
+  // mount/unmount timing even when the motion itself is disabled.
+  const variants = reduceMotion
+    ? { hidden: { opacity: 0 }, visible: { opacity: 1 }, exit: { opacity: 0 } }
+    : modalSpring
+
   return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
-      onClick={onClose}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        onAnimationEnd={() => {
-          if (isClosing) setIsClosing(false)
-        }}
-        className={cn(
-          'max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg border border-surface-border bg-surface-overlay p-6 shadow-md',
-          isClosing ? 'modal-closing' : 'modal-enter',
-          className
-        )}
-      >
-        {children}
-      </div>
-    </div>,
+    <AnimatePresence>
+      {isOpen && (
+        <motion.div
+          key="modal-backdrop"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm"
+          onClick={onClose}
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: reduceMotion ? 0 : 0.15 }}
+        >
+          <motion.div
+            onClick={(e) => e.stopPropagation()}
+            variants={variants}
+            initial="hidden"
+            animate="visible"
+            exit="exit"
+            className={cn(
+              'max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg border border-glass-border bg-surface-overlay/95 p-6 shadow-md backdrop-blur-xl',
+              className
+            )}
+          >
+            {children}
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>,
     modalContainer
   )
 }

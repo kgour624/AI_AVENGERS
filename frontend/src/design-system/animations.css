@@ -1,37 +1,9 @@
-/* Modal open/close animations - referenced by components/ui/Modal.tsx.
-   WHY keep animations separate from tokens.css: tokens are values,
-   animations are behavior - separating them lets us swap animation
-   style without touching color/spacing tokens. */
-
-@keyframes modal-in {
-  from {
-    opacity: 0;
-    transform: scale(0.98) translateY(4px);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
-}
-
-@keyframes modal-out {
-  from {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
-  to {
-    opacity: 0;
-    transform: scale(0.98) translateY(4px);
-  }
-}
-
-.modal-enter {
-  animation: modal-in 150ms ease-out;
-}
-
-.modal-closing {
-  animation: modal-out 120ms ease-in forwards;
-}
+/* ARC-51 §3: modal open/close is now handled by framer-motion
+   (components/ui/Modal.tsx + design-system/motion.ts's modalSpring),
+   not CSS keyframes - the .modal-enter/.modal-closing classes and
+   their keyframes that used to live here were removed since nothing
+   references them anymore (verified no other component used them
+   before deleting, not just assumed). */
 
 @keyframes pulse-thinking {
   0%,
