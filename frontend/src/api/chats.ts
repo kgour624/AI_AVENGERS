@@ -17,6 +17,19 @@ export const createChat = (projectId: string, title: string) =>
     .post<ApiResponse<Chat>>(`/api/v1/projects/${projectId}/chats`, { title })
     .then((res) => res.data.data!)
 
+// Feature #3 fix (docs bug list): PATCH/DELETE /chats/:id already
+// existed and are fully wired (chat/service.go UpdateTitle, Archive)
+// - only the frontend never called them.
+export const updateChatTitle = (chatId: string, title: string) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/chats/${chatId}`, { title })
+    .then((res) => res.data.data!)
+
+export const archiveChat = (chatId: string) =>
+  baseAPI
+    .delete<ApiResponse<{ status: string }>>(`/api/v1/chats/${chatId}`)
+    .then((res) => res.data.data!)
+
 export const getMessages = (chatId: string, options?: { signal?: AbortSignal }) =>
   baseAPI
     .get<ApiResponse<Message[]>>(`/api/v1/chats/${chatId}/messages`, { signal: options?.signal })

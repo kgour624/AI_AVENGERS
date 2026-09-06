@@ -1,11 +1,101 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
-import { getChats, createChat } from '@/api/chats'
+import { getChats, createChat, updateChatTitle, archiveChat } from '@/api/chats'
+import type { Chat } from '@/types/project'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { Modal } from '@/components/ui/Modal'
+
+/**
+ * Feature #3 fix (docs bug list): inline rename/archive per chat row.
+ * Rename uses an inline text input (not a separate modal) since it's
+ * a single-field edit directly on the row that's already visible -
+ * a modal would be unnecessary ceremony for one text field.
+ */
+function ChatRow({
+  chat,
+  projectId,
+  onChanged,
+}: {
+  chat: Chat
+  projectId: string
+  onChanged: () => void
+}) {
+  const [isEditing, setIsEditing] = useState(false)
+  const [title, setTitle] = useState(chat.title)
+
+  const renameMutation = useMutation({
+    mutationFn: () => updateChatTitle(chat.id, title.trim()),
+    onSuccess: () => {
+      setIsEditing(false)
+      onChanged()
+    },
+  })
+
+  const archiveMutation = useMutation({
+    mutationFn: () => archiveChat(chat.id),
+    onSuccess: onChanged,
+  })
+
+  if (isEditing) {
+    return (
+      <div className="flex items-center gap-1 px-2 py-1">
+        <input
+          value={title}
+          onChange={(e) => setTitle(e.target.value)}
+          autoFocus
+          className="flex-1 rounded-md border border-surface-border bg-surface-overlay px-2 py-1 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && title.trim()) renameMutation.mutate()
+            if (e.key === 'Escape') setIsEditing(false)
+          }}
+        />
+        <button
+          className="text-xs text-brand"
+          disabled={!title.trim() || renameMutation.isPending}
+          onClick={() => renameMutation.mutate()}
+        >
+          Save
+        </button>
+        <button className="text-xs text-text-secondary" onClick={() => setIsEditing(false)}>
+          Cancel
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="group flex items-center gap-1 rounded-md px-2 py-1.5 hover:bg-surface-overlay">
+      <Link
+        to={`/projects/${projectId}/chats/${chat.id}`}
+        className="flex-1 truncate text-sm text-text-secondary hover:text-text-primary"
+      >
+        {chat.title}
+      </Link>
+      <button
+        aria-label="Rename chat"
+        title="Rename"
+        className="invisible text-xs text-text-disabled hover:text-text-primary group-hover:visible"
+        onClick={() => setIsEditing(true)}
+      >
+        {'\u270f\ufe0f'}
+      </button>
+      <button
+        aria-label="Archive chat"
+        title="Archive"
+        disabled={archiveMutation.isPending}
+        className="invisible text-xs text-text-disabled hover:text-mode-refuse group-hover:visible"
+        onClick={() => {
+          if (window.confirm(`Archive "${chat.title}"?`)) archiveMutation.mutate()
+        }}
+      >
+        {'\ud83d\uddc4\ufe0f'}
+      </button>
+    </div>
+  )
+}
 
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 10 ("Project Page (with
@@ -56,13 +146,12 @@ export function ChatList({ projectId }: { projectId: string }) {
 
       <div className="space-y-1">
         {chats?.map((chat) => (
-          <Link
+          <ChatRow
             key={chat.id}
-            to={`/projects/${projectId}/chats/${chat.id}`}
-            className="block rounded-md px-2 py-1.5 text-sm text-text-secondary hover:bg-surface-overlay hover:text-text-primary"
-          >
-            {chat.title}
-          </Link>
+            chat={chat}
+            projectId={projectId}
+            onChanged={() => queryClient.invalidateQueries({ queryKey: ['projects', projectId, 'chats'] })}
+          />
         ))}
         {chats?.length === 0 && <p className="text-sm text-text-disabled">No chats yet.</p>}
       </div>
