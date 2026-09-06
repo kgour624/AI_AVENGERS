@@ -16,7 +16,7 @@ import { formatRelativeTime } from '@/utils/format'
  * part of the wireframe had nothing to render. Backend now returns
  * real projectCount/messageCount aggregates (admin_handler.go), shown
  * below instead of being fabricated client-side.
- */</br>
+ */
 function AdminClients() {
   const queryClient = useQueryClient()
   const { data: clients, isLoading } = useQuery({
@@ -52,9 +52,15 @@ function AdminClients() {
               <p className="font-medium text-text-primary">{client.fullName}</p>
               <p className="text-xs text-text-secondary">{client.email}</p>
               <p className="text-xs text-text-disabled">
-                {client.projectCount} project{client.projectCount === 1 ? '' : 's'} \u00b7{' '}
+                {client.projectCount} project{client.projectCount === 1 ? '' : 's'}
+                {' \u00b7 '}
                 {client.messageCount} message{client.messageCount === 1 ? '' : 's'} sent
-                {client.lastLogin && <> \u00b7 Last login: {formatRelativeTime(client.lastLogin)}</>}
+                {client.lastLogin && (
+                  <>
+                    {' \u00b7 Last login: '}
+                    {formatRelativeTime(client.lastLogin)}
+                  </>
+                )}
               </p>
             </div>
             <div className="flex items-center gap-2">
