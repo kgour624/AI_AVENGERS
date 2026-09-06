@@ -155,3 +155,27 @@ export interface RatingSummary {
 export const getAdminRatings = () =>
   baseAPI.get<ApiResponse<RatingSummary[]>>('/api/v1/admin/ratings').then((res) => res.data.data!)
 
+// Bug 1.6 fix (docs bug list): GetSettings/UpdateSetting endpoints
+// already existed on the backend, but no frontend function ever
+// called them. Verified against admin_handler.go directly: GET
+// returns [{key, value, description, updatedAt}] with `value` as
+// arbitrary JSON per key; PATCH /admin/settings/:key expects
+// {value: <that key's JSON>}. Nested keys inside `value` (e.g.
+// china_wall's reranker_threshold) round-trip through baseAPI's
+// camelizeKeys/snakeifyKeys interceptors like everything else, so
+// AdminSettings.tsx can work in camelCase throughout.
+export interface SystemSetting {
+  key: string
+  value: Record<string, unknown>
+  description: string
+  updatedAt: string
+}
+
+export const getAdminSettings = () =>
+  baseAPI.get<ApiResponse<SystemSetting[]>>('/api/v1/admin/settings').then((res) => res.data.data!)
+
+export const updateAdminSetting = (key: string, value: Record<string, unknown>) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string; key: string }>>(`/api/v1/admin/settings/${key}`, { value })
+    .then((res) => res.data.data!)
+
