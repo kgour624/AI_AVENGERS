@@ -29,7 +29,7 @@ type Project struct {
 	ArchitectureType string     `json:"architecture_type,omitempty"`
 	CreatedAt        time.Time  `json:"created_at"`
 	UpdatedAt        time.Time  `json:"updated_at"`
-	Experts          []ProjectExpert `json:"experts,omitempty"`
+	Experts          []ProjectExpert `json:"experts"`
 }
 
 // ProjectExpert is an expert assigned to a project.
@@ -95,7 +95,8 @@ func (s *Service) List(ctx context.Context, clientID uuid.UUID) ([]Project, erro
 	rows, err := s.db.Query(ctx,
 		`SELECT id, client_id, name, COALESCE(description,''), status,
 		        COALESCE(repo_url,''), COALESCE(repo_provider,''),
-		        COALESCE(repo_branch,'main'), repo_connected, created_at, updated_at
+		        COALESCE(repo_branch,'main'), repo_connected,
+		        COALESCE(architecture_type,''), created_at, updated_at
 		 FROM projects
 		 WHERE client_id=$1 AND deleted_at IS NULL
 		 ORDER BY updated_at DESC`,
@@ -112,15 +113,54 @@ func (s *Service) List(ctx context.Context, clientID uuid.UUID) ([]Project, erro
 		if err := rows.Scan(
 			&p.ID, &p.ClientID, &p.Name, &p.Description, &p.Status,
 			&p.RepoURL, &p.RepoProvider, &p.RepoBranch, &p.RepoConnected,
-			&p.CreatedAt, &p.UpdatedAt,
+			&p.ArchitectureType, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
 			continue
 		}
+		p.Experts = []ProjectExpert{}
 		projects = append(projects, p)
 	}
 	if projects == nil {
 		projects = []Project{}
 	}
+
+	// Batch-load real experts for every listed project in a single
+	// query (project_id = ANY(...)), instead of N+1 per-project calls -
+	// List() previously never loaded Experts at all (only GetByID did).
+	if len(projects) > 0 {
+		ids := make([]uuid.UUID, len(projects))
+		for i, p := range projects {
+			ids[i] = p.ID
+		}
+		expertRows, err := s.db.Query(ctx,
+			`SELECT pe.project_id, pe.expert_id, e.name, e.domain, pe.added_at, pe.is_active
+			 FROM project_experts pe
+			 JOIN experts e ON e.id = pe.expert_id
+			 WHERE pe.project_id = ANY($1) AND pe.is_active = TRUE
+			 ORDER BY pe.added_at ASC`,
+			ids,
+		)
+		if err != nil {
+			s.logger.Warn("batch load project experts failed", zap.Error(err))
+		} else {
+			defer expertRows.Close()
+			byProject := make(map[uuid.UUID][]ProjectExpert)
+			for expertRows.Next() {
+				var projectID uuid.UUID
+				var e ProjectExpert
+				if err := expertRows.Scan(&projectID, &e.ExpertID, &e.ExpertName, &e.Domain, &e.AddedAt, &e.IsActive); err != nil {
+					continue
+				}
+				byProject[projectID] = append(byProject[projectID], e)
+			}
+			for i := range projects {
+				if experts, ok := byProject[projects[i].ID]; ok {
+					projects[i].Experts = experts
+				}
+			}
+		}
+	}
+
 	return projects, nil
 }
 
@@ -131,21 +171,31 @@ func (s *Service) GetByID(ctx context.Context, projectID, clientID uuid.UUID) (*
 	err := s.db.QueryRow(ctx,
 		`SELECT id, client_id, name, COALESCE(description,''), status,
 		        COALESCE(repo_url,''), COALESCE(repo_provider,''),
-		        COALESCE(repo_branch,'main'), repo_connected, created_at, updated_at
+		        COALESCE(repo_branch,'main'), repo_connected,
+		        COALESCE(architecture_type,''), created_at, updated_at
 		 FROM projects
 		 WHERE id=$1 AND client_id=$2 AND deleted_at IS NULL`,
 		projectID, clientID,
 	).Scan(
 		&p.ID, &p.ClientID, &p.Name, &p.Description, &p.Status,
 		&p.RepoURL, &p.RepoProvider, &p.RepoBranch, &p.RepoConnected,
-		&p.CreatedAt, &p.UpdatedAt,
+		&p.ArchitectureType, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, ErrNotFound
 	}
 
-	// Load experts
-	experts, _ := s.GetExperts(ctx, projectID)
+	// Load experts - error is now logged and defaulted, never silently
+	// discarded (a discarded error here previously left Experts nil,
+	// which the omitempty tag then hid from the wire entirely).
+	experts, err := s.GetExperts(ctx, projectID)
+	if err != nil {
+		s.logger.Warn("get project experts failed",
+			zap.String("project_id", projectID.String()),
+			zap.Error(err),
+		)
+		experts = []ProjectExpert{}
+	}
 	p.Experts = experts
 	return &p, nil
 }
