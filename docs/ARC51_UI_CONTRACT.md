@@ -208,4 +208,22 @@ No section starts until the previous one is verified. This document is updated w
 - `CitationChip.tsx`: glow-cyan hover treatment on the chip button. `Tooltip`/`Modal` internals untouched (Modal automatically inherited §3's spring animation for free).
 - `ExpertResponse.tsx`: glass card + a `border-l-4` left border colored/glowed by `response.mode`, reusing the EXISTING product-semantic mode colors (not a new decorative palette — §2's rule). Entrance motion via inline `motion.div` (fade+slight-rise, respects `useReducedMotion`). **Zero changes to**: citation-splitting logic, ASK-mode question rendering, rating widget gating on `persistedMessageId`, gate-reasoning toggle — confirmed by re-reading the full file after editing, not just the diff.
 
-### Next: §10 Admin panel glass pass (order 10, final section) — lower drama than client-facing pages per §1's page-by-page notes (admin needs density/information, not spectacle).
+### §10 Admin panel glass pass — VERIFIED ✅ (FINAL SECTION)
+- `AdminLayout.tsx`: glass sidebar (`bg-surface-raised/70 backdrop-blur-xl border-glass-border`), `bg-surface-void` main wrapper, active-nav left-border-glow — same visual language as §6's client-facing Header/Sidebar, but deliberately no ambient glow/stagger motion (fixed 5-item nav, not a dynamic list, per §1's "admin needs density, not spectacle" rule).
+- `AdminDashboard.tsx`: stat cards get `glow="cyan"`, quick-action links get `ease-arc` hover transition.
+- `AdminExperts.tsx`, `AdminClients.tsx`, `AdminStats.tsx`: their existing `<Card>` usages get `glow="cyan"` for hover-affordance consistency with every other card in the app.
+- **Bonus bugs found and fixed while touching AdminStats.tsx** (never audited before this pass): 4 more instances of the same bare-`\uXXXX`-as-JSX-children-text bug found repeatedly this session (Header, AdminDashboard, AdminClients, ProjectMemoryPanel) — the \u2b50 rating star and 3 separate middle-dot/em-dash separators. All wrapped in `{'...'}` expression containers.
+- **No functional/data logic touched in any admin file** — every `useQuery`, mutation, and handler in AdminLayout/AdminDashboard/AdminExperts/AdminClients/AdminStats is unchanged; confirmed by re-reading each full file after editing, not just the diff.
+
+---
+
+## \ud83c\udfc1 ARC-51 ROLLOUT COMPLETE (§1–§10, 2026-09-06)
+
+All 10 sections from §7's plan are done, verified section-by-section, with zero functional regressions by construction (only `className`/motion-wrapper changes, per §1's non-negotiable rule - no `queryFn`/`mutationFn`/loader/store/route was touched anywhere in this rollout).
+
+**Not yet done (real, honest remaining items, not hidden):**
+- No actual `npm install && npm run build` was run at any point in this rollout (same standing caveat as every frontend change in this repo's history) - `framer-motion` is a genuinely new dependency this time, so this is the single most important next action before treating ARC-51 as production-ready.
+- Route-level transitions (fade between pages) were explicitly deferred in §3 - would require restructuring the router's element tree, out of scope for a presentation-only pass.
+- `ChatPage.tsx` itself (the page wrapping StreamingIndicator/ExpertResponse) was not restyled - only its child components were. If the page shell around them still uses old flat surface-border styling, that's a natural small follow-up, not a contract violation (the contract only committed to the 10 named sections).
+
+**How to verify the whole thing:** `cd frontend && npm install && npm run build && npm run typecheck`, then manually walk: `/login` → create/open a project → send a chat message → open `/experts` → open `/admin` and its 4 sub-pages. Every animation should respect `prefers-reduced-motion` when toggled in OS/browser settings.
