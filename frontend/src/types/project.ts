@@ -65,23 +65,22 @@ export interface Message {
    * persisted (reloaded) message rather than a live SSE response.
    */
   gateStopped?: number
+  /**
+   * Gate 3 WARN reasoning text. Bug 4.1 fix (docs bug list): backend
+   * migration 004 added `warning_text`/`clarifying_questions` columns
+   * to `messages` and chat/service.go + message/handler.go now save
+   * and select them (see those files' "Bug 3 fix" comments) - but
+   * this interface and utils/adaptMessage.ts were never updated to
+   * read them back, so a WARN/ASK message's extra data still
+   * vanished on reload even though the backend had it all along.
+   * Optional because most messages (ADVISE/REFUSE/PUSH_BACK) never
+   * set these.
+   */
+  warningText?: string
+  /** Gate 1 ASK clarifying questions. See warningText comment above. */
+  clarifyingQuestions?: string[]
   createdAt: string
 }
-
-/**
- * KNOWN DATA-LOSS GAP (documented, not silently worked around):
- * `ExpertResponse.warning` (Gate 3 WARN reasoning) and
- * `ExpertResponse.questions` (Gate 1 ASK clarifying questions) have NO
- * corresponding column anywhere in the `messages` table schema
- * (AI_AVENGERS_SYSTEM_ARCHITECTURE.md section 5). That means once a
- * turn completes and the page is reloaded, a WARN message's warning
- * text and an ASK message's question list are permanently gone -
- * only the persisted `content`/`decisionMode`/`citations` survive.
- * This is a real backend gap, not a frontend rendering choice: adding
- * `warning_text` and `clarifying_questions` (or similar) columns to
- * `messages` is the actual fix, tracked in HANDOFF.md rather than
- * faked here with empty defaults that would look correct but aren't.
- */
 
 /** Route loader return shape for /projects/:projectId/chats/:chatId */
 export interface ChatLoaderData {

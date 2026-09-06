@@ -46,8 +46,11 @@ export function persistedMessageToExpertResponse(
     citations: message.citations ?? [],
     confidence: message.confidence ?? 0,
     gateStopped: (message.gateStopped ?? 0) as 0 | 1 | 2 | 3 | 4 | 5,
-    // warning and questions are NOT reconstructable from a persisted
-    // Message - see the documented gap in types/project.ts. Left
-    // undefined here rather than guessed at.
+    // Bug 4.1 fix (docs bug list): these ARE reconstructable now - the
+    // backend persists them (migration 004) and Message finally
+    // exposes them (see types/project.ts). Previously always
+    // undefined here even though the data existed all along.
+    warning: message.warningText,
+    questions: message.clarifyingQuestions,
   }
 }
