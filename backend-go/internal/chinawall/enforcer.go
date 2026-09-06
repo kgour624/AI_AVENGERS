@@ -303,8 +303,9 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 	return citations
 }
 
-// stripUncited removes sentences without citations.
-// Returns cleaned answer and count of stripped sentences.
+// stripUncited removes sentences without citations, while preserving
+// markdown/code structure (Bug 3.1 fix - see splitSentences below for
+// the actual splitting logic; this function only changed its join).
 func (e *Enforcer) stripUncited(answer string) (string, int) {
 	citationPattern := regexp.MustCompile(`\[CHUNK_[a-f0-9-]+\]`)
 	sentences := splitSentences(answer)
@@ -315,6 +316,9 @@ func (e *Enforcer) stripUncited(answer string) (string, int) {
 	for _, sentence := range sentences {
 		trimmed := strings.TrimSpace(sentence)
 		if trimmed == "" {
+			// Blank-line marker from splitSentences - always keep, this
+			// is what preserves paragraph spacing between kept lines.
+			clean = append(clean, sentence)
 			continue
 		}
 		hasCitation := citationPattern.MatchString(sentence)
@@ -328,7 +332,11 @@ func (e *Enforcer) stripUncited(answer string) (string, int) {
 		}
 	}
 
-	return strings.Join(clean, " "), stripped
+	// WHY Join with "" not " ": every surviving sentence already carries
+	// its own trailing separator (". ", or "\n" at line end) from
+	// splitSentences - adding another separator here would double up
+	// whitespace. This is what lets markdown/code survive round-trip.
+	return strings.Join(clean, ""), stripped
 }
 
 // buildRefusal creates a standardized refusal response.
@@ -340,15 +348,92 @@ func (e *Enforcer) buildRefusal(reason, message string) *EnforceResult {
 	}
 }
 
-// splitSentences splits text into sentences.
+// splitSentences splits text into sentence-like units for citation
+// enforcement, WITHOUT destroying markdown or code (Bug 3.1 fix,
+// docs bug list).
+//
+// The old implementation did strings.Split(text, ".") on the raw
+// text, so every period ANYWHERE - inside code (fmt.Println(),
+// db.user.id), version numbers (v1.0), decimals (3.14), and across
+// markdown headings/bullets/code fences - was treated as a sentence
+// boundary, then stripUncited rejoined survivors with a single
+// space, flattening all structure into one scrambled line.
+//
+// Fix, in order (Go's regexp/RE2 has no lookaround, so this is a
+// two-pass extract-then-restore approach rather than one clever regex):
+//  1. protectCode() replaces fenced ``` code blocks and inline `code`
+//     spans with placeholder tokens FIRST, so nothing inside them is
+//     ever split or touched.
+//  2. Split on newlines before anything else, so each markdown line
+//     (heading, bullet, blank line) stays intact as its own unit.
+//  3. Within one non-blank line, split only on ". " (period
+//     immediately followed by a space) - fmt.Println(), db.user.id,
+//     v1.0, and 3.14 never have a space right after that internal
+//     period, so none of them match; a real sentence boundary almost
+//     always does.
+//  4. Each returned sentence carries its own trailing separator
+//     (". " mid-line, "\n" at end-of-line, or bare "\n" for a blank
+//     line) so stripUncited can rejoin survivors with plain
+//     concatenation and get the original structure back.
 func splitSentences(text string) []string {
+	protected, codeBlocks := protectCode(text)
+
 	var sentences []string
-	for _, s := range strings.Split(text, ".") {
-		if s = strings.TrimSpace(s); s != "" {
-			sentences = append(sentences, s+".")
+	for _, line := range strings.Split(protected, "\n") {
+		if strings.TrimSpace(line) == "" {
+			// Blank line = paragraph break. Keep as its own unit so
+			// paragraph spacing survives even if neighboring sentences
+			// get stripped.
+			sentences = append(sentences, "\n")
+			continue
+		}
+		parts := strings.Split(line, ". ")
+		for i, p := range parts {
+			trimmed := strings.TrimSpace(p)
+			if trimmed == "" {
+				continue
+			}
+			if i < len(parts)-1 {
+				trimmed += ". "
+			} else {
+				trimmed += "\n"
+			}
+			sentences = append(sentences, restoreCode(trimmed, codeBlocks))
 		}
 	}
 	return sentences
+}
+
+// protectCode replaces fenced code blocks (```...```) and inline code
+// spans (`...`) with placeholder tokens so splitSentences never splits
+// or rejoins their content. Returns the substituted text and a map
+// from placeholder token -> original code text, to be reversed by
+// restoreCode once each final sentence unit is decided.
+func protectCode(text string) (string, map[string]string) {
+	blocks := make(map[string]string)
+	n := 0
+	nextToken := func(match string) string {
+		token := fmt.Sprintf("\x00CODE%d\x00", n)
+		blocks[token] = match
+		n++
+		return token
+	}
+
+	fenced := regexp.MustCompile("(?s)```.*?```")
+	out := fenced.ReplaceAllStringFunc(text, nextToken)
+
+	inline := regexp.MustCompile("`[^`\n]+`")
+	out = inline.ReplaceAllStringFunc(out, nextToken)
+
+	return out, blocks
+}
+
+// restoreCode reverses protectCode's substitution for one sentence.
+func restoreCode(sentence string, blocks map[string]string) string {
+	for token, original := range blocks {
+		sentence = strings.ReplaceAll(sentence, token, original)
+	}
+	return sentence
 }
 
 // isHeadingOrTransition checks if a sentence is structural (heading, transition).

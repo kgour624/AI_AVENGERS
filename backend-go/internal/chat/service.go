@@ -147,17 +147,25 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 	if msg.ClarifyingQuestions == nil {
 		msg.ClarifyingQuestions = []string{}
 	}
+	// Bug 3.4 fix (docs bug list): Citations existed on this struct but
+	// was never in the INSERT column list below - every message's
+	// citations column was permanently NULL, which silently broke the
+	// rating->chunk-boost self-learning loop (rating/handler.go reads
+	// citations back via SELECT to know which chunks to boost/penalize).
+	if msg.Citations == nil {
+		msg.Citations = []interface{}{}
+	}
 
 	var id uuid.UUID
 	err := s.db.QueryRow(ctx,
 		`INSERT INTO messages
 			(chat_id, role, content, turn_number, expert_id, decision_mode,
-			 confidence, warning_text, clarifying_questions)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			 confidence, warning_text, clarifying_questions, citations)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
 		msg.ExpertID, msg.DecisionMode, msg.Confidence,
-		msg.WarningText, msg.ClarifyingQuestions,
+		msg.WarningText, msg.ClarifyingQuestions, msg.Citations,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)
@@ -183,6 +191,7 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		        COALESCE(tokens_used,0), COALESCE(cost_usd,0),
 		        COALESCE(warning_text,''),
 		        COALESCE(clarifying_questions,'[]'::jsonb),
+		        COALESCE(citations,'[]'::jsonb),
 		        created_at
 		 FROM messages
 		 WHERE chat_id=$1
@@ -198,12 +207,15 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 	var messages []Message
 	for rows.Next() {
 		var m Message
-		var clarifyingJSON []byte
+		// Bug 3.4 fix: citations JSONB is now selected and scanned back
+		// into m.Citations (as []map[string]interface{}, matching the
+		// pattern already used for clarifying_questions below).
+		var clarifyingJSON, citationsJSON []byte
 		if err := rows.Scan(
 			&m.ID, &m.ChatID, &m.Role, &m.Content, &m.TurnNumber,
 			&m.ExpertID, &m.DecisionMode, &m.Confidence,
 			&m.TokensUsed, &m.CostUSD,
-			&m.WarningText, &clarifyingJSON,
+			&m.WarningText, &clarifyingJSON, &citationsJSON,
 			&m.CreatedAt,
 		); err != nil {
 			continue
@@ -214,6 +226,12 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		}
 		if m.ClarifyingQuestions == nil {
 			m.ClarifyingQuestions = []string{}
+		}
+		// Unmarshal citations JSONB -> generic slice (interface{} field)
+		if len(citationsJSON) > 0 {
+			var cit []map[string]interface{}
+			_ = json.Unmarshal(citationsJSON, &cit)
+			m.Citations = cit
 		}
 		messages = append(messages, m)
 	}

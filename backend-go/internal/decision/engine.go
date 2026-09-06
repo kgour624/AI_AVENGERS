@@ -95,6 +95,15 @@ func (e *Engine) Process(
 	if result := e.gate1(question, expert); result != nil {
 		return result, nil
 	}
+	// Bug 3.5 fix (docs bug list): gate1WithLLM was fully implemented
+	// (zero-shot structured vagueness check) but never called from
+	// anywhere - dead code. Its own doc comment says "Called when
+	// keyword check is inconclusive", which is exactly this: gate1's
+	// keyword-based check found nothing (returned nil), so fall back to
+	// the LLM check before assuming the question is clear enough.
+	if result := e.gate1WithLLM(ctx, question, expert); result != nil {
+		return result, nil
+	}
 
 	// GATE 2: Knowledge Coverage
 	if result := e.gate2(question, chunks, expert); result != nil {

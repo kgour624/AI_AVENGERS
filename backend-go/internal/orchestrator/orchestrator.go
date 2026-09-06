@@ -301,10 +301,17 @@ func (o *Orchestrator) updateMemory(ctx context.Context, req OrchestratorRequest
 		if resp.Mode == decision.ModeADVISE {
 			importance = 4
 		}
+		// Bug 3.2 fix (docs bug list): pass nil, not uuid.New(). The real
+		// assistant message row does not exist yet at this point (it is
+		// saved separately by message/handler.go's saveAssistantMessage,
+		// possibly in a goroutine that has not completed) - a fabricated
+		// random UUID here violated master_event_log's message_id FK on
+		// every turn. RecordTurn's messageID param is now *uuid.UUID
+		// (nullable), matching the nullable FK column exactly.
 		o.memManager.RecordTurn(
 			ctx,
 			req.ProjectID, resp.ExpertID, req.ClientID,
-			req.ChatID, uuid.New(),
+			req.ChatID, nil,
 			req.TurnNumber,
 			req.Message, resp.Content,
 			string(resp.Mode), importance,

@@ -280,6 +280,12 @@ func (h *Handler) saveAssistantMessage(
 		// so they survive page reloads (Bug 3 fix)
 		WarningText:         resp.Warning,
 		ClarifyingQuestions: resp.Questions,
+		// Bug 3.4 fix (docs bug list): resp.Citations was never passed
+		// through here, so the messages.citations column was always
+		// NULL - this silently broke the rating->chunk-boost feedback
+		// loop (rating/handler.go's updateChunkBoosts reads citations
+		// back from a saved message to know which chunks to boost).
+		Citations:           resp.Citations,
 	})
 	if err != nil {
 		h.logger.Warn("save assistant message failed",

@@ -98,7 +98,17 @@ func (m *Manager) RecordTurn(
 	expertID uuid.UUID,
 	clientID uuid.UUID,
 	chatID uuid.UUID,
-	messageID uuid.UUID,
+	// messageID is a POINTER, not a value - Bug 3.2 fix (docs bug list).
+	// The caller (orchestrator.updateMemory) genuinely does not know the
+	// real messages.id at this point: the assistant message is saved by
+	// message/handler.go's saveAssistantMessage in a SEPARATE goroutine
+	// that may not have run yet. The previous code passed uuid.New() -
+	// a fabricated ID that never exists in the messages table - which
+	// violated master_event_log's `message_id UUID REFERENCES
+	// messages(id)` FK on every single turn. That column is nullable in
+	// the schema (no NOT NULL) precisely for cases like this - passing
+	// nil here is the honest, schema-correct fix, not a fabricated ID.
+	messageID *uuid.UUID,
 	turnNumber int,
 	userMessage string,
 	assistantResponse string,
@@ -141,13 +151,12 @@ func (m *Manager) RecordTurn(
 		bgCtx := context.Background()
 		expertIDPtr := &expertID
 		chatIDPtr := &chatID
-		msgIDPtr := &messageID
 		_ = m.l3.Append(bgCtx, L3Event{
 			ProjectID: projectID,
 			ExpertID:  expertIDPtr,
 			ClientID:  clientID,
 			ChatID:    chatIDPtr,
-			MessageID: msgIDPtr,
+			MessageID: messageID, // already *uuid.UUID, nil-safe
 			EventType: EventResponseGenerated,
 			EventData: map[string]interface{}{
 				"turn_number":   turnNumber,
