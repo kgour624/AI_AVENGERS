@@ -94,7 +94,13 @@ type Service struct {
 	gitlabOAuth   OAuthConfig
 	httpClient    *http.Client
 	redis         *redis.Client // for OAuth state CSRF protection
-	logger        *zap.Logger
+	// frontendURL fix (feature #6, docs bug list): OAuthCallback used to
+	// return raw JSON to what is actually a top-level browser navigation
+	// (the OAuth provider redirects the browser here directly) - the
+	// user saw a bare JSON page instead of landing back in the SPA. This
+	// is the base URL OAuthCallback redirects back to.
+	frontendURL string
+	logger      *zap.Logger
 }
 
 // NewService creates a new repo integration service.
@@ -106,6 +112,7 @@ func NewService(
 	githubClientID, githubClientSecret string,
 	gitlabClientID, gitlabClientSecret string,
 	baseURL string,
+	frontendURL string,
 	logger *zap.Logger,
 ) *Service {
 	return &Service{
@@ -124,8 +131,9 @@ func NewService(
 			ClientSecret: gitlabClientSecret,
 			RedirectURL:  baseURL + "/api/v1/repo/callback/gitlab",
 		},
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		logger:     logger,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		frontendURL: frontendURL,
+		logger:      logger,
 	}
 }
 
@@ -775,29 +783,32 @@ func (h *Handler) GetOAuthURL(c *gin.Context) {
 // Called by GitHub/GitLab after user authorizes the app.
 // No JWT — this is a browser redirect from the OAuth provider.
 //
-// Mental execution:
-// GitHub redirects: GET /repo/callback/github?code=abc&state=xyz
-// 1. Look up state in Redis -> "github:project-uuid" (CSRF check)
-// 2. Delete state from Redis (one-time use)
-// 3. Exchange code for access token
-// 4. ConnectRepo with the token
-// 5. Start background sync
-// 6. Return JSON {status: connected} — frontend navigates
+// Feature #6 fix (docs bug list): every exit path below now issues an
+// HTTP redirect (c.Redirect) back into the frontend SPA instead of
+// response.* JSON helpers. WHY: this URL is what the OAuth PROVIDER
+// redirects the user's BROWSER to directly (a top-level navigation),
+// not an XHR/fetch call from React - returning JSON left the user
+// staring at a bare JSON page after authorizing, with no way back
+// into the app. Failure paths redirect to the project page (once the
+// project ID is known from state) or the app root (before that),
+// each with a `repoError` query param the frontend can read and show
+// as a toast/banner; success redirects to the project page with
+// `repoConnected=true`.
 func (h *Handler) OAuthCallback(c *gin.Context) {
 	provider := c.Param("provider")
 	code := c.Query("code")
 	state := c.Query("state")
+	frontendBase := h.svc.frontendURL
 
 	if code == "" || state == "" {
-		response.BadRequest(c, "MISSING_PARAMS", "code and state are required")
+		c.Redirect(http.StatusFound, frontendBase+"/?repoError=missing_params")
 		return
 	}
 
 	// Validate state (CSRF check)
 	stateValue, err := h.svc.redis.Get(c.Request.Context(), oauthStateKey(state)).Result()
 	if err != nil {
-		// State not found or expired
-		response.BadRequest(c, "INVALID_STATE", "OAuth state invalid or expired. Please try again.")
+		c.Redirect(http.StatusFound, frontendBase+"/?repoError=invalid_state")
 		return
 	}
 
@@ -807,14 +818,18 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	// Parse state value: "provider:projectID"
 	parts := strings.SplitN(stateValue, ":", 2)
 	if len(parts) != 2 || parts[0] != provider {
-		response.BadRequest(c, "INVALID_STATE", "OAuth state provider mismatch")
+		c.Redirect(http.StatusFound, frontendBase+"/?repoError=state_mismatch")
 		return
 	}
 	projectID, err := uuid.Parse(parts[1])
 	if err != nil {
-		response.BadRequest(c, "INVALID_STATE", "OAuth state contains invalid project ID")
+		c.Redirect(http.StatusFound, frontendBase+"/?repoError=invalid_project")
 		return
 	}
+	// From here on the project is known - send failures back to that
+	// specific project page rather than the generic app root, so the
+	// user lands where they started instead of the project list.
+	projectURL := fmt.Sprintf("%s/projects/%s", frontendBase, projectID)
 
 	// Exchange code for access token
 	accessToken, err := h.svc.ExchangeCode(c.Request.Context(), provider, code)
@@ -823,7 +838,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 			zap.String("provider", provider),
 			zap.Error(err),
 		)
-		response.BadRequest(c, "OAUTH_EXCHANGE_FAILED", "Failed to exchange OAuth code. Please try again.")
+		c.Redirect(http.StatusFound, projectURL+"?repoError=exchange_failed")
 		return
 	}
 
@@ -836,7 +851,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		projectID,
 	).Scan(&clientID)
 	if err != nil {
-		response.NotFound(c, "project")
+		c.Redirect(http.StatusFound, frontendBase+"/?repoError=project_not_found")
 		return
 	}
 
@@ -849,7 +864,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	)
 	if err != nil {
 		h.logger.Error("ConnectRepo failed after OAuth", zap.Error(err))
-		response.InternalError(c)
+		c.Redirect(http.StatusFound, projectURL+"?repoError=connect_failed")
 		return
 	}
 
@@ -861,11 +876,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		zap.String("project_id", projectID.String()),
 	)
 
-	response.OK(c, map[string]interface{}{
-		"status":        "connected",
-		"connection_id": connID,
-		"project_id":    projectID,
-	})
+	c.Redirect(http.StatusFound, projectURL+"?repoConnected=true")
 }
 
 // ConnectRepo POST /projects/:id/repo

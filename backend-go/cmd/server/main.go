@@ -198,7 +198,7 @@ func buildRouter(
 		cfg.Security.EncryptionKey,
 		cfg.OAuth.GitHubClientID, cfg.OAuth.GitHubClientSecret,
 		cfg.OAuth.GitLabClientID, cfg.OAuth.GitLabClientSecret,
-		cfg.OAuth.BaseURL,
+		cfg.OAuth.BaseURL, cfg.OAuth.FrontendURL,
 		logger,
 	)
 
