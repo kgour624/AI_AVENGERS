@@ -43,6 +43,23 @@ function resolveShape(domain: string): BaseShape {
   return 'core'
 }
 
+type DomainColor = 'cyan' | 'amber' | 'violet' | 'purple'
+
+function resolveDomainColor(domain: string): DomainColor {
+  const d = domain.toLowerCase()
+  if (d.includes('system') || d.includes('design')) return 'cyan'
+  if (d.includes('database') || d.includes('db') || d.includes('sql')) return 'amber'
+  if (d.includes('security')) return 'violet'
+  return 'purple'
+}
+
+const DOMAIN_COLOR_CLASS: Record<DomainColor, string> = {
+  cyan: 'text-glow-cyan',
+  amber: 'text-glow-amber',
+  violet: 'text-glow-violet',
+  purple: 'text-glow-purple',
+}
+
 function BaseShapeSvg({ shape }: { shape: BaseShape }) {
   switch (shape) {
     case 'hexagon':
@@ -120,6 +137,7 @@ function HoloSilhouette() {
  */
 export function ExpertAvatar({ domain, status, mode, size = 'md', className }: ExpertAvatarProps) {
   const shape = useMemo(() => resolveShape(domain), [domain])
+  const domainColorClass = useMemo(() => DOMAIN_COLOR_CLASS[resolveDomainColor(domain)], [domain])
   const px = SIZE_PX[size]
 
   const ringColorClass =
@@ -149,7 +167,7 @@ export function ExpertAvatar({ domain, status, mode, size = 'md', className }: E
         )}
       </div>
 
-      <svg viewBox="0 0 100 100" className="relative h-[78%] w-[78%] text-glow-purple">
+      <svg viewBox="0 0 100 100" className={cn('relative h-[78%] w-[78%]', domainColorClass)}>
         <BaseShapeSvg shape={shape} />
         <HoloSilhouette />
       </svg>
