@@ -39,25 +39,38 @@ export function Header() {
   }
 
   return (
-    <header className="flex h-12 flex-shrink-0 items-center justify-between border-b border-surface-border bg-surface-raised px-4">
+    // ARC-51 §6: glass panel (backdrop-blur-xl + border-glass-border,
+    // §2 tokens) instead of the flat bg-surface-raised border. Every
+    // functional element below (toggleSidebar, nav Links, handleLogout)
+    // is byte-for-byte the same logic - only className changed.
+    <header className="flex h-12 flex-shrink-0 items-center justify-between border-b border-glass-border bg-surface-raised/70 px-4 backdrop-blur-xl">
       <div className="flex items-center gap-4">
         <button
           onClick={toggleSidebar}
           aria-label="Toggle sidebar"
-          className="text-text-secondary hover:text-text-primary"
+          className="text-text-secondary transition-colors duration-150 ease-arc hover:text-glow-cyan"
         >
           {'\u2630'}
         </button>
-        <Link to="/" className="font-semibold text-text-primary">
+        <Link
+          to="/"
+          className="font-semibold tracking-wide text-text-primary [text-shadow:0_0_16px_var(--glow-purple)]"
+        >
           {'\u26A1'} AI Avengers
         </Link>
-        <Link to="/experts" className="text-sm text-text-secondary hover:text-text-primary">
+        <Link
+          to="/experts"
+          className="text-sm text-text-secondary transition-colors duration-150 ease-arc hover:text-glow-cyan"
+        >
           Experts
         </Link>
       </div>
       <div className="flex items-center gap-4">
         {isAdmin && (
-          <Link to="/admin" className="text-sm text-text-secondary hover:text-text-primary">
+          <Link
+            to="/admin"
+            className="text-sm text-text-secondary transition-colors duration-150 ease-arc hover:text-glow-purple"
+          >
             Admin
           </Link>
         )}
@@ -68,7 +81,7 @@ export function Header() {
         )}
         <button
           onClick={handleLogout}
-          className="text-sm text-text-secondary hover:text-text-primary"
+          className="text-sm text-text-secondary transition-colors duration-150 ease-arc hover:text-mode-refuse"
         >
           Logout
         </button>
