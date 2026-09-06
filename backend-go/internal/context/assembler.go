@@ -159,6 +159,28 @@ func (a *Assembler) Assemble(
 		}
 	}
 
+	// 6. Connected repo code chunks (client's own codebase, if any).
+	// Bug 3.3 fix (docs bug list): repo_chunks table + sync pipeline
+	// (migration 003, repo.Service.SyncRepo) already populate this per
+	// project, but nothing in this file ever queried it - connecting a
+	// GitHub/GitLab repo silently had zero effect on any expert's
+	// answers. Appended into the SAME CourseChunks slice (reuses
+	// chinawall.CourseChunk, not a new type) so this flows through the
+	// exact `chunks` parameter decision.Engine.Process and
+	// chinawall.Enforcer already consume - no other file needs to
+	// change for this context to actually reach the LLM prompt.
+	// Cheap no-op for projects with no connected repo: the query is
+	// scoped by project_id (indexed), so it simply returns 0 rows.
+	if tokensUsed < budget*95/100 {
+		repoChunks, err := a.getRepoChunks(ctx, projectID, question, a.chunksTopK)
+		if err == nil && len(repoChunks) > 0 {
+			assembled.CourseChunks = append(assembled.CourseChunks, repoChunks...)
+			for _, c := range repoChunks {
+				tokensUsed += estimateTokens(c.Text)
+			}
+		}
+	}
+
 	assembled.TotalTokens = tokensUsed
 
 	a.logger.Debug("context assembled",
@@ -358,6 +380,120 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 			c := candidates[r.Index]
 			chunks = append(chunks, chinawall.CourseChunk{
 				ID: c.ID, Text: c.Text, Topic: c.Topic, RerankScore: r.Score,
+			})
+		}
+	}
+	return chunks, nil
+}
+
+// getRepoChunks retrieves and reranks connected-repo code chunks,
+// using the exact same hybrid (vector + keyword) search pattern as
+// getCourseChunks above, scoped by project_id instead of expert_id.
+//
+// Bug 3.3 fix (docs bug list): this method did not exist at all -
+// repo_chunks was written to by the sync pipeline but never read by
+// anything. Returns chinawall.CourseChunk (not a new type) so results
+// flow through the same `chunks` parameter every expert call already
+// consumes - see the call site in Assemble() above for why that
+// matters.
+func (a *Assembler) getRepoChunks(ctx context.Context, projectID uuid.UUID, question string, limit int) ([]chinawall.CourseChunk, error) {
+	embedding, err := a.ml.EmbedSingle(ctx, question)
+	if err != nil {
+		return nil, fmt.Errorf("embed failed: %w", err)
+	}
+
+	vectorRows, err := a.db.Query(ctx,
+		`SELECT id, chunk_text, file_path
+		 FROM repo_chunks
+		 WHERE project_id=$1
+		 ORDER BY embedding <=> $2
+		 LIMIT 15`,
+		projectID, pgvector.NewVector(embedding),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("repo vector search failed: %w", err)
+	}
+	defer vectorRows.Close()
+
+	type rawRepoChunk struct {
+		ID       uuid.UUID
+		Text     string
+		FilePath string
+	}
+
+	seen := make(map[uuid.UUID]bool)
+	var candidates []rawRepoChunk
+
+	for vectorRows.Next() {
+		var c rawRepoChunk
+		if err := vectorRows.Scan(&c.ID, &c.Text, &c.FilePath); err != nil {
+			continue
+		}
+		if !seen[c.ID] {
+			seen[c.ID] = true
+			candidates = append(candidates, c)
+		}
+	}
+
+	// Keyword search (full-text) - migration 003 already adds
+	// chunk_text_tsv as a generated column + GIN index for exactly this.
+	keywordRows, err := a.db.Query(ctx,
+		`SELECT id, chunk_text, file_path
+		 FROM repo_chunks
+		 WHERE project_id=$1
+		   AND chunk_text_tsv @@ plainto_tsquery('english', $2)
+		 LIMIT 10`,
+		projectID, question,
+	)
+	if err == nil {
+		defer keywordRows.Close()
+		for keywordRows.Next() {
+			var c rawRepoChunk
+			if err := keywordRows.Scan(&c.ID, &c.Text, &c.FilePath); err != nil {
+				continue
+			}
+			if !seen[c.ID] {
+				seen[c.ID] = true
+				candidates = append(candidates, c)
+			}
+		}
+	}
+	// Keyword search failure is non-fatal - vector results still usable
+
+	if len(candidates) == 0 {
+		return nil, nil
+	}
+
+	texts := make([]string, len(candidates))
+	for i, c := range candidates {
+		texts[i] = c.Text
+	}
+
+	reranked, err := a.ml.Rerank(ctx, question, texts, limit)
+	if err != nil {
+		var chunks []chinawall.CourseChunk
+		for i, c := range candidates {
+			if i >= limit {
+				break
+			}
+			// WHY prefix "repo:": lets a citation/log consumer tell a
+			// course chunk from a code chunk at a glance without a
+			// separate type or field - CourseChunk has no "source" field
+			// and adding one would ripple into chinawall/decision/every
+			// caller that constructs or reads a CourseChunk today.
+			chunks = append(chunks, chinawall.CourseChunk{
+				ID: c.ID, Text: c.Text, Topic: "repo:" + c.FilePath, RerankScore: 0.5,
+			})
+		}
+		return chunks, nil
+	}
+
+	var chunks []chinawall.CourseChunk
+	for _, r := range reranked {
+		if r.Index < len(candidates) {
+			c := candidates[r.Index]
+			chunks = append(chunks, chinawall.CourseChunk{
+				ID: c.ID, Text: c.Text, Topic: "repo:" + c.FilePath, RerankScore: r.Score,
 			})
 		}
 	}
