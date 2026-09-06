@@ -1,10 +1,12 @@
 import { useState } from 'react'
 import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData } from 'react-router-dom'
+import { motion, useReducedMotion } from 'framer-motion'
 import { getExperts } from '@/api/experts'
 import type { Expert } from '@/types/expert'
 import { ExpertCard } from '@/components/expert/ExpertCard'
 import { ExpertTopicsModal } from '@/components/expert/ExpertTopicsModal'
+import { fadeUp, staggerContainer, ARC_MOTION } from '@/design-system/motion'
 
 async function loader({ request }: LoaderFunctionArgs) {
   const experts = await getExperts({ signal: request.signal })
@@ -15,6 +17,7 @@ export const expertsRoute = { element: <ExpertsPage />, loader }
 
 export default function ExpertsPage() {
   const { experts } = useLoaderData() as { experts: Expert[] }
+  const reduceMotion = useReducedMotion()
   // Feature #4 fix (docs bug list): ExpertCard already had an
   // onViewTopics callback prop, never wired to anything here.
   const [topicsTargetId, setTopicsTargetId] = useState<string | null>(null)
@@ -25,15 +28,18 @@ export default function ExpertsPage() {
       {experts.length === 0 ? (
         <p className="text-text-secondary">No experts available yet.</p>
       ) : (
-        <div className="space-y-3">
-          {experts.map((expert) => (
-            <ExpertCard
-              key={expert.id}
-              expert={expert}
-              onViewTopics={(expertId) => setTopicsTargetId(expertId)}
-            />
+        <motion.div
+          initial={reduceMotion ? undefined : 'hidden'}
+          animate="visible"
+          variants={staggerContainer}
+          className="space-y-3"
+        >
+          {experts.map((expert, i) => (
+            <motion.div key={expert.id} variants={i < ARC_MOTION.maxStaggerItems ? fadeUp : undefined}>
+              <ExpertCard expert={expert} onViewTopics={(expertId) => setTopicsTargetId(expertId)} />
+            </motion.div>
           ))}
-        </div>
+        </motion.div>
       )}
 
       {topicsTargetId && (
