@@ -47,7 +47,7 @@ function AdminClients() {
       <h1 className="mb-4 text-xl font-semibold">Clients</h1>
       <div className="space-y-2">
         {clients?.map((client) => (
-          <Card key={client.id} className="flex items-center justify-between">
+          <Card key={client.id} glow="cyan" className="flex items-center justify-between">
             <div>
               <p className="font-medium text-text-primary">{client.fullName}</p>
               <p className="text-xs text-text-secondary">{client.email}</p>
