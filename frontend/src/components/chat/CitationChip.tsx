@@ -28,7 +28,7 @@ export function CitationChip({ citation }: { citation: Citation }) {
         <button
           type="button"
           onClick={() => setIsModalOpen(true)}
-          className="rounded border border-surface-border bg-surface-overlay px-1.5 py-0.5 text-xs font-mono text-brand hover:bg-brand/10"
+          className="rounded border border-glass-border bg-surface-overlay px-1.5 py-0.5 text-xs font-mono text-glow-cyan transition-[border-color,box-shadow] duration-150 ease-arc hover:border-glow-cyan/50 hover:bg-glow-cyan/10 hover:shadow-[0_0_12px_-4px_var(--glow-cyan)]"
         >
           [CHUNK_{citation.chunkId.slice(0, 8)}]
         </button>
