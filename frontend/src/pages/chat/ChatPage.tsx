@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState, useEffect } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import type { LoaderFunctionArgs } from 'react-router-dom'
-import { useLoaderData, useRevalidator } from 'react-router-dom'
+import { useLoaderData, useRevalidator, useParams, Link } from 'react-router-dom'
 import { getChat, getMessages } from '@/api/chats'
 import { getProjectExperts } from '@/api/projects'
 import type { ChatLoaderData } from '@/types/project'
@@ -67,6 +67,11 @@ export const chatRoute = { element: <ChatPage />, loader }
 
 export default function ChatPage() {
   const { chat, messages, experts } = useLoaderData() as ChatLoaderData
+  // WHY useParams here even though the loader already has projectId:
+  // the loader's params are not exposed to the component via
+  // useLoaderData - this is the standard React Router way for a
+  // component to read its own route's params independently.
+  const { projectId } = useParams<{ projectId: string }>()
   const { sendMessage } = useSSEStream()
   const revalidator = useRevalidator()
   const [pendingUserText, setPendingUserText] = useState<string | null>(null)
@@ -137,7 +142,15 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full flex-col">
-      <h2 className="border-b border-surface-border px-6 py-4 text-lg font-medium">{chat.title}</h2>
+      <div className="flex items-center gap-3 border-b border-surface-border px-6 py-4">
+        <Link
+          to={`/projects/${projectId}`}
+          className="text-sm text-text-secondary hover:text-text-primary"
+        >
+          {'\u2190'} Back to Project
+        </Link>
+        <h2 className="text-lg font-medium">{chat.title}</h2>
+      </div>
 
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-6">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
