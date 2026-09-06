@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useRevalidator } from 'react-router-dom'
-import { connectRepo, syncRepo } from '@/api/repo'
+import { connectRepo, syncRepo, getOAuthURL } from '@/api/repo'
 import { Modal } from '@/components/ui/Modal'
 import { Input } from '@/components/ui/Input'
 import { Button } from '@/components/ui/Button'
@@ -71,13 +71,33 @@ export function RepoConnectModal({ isOpen, onClose, projectId }: RepoConnectModa
   })
 
   const canSubmit = repoUrl.trim().length > 0 && accessToken.length > 0
+  const [oauthError, setOauthError] = useState('')
+  const [isOauthLoading, setIsOauthLoading] = useState(false)
+
+  // Feature #6 fix (docs bug list): real 1-click OAuth - fetches the
+  // provider authorization URL via XHR (getOAuthURL), then does a
+  // top-level browser navigation to it. The browser eventually lands
+  // back on this same project page (repo/service.go's OAuthCallback
+  // now redirects there with ?repoConnected=true or ?repoError=...)
+  // rather than staying in this modal - there is no XHR response to
+  // await once the redirect happens, by design of the OAuth flow.
+  const handleOAuthConnect = async () => {
+    setIsOauthLoading(true)
+    setOauthError('')
+    try {
+      const { url } = await getOAuthURL(projectId, provider)
+      window.location.href = url
+    } catch (err) {
+      setOauthError(err instanceof Error ? err.message : 'Could not start OAuth flow')
+      setIsOauthLoading(false)
+    }
+  }
 
   return (
     <Modal isOpen={isOpen} onClose={onClose}>
       <h3 className="mb-1 text-sm font-medium text-text-primary">Connect Repository</h3>
       <p className="mb-4 text-xs text-text-secondary">
-        Requires a Personal Access Token with repo read access. OAuth connect is not available yet -
-        see this project's HANDOFF.md for details.
+        Connect with OAuth (recommended) or paste a Personal Access Token manually.
       </p>
 
       <div className="flex flex-col gap-3">
@@ -96,6 +116,22 @@ export function RepoConnectModal({ isOpen, onClose, projectId }: RepoConnectModa
           >
             GitLab
           </button>
+        </div>
+
+        <Button
+          type="button"
+          variant="primary"
+          isLoading={isOauthLoading}
+          onClick={handleOAuthConnect}
+        >
+          Connect with {provider === 'github' ? 'GitHub' : 'GitLab'} (OAuth)
+        </Button>
+        {oauthError && <p className="text-xs text-mode-refuse">{oauthError}</p>}
+
+        <div className="my-1 flex items-center gap-2 text-xs text-text-disabled">
+          <div className="h-px flex-1 bg-surface-border" />
+          OR
+          <div className="h-px flex-1 bg-surface-border" />
         </div>
 
         <Input

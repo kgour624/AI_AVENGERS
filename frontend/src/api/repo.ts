@@ -44,6 +44,21 @@ export const connectRepo = (projectId: string, req: ConnectRepoRequest) =>
     )
     .then((res) => res.data.data!)
 
+// Feature #6 fix (docs bug list): the OAuth-initiation route
+// (GET /repo/oauth/:provider) and the callback route were both
+// actually unregistered when api/repo.ts's original header comment
+// above was written - both are now registered (main.go) AND the
+// callback now redirects back into the SPA instead of returning raw
+// JSON to a top-level browser navigation (repo/service.go's
+// OAuthCallback, fixed in the same batch as this function). This is
+// what makes a real "1-click" flow possible for the first time.
+export const getOAuthURL = (projectId: string, provider: 'github' | 'gitlab') =>
+  baseAPI
+    .get<ApiResponse<{ url: string; state: string }>>(`/api/v1/repo/oauth/${provider}`, {
+      params: { project_id: projectId },
+    })
+    .then((res) => res.data.data!)
+
 export const syncRepo = (projectId: string) =>
   baseAPI
     .post<ApiResponse<{ status: string }>>(`/api/v1/projects/${projectId}/repo/sync`)
