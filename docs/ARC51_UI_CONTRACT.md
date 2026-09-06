@@ -227,3 +227,37 @@ All 10 sections from §7's plan are done, verified section-by-section, with zero
 - `ChatPage.tsx` itself (the page wrapping StreamingIndicator/ExpertResponse) was not restyled - only its child components were. If the page shell around them still uses old flat surface-border styling, that's a natural small follow-up, not a contract violation (the contract only committed to the 10 named sections).
 
 **How to verify the whole thing:** `cd frontend && npm install && npm run build && npm run typecheck`, then manually walk: `/login` → create/open a project → send a chat message → open `/experts` → open `/admin` and its 4 sub-pages. Every animation should respect `prefers-reduced-motion` when toggled in OS/browser settings.
+
+---
+
+## S11-S16 - Post-rollout gap-fill pass (2026-09-06)
+
+Admin's original detailed mandate included several specific asks the S1-S10 contract above never actually scoped (my own gap in writing the contract, not an execution gap). Fixed in small verified commits:
+
+### S11 Atmosphere layer - VERIFIED
+- tokens.css: new .arc-atmosphere class - two low-opacity radial glows + a subtle 48px grid, on top of the existing --surface-void color. Pure background-image, no extra DOM nodes, no motion.
+- Applied to AppShell.tsx and AdminLayout.tsx (replacing flat bg-surface-void).
+
+### S12 Domain-colored avatars + Level bar - VERIFIED
+- New tokens --glow-amber/--glow-violet - deliberately NOT reusing mode-warn/mode-refuse (product semantics, S2's locked rule).
+- ExpertAvatar.tsx: new resolveDomainColor() alongside resolveShape() - system_design=cyan, database=amber, security=violet, fallback=purple. Status ring/mode-coloring logic untouched.
+- ExpertCard.tsx: View Topics -> View Capabilities (handler unchanged); numeric (4/5) replaced with a 5-segment DepthLevelBar - depthLabel()/avgDepthLevel logic untouched.
+
+### S13 Real experts + architecture-type - VERIFIED
+- service.go: List() now batch-loads real experts (single project_id = ANY(...) query) instead of never populating them. Both List() and GetByID() now select architecture_type. GetByID's discarded-error fixed to log + default. Experts json tag omitempty removed.
+- types/project.ts: added architectureType?: string.
+- ProjectCard.tsx: architecture badge (only if set), expert avatar stack, live pulse dot.
+
+### S14 Projects telemetry HUD - VERIFIED
+- ProjectsPage.tsx: HUD bar showing Active Experts (real) and Repository Links (real). "Total Neural Syncs" and "System Load" explicitly NOT built - no backing data exists. Flagged as open gaps.
+
+### S15 Admin telemetry polish - VERIFIED
+- Stat cards: glowing text-shadow numbers. Sparklines NOT added - GetStats has no time-series data.
+- Violations card: real 7-day breakdown from getAdminViolations() (real createdAt timestamps), not a fabricated radar chart.
+
+### S16 Motion polish - VERIFIED
+- Telemetry HUD bar wrapped in motion.div using existing ARC_MOTION constants.
+
+**Not done / explicitly deferred:**
+- npm install/build/typecheck still not run.
+- No fake data introduced anywhere in S11-S16 - every gap with no real backing data is listed above instead of invented.
