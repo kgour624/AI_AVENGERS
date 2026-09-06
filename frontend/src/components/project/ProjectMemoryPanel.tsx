@@ -49,7 +49,9 @@ export function ProjectMemoryPanel({ projectId }: { projectId: string }) {
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-brand">{entry.expertName}</span>
             <span className="text-xs text-text-disabled">
-              {TYPE_LABELS[entry.memoryType] ?? entry.memoryType} \u00b7 {formatRelativeTime(entry.createdAt)}
+              {TYPE_LABELS[entry.memoryType] ?? entry.memoryType}
+              {' \u00b7 '}
+              {formatRelativeTime(entry.createdAt)}
             </span>
           </div>
           <p className="mt-1 text-sm text-text-primary">{entry.content}</p>
