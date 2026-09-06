@@ -20,11 +20,21 @@ const NAV_ITEMS = [
  * Settings) by typing the URL directly, since none of the 5 real
  * routes registered in App.tsx's /admin subtree were ever linked here.
  */
+/**
+ * ARC-51 §10 (docs/ARC51_UI_CONTRACT.md): same glass language as the
+ * client-facing Header/Sidebar (§6), but deliberately LOWER drama -
+ * no ambient glow, no stagger motion on the nav list (it's a fixed 5
+ * items, not a dynamic data list) - §1's page-by-page notes are
+ * explicit that admin needs density/information, not spectacle. Every
+ * NavLink/Outlet/cn() logic line is untouched, only classNames changed.
+ */
 export function AdminLayout() {
   return (
-    <div className="flex h-screen bg-surface-base text-text-primary">
-      <aside className="w-56 flex-shrink-0 border-r border-surface-border bg-surface-raised p-4">
-        <p className="mb-4 font-semibold">{'\u26A1'} AI Avengers Admin</p>
+    <div className="flex h-screen bg-surface-void text-text-primary">
+      <aside className="w-56 flex-shrink-0 border-r border-glass-border bg-surface-raised/70 p-4 backdrop-blur-xl">
+        <p className="mb-4 font-semibold tracking-wide [text-shadow:0_0_12px_var(--glow-purple)]">
+          {'\u26A1'} AI Avengers Admin
+        </p>
         <nav className="flex flex-col gap-1">
           {NAV_ITEMS.map((item) => (
             <NavLink
@@ -33,8 +43,8 @@ export function AdminLayout() {
               end={item.end}
               className={({ isActive }) =>
                 cn(
-                  'rounded-md px-2 py-1.5 text-sm text-text-secondary hover:bg-surface-overlay hover:text-text-primary',
-                  isActive && 'bg-surface-overlay text-text-primary'
+                  'rounded-md border-l-2 border-transparent px-2 py-1.5 text-sm text-text-secondary transition-colors duration-150 ease-arc hover:bg-surface-panel-hover hover:text-text-primary',
+                  isActive && 'border-glow-purple bg-surface-panel-hover text-text-primary'
                 )
               }
             >
