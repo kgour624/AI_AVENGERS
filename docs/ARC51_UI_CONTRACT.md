@@ -203,4 +203,9 @@ No section starts until the previous one is verified. This document is updated w
 - `ExpertCard.tsx`: added `<ExpertAvatar domain={expert.domain} status="idle" size="md" />` next to the name, `glow="cyan"` on its `<Card>`. Status is always `'idle'` here deliberately — this is a static browsing list with no live SSE stream reaching it; `'analyzing'`/`'responded'` states are reserved for §9 (chat interface) where they're actually true.
 - `ExpertsPage.tsx`: list wrapped in the same `staggerContainer`/`fadeUp` pattern as §6/§7. `onViewTopics` wiring (feature #4 fix, earlier session) untouched.
 
-### Next: §9 Chat interface — StreamingIndicator (real ExpertAvatar analyzing state), ExpertResponse card polish, citation chip hover (order 9).
+### §9 Chat interface — VERIFIED ✅
+- `StreamingIndicator.tsx`: replaced plain bullet-dot list with real `ExpertAvatar` instances — completed responses use their REAL `domain`+`mode` from the SSE payload (`status="responded"`), pending ones use an identity-less generic avatar (`domain=""`, `status="analyzing"`). **The documented data gap is unchanged and not papered over**: still no fake "Gate 3/5" text, since the SSE `thinking` event genuinely doesn't carry that data.
+- `CitationChip.tsx`: glow-cyan hover treatment on the chip button. `Tooltip`/`Modal` internals untouched (Modal automatically inherited §3's spring animation for free).
+- `ExpertResponse.tsx`: glass card + a `border-l-4` left border colored/glowed by `response.mode`, reusing the EXISTING product-semantic mode colors (not a new decorative palette — §2's rule). Entrance motion via inline `motion.div` (fade+slight-rise, respects `useReducedMotion`). **Zero changes to**: citation-splitting logic, ASK-mode question rendering, rating widget gating on `persistedMessageId`, gate-reasoning toggle — confirmed by re-reading the full file after editing, not just the diff.
+
+### Next: §10 Admin panel glass pass (order 10, final section) — lower drama than client-facing pages per §1's page-by-page notes (admin needs density/information, not spectacle).
