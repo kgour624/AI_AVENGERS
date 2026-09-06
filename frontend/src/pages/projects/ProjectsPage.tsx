@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData, useRevalidator, useNavigate } from 'react-router-dom'
 import { motion, useReducedMotion } from 'framer-motion'
@@ -32,6 +32,14 @@ export default function ProjectsPage() {
   const navigate = useNavigate()
   const reduceMotion = useReducedMotion()
   const [isCreateOpen, setIsCreateOpen] = useState(false)
+
+  // ARC-51 S14 telemetry HUD: only real, derivable metrics - see
+  // commit message for what was deliberately NOT fabricated here.
+  const activeExpertsCount = useMemo(
+    () => new Set(projects.flatMap((p) => (p.experts ?? []).map((e) => e.expertId))).size,
+    [projects]
+  )
+  const connectedRepoCount = useMemo(() => projects.filter((p) => p.repoConnected).length, [projects])
 
   // Shared by both the header's "+ New Project" button/modal AND the
   // empty-state hero's CTA/templates - same real revalidate+navigate
