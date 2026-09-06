@@ -35,6 +35,13 @@ export function ProjectExpertManager({ projectId, experts }: { projectId: string
   const revalidator = useRevalidator()
   const [isModalOpen, setIsModalOpen] = useState(false)
 
+  // Defensive default: GetByID (backend-go/internal/project/service.go)
+  // does `experts, _ := s.GetExperts(...)` - discarding the query
+  // error means a transient DB error leaves Experts nil, which the
+  // Project struct's `experts,omitempty` json tag then omits from the
+  // wire entirely. Must not crash the add/remove-expert UI over it.
+  const safeExperts = experts ?? []
+
   const { data: allExperts } = useQuery({
     queryKey: ['experts'],
     queryFn: () => getExperts(),
@@ -51,12 +58,12 @@ export function ProjectExpertManager({ projectId, experts }: { projectId: string
     onSuccess: () => revalidator.revalidate(),
   })
 
-  const addedIds = new Set(experts.map((e) => e.expertId))
+  const addedIds = new Set(safeExperts.map((e) => e.expertId))
 
   return (
     <div>
       <div className="flex flex-wrap items-center gap-2">
-        {experts.map((e) => (
+        {safeExperts.map((e) => (
           <div key={e.expertId} className="group relative">
             <ExpertBadge expert={e} />
             <button

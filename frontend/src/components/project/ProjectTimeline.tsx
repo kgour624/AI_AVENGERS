@@ -24,7 +24,13 @@ function dayGroupLabel(dateStr: string): string {
 }
 
 export function ProjectTimeline({ events }: { events: L3Event[] }) {
-  if (events.length === 0) {
+  // Defensive default: `timeline` (ProjectPage.tsx's loader) comes
+  // from getProjectTimeline(), whose ApiResponse<T>.data field is
+  // typed optional (types/api.ts) even though the API client asserts
+  // it non-null - a real backend gap (e.g. an empty timeline
+  // response omitting `data`) must not crash this component.
+  const eventList = events ?? []
+  if (eventList.length === 0) {
     return <p className="text-sm text-text-secondary">No activity yet.</p>
   }
 
@@ -35,7 +41,7 @@ export function ProjectTimeline({ events }: { events: L3Event[] }) {
   // client-side would silently mask a backend ordering bug instead of
   // surfacing it).
   const groups: { label: string; events: L3Event[] }[] = []
-  for (const event of events) {
+  for (const event of eventList) {
     const label = dayGroupLabel(event.createdAt)
     const lastGroup = groups[groups.length - 1]
     if (lastGroup && lastGroup.label === label) {

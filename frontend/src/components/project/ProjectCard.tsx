@@ -24,7 +24,7 @@ export function ProjectCard({ project }: { project: Project }) {
   return (
     <Card glow="purple">
       <p className="font-medium text-text-primary">{project.name}</p>
-      <p className="mt-1 text-sm text-text-secondary">Experts: {project.experts.length}</p>
+      <p className="mt-1 text-sm text-text-secondary">Experts: {project.experts?.length ?? 0}</p>
       <p className="mt-1 text-sm text-text-secondary">
         Last active: {formatRelativeTime(project.updatedAt)}
       </p>
