@@ -6,6 +6,15 @@
    Source: FRONTEND_SYSTEM_DESIGN.md section 4. */
 
 :root {
+  /* WHY here: native browser-rendered form chrome (select dropdown
+     popups, checkboxes/radios, date/time pickers, scrollbars) follows
+     the OS/browser's light theme by default unless explicitly told
+     otherwise - every author-styled element in this app is already
+     dark, but without this, native controls would still render light,
+     showing up as jarring white/black patches inside an otherwise
+     dark UI. Pure CSS, zero functional change. */
+  color-scheme: dark;
+
   /* Response Mode Colors */
   --color-advise: oklch(65% 0.15 145); /* Green */
   --color-ask: oklch(65% 0.15 220); /* Blue */
@@ -63,6 +72,19 @@
 body {
   background-color: var(--surface-base);
   color: var(--text-primary);
+}
+
+/* Chrome/Safari force a white or yellow background on autofilled
+   inputs regardless of author CSS unless overridden via this
+   pseudo-class - without it, an autofilled email/password field would
+   flash light even though Input.tsx already sets a dark background
+   normally. */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus {
+  -webkit-box-shadow: 0 0 0 1000px var(--surface-overlay) inset;
+  -webkit-text-fill-color: var(--text-primary);
+  caret-color: var(--text-primary);
 }
 
 /* ============================================================
