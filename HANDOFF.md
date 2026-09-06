@@ -1115,4 +1115,44 @@ See `docs/INTERFACE_FIRST_CONTRACT.md` \u00a79 for the full audit.
 - `cd frontend && npm run build` - confirm all TS changes compile (new components, new API functions, Header/Sidebar/AdminLayout rewrites)
 - Manual QA: create a project, create an expert, send a chat message and check citations persist after reload, connect a repo and verify its chunks appear in an expert's answer, trigger a Gate 3 WARN and reload the page to confirm the warning text survives
 
-*Last updated: 2026-09-06 (Bug fix batch)*
+---
+
+## \ud83d\udd27 FEATURE BATCH \u2014 2026-09-06 (7 backend-ready, frontend-missing features)
+
+> Interface-first discipline followed throughout: every feature's real
+> request/response shape was read from the actual Go handler/service
+> BEFORE writing any frontend code, per docs/INTERFACE_FIRST_CONTRACT.md.
+> This surfaced 3 real backend bugs that were NOT in the original
+> report, fixed in the same batch (see below).
+
+| # | Feature | Status | Files |
+|---|---|---|---|
+| 1 | Edit Charter (was permanently disabled) | \u2705 Fixed | `EditCharterModal.tsx` (new), `AdminExperts.tsx`, `api/admin.ts` |
+| 2 | Project edit/delete | \u2705 Fixed | `EditProjectModal.tsx` (new), `ProjectPage.tsx`, `api/projects.ts` |
+| 3 | Chat rename/archive | \u2705 Fixed | `ChatList.tsx`, `api/chats.ts` |
+| 4 | Expert deep topics explorer | \u2705 Fixed, scope-corrected | `ExpertTopicsModal.tsx` (new), `ExpertsPage.tsx` |
+| 5 | L2 project memory view | \u2705 Fixed (+ real backend bug found) | `ProjectMemoryPanel.tsx` (new), `ProjectPage.tsx`, `api/memory.ts`, `memory/manager.go`, `main.go` |
+| 6 | 1-click OAuth connect | \u2705 Fixed (+ real backend bug found) | `RepoConnectModal.tsx`, `api/repo.ts`, `repo/service.go`, `config/config.go`, `main.go` |
+| 7 | Client usage insights | \u2705 Fixed (+ backend aggregate added) | `AdminClients.tsx`, `api/admin.ts`, `admin_handler.go` |
+
+### Real backend bugs found while verifying the report (not in the original 7 claims)
+
+1. **`GET /projects/:id/memory` was silently returning L3 timeline data, not L2 decisions.** Its handler called `memManager.GetTimeline(ctx, projectID, 20, 0)` - the exact same method `/timeline` calls with limit=50. It never queried `project_memory_l2` at all, despite `L2Store.GetRecent` already existing and doing the right query. Fixed by adding `Manager.GetProjectMemory` (joins expert name) and repointing the handler.
+2. **`OAuthCallback` returned raw JSON to what is actually a top-level browser navigation** (the OAuth provider redirects the browser here directly, not an XHR call) - a user completing OAuth would see a bare JSON page, not land back in the app. Fixed with `c.Redirect` on every exit path + new `OAuth.FrontendURL` config.
+3. **`ListClients` had no project/message counts at all** - the "usage" part of the original wireframe (and this feature's #7 ask) had zero backing data. Added as real SQL aggregates (correlated subqueries), not fabricated frontend-side.
+
+### Correction to the original report (feature #4)
+
+`GET /experts/:id/topics` does **not** return `can_handle`/`cannot_handle`/`example_questions` as claimed - verified against `expert/handler.go`'s real `GetTopics` SQL, which selects only `topic, depth_level, chunk_count, complexity_ceiling`. `ExpertTopicsModal.tsx` only renders what the endpoint actually returns.
+
+### Known follow-up gaps (documented, not silently worked around)
+
+- `AdminExperts.tsx`'s Edit Charter modal cannot pre-fill the current charter text - `ListExperts` doesn't select `reasoning_charter`. Editing still works (PATCH replaces the value); seeing the current value first needs that column added to `ListExperts`' SELECT.
+- `UpdateExpert`'s `description` field is bindable but silently never applied in any UPDATE statement (found while reading the handler, out of scope for this batch - not touched).
+- Archived chats (`ChatList.tsx`) may still appear in the list after archiving if `ListChats`' backend query doesn't filter `is_archived` - not verified in this batch, worth a quick check.
+
+### Also fixed in this batch (same root cause found and fixed 3 times)
+
+Bare `\uXXXX` escapes as unquoted JSX children text (does not get interpreted by the JS engine - only real string literals do) turned up 3 more times while writing this batch's own new code (`AdminClients.tsx`, `ProjectMemoryPanel.tsx`) - same class of bug as Header.tsx/AdminLayout.tsx/AdminDashboard.tsx earlier. All wrapped in `{'...'}` expression containers now.
+
+*Last updated: 2026-09-06 (7-feature batch)*
