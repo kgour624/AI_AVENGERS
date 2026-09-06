@@ -146,8 +146,8 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming }: Ex
       {showReasoning && (
         <p className="mt-2 text-xs text-text-secondary">
           Stopped at Gate {response.gateStopped} of 5. See{' '}
-          <code className="font-mono">AI_AVENGERS_SYSTEM_ARCHITECTURE.md \u00a7 10</code> for what each gate
-          checks.
+          <code className="font-mono">AI_AVENGERS_SYSTEM_ARCHITECTURE.md {'\u00a7'} 10</code> for what each
+          gate checks.
         </p>
       )}
     </motion.div>
