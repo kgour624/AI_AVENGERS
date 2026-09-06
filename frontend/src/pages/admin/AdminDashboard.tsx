@@ -63,7 +63,7 @@ export default function AdminDashboard() {
           <Link
             key={action.to}
             to={action.to}
-            className="rounded-md bg-surface-overlay px-3 py-1.5 text-sm text-text-primary hover:bg-surface-border"
+            className="rounded-md bg-surface-overlay px-3 py-1.5 text-sm text-text-primary transition-colors duration-150 ease-arc hover:bg-surface-panel-hover"
           >
             {action.label}
           </Link>
@@ -71,20 +71,20 @@ export default function AdminDashboard() {
       </div>
 
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-        <Card>
+        <Card glow="cyan">
           <p className="text-xs text-text-secondary">Experts</p>
           <p className="text-2xl font-semibold">{stats.experts.total}</p>
           <p className="text-xs text-text-disabled">{stats.experts.active} active</p>
         </Card>
-        <Card>
+        <Card glow="cyan">
           <p className="text-xs text-text-secondary">Clients</p>
           <p className="text-2xl font-semibold">{stats.clients}</p>
         </Card>
-        <Card>
+        <Card glow="cyan">
           <p className="text-xs text-text-secondary">Projects</p>
           <p className="text-2xl font-semibold">{stats.projects}</p>
         </Card>
-        <Card>
+        <Card glow="cyan">
           <p className="text-xs text-text-secondary">Total LLM cost</p>
           <p className="text-2xl font-semibold">{formatCostUsd(stats.llmTotalCost)}</p>
           <p className="text-xs text-text-disabled">{stats.llmTotalCalls} calls</p>
