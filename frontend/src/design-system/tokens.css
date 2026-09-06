@@ -78,3 +78,25 @@ body {
   --glass-border: oklch(100% 0 0 / 0.08);
   --ease-arc: cubic-bezier(0.16, 1, 0.3, 1);
 }
+
+.arc-atmosphere {
+  background-color: var(--surface-void);
+  background-image:
+    radial-gradient(circle at 15% 10%, oklch(65% 0.2 300 / 0.1), transparent 40%),
+    radial-gradient(circle at 85% 90%, oklch(75% 0.15 200 / 0.08), transparent 45%),
+    repeating-linear-gradient(
+      0deg,
+      oklch(100% 0 0 / 0.025) 0px,
+      oklch(100% 0 0 / 0.025) 1px,
+      transparent 1px,
+      transparent 48px
+    ),
+    repeating-linear-gradient(
+      90deg,
+      oklch(100% 0 0 / 0.025) 0px,
+      oklch(100% 0 0 / 0.025) 1px,
+      transparent 1px,
+      transparent 48px
+    );
+  background-attachment: fixed;
+}
