@@ -49,6 +49,13 @@ export default {
         md: '8px',
         lg: '12px',
       },
+      // ARC-51 (docs/ARC51_UI_CONTRACT.md §1/§5): exposes --ease-arc
+      // (tokens.css) as a Tailwind utility (`ease-arc`) so every
+      // component can reference the same easing curve by class name
+      // instead of repeating the raw cubic-bezier string.
+      transitionTimingFunction: {
+        arc: 'cubic-bezier(0.16, 1, 0.3, 1)',
+      },
     },
   },
   plugins: [],

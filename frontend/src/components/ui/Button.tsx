@@ -40,8 +40,14 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
         // twice. Cross-questioned this scenario before finalizing.
         disabled={disabled || isLoading}
         className={cn(
-          'inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors',
-          'disabled:cursor-not-allowed disabled:opacity-50',
+          // ARC-51 §5: press/hover polish. transition-[...] lists exact
+          // properties (background-color, transform, box-shadow) rather
+          // than transition-all, so this never accidentally animates a
+          // layout-affecting property. active:scale-95 is the "spring
+          // press" feel; disabled buttons don't scale since clicking
+          // them does nothing anyway.
+          'inline-flex items-center justify-center gap-2 rounded-md font-medium transition-[background-color,transform,box-shadow] duration-150 ease-arc active:scale-95',
+          'disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100',
           'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2 focus-visible:ring-offset-surface-base',
           variantClasses[variant],
           sizeClasses[size],
