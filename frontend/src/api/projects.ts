@@ -20,6 +20,24 @@ export const getProject = (id: string, options?: { signal?: AbortSignal }) =>
 export const createProject = (req: CreateProjectRequest) =>
   baseAPI.post<ApiResponse<Project>>('/api/v1/projects', req).then((res) => res.data.data!)
 
+// Feature #2 fix (docs bug list): PATCH/DELETE /projects/:id already
+// existed and are fully functional (project/service.go Update,
+// SoftDelete) - only the frontend never called them.
+export interface UpdateProjectRequest {
+  name?: string
+  description?: string
+}
+
+export const updateProject = (projectId: string, req: UpdateProjectRequest) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/projects/${projectId}`, req)
+    .then((res) => res.data.data!)
+
+export const deleteProject = (projectId: string) =>
+  baseAPI
+    .delete<ApiResponse<{ status: string }>>(`/api/v1/projects/${projectId}`)
+    .then((res) => res.data.data!)
+
 export const getProjectExperts = (projectId: string, options?: { signal?: AbortSignal }) =>
   baseAPI
     .get<ApiResponse<Project>>(`/api/v1/projects/${projectId}`, { signal: options?.signal })

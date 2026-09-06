@@ -1,6 +1,7 @@
+import { useState } from 'react'
 import type { LoaderFunctionArgs } from 'react-router-dom'
-import { useLoaderData, Outlet } from 'react-router-dom'
-import { getProject } from '@/api/projects'
+import { useLoaderData, useNavigate, useRevalidator, Outlet } from 'react-router-dom'
+import { getProject, deleteProject } from '@/api/projects'
 import { getProjectTimeline } from '@/api/memory'
 import type { Project } from '@/types/project'
 import type { L3Event } from '@/types/memory'
@@ -8,6 +9,8 @@ import { RepoStatus } from '@/components/project/RepoStatus'
 import { ChatList } from '@/components/project/ChatList'
 import { ProjectExpertManager } from '@/components/project/ProjectExpertManager'
 import { ProjectTimeline } from '@/components/project/ProjectTimeline'
+import { EditProjectModal } from '@/components/project/EditProjectModal'
+import { Button } from '@/components/ui/Button'
 
 /**
  * PHASE 6 CORRECTION: ProjectTimeline is now wired in. This was
@@ -37,11 +40,44 @@ export const projectRoute = { element: <ProjectPage />, loader }
 
 export default function ProjectPage() {
   const { project, timeline } = useLoaderData() as { project: Project; timeline: L3Event[] }
+  const revalidator = useRevalidator()
+  const navigate = useNavigate()
+  const [isEditOpen, setIsEditOpen] = useState(false)
+
+  const handleDelete = async () => {
+    // Feature #2 fix (docs bug list): no delete/archive option existed
+    // anywhere in the UI, despite DELETE /projects/:id (soft delete)
+    // being fully functional on the backend.
+    if (!window.confirm(`Delete "${project.name}"? This cannot be undone from the UI.`)) return
+    await deleteProject(project.id)
+    navigate('/')
+  }
 
   return (
     <div className="p-6">
-      <h1 className="text-xl font-semibold">{project.name}</h1>
-      <p className="mt-1 text-sm text-text-secondary">{project.description}</p>
+      <div className="flex items-start justify-between">
+        <div>
+          <h1 className="text-xl font-semibold">{project.name}</h1>
+          <p className="mt-1 text-sm text-text-secondary">{project.description}</p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="secondary" size="sm" onClick={() => setIsEditOpen(true)}>
+            Edit
+          </Button>
+          <Button variant="danger" size="sm" onClick={handleDelete}>
+            Delete
+          </Button>
+        </div>
+      </div>
+
+      <EditProjectModal
+        isOpen={isEditOpen}
+        onClose={() => setIsEditOpen(false)}
+        projectId={project.id}
+        currentName={project.name}
+        currentDescription={project.description}
+        onSaved={() => revalidator.revalidate()}
+      />
 
       <div className="mt-4">
         <p className="mb-1 text-sm font-medium text-text-secondary">Experts in this project</p>
