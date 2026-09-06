@@ -44,31 +44,24 @@ export const fadeUp: Variants = {
 }
 
 /**
- * Wraps a list/grid parent. Clamps effective stagger delay so a long
- * list (e.g. 40 project cards) never feels sluggish - beyond
- * maxStaggerItems, every item after that shares the same final delay
- * instead of the delay growing unbounded.
+ * Wraps a list/grid parent for stagger entrance.
+ *
+ * WHY this takes no itemCount parameter despite ARC_MOTION.maxStaggerItems
+ * existing: framer-motion's staggerChildren applies a per-child delay
+ * in render order with no built-in cap - clamping total perceived
+ * delay on a long list is the CONSUMER's job (e.g. render at most
+ * ARC_MOTION.maxStaggerItems children inside this container as
+ * motion.div, and render the remainder as plain unanimated children
+ * appended after), not something this shared variants object can
+ * enforce on its own. Kept here as a single source of truth for the
+ * timing values only.
  */
-export function staggerContainer(itemCount: number): Variants {
-  const effectiveCount = Math.min(itemCount, ARC_MOTION.maxStaggerItems)
-  return {
-    hidden: {},
-    visible: {
-      transition: {
-        staggerChildren: ARC_MOTION.stagger,
-        delayChildren: 0,
-        // WHY this isn't actually clamped further here: framer-motion's
-        // staggerChildren applies per-child in render order regardless
-        // of itemCount - the clamp is enforced by consumers slicing
-        // their own list to `effectiveCount` staggered + the remainder
-        // rendered without additional per-item delay. Documented here
-        // so a consumer doesn't assume this function does more than it
-        // does.
-      },
+export const staggerContainer: Variants = {
+  hidden: {},
+  visible: {
+    transition: {
+      staggerChildren: ARC_MOTION.stagger,
+      delayChildren: 0,
     },
-  }
-  // effectiveCount currently unused beyond documentation above;
-  // kept as a named value (not inlined) so the WHY comment has
-  // something concrete to point at for future consumers.
-  void effectiveCount
+  },
 }
