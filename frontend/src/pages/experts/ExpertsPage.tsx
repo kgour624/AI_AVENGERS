@@ -1,8 +1,10 @@
+import { useState } from 'react'
 import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData } from 'react-router-dom'
 import { getExperts } from '@/api/experts'
 import type { Expert } from '@/types/expert'
 import { ExpertCard } from '@/components/expert/ExpertCard'
+import { ExpertTopicsModal } from '@/components/expert/ExpertTopicsModal'
 
 async function loader({ request }: LoaderFunctionArgs) {
   const experts = await getExperts({ signal: request.signal })
@@ -13,6 +15,9 @@ export const expertsRoute = { element: <ExpertsPage />, loader }
 
 export default function ExpertsPage() {
   const { experts } = useLoaderData() as { experts: Expert[] }
+  // Feature #4 fix (docs bug list): ExpertCard already had an
+  // onViewTopics callback prop, never wired to anything here.
+  const [topicsTargetId, setTopicsTargetId] = useState<string | null>(null)
 
   return (
     <div className="p-6">
@@ -22,9 +27,22 @@ export default function ExpertsPage() {
       ) : (
         <div className="space-y-3">
           {experts.map((expert) => (
-            <ExpertCard key={expert.id} expert={expert} />
+            <ExpertCard
+              key={expert.id}
+              expert={expert}
+              onViewTopics={(expertId) => setTopicsTargetId(expertId)}
+            />
           ))}
         </div>
+      )}
+
+      {topicsTargetId && (
+        <ExpertTopicsModal
+          isOpen={topicsTargetId !== null}
+          onClose={() => setTopicsTargetId(null)}
+          expertId={topicsTargetId}
+          expertName={experts.find((e) => e.id === topicsTargetId)?.name ?? ''}
+        />
       )}
     </div>
   )
