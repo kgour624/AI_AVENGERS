@@ -38,7 +38,7 @@ export function CitationChip({ citation }: { citation: Citation }) {
         <h3 className="mb-2 text-sm font-medium text-text-secondary">Citation detail</h3>
         <p className="text-sm text-text-primary">{citation.text}</p>
         <p className="mt-3 text-xs text-text-disabled">
-          Chunk ID: {citation.chunkId} \u00b7 Relevance score: {citation.score.toFixed(3)}
+          Chunk ID: {citation.chunkId} {'\u00b7'} Relevance score: {citation.score.toFixed(3)}
         </p>
       </Modal>
     </>

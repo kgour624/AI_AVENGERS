@@ -23,7 +23,7 @@ export function StreamingIndicator({ stream, expertCount }: { stream: StreamStat
 
   return (
     <div className="rounded-lg border border-glass-border bg-surface-raised/70 p-4 backdrop-blur-xl">
-      <p className="mb-3 text-sm text-text-secondary">{'\u26a1'} Neural Processing\u2026</p>
+      <p className="mb-3 text-sm text-text-secondary">{'\u26a1'} Neural Processing{'\u2026'}</p>
       <div className="flex flex-wrap gap-4">
         {stream.expertResponses.map((response, i) => (
           <div key={response.expertId ?? i} className="flex flex-col items-center gap-1">
@@ -36,7 +36,7 @@ export function StreamingIndicator({ stream, expertCount }: { stream: StreamStat
         {Array.from({ length: pendingCount }).map((_, i) => (
           <div key={`pending-${i}`} className="flex flex-col items-center gap-1">
             <ExpertAvatar domain="" status="analyzing" size="sm" />
-            <span className="text-xs text-text-disabled">Thinking\u2026</span>
+            <span className="text-xs text-text-disabled">Thinking{'\u2026'}</span>
           </div>
         ))}
       </div>
