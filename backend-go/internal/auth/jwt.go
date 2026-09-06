@@ -84,16 +84,25 @@ func (s *JWTService) IssueTokenPair(ctx context.Context, userID uuid.UUID, email
 	// Store refresh token in Redis
 	// Key: refresh:{userID}:{tokenID}
 	// WHY include tokenID: allows revoking specific sessions, not all sessions
+	//
+	// WHY this is now a hard error (was previously logged-and-ignored):
+	// ValidateRefreshToken requires this exact Redis key to exist later -
+	// a token pair returned here as "successful" despite a failed Set()
+	// would validate fine as a JWT (signature/expiry) but ALWAYS fail
+	// ValidateRefreshToken's Redis-existence check on first use, since
+	// it was never actually stored. That silently strands the session
+	// (see main.go's handleRefresh comment for the full failure chain) -
+	// far worse than failing loudly here, where the caller can retry.
 	refreshClaims, _ := s.ParseToken(refreshToken)
 	redisKey := fmt.Sprintf("refresh:%s:%s", userID, refreshClaims.ID)
 	ttl := time.Until(refreshExpiry)
 
 	if err := s.redis.Set(ctx, redisKey, refreshToken, ttl).Err(); err != nil {
-		// Log but don't fail — token still works, just can't be revoked
-		s.logger.Warn("failed to store refresh token in Redis",
+		s.logger.Error("failed to store refresh token in Redis - failing token issuance",
 			zap.String("user_id", userID.String()),
 			zap.Error(err),
 		)
+		return nil, fmt.Errorf("failed to persist refresh token: %w", err)
 	}
 
 	return &TokenPair{

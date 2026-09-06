@@ -646,15 +646,23 @@ func handleRefresh(jwtService *auth.JWTService) gin.HandlerFunc {
 			return
 		}
 
-		// Revoke old refresh token (rotation)
-		_ = jwtService.RevokeRefreshToken(c.Request.Context(), refreshToken)
-
-		// Issue new token pair
+		// WHY issue the NEW token pair BEFORE revoking the OLD one (this
+		// order was previously reversed): if IssueTokenPair fails after
+		// the old token was already revoked, the session is permanently
+		// stranded - no valid refresh token exists anywhere (old
+		// revoked, new never issued), and the browser's cookie still
+		// holds the now-revoked old value, so every future refresh
+		// attempt fails too. Issuing first means a failure here leaves
+		// the OLD (still valid) token alone - the client can just retry.
 		tokens, err := jwtService.IssueTokenPair(c.Request.Context(), claims.UserID, claims.Email, claims.Role)
 		if err != nil {
 			response.InternalError(c)
 			return
 		}
+
+		// Only revoke the old refresh token now that the new one is
+		// confirmed issued and stored.
+		_ = jwtService.RevokeRefreshToken(c.Request.Context(), refreshToken)
 
 		// Rotate cookie — new refresh token replaces old
 		setRefreshCookie(c, tokens.RefreshToken, jwtService.RefreshExpiryDays())
