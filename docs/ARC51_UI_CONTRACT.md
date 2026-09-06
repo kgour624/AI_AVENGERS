@@ -175,4 +175,10 @@ No section starts until the previous one is verified. This document is updated w
 - Visual: `surface-void` background, two CSS ambient drifting glows (not mouse-tracked), 4-avatar decorative constellation (`aria-hidden`, no API call — `/experts` needs a JWT this page doesn't have), glass login card with `framer-motion` entrance spring (`modalSpring`-equivalent inline, respects `useReducedMotion`).
 - **Bug caught and fixed in this same section:** the em dash in the new subtitle copy was written as a bare `\u2014` in JSX children text (same class of bug fixed repeatedly elsewhere this session — Header.tsx, AdminDashboard.tsx, AdminClients.tsx, ProjectMemoryPanel.tsx). Wrapped in `{'\u2014'}` before this was reported back, since I re-read my own output before calling it done.
 
-### Next: §3 `Modal.tsx` framer-motion conversion (order 3, unaffected by the §4 reorder above).
+### §3 Modal.tsx — VERIFIED ✅
+- Replaced the CSS-keyframe `isClosing`/`previousIsOpen` state machine with `AnimatePresence` + `motion.div` using the shared `modalSpring` variant (`design-system/motion.ts`). Backdrop gets a light `backdrop-blur-sm`, panel gets `backdrop-blur-xl` + `border-glass-border` (§2 tokens).
+- **Public prop contract unchanged** (`isOpen`, `onClose`, `children`, `className`) — confirmed safe by construction (no prop added/removed/retyped), so every existing caller (`CreateProjectModal`, `CreateExpertModal`, `EditCharterModal`, `EditProjectModal`, `RepoConnectModal`, `TranscriptUploadModal`, `ExpertTopicsModal`) needs zero changes.
+- Reduced-motion contract honored: `useReducedMotion()` swaps the spring variant for an opacity-only one at `duration: 0`, rather than skipping `AnimatePresence` (it still needs to control mount/unmount timing even with motion disabled).
+- Cleanup: removed the now-fully-unused `.modal-enter`/`.modal-closing` classes and `@keyframes modal-in`/`modal-out` from `animations.css` — verified nothing else referenced them before deleting, not assumed.
+
+### Next: §5 `Card.tsx` glow prop + Button press/hover polish (order 5). §6 (Header/Sidebar glass) depends on this, so doing it next keeps §7's order intact.
