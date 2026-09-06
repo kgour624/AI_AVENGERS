@@ -1,3 +1,12 @@
+import { useState } from 'react'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { getAdminSettings, updateAdminSetting, type SystemSetting } from '@/api/admin'
+import { Card } from '@/components/ui/Card'
+import { Button } from '@/components/ui/Button'
+import { Input } from '@/components/ui/Input'
+import { Skeleton } from '@/components/ui/Skeleton'
+import { handleAPIError } from '@/utils/errors'
+
 /**
  * Bug 1.6 fix (docs bug list): this page was a static placeholder.
  * Per its own (now removed) header comment and HANDOFF.md, that WAS a
