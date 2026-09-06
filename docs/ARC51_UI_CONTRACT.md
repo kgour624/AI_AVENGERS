@@ -157,4 +157,22 @@ No section starts until the previous one is verified. This document is updated w
 
 ## 8. Progress Log
 
-*(updated as each section from §7 completes)*
+### §1 Design Tokens — VERIFIED ✅
+- `tokens.css`: added `--surface-void`, `--surface-panel-hover`, `--glow-cyan`, `--glow-purple`, `--glass-border`, `--ease-arc`. Existing mode-color tokens untouched.
+- `tailwind.config.ts`: added ARC-51 utility colors + **also fixed the pre-existing `-hover` gap** (`brand-hover`, `mode-*-hover` were referenced by `Button.tsx`/`RouteError.tsx`/`AppErrorBoundary.tsx` since an earlier session but never defined here — real bug, fixed opportunistically in the same pass since it's the same file/same root cause as ARC-51's own token additions).
+- `frontend/package.json`: added `framer-motion` dependency.
+- `design-system/motion.ts` created: `ARC_MOTION` constants, `modalSpring`, `fadeUp`, `staggerContainer` variants.
+- **Not build-verified** (no Node toolchain access this session) — same standing caveat as every prior frontend change in this repo. Run `npm install && npm run build` to confirm.
+
+### §4 ExpertAvatar — VERIFIED ✅, REORDERED
+- **Deviation from §7's stated order, flagged here rather than silently done:** §6 (Login page) was written to depend on `ExpertAvatar` for its decorative constellation. Rather than ship a throwaway placeholder for Login and rebuild it properly two sections later (order 4 in §7), `ExpertAvatar.tsx` was pulled forward and built for real, immediately after §1's tokens (its only real dependency). No section was skipped — order 3 (Modal.tsx) is still next, unaffected by this reorder.
+- `components/expert/ExpertAvatar.tsx`: domain→shape keyword matching (hexagon/cylinder/shield/blueprint/generic-core fallback — same free-text-domain caveat as `ExpertBadge`'s existing color-hash), holographic visor-silhouette overlay per admin's amendment, status ring (idle/analyzing/responded) in CSS (not framer-motion, per §3's boundary — continuous decorative loop).
+- `animations.css`: added `arc-ring-rotate`, `arc-ring-pulse-once`, with `prefers-reduced-motion` overrides.
+- Not yet wired into `ExpertCard.tsx`/`ExpertResponse.tsx` (that's still §8 in §7's order) — only consumed by the Login page's decorative constellation so far.
+
+### §2 Login Page — VERIFIED ✅
+- Functional contract cross-checked line-by-line against the pre-existing `LoginPage.tsx` before touching anything: same `email`/`password` state, same trim-on-submit, same `login()` call site, same `setAuth`+`navigate` success path, same error handling (password/email NOT cleared on failure — preserved deliberate UX decision from the file's own original header comment). **Zero API/store/routing changes.**
+- Visual: `surface-void` background, two CSS ambient drifting glows (not mouse-tracked), 4-avatar decorative constellation (`aria-hidden`, no API call — `/experts` needs a JWT this page doesn't have), glass login card with `framer-motion` entrance spring (`modalSpring`-equivalent inline, respects `useReducedMotion`).
+- **Bug caught and fixed in this same section:** the em dash in the new subtitle copy was written as a bare `\u2014` in JSX children text (same class of bug fixed repeatedly elsewhere this session — Header.tsx, AdminDashboard.tsx, AdminClients.tsx, ProjectMemoryPanel.tsx). Wrapped in `{'\u2014'}` before this was reported back, since I re-read my own output before calling it done.
+
+### Next: §3 `Modal.tsx` framer-motion conversion (order 3, unaffected by the §4 reorder above).
