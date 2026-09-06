@@ -64,3 +64,17 @@ body {
   background-color: var(--surface-base);
   color: var(--text-primary);
 }
+
+/* ============================================================
+   ARC-51 — additive tokens only. Does NOT replace the response-mode
+   colors above (--color-advise etc.) - those encode Gate/China Wall
+   output meaning, not decoration. See docs/ARC51_UI_CONTRACT.md §2.
+   ============================================================ */
+:root {
+  --surface-void: oklch(9% 0.012 270); /* Page bg - darker than --surface-base */
+  --surface-panel-hover: oklch(18% 0.015 270);
+  --glow-cyan: oklch(75% 0.15 200);
+  --glow-purple: oklch(65% 0.2 300);
+  --glass-border: oklch(100% 0 0 / 0.08);
+  --ease-arc: cubic-bezier(0.16, 1, 0.3, 1);
+}

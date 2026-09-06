@@ -20,11 +20,25 @@ export default {
         'text-secondary': 'oklch(65% 0.01 270)',
         'text-disabled': 'oklch(40% 0.01 270)',
         brand: 'oklch(65% 0.20 270)',
+        'brand-hover': 'oklch(from oklch(65% 0.20 270) calc(l - 8%) c h)',
         'mode-advise': 'oklch(65% 0.15 145)',
+        'mode-advise-hover': 'oklch(from oklch(65% 0.15 145) calc(l - 8%) c h)',
         'mode-ask': 'oklch(65% 0.15 220)',
+        'mode-ask-hover': 'oklch(from oklch(65% 0.15 220) calc(l - 8%) c h)',
         'mode-warn': 'oklch(70% 0.18 60)',
+        'mode-warn-hover': 'oklch(from oklch(70% 0.18 60) calc(l - 8%) c h)',
         'mode-pushback': 'oklch(68% 0.18 40)',
+        'mode-pushback-hover': 'oklch(from oklch(68% 0.18 40) calc(l - 8%) c h)',
         'mode-refuse': 'oklch(60% 0.20 25)',
+        'mode-refuse-hover': 'oklch(from oklch(60% 0.20 25) calc(l - 8%) c h)',
+        // ARC-51 additive tokens - see docs/ARC51_UI_CONTRACT.md §2.
+        // WHY literal oklch() here too, mirroring tokens.css: same JIT
+        // constraint documented in this file's own header comment.
+        'surface-void': 'oklch(9% 0.012 270)',
+        'surface-panel-hover': 'oklch(18% 0.015 270)',
+        'glow-cyan': 'oklch(75% 0.15 200)',
+        'glow-purple': 'oklch(65% 0.20 300)',
+        'glass-border': 'oklch(100% 0 0 / 0.08)',
       },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
