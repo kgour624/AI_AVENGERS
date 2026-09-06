@@ -12,7 +12,7 @@ import { Header } from './Header'
  */
 export function AppShell() {
   return (
-    <div className="flex h-screen flex-col bg-surface-void text-text-primary">
+    <div className="arc-atmosphere flex h-screen flex-col text-text-primary">
       <Header />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />

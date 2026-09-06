@@ -30,7 +30,7 @@ const NAV_ITEMS = [
  */
 export function AdminLayout() {
   return (
-    <div className="flex h-screen bg-surface-void text-text-primary">
+    <div className="arc-atmosphere flex h-screen text-text-primary">
       <aside className="w-56 flex-shrink-0 border-r border-glass-border bg-surface-raised/70 p-4 backdrop-blur-xl">
         <p className="mb-4 font-semibold tracking-wide [text-shadow:0_0_12px_var(--glow-purple)]">
           {'\u26A1'} AI Avengers Admin
