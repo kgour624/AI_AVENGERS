@@ -6,6 +6,10 @@ export interface CreateProjectRequest {
   name: string
   description?: string
 }
+// (Exported above - consumed by ProjectsEmptyHero.tsx's quick-start
+// templates, which call createProject() directly with the same type
+// CreateProjectModal.tsx uses, per ARC51_UI_CONTRACT.md §7's
+// non-negotiable "real API call, not decorative" rule.)
 
 export const getProjects = (options?: { signal?: AbortSignal }) =>
   baseAPI
