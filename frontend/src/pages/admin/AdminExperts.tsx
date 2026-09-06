@@ -67,7 +67,7 @@ function AdminExperts() {
 
       <div className="space-y-3">
         {experts?.map((expert) => (
-          <Card key={expert.id}>
+          <Card key={expert.id} glow="cyan">
             <div className="flex items-center justify-between">
               <p className="font-medium text-text-primary">{expert.name}</p>
               <Badge variant={expert.isActive ? 'brand' : 'neutral'}>
