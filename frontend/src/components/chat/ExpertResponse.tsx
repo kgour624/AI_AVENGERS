@@ -50,6 +50,7 @@ export interface ExpertResponseProps {
 
 export function ExpertResponse({ response, persistedMessageId, isStreaming }: ExpertResponseProps) {
   const [showReasoning, setShowReasoning] = useState(false)
+  const reduceMotion = useReducedMotion()
 
   // WHY guard on response.error before rendering the normal body: a
   // partially-failed expert (one expert's goroutine errored while
@@ -69,7 +70,15 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming }: Ex
   const segments = splitContentByCitations(response.content, response.citations)
 
   return (
-    <div className={cn('rounded-lg border border-surface-border bg-surface-raised p-4', isStreaming && 'opacity-80')}>
+    <motion.div
+      initial={reduceMotion ? undefined : { opacity: 0, y: 8 }}
+      animate={{ opacity: isStreaming ? 0.8 : 1, y: 0 }}
+      transition={{ duration: ARC_MOTION.panel, ease: ARC_MOTION.ease }}
+      className={cn(
+        'rounded-lg border-l-4 border-y border-r border-glass-border bg-surface-raised/80 p-4 backdrop-blur-xl',
+        MODE_BORDER_GLOW[response.mode]
+      )}
+    >
       <div className="mb-2 flex items-center justify-between">
         <p className="text-sm font-medium text-text-primary">{response.expertName}</p>
         <div className="flex items-center gap-2">
@@ -141,6 +150,6 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming }: Ex
           checks.
         </p>
       )}
-    </div>
+    </motion.div>
   )
 }
