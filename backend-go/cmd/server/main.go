@@ -396,12 +396,14 @@ func handleGetMe(svc *auth.AuthService) gin.HandlerFunc {
 			response.Unauthorized(c, "User not found")
 			return
 		}
+		// camelCase to match openapi.yaml User schema - see buildAuthResponse's
+		// comment above for why this is safe to change on the response side alone.
 		response.OK(c, map[string]interface{}{
-			"id":           user.ID,
-			"email":        user.Email,
-			"full_name":    user.FullName,
-			"role":         user.Role,
-			"totp_enabled": user.TOTPEnabled,
+			"id":          user.ID,
+			"email":       user.Email,
+			"fullName":    user.FullName,
+			"role":        user.Role,
+			"totpEnabled": user.TOTPEnabled,
 		})
 	}
 }
@@ -458,17 +460,24 @@ func clearRefreshCookie(c *gin.Context) {
 // It is set as an httpOnly cookie by the caller before calling this.
 // frontend/src/types/auth.ts explicitly documents this design.
 func buildAuthResponse(user *auth.User, tokens *auth.TokenPair) map[string]interface{} {
+	// WHY camelCase keys directly (not snake_case + frontend bridge):
+	// Interface-First audit (docs/INTERFACE_FIRST_CONTRACT.md §4) found
+	// this handler emitted snake_case while openapi.yaml's User/TokenPair
+	// schemas are camelCase. Go now owns the wire casing directly - the
+	// frontend's camelizeKeys() response interceptor is a safe no-op on
+	// already-camelCase keys (utils/casing.ts fast-paths keys with no
+	// underscore), so this is safe to change unilaterally on this side.
 	return map[string]interface{}{
 		"user": map[string]interface{}{
-			"id":           user.ID,
-			"email":        user.Email,
-			"full_name":    user.FullName,
-			"role":         user.Role,
-			"totp_enabled": user.TOTPEnabled,
+			"id":          user.ID,
+			"email":       user.Email,
+			"fullName":    user.FullName,
+			"role":        user.Role,
+			"totpEnabled": user.TOTPEnabled,
 		},
-		"token_pair": map[string]interface{}{
-			"access_token":       tokens.AccessToken,
-			"expires_in_seconds": int(time.Until(tokens.ExpiresAt).Seconds()),
+		"tokenPair": map[string]interface{}{
+			"accessToken":      tokens.AccessToken,
+			"expiresInSeconds": int(time.Until(tokens.ExpiresAt).Seconds()),
 		},
 	}
 }
@@ -644,10 +653,17 @@ func handleRefresh(jwtService *auth.JWTService) gin.HandlerFunc {
 		// Rotate cookie — new refresh token replaces old
 		setRefreshCookie(c, tokens.RefreshToken, jwtService.RefreshExpiryDays())
 
-		// Return only new access token — refresh token is in cookie
+		// Return only new access token — refresh token is in cookie.
+		// camelCase to match openapi.yaml TokenPair schema. NOTE: this
+		// endpoint's response is read by frontend/src/api/base.ts's
+		// refreshSession() via a RAW axios call that bypasses the
+		// camelizeKeys() interceptor entirely (by design, to avoid
+		// interceptor re-entrancy on a 401 from refresh itself) - that
+		// file was updated in the same commit as this change so the two
+		// sides do not drift even for one commit.
 		response.OK(c, map[string]interface{}{
-			"access_token":       tokens.AccessToken,
-			"expires_in_seconds": int(time.Until(tokens.ExpiresAt).Seconds()),
+			"accessToken":      tokens.AccessToken,
+			"expiresInSeconds": int(time.Until(tokens.ExpiresAt).Seconds()),
 		})
 	}
 }

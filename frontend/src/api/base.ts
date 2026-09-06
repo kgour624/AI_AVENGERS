@@ -87,17 +87,25 @@ export async function refreshSession(): Promise<string> {
   // on login). withCredentials:true makes the browser send it
   // automatically. JavaScript never touches the refresh token.
   //
-  // Response shape: { success, data: { access_token, expires_in_seconds }, meta }
+  // Response shape: { success, data: { accessToken, expiresInSeconds }, meta }
   // (refresh token is NOT in response body — it's rotated in the cookie)
+  //
+  // WHY camelCase here now: backend-go/cmd/server/main.go's handleRefresh
+  // was updated in this same commit to emit camelCase directly (Interface-
+  // First audit, docs/INTERFACE_FIRST_CONTRACT.md §4). This call bypasses
+  // baseAPI's camelizeKeys() response interceptor on purpose (raw axios,
+  // to avoid interceptor re-entrancy if refresh itself 401s), so it reads
+  // the wire shape directly - it must be updated in lockstep with the
+  // backend handler, not left to drift.
   const res = await axios.post<{
     success: boolean
-    data: { access_token: string; expires_in_seconds: number }
+    data: { accessToken: string; expiresInSeconds: number }
   }>(
     `${import.meta.env.VITE_API_URL}/api/v1/auth/refresh`,
     {},
     { withCredentials: true }
   )
-  const newToken = res.data.data.access_token
+  const newToken = res.data.data.accessToken
   useAuthStore.getState().setAccessToken(newToken)
   return newToken
 }
