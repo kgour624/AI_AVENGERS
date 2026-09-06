@@ -192,4 +192,11 @@ No section starts until the previous one is verified. This document is updated w
 - Sidebar's project list now uses `motion.ul`/`motion.li` with the shared `staggerContainer`/`fadeUp` variants (§3), capped at `ARC_MOTION.maxStaggerItems` per motion.ts's own documented consumer-side cap.
 - Active project indicator changed from a `\u25b8` text-prefix to a `border-glow-purple` left-border (same signal, different visual language — not a regression, a presentational swap).
 
-### Next: §7 Projects empty-state HUD hero + quick-start templates (order 7). This is the biggest remaining section — real `createProject` calls behind the quick-start templates, not decorative buttons, per §1's non-negotiable rule.
+### §7 Projects empty-state HUD hero — VERIFIED ✅
+- `ProjectsEmptyHero.tsx` (new): glowing rotating AI-core graphic (CSS, reuses `arc-ring-rotate`), heading/subtitle, `\u26A1 Initialize First Project` CTA (opens the existing `CreateProjectModal` — zero duplicate create-logic), and 3 quick-start blueprint templates.
+- **Non-negotiable rule enforced**: templates call the real `createProject()` API directly (same function the modal uses) with a pre-filled name/description — verified this is not a decorative mockup by tracing the exact call path before considering this done.
+- `ProjectsPage.tsx`: empty state renders `ProjectsEmptyHero`; non-empty state's grid now uses `motion.div`/`staggerContainer`/`fadeUp` (same pattern as Sidebar's §6 list). `handleCreated` unified so both the header's "+ New Project" button and the hero's CTA/templates share one revalidate+navigate path — no duplicated logic between the two entry points.
+- `ProjectCard.tsx`: added `glow="purple"` to its existing `<Card>` usage (backward-compatible prop from §5).
+- **Note on commit granularity**: this section was split into 4 small commits (new component → type doc-comment → page wiring → ProjectCard polish) after an earlier single large multi-file commit attempt was interrupted mid-flight and needed to be redone from scratch — smaller commits going forward reduce how much re-verification is needed if a single tool call fails partway through.
+
+### Next: §8 Wire `ExpertAvatar` into `ExpertCard`/`ExpertsPage` (order 8).
