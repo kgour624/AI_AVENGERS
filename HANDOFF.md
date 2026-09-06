@@ -1061,4 +1061,58 @@ String interpolation for the vector literal. Should use `pgvector.NewVector(embe
 
 ---
 
-*Last updated: 2026-09-05 (Complete audit)*
+---
+
+## \ud83d\udd27 BUG FIX BATCH \u2014 2026-09-06 (all reported bugs)
+
+> Admin ran `docker-compose up --build` locally and confirmed login
+> works end-to-end BEFORE this batch - the backend genuinely compiles
+> and runs (this is real, not assumed). All fixes below were made by
+> reading the actual current source first, not the design docs.
+
+| # | Bug | Status | Files |
+|---|---|---|---|
+| 1.1 | No Create Project entry point | \u2705 Fixed | `CreateProjectModal.tsx` (new), `ProjectsPage.tsx` |
+| 1.2 | Sidebar static stub, no real project list | \u2705 Fixed | `Sidebar.tsx` |
+| 1.3 | No logout/profile/nav, literal `\uXXXX` escapes in JSX text | \u2705 Fixed | `Header.tsx`, `api/auth.ts` (added `getMe`), `hooks/useAuth.ts` |
+| 1.4 | Admin sidebar had no nav links | \u2705 Fixed | `AdminLayout.tsx` |
+| 1.5 | No Create Expert entry point (`api/admin.ts::createExpert` did not actually exist, contrary to the bug report - added it) | \u2705 Fixed | `CreateExpertModal.tsx` (new), `AdminExperts.tsx`, `api/admin.ts` |
+| 1.6 | AdminSettings placeholder (was a deliberate decision, not an oversight - see HANDOFF's earlier entry) | \u2705 Fixed | `AdminSettings.tsx` (4 bespoke forms), `api/admin.ts` (added `getAdminSettings`/`updateAdminSetting`) |
+| 2.1 | "Refresh token never sent" | \u274c **Not a real bug** - see correction below | — |
+| 3.1 | `splitSentences` destroyed markdown/code | \u2705 Fixed | `chinawall/enforcer.go` |
+| 3.2 | FK violation on `master_event_log.message_id` (fabricated `uuid.New()`) | \u2705 Fixed | `memory/manager.go`, `orchestrator/orchestrator.go` |
+| 3.3 | Connected repo context never queried | \u2705 Fixed | `context/assembler.go` (new `getRepoChunks`) |
+| 3.4 | Citations never saved to `messages` | \u2705 Fixed | `chat/service.go`, `message/handler.go` |
+| 3.5 | `gate1WithLLM` dead code | \u2705 Fixed | `decision/engine.go` |
+| 4.1 | Warning/questions lost on reload | \u2705 Fixed | `types/project.ts`, `utils/adaptMessage.ts` |
+
+### Correction on bug 2.1 ("refresh token never sent")
+
+Verified against the actual code before fixing anything: `handleLogin`/
+`handleRegister`/`handleAdminLogin` in `main.go` all call
+`setRefreshCookie(c, tokens.RefreshToken, ...)` **before** writing the
+response - the httpOnly cookie IS set. `handleRefresh`'s body-fallback
+struct field has **no** `binding:"required"` tag, and the cookie is
+read first, body only as an unvalidated fallback for non-browser
+clients. The literal bug as described does not exist in this code.
+If a real 400 is observed on reload in a specific environment, the
+likely cause is something environment-specific (cookie domain/CORS
+between a dev proxy and the API origin) - worth a `curl` test against
+that specific setup, not a code fix, since the code's cookie logic is
+correct as written.
+
+### What changed the casing/contract layer (carried over from the Interface-First audit, same day)
+
+`buildAuthResponse`, `handleGetMe`, `handleRefresh` now emit camelCase
+directly (matching `openapi.yaml`), with `frontend/src/api/base.ts`'s
+`refreshSession()` updated in lockstep since it reads that endpoint's
+response raw (bypassing the `camelizeKeys()` interceptor by design).
+See `docs/INTERFACE_FIRST_CONTRACT.md` \u00a79 for the full audit.
+
+### Verification still needed (not done in this session - no Node/Go toolchain access)
+
+- `cd backend-go && go build ./...` - confirm all Go changes compile (RecordTurn's signature change touches 2 call sites, both updated, but not build-verified here)
+- `cd frontend && npm run build` - confirm all TS changes compile (new components, new API functions, Header/Sidebar/AdminLayout rewrites)
+- Manual QA: create a project, create an expert, send a chat message and check citations persist after reload, connect a repo and verify its chunks appear in an expert's answer, trigger a Gate 3 WARN and reload the page to confirm the warning text survives
+
+*Last updated: 2026-09-06 (Bug fix batch)*
