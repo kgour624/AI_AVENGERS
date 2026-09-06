@@ -38,15 +38,22 @@ function AdminStats() {
       ) : (
         <div className="space-y-2">
           {ratings?.map((r) => (
-            <Card key={r.expertName} className="flex items-center justify-between">
+            <Card key={r.expertName} glow="cyan" className="flex items-center justify-between">
               <div>
                 <p className="text-sm font-medium text-text-primary">{r.expertName}</p>
                 <p className="text-xs text-text-secondary">{r.domain}</p>
               </div>
               <div className="text-right">
-                <p className="text-sm">\u2b50 {r.avgScore.toFixed(1)} ({r.totalRatings})</p>
+                {/* Same bare-\uXXXX-in-JSX-text bug found repeatedly this
+                    session (Header, AdminDashboard, AdminClients,
+                    ProjectMemoryPanel) - this file had never been
+                    audited for it until now. Wrapped in {'...'}. */}
+                <p className="text-sm">
+                  {'\u2b50'} {r.avgScore.toFixed(1)} ({r.totalRatings})
+                </p>
                 <p className="text-xs text-text-disabled">
-                  {r.goodRatings} good \u00b7 {r.badRatings} bad
+                  {r.goodRatings} good{' \u00b7 '}
+                  {r.badRatings} bad
                 </p>
               </div>
             </Card>
@@ -63,8 +70,11 @@ function AdminStats() {
         <div className="space-y-1">
           {violations.map((v) => (
             <p key={v.id} className="text-sm text-text-secondary">
-              <span className="text-text-disabled">{formatRelativeTime(v.createdAt)}</span> \u00b7{' '}
-              {v.eventType} \u2014 {v.reasoning}
+              <span className="text-text-disabled">{formatRelativeTime(v.createdAt)}</span>
+              {' \u00b7 '}
+              {v.eventType}
+              {' \u2014 '}
+              {v.reasoning}
             </p>
           ))}
         </div>
