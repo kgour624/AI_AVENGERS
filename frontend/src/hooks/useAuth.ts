@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useAuthStore } from '@/stores/authStore'
 import { refreshSession } from '@/api/base'
+import { getMe } from '@/api/auth'
 
 /**
  * App-mount bootstrap: attempt a silent session restore via the
@@ -33,6 +34,21 @@ export function useAuthBootstrap() {
 
     let cancelled = false
     refreshSession()
+      .then(async (token) => {
+        // Bug 1.3 fix (docs bug list): populate the full user profile
+        // (fullName, email) so Header can display it - previously
+        // only `role` was ever recoverable after a reload, via the
+        // JWT-decode stopgap in authStore.isAdmin(), even though
+        // GET /auth/me exists precisely to restore the rest.
+        try {
+          const user = await getMe()
+          if (!cancelled) useAuthStore.getState().setAuth(user, token)
+        } catch {
+          // /me failed but the refresh itself succeeded - stay logged
+          // in with role-only info (the JWT-decode fallback still
+          // covers isAdmin()); not fatal enough to log the user out.
+        }
+      })
       .catch(() => {
         // No valid refresh cookie - this is the normal "not logged in"
         // case, not an error. AuthGuard will redirect to /login.

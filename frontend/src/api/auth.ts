@@ -18,3 +18,11 @@ export const adminLogin = (req: AdminLoginRequest) =>
     .then((res) => res.data.data!)
 
 export const logout = () => baseAPI.post('/api/v1/auth/logout').then((res) => res.data)
+
+// Bug 1.3 fix (docs bug list): GET /auth/me exists on the backend
+// specifically to restore the full profile after a hard reload
+// (HANDOFF.md Gap #2), but nothing on the frontend ever called it -
+// authStore.user stayed null forever after a reload, so Header had
+// no name/email to show even once this endpoint existed. Wired into
+// hooks/useAuth.ts's bootstrap flow.
+export const getMe = () => baseAPI.get<ApiResponse<User>>('/api/v1/auth/me').then((res) => res.data.data!)
