@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
+import { motion, useReducedMotion } from 'framer-motion'
 import type { ExpertResponse as ExpertResponseType } from '@/types/expert'
 import { ModeBadge } from '@/components/ui/Badge'
 import { CitationChip } from './CitationChip'
@@ -7,6 +8,22 @@ import { CodeBlock } from './CodeBlock'
 import { RatingWidget } from './RatingWidget'
 import { splitContentByCitations } from '@/utils/parseCitations'
 import { cn } from '@/utils/cn'
+import { ARC_MOTION } from '@/design-system/motion'
+
+/**
+ * ARC-51 §9 (docs/ARC51_UI_CONTRACT.md): mode -> left-border glow
+ * color, reusing the EXISTING product-semantic mode colors (§2's
+ * rule: mode colors encode Gate/China Wall output, never repurposed
+ * as decoration elsewhere). Not a new color system - just a new place
+ * these already-meaningful colors get used.
+ */
+const MODE_BORDER_GLOW: Record<ExpertResponseType['mode'], string> = {
+  ADVISE: 'border-l-mode-advise shadow-[-4px_0_16px_-8px_var(--color-advise)]',
+  ASK: 'border-l-mode-ask shadow-[-4px_0_16px_-8px_var(--color-ask)]',
+  WARN: 'border-l-mode-warn shadow-[-4px_0_16px_-8px_var(--color-warn)]',
+  PUSH_BACK: 'border-l-mode-pushback shadow-[-4px_0_16px_-8px_var(--color-pushback)]',
+  REFUSE: 'border-l-mode-refuse shadow-[-4px_0_16px_-8px_var(--color-refuse)]',
+}
 
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 9 ("This is the core value
