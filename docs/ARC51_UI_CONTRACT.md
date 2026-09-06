@@ -181,4 +181,15 @@ No section starts until the previous one is verified. This document is updated w
 - Reduced-motion contract honored: `useReducedMotion()` swaps the spring variant for an opacity-only one at `duration: 0`, rather than skipping `AnimatePresence` (it still needs to control mount/unmount timing even with motion disabled).
 - Cleanup: removed the now-fully-unused `.modal-enter`/`.modal-closing` classes and `@keyframes modal-in`/`modal-out` from `animations.css` — verified nothing else referenced them before deleting, not assumed.
 
-### Next: §5 `Card.tsx` glow prop + Button press/hover polish (order 5). §6 (Header/Sidebar glass) depends on this, so doing it next keeps §7's order intact.
+### §5 Card + Button polish — VERIFIED ✅
+- `tailwind.config.ts`: added `transitionTimingFunction.arc` so `ease-arc` is usable as a utility class everywhere (exposes `--ease-arc` from §1's tokens.css addition).
+- `Card.tsx`: new optional `glow?: 'cyan'|'purple'|'none'` prop, default `'none'` — renders pixel-identical to the pre-ARC-51 Card when omitted. Every existing `<Card>` usage (AdminClients, AdminExperts, AdminDashboard, ProjectCard, etc.) needed zero changes.
+- `Button.tsx`: `active:scale-95` press feedback + `ease-arc` transition, scoped to exact properties (`background-color,transform,box-shadow`) rather than `transition-all`, to never accidentally animate a layout-affecting property. Disabled buttons don't scale (`disabled:active:scale-100`).
+
+### §6 Header/Sidebar glass — VERIFIED ✅
+- `AppShell.tsx`: `bg-surface-base` → `bg-surface-void` (§2 token) so the glass Header/Sidebar read as floating above the page.
+- `Header.tsx`/`Sidebar.tsx`: `border-glass-border` + `bg-surface-raised/70 backdrop-blur-xl` glass treatment. **Every handler/hook is untouched** (`toggleSidebar`, `handleLogout`, `useQuery(queryKeys.projects.all)`, `useParams` active-project detection) — confirmed by construction, since only `className` strings and a motion wrapper were added, no logic lines changed.
+- Sidebar's project list now uses `motion.ul`/`motion.li` with the shared `staggerContainer`/`fadeUp` variants (§3), capped at `ARC_MOTION.maxStaggerItems` per motion.ts's own documented consumer-side cap.
+- Active project indicator changed from a `\u25b8` text-prefix to a `border-glow-purple` left-border (same signal, different visual language — not a regression, a presentational swap).
+
+### Next: §7 Projects empty-state HUD hero + quick-start templates (order 7). This is the biggest remaining section — real `createProject` calls behind the quick-start templates, not decorative buttons, per §1's non-negotiable rule.
