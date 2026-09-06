@@ -9,6 +9,7 @@ import { RepoStatus } from '@/components/project/RepoStatus'
 import { ChatList } from '@/components/project/ChatList'
 import { ProjectExpertManager } from '@/components/project/ProjectExpertManager'
 import { ProjectTimeline } from '@/components/project/ProjectTimeline'
+import { ProjectMemoryPanel } from '@/components/project/ProjectMemoryPanel'
 import { EditProjectModal } from '@/components/project/EditProjectModal'
 import { Button } from '@/components/ui/Button'
 
@@ -86,6 +87,11 @@ export default function ProjectPage() {
 
       <div className="mt-6">
         <ChatList projectId={project.id} />
+      </div>
+
+      <div className="mt-6">
+        <p className="mb-1 text-sm font-medium text-text-secondary">Cross-Expert Decisions</p>
+        <ProjectMemoryPanel projectId={project.id} />
       </div>
 
       <div className="mt-6">

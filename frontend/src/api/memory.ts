@@ -1,6 +1,6 @@
 import { baseAPI } from './base'
 import type { ApiResponse } from '@/types/api'
-import type { L3Event } from '@/types/memory'
+import type { L3Event, L2Entry } from '@/types/memory'
 
 /**
  * Source: confirmed reachable in cmd/server/main.go's first (real)
@@ -18,6 +18,19 @@ import type { L3Event } from '@/types/memory'
 export const getProjectTimeline = (projectId: string, options?: { signal?: AbortSignal }) =>
   baseAPI
     .get<ApiResponse<L3Event[]>>(`/api/v1/projects/${projectId}/timeline`, {
+      signal: options?.signal,
+    })
+    .then((res) => res.data.data!)
+
+// Feature #5 fix (docs bug list): GET /projects/:id/memory existed as
+// a route, but its handler was repointed in this same batch
+// (backend-go/internal/memory/manager.go's new GetProjectMemory) - it
+// previously called the SAME method /timeline calls (a real backend
+// bug, not just a missing frontend call), so this function did not
+// exist here until that was fixed.
+export const getProjectMemory = (projectId: string, options?: { signal?: AbortSignal }) =>
+  baseAPI
+    .get<ApiResponse<L2Entry[]>>(`/api/v1/projects/${projectId}/memory`, {
       signal: options?.signal,
     })
     .then((res) => res.data.data!)
