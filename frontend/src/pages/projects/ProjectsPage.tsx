@@ -15,7 +15,12 @@ import { fadeUp, staggerContainer, ARC_MOTION } from '@/design-system/motion'
  * ("Route only defines path. Component owns its data requirements.").
  */
 async function loader({ request }: LoaderFunctionArgs) {
-  const projects = await getProjects({ signal: request.signal })
+  // Defensive fallback: getProjects() resolves via a TS non-null
+  // assertion that the backend's data field is never undefined/null -
+  // that is a compile-time promise only, not a runtime guarantee.
+  // The component calls .length/.map on this directly, so it must
+  // always receive a real array here.
+  const projects = (await getProjects({ signal: request.signal })) ?? []
   return { projects }
 }
 
