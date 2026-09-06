@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { LoaderFunctionArgs } from 'react-router-dom'
-import { useLoaderData, useNavigate, useRevalidator, Outlet } from 'react-router-dom'
+import { useLoaderData, useNavigate, useRevalidator, Outlet, Link } from 'react-router-dom'
 import { getProject, deleteProject } from '@/api/projects'
 import { getProjectTimeline } from '@/api/memory'
 import type { Project } from '@/types/project'
@@ -56,6 +56,12 @@ export default function ProjectPage() {
 
   return (
     <div className="p-6">
+      <Link
+        to="/"
+        className="mb-3 inline-flex items-center gap-1 text-sm text-text-secondary hover:text-text-primary"
+      >
+        {'\u2190'} Back to Projects
+      </Link>
       <div className="flex items-start justify-between">
         <div>
           <h1 className="text-xl font-semibold">{project.name}</h1>
