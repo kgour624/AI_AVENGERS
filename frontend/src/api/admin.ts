@@ -103,6 +103,11 @@ export const getIngestionJobs = (expertId: string) =>
     .get<ApiResponse<IngestionJob[]>>(`/api/v1/admin/experts/${expertId}/jobs`)
     .then((res) => res.data.data!)
 
+// Feature #7 fix (docs bug list): projectCount/messageCount added -
+// previously ListClients returned neither, so there was no data for
+// the frontend to show beyond the enable/disable toggle. Both are now
+// real backend aggregates (admin_handler.go's ListClients), not
+// frontend-side guesses.
 export interface AdminClient {
   id: string
   email: string
@@ -110,6 +115,8 @@ export interface AdminClient {
   isActive: boolean
   lastLogin?: string
   createdAt: string
+  projectCount: number
+  messageCount: number
 }
 
 export const getAdminClients = () =>

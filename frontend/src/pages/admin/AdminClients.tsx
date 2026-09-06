@@ -9,13 +9,14 @@ import { formatRelativeTime } from '@/utils/format'
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 11 ("Client Management -
  * View all clients, Enable/disable clients, View client projects and
- * usage"). The "view projects and usage" part of that list has NO
- * backing endpoint anywhere in either design doc or the real
- * ListClients handler - it only returns id/email/fullName/isActive/
- * lastLogin/createdAt, nothing about that client's projects. Omitted
- * rather than fabricated; flagged in HANDOFF.md as a backend gap if
- * that drill-down view is actually wanted.
- */
+ * usage").
+ *
+ * Feature #7 fix (docs bug list): ListClients previously returned
+ * only id/email/fullName/isActive/lastLogin/createdAt - the "usage"
+ * part of the wireframe had nothing to render. Backend now returns
+ * real projectCount/messageCount aggregates (admin_handler.go), shown
+ * below instead of being fabricated client-side.
+ */</br>
 function AdminClients() {
   const queryClient = useQueryClient()
   const { data: clients, isLoading } = useQuery({
@@ -50,9 +51,11 @@ function AdminClients() {
             <div>
               <p className="font-medium text-text-primary">{client.fullName}</p>
               <p className="text-xs text-text-secondary">{client.email}</p>
-              {client.lastLogin && (
-                <p className="text-xs text-text-disabled">Last login: {formatRelativeTime(client.lastLogin)}</p>
-              )}
+              <p className="text-xs text-text-disabled">
+                {client.projectCount} project{client.projectCount === 1 ? '' : 's'} \u00b7{' '}
+                {client.messageCount} message{client.messageCount === 1 ? '' : 's'} sent
+                {client.lastLogin && <> \u00b7 Last login: {formatRelativeTime(client.lastLogin)}</>}
+              </p>
             </div>
             <div className="flex items-center gap-2">
               <Badge variant={client.isActive ? 'brand' : 'neutral'}>
