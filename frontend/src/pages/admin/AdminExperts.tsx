@@ -7,6 +7,7 @@ import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { TranscriptUploadModal } from '@/components/admin/TranscriptUploadModal'
 import { CreateExpertModal } from '@/components/admin/CreateExpertModal'
+import { EditCharterModal } from '@/components/admin/EditCharterModal'
 import { useIngestionStatus } from '@/hooks/useIngestionStatus'
 
 /**
@@ -44,6 +45,7 @@ function AdminExperts() {
   const queryClient = useQueryClient()
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null)
   const [isCreateOpen, setIsCreateOpen] = useState(false)
+  const [charterTargetId, setCharterTargetId] = useState<string | null>(null)
 
   return (
     <div className="p-6">
@@ -81,7 +83,8 @@ function AdminExperts() {
               <Button variant="secondary" size="sm" onClick={() => setUploadTargetId(expert.id)}>
                 Upload Transcript
               </Button>
-              <Button variant="ghost" size="sm" disabled title="Charter editing UI - not yet built">
+              {/* Feature #1 fix (docs bug list): was permanently disabled. */}
+              <Button variant="ghost" size="sm" onClick={() => setCharterTargetId(expert.id)}>
                 Edit Charter
               </Button>
             </div>
@@ -108,6 +111,26 @@ function AdminExperts() {
         onClose={() => setIsCreateOpen(false)}
         onCreated={() => queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })}
       />
+
+      {charterTargetId && (
+        <EditCharterModal
+          isOpen={charterTargetId !== null}
+          onClose={() => setCharterTargetId(null)}
+          expertId={charterTargetId}
+          expertName={experts?.find((e) => e.id === charterTargetId)?.name ?? ''}
+          // WHY '' not experts?.find(...)?.reasoningCharter: the admin
+          // experts list endpoint (getAdminExperts) does not select
+          // reasoning_charter at all (verified against ListExperts'
+          // SQL - only stats columns), so there is nothing to seed the
+          // textarea with beyond empty. Editing still works (PATCH
+          // replaces the value); this only means the admin can't see
+          // the CURRENT charter text before overwriting it, which is a
+          // real remaining gap worth a follow-up (add reasoning_charter
+          // to ListExperts' SELECT) rather than something fixable here.
+          currentCharter=""
+          onSaved={() => queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })}
+        />
+      )}
     </div>
   )
 }

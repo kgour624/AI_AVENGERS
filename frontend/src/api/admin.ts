@@ -42,6 +42,18 @@ import type { Expert } from '@/types/expert'
 export const getAdminExperts = () =>
   baseAPI.get<ApiResponse<Expert[]>>('/api/v1/admin/experts').then((res) => res.data.data!)
 
+// Feature #1 fix (docs bug list): PATCH /admin/experts/:id already
+// existed and accepts reasoningCharter (verified against
+// admin_handler.go's UpdateExpert - it also accepts name/isActive,
+// but description is silently ignored despite being bindable; only
+// wiring the field this feature actually needs).
+export const updateExpertCharter = (expertId: string, reasoningCharter: string) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/experts/${expertId}`, {
+      reasoningCharter,
+    })
+    .then((res) => res.data.data!)
+
 // Bug 1.5 fix (docs bug list): the real backend route
 // (POST /admin/experts -> AdminHandler.CreateExpert) was already
 // registered, but no frontend function ever called it and no UI
