@@ -68,6 +68,20 @@ export default function ProjectsPage() {
         )}
       </div>
 
+      {projects.length > 0 && (
+        <div className="mb-6 flex gap-6 rounded-lg border border-glass-border bg-surface-raised/50 px-4 py-3 backdrop-blur-xl">
+          <div>
+            <p className="text-xs uppercase tracking-wide text-text-disabled">Active Experts</p>
+            <p className="text-lg font-semibold text-glow-cyan">{activeExpertsCount}</p>
+          </div>
+          <div className="w-px bg-glass-border" />
+          <div>
+            <p className="text-xs uppercase tracking-wide text-text-disabled">Repository Links</p>
+            <p className="text-lg font-semibold text-glow-purple">{connectedRepoCount}</p>
+          </div>
+        </div>
+      )}
+
       {projects.length === 0 ? (
         <ProjectsEmptyHero onCreated={handleCreated} />
       ) : (
