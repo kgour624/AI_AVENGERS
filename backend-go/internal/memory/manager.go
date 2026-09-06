@@ -169,6 +169,75 @@ func (m *Manager) RecordTurn(
 	}()
 }
 
+// ProjectMemoryEntry is an L2 group-memory record enriched with the
+// expert's display name, for the project's consolidated cross-expert
+// decisions view (feature gap #5, docs bug list).
+type ProjectMemoryEntry struct {
+	ID            uuid.UUID `json:"id"`
+	ProjectID     uuid.UUID `json:"projectId"`
+	ExpertID      uuid.UUID `json:"expertId"`
+	ExpertName    string    `json:"expertName"`
+	MemoryType    string    `json:"memoryType"`
+	Content       string    `json:"content"`
+	Context       string    `json:"context"`
+	TurnReference int       `json:"turnReference"`
+	Importance    int       `json:"importance"`
+	IsSuperseded  bool      `json:"isSuperseded"`
+	CreatedAt     time.Time `json:"createdAt"`
+}
+
+// GetProjectMemory returns L2 group-memory entries (decisions any
+// expert made in this project), enriched with expert names.
+//
+// Feature #5 fix (docs bug list): GET /projects/:id/memory already
+// existed as a registered route, but its handler
+// (handleGetProjectMemory, cmd/server/main.go) called GetTimeline -
+// the exact same L3 event-log method /timeline calls, just with
+// limit=20 instead of 50. It never queried project_memory_l2 at all,
+// despite L2Store.GetRecent already existing and doing the right
+// query (just without the expert-name join a UI needs). This is the
+// real L2 fetch; main.go's handler is repointed to call it in the
+// same commit as this change.
+//
+// WHY camelCase JSON tags directly (not snake_case): this endpoint
+// was never in openapi.yaml (found missing during the Interface-First
+// audit, docs/INTERFACE_FIRST_CONTRACT.md) - since it needs adding to
+// the spec anyway, it is added camelCase from the start, matching the
+// §4 locked decision (Go owns wire casing directly, no frontend bridge).
+func (m *Manager) GetProjectMemory(ctx context.Context, projectID uuid.UUID, limit int) ([]ProjectMemoryEntry, error) {
+	rows, err := m.l2.db.Query(ctx,
+		`SELECT l2.id, l2.project_id, l2.expert_id, e.name, l2.memory_type, l2.content,
+		        COALESCE(l2.context,''), COALESCE(l2.turn_reference,0),
+		        l2.importance, l2.is_superseded, l2.created_at
+		 FROM project_memory_l2 l2
+		 JOIN experts e ON e.id = l2.expert_id
+		 WHERE l2.project_id=$1 AND l2.is_superseded=FALSE
+		 ORDER BY l2.importance DESC, l2.created_at DESC
+		 LIMIT $2`,
+		projectID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var entries []ProjectMemoryEntry
+	for rows.Next() {
+		var e ProjectMemoryEntry
+		if err := rows.Scan(
+			&e.ID, &e.ProjectID, &e.ExpertID, &e.ExpertName, &e.MemoryType, &e.Content,
+			&e.Context, &e.TurnReference, &e.Importance, &e.IsSuperseded, &e.CreatedAt,
+		); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	if entries == nil {
+		entries = []ProjectMemoryEntry{}
+	}
+	return entries, nil
+}
+
 // RecordViolation logs a China Wall violation to L3.
 func (m *Manager) RecordViolation(
 	ctx context.Context,

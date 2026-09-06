@@ -91,7 +91,15 @@ type OAuthConfig struct {
 	GitHubClientSecret string
 	GitLabClientID     string
 	GitLabClientSecret string
-	BaseURL            string // e.g. https://api.yourdomain.com
+	BaseURL            string // e.g. https://api.yourdomain.com - used to build the redirect_uri GitHub/GitLab sends the browser BACK to (this backend's own /repo/callback route)
+	// FrontendURL fix (feature #6, docs bug list): OAuthCallback
+	// previously returned raw JSON as the response to a top-level
+	// browser navigation (the OAuth provider redirects the browser
+	// itself here, not an XHR call) - the user would see a bare JSON
+	// page after authorizing, not land back in the SPA. This is where
+	// the callback redirects the browser TO once the connection
+	// succeeds or fails - a different URL than BaseURL above.
+	FrontendURL string // e.g. https://app.yourdomain.com
 }
 
 type RateLimitConfig struct {
@@ -170,6 +178,7 @@ func Load() (*Config, error) {
 			GitLabClientID:     v.GetString("GITLAB_CLIENT_ID"),
 			GitLabClientSecret: v.GetString("GITLAB_CLIENT_SECRET"),
 			BaseURL:            v.GetString("BASE_URL"),
+			FrontendURL:        v.GetString("FRONTEND_URL"),
 		},
 		RateLimit: RateLimitConfig{
 			PerIP:   v.GetInt("RATE_LIMIT_PER_IP"),
@@ -301,6 +310,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.OAuth.BaseURL == "" {
 		c.OAuth.BaseURL = "http://localhost:8080"
+	}
+	if c.OAuth.FrontendURL == "" {
+		c.OAuth.FrontendURL = "http://localhost:3000"
 	}
 	if c.RateLimit.PerIP == 0 {
 		c.RateLimit.PerIP = 100

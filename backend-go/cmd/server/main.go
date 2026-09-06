@@ -348,7 +348,13 @@ func buildRouter(
 // ============================================================
 
 // handleGetProjectMemory GET /projects/:id/memory
-// Returns L2 project memory entries for the timeline UI.
+// Returns L2 group-memory entries (cross-expert decisions).
+//
+// Feature #5 fix (docs bug list): this handler previously called
+// memManager.GetTimeline (L3 event log) - the SAME method
+// handleGetProjectTimeline below calls, just with a different limit.
+// It never queried L2 (project_memory_l2) at all. Repointed to the
+// real L2 fetch, memManager.GetProjectMemory (memory/manager.go).
 func handleGetProjectMemory(memManager *memory.Manager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		projectID, err := uuid.Parse(c.Param("id"))
@@ -356,12 +362,12 @@ func handleGetProjectMemory(memManager *memory.Manager) gin.HandlerFunc {
 			response.BadRequest(c, "INVALID_ID", "invalid project ID")
 			return
 		}
-		events, err := memManager.GetTimeline(c.Request.Context(), projectID, 20, 0)
+		entries, err := memManager.GetProjectMemory(c.Request.Context(), projectID, 20)
 		if err != nil {
 			response.InternalError(c)
 			return
 		}
-		response.OK(c, events)
+		response.OK(c, entries)
 	}
 }
 
