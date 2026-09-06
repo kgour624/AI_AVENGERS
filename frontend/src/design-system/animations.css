@@ -46,3 +46,42 @@
 .thinking-indicator {
   animation: pulse-thinking 1.4s ease-in-out infinite;
 }
+
+/* ARC-51 — ExpertAvatar status ring (components/expert/ExpertAvatar.tsx).
+   CSS, not framer-motion, per docs/ARC51_UI_CONTRACT.md §3: this runs
+   continuously per-card, so a JS-driven animation would be needless
+   overhead for a purely decorative infinite loop. */
+@keyframes arc-ring-rotate {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.arc-avatar-ring-analyzing {
+  animation: arc-ring-rotate 2.2s linear infinite;
+}
+
+@keyframes arc-ring-pulse-once {
+  0% {
+    box-shadow: 0 0 0 0 currentColor;
+    opacity: 1;
+  }
+  100% {
+    box-shadow: 0 0 0 8px transparent;
+    opacity: 0.9;
+  }
+}
+
+.arc-avatar-ring-responded {
+  animation: arc-ring-pulse-once 500ms var(--ease-arc, ease-out) 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .arc-avatar-ring-analyzing,
+  .arc-avatar-ring-responded {
+    animation: none;
+  }
+}
