@@ -76,3 +76,40 @@ Not in scope: rewriting business logic. If a re-point reveals the generated type
 4. CI platform: repo pushes directly to main, no MRs - does Phase 4 mean a .gitlab-ci.yml running on every push to main (report-only), or a pre-push local hook?
 
 No implementation begins until these four are answered.
+
+## 9. Phase 1 Progress Log
+
+**Prerequisite for Q3 confirmed:** admin ran `docker-compose up` locally, backend and frontend both started successfully, login worked end-to-end. This confirms the duplicate-buildRouter fix (HANDOFF.md) is real - `main.go` has exactly one `buildRouter` definition, verified by reading the full 687-line file. Phase 1's route diff below is against a backend confirmed to actually compile and run, not an assumption.
+
+**Finding 1 - FIXED: response casing violated the spec.** `main.go`'s `buildAuthResponse`, `handleGetMe`, and `handleRefresh` emitted snake_case (`full_name`, `totp_enabled`, `token_pair`, `access_token`, `expires_in_seconds`) while `openapi.yaml`'s `User`/`TokenPair`/`AuthResponse` schemas are camelCase - a real, live contract violation, not a hypothetical. Per §4's locked decision (Go owns camelCase directly), fixed on the Go side.
+
+Cross-checked before touching anything, per the project's own rule (frontend + backend together, not backend alone):
+- `frontend/src/utils/casing.ts`'s `camelizeKeys()` fast-paths any key with no underscore - confirmed switching backend to camelCase is a safe no-op for every response that goes through `baseAPI`'s interceptor (`buildAuthResponse`, `handleGetMe`).
+- `frontend/src/api/base.ts`'s `refreshSession()` uses a **raw** `axios.post` call that bypasses `camelizeKeys()` entirely (deliberate, to avoid interceptor re-entrancy if refresh itself 401s) and read `res.data.data.access_token` directly. Changing `handleRefresh`'s response casing without also fixing this call in the same commit would have broken token refresh silently. Both were fixed together in one commit.
+- Request-side snake_case bindings (`RegisterRequest.FullName` still binds `json:"full_name"`, refresh's body-fallback field still binds `json:"refresh_token"`) were **deliberately left unchanged** - `frontend/src/api/base.ts`'s request interceptor still calls `snakeifyKeys()` on outgoing bodies today, so the current snake_case request bindings are still correct and working. Changing these now, without also removing the frontend's outgoing snakeify step in the same change, would break register. This is Phase 2/4 scope (removing the casing bridge entirely), not this fix.
+
+**Finding 2 - GAP, not yet fixed: `openapi.yaml` is missing ~18 real, registered routes.** Diffed the spec's `paths:` section (ends at `/messages/{id}/rate`) against every route actually registered in `main.go`'s `buildRouter`. Missing entirely from the spec:
+
+```
+GET  /repo/oauth/:provider
+GET  /repo/callback/:provider
+POST /projects/:id/repo
+POST /projects/:id/repo/sync
+GET  /projects/:id/repo/status
+GET  /projects/:id/memory
+GET  /projects/:id/timeline
+GET  /admin/experts
+POST /admin/experts
+PATCH /admin/experts/:id
+POST /admin/experts/:id/ingest
+GET  /admin/experts/:id/jobs
+GET  /admin/clients
+PATCH /admin/clients/:id
+GET  /admin/stats
+GET  /admin/violations
+GET  /admin/ratings
+GET  /admin/settings
+PATCH /admin/settings/:key
+```
+
+Not fabricating schemas for these yet - each needs its real response shape read from the actual handler/service first (`repo/service.go`, `admin/admin_handler.go`, `memory/manager.go`), same discipline as the casing fix above. This is the next concrete Phase 1 task, pending confirmation to proceed.
