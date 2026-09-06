@@ -38,6 +38,8 @@ export default {
         'surface-panel-hover': 'oklch(18% 0.015 270)',
         'glow-cyan': 'oklch(75% 0.15 200)',
         'glow-purple': 'oklch(65% 0.20 300)',
+        'glow-amber': 'oklch(78% 0.16 80)',
+        'glow-violet': 'oklch(62% 0.22 320)',
         'glass-border': 'oklch(100% 0 0 / 0.08)',
       },
       fontFamily: {

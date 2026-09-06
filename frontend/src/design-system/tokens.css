@@ -75,6 +75,8 @@ body {
   --surface-panel-hover: oklch(18% 0.015 270);
   --glow-cyan: oklch(75% 0.15 200);
   --glow-purple: oklch(65% 0.2 300);
+  --glow-amber: oklch(78% 0.16 80);
+  --glow-violet: oklch(62% 0.22 320);
   --glass-border: oklch(100% 0 0 / 0.08);
   --ease-arc: cubic-bezier(0.16, 1, 0.3, 1);
 }
