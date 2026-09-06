@@ -301,12 +301,31 @@ func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 // ============================================================
 
 // ListClients GET /admin/clients
+//
+// Feature #7 fix (docs bug list): previously returned only
+// id/email/full_name/is_active/last_login/created_at - no way to see
+// a client's activity at all. Added project_count and message_count
+// as correlated subqueries rather than fabricating them on the
+// frontend (there was no data to fabricate FROM). message_count only
+// counts role='user' rows (messages the client actually sent), not
+// assistant responses, so it reads as "how many times has this client
+// asked something" rather than double-counting both sides of a turn.
 func (h *AdminHandler) ListClients(c *gin.Context) {
 	rows, err := h.db.Query(c.Request.Context(), `
-		SELECT id, email, full_name, is_active, last_login, created_at
-		FROM users
-		WHERE role='client' AND deleted_at IS NULL
-		ORDER BY created_at DESC`)
+		SELECT u.id, u.email, u.full_name, u.is_active, u.last_login, u.created_at,
+		       COALESCE((
+		           SELECT COUNT(*) FROM projects p
+		           WHERE p.client_id = u.id AND p.deleted_at IS NULL
+		       ), 0) AS project_count,
+		       COALESCE((
+		           SELECT COUNT(*) FROM messages m
+		           JOIN chats c2 ON c2.id = m.chat_id
+		           JOIN projects p2 ON p2.id = c2.project_id
+		           WHERE p2.client_id = u.id AND m.role = 'user'
+		       ), 0) AS message_count
+		FROM users u
+		WHERE u.role='client' AND u.deleted_at IS NULL
+		ORDER BY u.created_at DESC`)
 	if err != nil {
 		response.InternalError(c)
 		return
@@ -314,17 +333,22 @@ func (h *AdminHandler) ListClients(c *gin.Context) {
 	defer rows.Close()
 
 	type clientRow struct {
-		ID        uuid.UUID  `json:"id"`
-		Email     string     `json:"email"`
-		FullName  string     `json:"full_name"`
-		IsActive  bool       `json:"is_active"`
-		LastLogin *time.Time `json:"last_login"`
-		CreatedAt time.Time  `json:"created_at"`
+		ID           uuid.UUID  `json:"id"`
+		Email        string     `json:"email"`
+		FullName     string     `json:"full_name"`
+		IsActive     bool       `json:"is_active"`
+		LastLogin    *time.Time `json:"last_login"`
+		CreatedAt    time.Time  `json:"created_at"`
+		ProjectCount int        `json:"project_count"`
+		MessageCount int        `json:"message_count"`
 	}
 	var clients []clientRow
 	for rows.Next() {
 		var cl clientRow
-		if err := rows.Scan(&cl.ID, &cl.Email, &cl.FullName, &cl.IsActive, &cl.LastLogin, &cl.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&cl.ID, &cl.Email, &cl.FullName, &cl.IsActive, &cl.LastLogin, &cl.CreatedAt,
+			&cl.ProjectCount, &cl.MessageCount,
+		); err != nil {
 			continue
 		}
 		clients = append(clients, cl)
