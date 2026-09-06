@@ -199,4 +199,8 @@ No section starts until the previous one is verified. This document is updated w
 - `ProjectCard.tsx`: added `glow="purple"` to its existing `<Card>` usage (backward-compatible prop from §5).
 - **Note on commit granularity**: this section was split into 4 small commits (new component → type doc-comment → page wiring → ProjectCard polish) after an earlier single large multi-file commit attempt was interrupted mid-flight and needed to be redone from scratch — smaller commits going forward reduce how much re-verification is needed if a single tool call fails partway through.
 
-### Next: §8 Wire `ExpertAvatar` into `ExpertCard`/`ExpertsPage` (order 8).
+### §8 ExpertAvatar wired into ExpertCard/ExpertsPage — VERIFIED ✅
+- `ExpertCard.tsx`: added `<ExpertAvatar domain={expert.domain} status="idle" size="md" />` next to the name, `glow="cyan"` on its `<Card>`. Status is always `'idle'` here deliberately — this is a static browsing list with no live SSE stream reaching it; `'analyzing'`/`'responded'` states are reserved for §9 (chat interface) where they're actually true.
+- `ExpertsPage.tsx`: list wrapped in the same `staggerContainer`/`fadeUp` pattern as §6/§7. `onViewTopics` wiring (feature #4 fix, earlier session) untouched.
+
+### Next: §9 Chat interface — StreamingIndicator (real ExpertAvatar analyzing state), ExpertResponse card polish, citation chip hover (order 9).
