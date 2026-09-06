@@ -2,6 +2,7 @@ import type { Expert } from '@/types/expert'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
+import { ExpertAvatar } from '@/components/expert/ExpertAvatar'
 
 /**
  * Expert selection/discovery card.
@@ -38,14 +39,22 @@ function ratingStars(avgRating: number): string {
 
 export function ExpertCard({ expert, onViewTopics, onAddToProject, isAdded }: ExpertCardProps) {
   return (
-    <Card>
+    // ARC-51 §8 (docs/ARC51_UI_CONTRACT.md): glow="cyan" (§5's
+    // backward-compatible Card prop) + ExpertAvatar (§4) - this is a
+    // static browsing list (no live SSE stream reaching this page), so
+    // status is always 'idle'. 'analyzing'/'responded' states are
+    // wired where they actually apply live: §9 (chat interface).
+    <Card glow="cyan">
       <div className="flex items-start justify-between gap-4">
-        <div>
-          <p className="font-medium text-text-primary">{expert.name}</p>
-          <p className="mt-1 text-sm text-text-secondary">
-            Domain: {expert.domain} | Depth: {depthLabel(expert.avgDepthLevel)} (
-            {expert.avgDepthLevel.toFixed(1)}/5)
-          </p>
+        <div className="flex items-center gap-3">
+          <ExpertAvatar domain={expert.domain} status="idle" size="md" />
+          <div>
+            <p className="font-medium text-text-primary">{expert.name}</p>
+            <p className="mt-1 text-sm text-text-secondary">
+              Domain: {expert.domain} | Depth: {depthLabel(expert.avgDepthLevel)} (
+              {expert.avgDepthLevel.toFixed(1)}/5)
+            </p>
+          </div>
         </div>
         <Badge variant="brand">{expert.totalTopics} topics</Badge>
       </div>
