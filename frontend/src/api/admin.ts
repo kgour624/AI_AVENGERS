@@ -42,6 +42,24 @@ import type { Expert } from '@/types/expert'
 export const getAdminExperts = () =>
   baseAPI.get<ApiResponse<Expert[]>>('/api/v1/admin/experts').then((res) => res.data.data!)
 
+// Bug 1.5 fix (docs bug list): the real backend route
+// (POST /admin/experts -> AdminHandler.CreateExpert) was already
+// registered, but no frontend function ever called it and no UI
+// button/modal existed either - confirmed by reading
+// admin_handler.go's CreateExpert directly: it requires name/slug/
+// domain (description optional) and returns {id, slug}.
+export interface CreateExpertRequest {
+  name: string
+  slug: string
+  domain: string
+  description?: string
+}
+
+export const createExpert = (req: CreateExpertRequest) =>
+  baseAPI
+    .post<ApiResponse<{ id: string; slug: string }>>('/api/v1/admin/experts', req)
+    .then((res) => res.data.data!)
+
 export const ingestTranscript = (expertId: string, file: File) => {
   const formData = new FormData()
   // WHY "transcript", not "file": confirmed against

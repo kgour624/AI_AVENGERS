@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { TranscriptUploadModal } from '@/components/admin/TranscriptUploadModal'
+import { CreateExpertModal } from '@/components/admin/CreateExpertModal'
 import { useIngestionStatus } from '@/hooks/useIngestionStatus'
 
 /**
@@ -42,11 +43,16 @@ function AdminExperts() {
   })
   const queryClient = useQueryClient()
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null)
+  const [isCreateOpen, setIsCreateOpen] = useState(false)
 
   return (
     <div className="p-6">
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-xl font-semibold">Experts</h1>
+        {/* Bug 1.5 fix (docs bug list): no way to create a new expert
+            existed anywhere on this page - only per-existing-expert
+            actions (Upload Transcript, disabled Edit Charter). */}
+        <Button onClick={() => setIsCreateOpen(true)}>+ New Expert</Button>
       </div>
 
       {isLoading && (
@@ -96,6 +102,12 @@ function AdminExperts() {
           }}
         />
       )}
+
+      <CreateExpertModal
+        isOpen={isCreateOpen}
+        onClose={() => setIsCreateOpen(false)}
+        onCreated={() => queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })}
+      />
     </div>
   )
 }
