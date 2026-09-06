@@ -1,8 +1,23 @@
+import { Link } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
 import { getAdminStats } from '@/api/admin'
 import { Card } from '@/components/ui/Card'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { formatCostUsd } from '@/utils/format'
+
+/**
+ * Quick Actions - this page had zero primary action buttons (no way to
+ * create an expert, manage clients, or reach settings from here - only
+ * read-only stat cards). AdminLayout's sidebar covers navigation; these
+ * are the specific next-actions the dashboard's own stats naturally
+ * lead to (e.g. "Clients: 1" -> Manage Clients).
+ */
+const QUICK_ACTIONS = [
+  { to: '/admin/experts', label: '+ New Expert' },
+  { to: '/admin/clients', label: 'Manage Clients' },
+  { to: '/admin/stats', label: 'View Ratings & Violations' },
+  { to: '/admin/settings', label: 'Settings' },
+]
 
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 11 ("Admin Dashboard"
@@ -43,6 +58,18 @@ export default function AdminDashboard() {
     <div className="p-6">
       <h1 className="mb-6 text-xl font-semibold">System Overview</h1>
 
+      <div className="mb-6 flex flex-wrap gap-2">
+        {QUICK_ACTIONS.map((action) => (
+          <Link
+            key={action.to}
+            to={action.to}
+            className="rounded-md bg-surface-overlay px-3 py-1.5 text-sm text-text-primary hover:bg-surface-border"
+          >
+            {action.label}
+          </Link>
+        ))}
+      </div>
+
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         <Card>
           <p className="text-xs text-text-secondary">Experts</p>
@@ -78,7 +105,13 @@ export default function AdminDashboard() {
 
       <Card className="mt-4">
         <p className="text-sm text-text-secondary">Average rating across experts</p>
-        <p className="mt-1 text-lg font-medium">{stats.avgRating} \u2b50</p>
+        {/* WHY {'\u2b50'} not bare \u2b50: JSX text nodes (unquoted,
+            between tags) do NOT interpret \uXXXX escapes - only actual
+            JS string literals do. Bare here would render the literal
+            6-character sequence instead of the star glyph, same class
+            of bug already found and fixed in Header.tsx/AdminLayout.tsx -
+            this file was simply never audited for it until now. */}
+        <p className="mt-1 text-lg font-medium">{stats.avgRating} {'\u2b50'}</p>
       </Card>
     </div>
   )
