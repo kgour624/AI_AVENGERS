@@ -109,7 +109,7 @@ export default function LoginPage() {
           {'\u26A1'} AI AVENGERS
         </h1>
         <p className="mb-6 text-center text-sm text-text-secondary">
-          Neural Command Center \u2014 Multi-Agent Domain Expert Simulator
+          Neural Command Center {'\u2014'} Multi-Agent Domain Expert Simulator
         </p>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
