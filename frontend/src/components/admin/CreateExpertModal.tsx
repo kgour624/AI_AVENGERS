@@ -126,11 +126,13 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
     <Modal isOpen={isOpen} onClose={handleClose}>
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         <h2 className="text-lg font-semibold text-text-primary">New Expert</h2>
+
+        {/* Required fields */}
         <Input
           label="Name"
           value={name}
           onChange={(e) => handleNameChange(e.target.value)}
-          placeholder="Arpit Bhiyani \u2014 System Design"
+          placeholder="Arpit Bhiyani — System Design"
           autoFocus
         />
         <Input
@@ -160,6 +162,131 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
             className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand"
           />
         </div>
+
+        {/* Advanced Config — collapsible */}
+        <div className="rounded-md border border-surface-border">
+          <button
+            type="button"
+            onClick={() => setShowAdvanced((v) => !v)}
+            className="flex w-full items-center justify-between px-3 py-2 text-sm text-text-secondary hover:text-text-primary"
+          >
+            <span>Advanced Config</span>
+            <span>{showAdvanced ? '\u25b2' : '\u25bc'}</span>
+          </button>
+
+          {showAdvanced && (
+            <div className="flex flex-col gap-4 border-t border-surface-border px-3 pb-3 pt-3">
+
+              {/* Model Tier */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm text-text-secondary">
+                  Model Tier
+                  <span className="ml-1 text-xs text-text-disabled">
+                    (cheap=DeepSeek, strong=Claude, fast=Gemini)
+                  </span>
+                </label>
+                <select
+                  value={modelTier}
+                  onChange={(e) => setModelTier(e.target.value as typeof modelTier)}
+                  className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+                >
+                  <option value="strong">strong — Claude (answer generation)</option>
+                  <option value="cheap">cheap — DeepSeek (tagging, metadata)</option>
+                  <option value="fast">fast — Gemini (quick checks)</option>
+                </select>
+              </div>
+
+              {/* Loop Pattern */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm text-text-secondary">
+                  Loop Pattern
+                  <span className="ml-1 text-xs text-text-disabled">
+                    (how this expert reasons)
+                  </span>
+                </label>
+                <select
+                  value={loopPattern}
+                  onChange={(e) => setLoopPattern(e.target.value as typeof loopPattern)}
+                  className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+                >
+                  <option value="react">react — Reason+Act (exploratory, thought is precious)</option>
+                  <option value="ota">ota — Observe-Think-Act (code generation, short loops)</option>
+                  <option value="plan_execute">plan_execute — Plan then Execute (structured tasks)</option>
+                </select>
+              </div>
+
+              {/* Temperature + Top-P side by side */}
+              <div className="grid grid-cols-2 gap-3">
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-sm text-text-secondary">
+                    Temperature
+                    <span className="ml-1 text-xs text-text-disabled">(0.0–2.0)</span>
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={2}
+                    step={0.1}
+                    value={temperature}
+                    onChange={(e) => setTemperature(e.target.value)}
+                    className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+                  />
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-sm text-text-secondary">
+                    Top-P
+                    <span className="ml-1 text-xs text-text-disabled">(0.0–1.0)</span>
+                  </label>
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={topP}
+                    onChange={(e) => setTopP(e.target.value)}
+                    className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+                  />
+                </div>
+              </div>
+
+              {/* Max Loop Iterations */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm text-text-secondary">
+                  Max Loop Iterations
+                  <span className="ml-1 text-xs text-text-disabled">(1–50, cost safety cap)</span>
+                </label>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  step={1}
+                  value={maxLoopIterations}
+                  onChange={(e) => setMaxLoopIterations(e.target.value)}
+                  className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+                />
+              </div>
+
+              {/* Allowed Tools */}
+              <div className="flex flex-col gap-1.5">
+                <label className="text-sm text-text-secondary">
+                  Allowed Tools
+                  <span className="ml-1 text-xs text-text-disabled">
+                    (comma-separated, e.g. PostArtifact,AskExpert)
+                  </span>
+                </label>
+                <input
+                  type="text"
+                  value={allowedToolsRaw}
+                  onChange={(e) => setAllowedToolsRaw(e.target.value)}
+                  placeholder="PostArtifact, AskExpert, ReadBlackboard"
+                  className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand"
+                />
+              </div>
+
+            </div>
+          )}
+        </div>
+
         {error && <p className="text-xs text-mode-refuse">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button type="button" variant="ghost" onClick={handleClose}>
