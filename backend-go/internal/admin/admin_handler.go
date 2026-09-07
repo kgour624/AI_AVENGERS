@@ -225,11 +225,15 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 
 	// Start background ingestion
 	// WHY goroutine: Ingestion takes minutes. Client gets job ID immediately.
+	// WHY replaceExisting=false: append mode per DOMAIN_EXPERT_COLLABORATION_DESIGN.md §5.4.
+	// Admin uploading a new transcript adds to the corpus; full-retrain (true) is a
+	// separate explicit operation reserved for Phase B.
 	go func() {
 		_, err := h.ingestion.IngestTranscript(
 			context.Background(),
 			jobID, expertID, expertName,
 			string(content), header.Filename,
+			false, // replaceExisting=false → append mode
 		)
 		if err != nil {
 			h.logger.Error("ingestion failed",
