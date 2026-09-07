@@ -17,56 +17,15 @@ import (
 	"ai_avengers/backend/internal/gateway/providers"
 )
 
-// openRouterRequest/Response kept temporarily for getActiveProvider/getAPIKey
-// which still read from DB. Will be cleaned up in next pass.
-type openRouterRequest struct {
-	Model       string              `json:"model"`
-	Messages    []openRouterMessage `json:"messages"`
-	MaxTokens   int                 `json:"max_tokens"`
-	Temperature float64             `json:"temperature"`
-}
-type openRouterMessage struct {
-	Role         string        `json:"role"`
-	Content      string        `json:"content"`
-	CacheControl *cacheControl `json:"cache_control,omitempty"`
-}
-type cacheControl struct { Type string `json:"type"` }
-type openRouterResponse struct {
-	Choices []struct { Message struct { Content string `json:"content"` } `json:"message"` } `json:"choices"`
-	Usage   struct { PromptTokens int `json:"prompt_tokens"`; CompletionTokens int `json:"completion_tokens"` } `json:"usage"`
-	Model   string `json:"model"`
-}
-
-// ModelType identifies which LLM to use.
-// WHY three tiers:
-// cheap  — fast, low cost, for metadata/tagging/coverage checks
-// strong — best quality, for answer generation and charter extraction
-// fast   — balanced, for quick checks
-type ModelType string
-
-const (
-	ModelCheap  ModelType = "cheap"
-	ModelStrong ModelType = "strong"
-	ModelFast   ModelType = "fast"
-)
-
-// providerURLs kept for backward compat with getActiveProvider/getAPIKey.
-// New code uses LLMProvider interface instead.
-var providerURLs = map[config.LLMProvider]string{
-	config.ProviderOpenRouter: "https://openrouter.ai/api/v1",
-	config.ProviderDeepSeek:   "https://api.deepseek.com/v1",
-	config.ProviderAnthropic:  "https://api.anthropic.com/v1",
-	config.ProviderGemini:     "https://generativelanguage.googleapis.com/v1beta/openai",
-}
-
 // LLMRequest is the input to the model gateway.
+// Uses ModelType from gateway/types (re-exported via provider.go).
 type LLMRequest struct {
 	Model        ModelType
 	SystemPrompt string
 	UserPrompt   string
 	MaxTokens    int
 	Temperature  float64
-	UseCache     bool // Cache identical prompts
+	UseCache     bool
 }
 
 // LLMResponse is the output from the model gateway.
@@ -80,65 +39,26 @@ type LLMResponse struct {
 	DurationMs   float64
 }
 
-// openRouterRequest is the OpenRouter API request format.
-type openRouterRequest struct {
-	Model       string              `json:"model"`
-	Messages    []openRouterMessage `json:"messages"`
-	MaxTokens   int                 `json:"max_tokens"`
-	Temperature float64             `json:"temperature"`
-}
-
-// openRouterMessage is a single message in the conversation.
-type openRouterMessage struct {
-	Role         string        `json:"role"`
-	Content      string        `json:"content"`
-	CacheControl *cacheControl `json:"cache_control,omitempty"`
-}
-
-// cacheControl enables Anthropic-style prompt caching via OpenRouter.
-// WHY: System prompts are identical across calls to same expert.
-// Caching saves 40-60% on token costs for repeated expert calls.
-type cacheControl struct {
-	Type string `json:"type"` // "ephemeral"
-}
-
-// openRouterResponse is the OpenRouter API response format.
-type openRouterResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
-	} `json:"usage"`
-	Model string `json:"model"`
-}
-
-// providerURLs maps provider → base URL for the chat completions endpoint.
-var providerURLs = map[config.LLMProvider]string{
-	config.ProviderOpenRouter: "https://openrouter.ai/api/v1",
-	config.ProviderDeepSeek:   "https://api.deepseek.com/v1",
-	config.ProviderAnthropic:  "https://api.anthropic.com/v1",
-	config.ProviderGemini:     "https://generativelanguage.googleapis.com/v1beta/openai",
-}
-
 // ModelGateway is the single interface for all LLM calls.
 // Delegates all provider-specific concerns to LLMProvider interface.
-// To add a new provider: implement LLMProvider, register in buildProvider().
+//
+// To add a new provider:
+//   1. Create internal/gateway/providers/myprovider.go
+//   2. Implement gateway/types.LLMProvider interface
+//   3. Add a case in buildProvider() below
+//   Nothing else changes.
 type ModelGateway struct {
 	cfg        config.LLMConfig
-	db         *pgxpool.Pool
+	db         *pgxpool.Pool // nil = env config only, no DB override
 	httpClient *http.Client
 	cache      sync.Map
 	totalCost  atomic.Value
 	callCount  atomic.Int64
 	logger     *zap.Logger
-	// provider is built lazily and cached. Rebuilt when active provider changes.
+	// provider is built lazily, cached, rebuilt when active provider changes.
 	providerMu   sync.RWMutex
-	providerName string      // last built provider name
-	provider     LLMProvider // current active implementation
+	providerName string
+	provider     LLMProvider
 }
 
 // NewModelGateway creates a new model gateway.
@@ -152,11 +72,14 @@ func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 	return g
 }
 
-// buildProvider creates the correct LLMProvider implementation.
-// Called when provider changes or on first use.
-// WHY factory here not in constructor:
-//   Active provider may change at runtime (admin panel).
-//   DB is not available at construction time.
+// SetDB wires the database pool for runtime settings override.
+// Called from main.go after DB connects.
+func (g *ModelGateway) SetDB(db *pgxpool.Pool) {
+	g.db = db
+}
+
+// buildProvider creates the correct LLMProvider implementation for the
+// currently active provider. Called lazily on first use and on change.
 func (g *ModelGateway) buildProvider(ctx context.Context) LLMProvider {
 	providerName := string(g.getActiveProvider(ctx))
 	apiKey := g.getAPIKey(ctx, config.LLMProvider(providerName))
@@ -185,32 +108,19 @@ func (g *ModelGateway) getProvider(ctx context.Context) LLMProvider {
 	}
 	g.providerMu.RUnlock()
 
-	// Rebuild
 	newProvider := g.buildProvider(ctx)
 	g.providerMu.Lock()
 	g.provider = newProvider
 	g.providerName = currentName
 	g.providerMu.Unlock()
 
-	g.logger.Info("LLM provider switched", zap.String("provider", currentName))
+	g.logger.Info("LLM provider active", zap.String("provider", currentName))
 	return newProvider
 }
 
-// Call makes an LLM call via OpenRouter.
-// Retries up to 3 times with exponential backoff on failure.
-// Caches responses if UseCache=true.
-//
-// Mental execution:
-// Input: {Model: cheap, UserPrompt: "tag this turn", MaxTokens: 200}
-// 1. Check cache — miss
-// 2. Build OpenRouter request
-// 3. POST to OpenRouter
-// 4. Parse response
-// 5. Track cost
-// 6. Cache result
-// 7. Return content
 // Call makes an LLM call via the active provider.
-// Provider resolved at call time — switching in admin panel takes effect immediately.
+// Provider is resolved at call time — switching provider in admin panel
+// takes effect on the next Call() with no restart needed.
 func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, error) {
 	if req.UseCache {
 		if cached, ok := g.cache.Load(g.cacheKey(req)); ok {
@@ -223,8 +133,12 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 	provider := g.getProvider(ctx)
 
 	maxTokens := req.MaxTokens
-	if maxTokens <= 0 { maxTokens = 2000 }
-	if provMax := provider.MaxTokens(req.Model); maxTokens > provMax { maxTokens = provMax }
+	if maxTokens <= 0 {
+		maxTokens = 2000
+	}
+	if provMax := provider.MaxTokens(req.Model); maxTokens > provMax {
+		maxTokens = provMax
+	}
 
 	var messages []ProviderMessage
 	if req.SystemPrompt != "" {
@@ -233,8 +147,11 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 	messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
 
 	provReq := ProviderRequest{
-		ModelTier: req.Model, Messages: messages,
-		MaxTokens: maxTokens, Temperature: req.Temperature, EnableCache: req.UseCache,
+		ModelTier:   req.Model,
+		Messages:    messages,
+		MaxTokens:   maxTokens,
+		Temperature: req.Temperature,
+		EnableCache: req.UseCache,
 	}
 
 	var lastErr error
@@ -255,40 +172,50 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			g.logger.Warn("LLM call attempt failed",
 				zap.Int("attempt", attempt+1),
 				zap.String("provider", provider.Name()),
-				zap.Error(err))
+				zap.Error(err),
+			)
 			continue
 		}
 
 		duration := time.Since(start)
 		inCost, outCost := provider.CostPer1K(req.Model)
-		cost := float64(provResp.InputTokens)/1000*inCost + float64(provResp.OutputTokens)/1000*outCost
+		cost := float64(provResp.InputTokens)/1000*inCost +
+			float64(provResp.OutputTokens)/1000*outCost
 
 		currentCost := g.totalCost.Load().(float64)
 		g.totalCost.Store(currentCost + cost)
 		g.callCount.Add(1)
 
 		result := &LLMResponse{
-			Content: provResp.Content, InputTokens: provResp.InputTokens,
-			OutputTokens: provResp.OutputTokens, CostUSD: cost,
-			ModelUsed: provResp.ModelUsed, DurationMs: float64(duration.Milliseconds()),
+			Content:      provResp.Content,
+			InputTokens:  provResp.InputTokens,
+			OutputTokens: provResp.OutputTokens,
+			CostUSD:      cost,
+			ModelUsed:    provResp.ModelUsed,
+			DurationMs:   float64(duration.Milliseconds()),
 		}
+
 		g.logger.Info("LLM call complete",
 			zap.String("provider", provider.Name()),
 			zap.String("tier", string(req.Model)),
 			zap.Float64("cost_usd", cost),
-			zap.Float64("duration_ms", result.DurationMs))
+			zap.Float64("duration_ms", result.DurationMs),
+		)
 
-		if req.UseCache { g.cache.Store(g.cacheKey(req), result) }
+		if req.UseCache {
+			g.cache.Store(g.cacheKey(req), result)
+		}
 		return result, nil
 	}
 	return nil, fmt.Errorf("all LLM attempts failed: %w", lastErr)
 }
 
-// SetDB wires the database pool for runtime settings override.
-// Called from main.go after DB connects.
-// WHY separate from constructor: gateway is created before DB connects.
-func (g *ModelGateway) SetDB(db *pgxpool.Pool) {
-	g.db = db
+// GetStats returns usage statistics.
+func (g *ModelGateway) GetStats() map[string]interface{} {
+	return map[string]interface{}{
+		"total_calls": g.callCount.Load(),
+		"total_cost":  g.totalCost.Load().(float64),
+	}
 }
 
 // getActiveProvider reads the active LLM provider from DB system_settings.
@@ -300,7 +227,6 @@ func (g *ModelGateway) getActiveProvider(ctx context.Context) config.LLMProvider
 			`SELECT value FROM system_settings WHERE key = 'llm_provider'`,
 		).Scan(&valueJSON)
 		if err == nil && len(valueJSON) > 0 {
-			// value is JSONB string like "\"openrouter\"" or "\"deepseek\""
 			var provider string
 			if json.Unmarshal(valueJSON, &provider) == nil && provider != "" {
 				return config.LLMProvider(provider)
@@ -316,7 +242,6 @@ func (g *ModelGateway) getActiveProvider(ctx context.Context) config.LLMProvider
 // getAPIKey returns the API key for the given provider.
 // DB value (from admin panel) takes precedence over env var.
 func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvider) string {
-	// Check DB override first
 	if g.db != nil {
 		var valueJSON []byte
 		err := g.db.QueryRow(ctx,
@@ -331,7 +256,6 @@ func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvide
 			}
 		}
 	}
-	// Fall back to env var
 	switch provider {
 	case config.ProviderDeepSeek:
 		return g.cfg.DeepSeekAPIKey
@@ -339,179 +263,12 @@ func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvide
 		return g.cfg.AnthropicAPIKey
 	case config.ProviderGemini:
 		return g.cfg.GeminiAPIKey
-	default: // openrouter
+	default:
 		return g.cfg.OpenRouterAPIKey
 	}
 }
 
-// callProvider routes an LLM call to the correct provider.
-// Replaces callOpenRouter() — same OpenAI-compatible format for all providers.
-func (g *ModelGateway) callProvider(
-	ctx context.Context,
-	modelName string,
-	messages []openRouterMessage,
-	maxTokens int,
-	temperature float64,
-) (*openRouterResponse, error) {
-	provider := g.getActiveProvider(ctx)
-	apiKey := g.getAPIKey(ctx, provider)
-	if apiKey == "" {
-		return nil, fmt.Errorf("no API key configured for provider %s", provider)
-	}
-
-	baseURL, ok := providerURLs[provider]
-	if !ok {
-		baseURL = providerURLs[config.ProviderOpenRouter]
-	}
-	// Allow env override of base URL (for OpenRouter custom endpoints)
-	if provider == config.ProviderOpenRouter && g.cfg.OpenRouterBaseURL != "" {
-		baseURL = strings.TrimRight(g.cfg.OpenRouterBaseURL, "/")
-	}
-
-	reqBody := openRouterRequest{
-		Model:       modelName,
-		Messages:    messages,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-	}
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("marshal request: %w", err)
-	}
-
-	httpReq, err := http.NewRequestWithContext(
-		ctx, http.MethodPost,
-		baseURL+"/chat/completions",
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-
-	httpReq.Header.Set("Content-Type", "application/json")
-	// Anthropic uses x-api-key; everyone else uses Authorization: Bearer
-	if provider == config.ProviderAnthropic {
-		httpReq.Header.Set("x-api-key", apiKey)
-		httpReq.Header.Set("anthropic-version", "2023-06-01")
-	} else {
-		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
-	}
-	if provider == config.ProviderOpenRouter {
-		httpReq.Header.Set("HTTP-Referer", "https://ai-avengers.app")
-		httpReq.Header.Set("X-Title", "AI Avengers")
-	}
-
-	resp, err := g.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("provider %s returned status %d", provider, resp.StatusCode)
-	}
-
-	var result openRouterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("decode response: %w", err)
-	}
-	if len(result.Choices) == 0 {
-		return nil, fmt.Errorf("no choices in response from %s", provider)
-	}
-	return &result, nil
-}
-
-// GetStats returns usage statistics.
-func (g *ModelGateway) GetStats() map[string]interface{} {
-	return map[string]interface{}{
-		"total_calls": g.callCount.Load(),
-		"total_cost":  g.totalCost.Load().(float64),
-	}
-}
-
-// callOpenRouter makes the actual HTTP call to OpenRouter.
-// Supports prompt caching for system prompts (40-60% cost reduction).
-//
-// WHY prompt caching (Byte by Byte AI course):
-// Course taught: LLMs process tokens sequentially.
-// System prompt is the same for every call to the same expert.
-// Anthropic/OpenRouter supports prefix caching: system prompt
-// is cached after first call, subsequent calls only pay for new tokens.
-// For 1000 calls with 500-token system prompt: saves 500,000 tokens.
-func (g *ModelGateway) callOpenRouter(
-	ctx context.Context,
-	modelName string,
-	messages []openRouterMessage,
-	maxTokens int,
-	temperature float64,
-) (*openRouterResponse, error) {
-	// Enable cache_control on system message if present
-	// This tells Anthropic/OpenRouter to cache the system prompt prefix
-	for i, msg := range messages {
-		if msg.Role == "system" {
-			messages[i].CacheControl = &cacheControl{Type: "ephemeral"}
-			break
-		}
-	}
-
-	reqBody := openRouterRequest{
-		Model:       modelName,
-		Messages:    messages,
-		MaxTokens:   maxTokens,
-		Temperature: temperature,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		g.cfg.OpenRouterBaseURL+"/chat/completions",
-		bytes.NewReader(body),
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", "Bearer "+g.cfg.OpenRouterAPIKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("HTTP-Referer", "https://ai-avengers.app")
-	req.Header.Set("X-Title", "AI Avengers")
-
-	resp, err := g.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("OpenRouter returned status %d", resp.StatusCode)
-	}
-
-	var openRouterResp openRouterResponse
-	if err := json.NewDecoder(resp.Body).Decode(&openRouterResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	if len(openRouterResp.Choices) == 0 {
-		return nil, fmt.Errorf("no choices in response")
-	}
-
-	return &openRouterResp, nil
-}
-
-// calculateCost computes the USD cost of an LLM call.
-func (g *ModelGateway) calculateCost(cfg modelConfig, inputTokens, outputTokens int) float64 {
-	inputCost := float64(inputTokens) / 1000 * cfg.CostPer1KInput
-	outputCost := float64(outputTokens) / 1000 * cfg.CostPer1KOutput
-	return inputCost + outputCost
-}
-
-// cacheKey generates a cache key for a request.
-// WHY hash: Prevents memory issues with long prompts as map keys.
+// cacheKey generates a stable cache key for a request.
 func (g *ModelGateway) cacheKey(req LLMRequest) string {
 	return fmt.Sprintf("%s:%s:%s", req.Model, req.SystemPrompt, req.UserPrompt)
 }
