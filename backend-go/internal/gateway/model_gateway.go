@@ -94,18 +94,24 @@ type openRouterResponse struct {
 	Model string `json:"model"`
 }
 
+// providerURLs maps provider → base URL for the chat completions endpoint.
+var providerURLs = map[config.LLMProvider]string{
+	config.ProviderOpenRouter: "https://openrouter.ai/api/v1",
+	config.ProviderDeepSeek:   "https://api.deepseek.com/v1",
+	config.ProviderAnthropic:  "https://api.anthropic.com/v1",
+	config.ProviderGemini:     "https://generativelanguage.googleapis.com/v1beta/openai",
+}
+
 // ModelGateway is the single interface for all LLM calls.
 // Handles: model routing, cost tracking, caching, retry with backoff.
-//
-// WHY single gateway:
-// All LLM calls go through one place — easy to add logging, cost limits,
-// model switching, and caching without touching business logic.
+// Supports multiple LLM providers — active provider read from DB at call time.
 type ModelGateway struct {
 	cfg        config.LLMConfig
+	db         interface{ QueryRow(ctx context.Context, sql string, args ...interface{}) interface{ Scan(dest ...interface{}) error } } // pgxpool.Pool interface
 	httpClient *http.Client
 	models     map[ModelType]modelConfig
-	cache      sync.Map // key: hash(model+prompt) → *LLMResponse
-	totalCost  atomic.Value // float64
+	cache      sync.Map
+	totalCost  atomic.Value
 	callCount  atomic.Int64
 	logger     *zap.Logger
 }
