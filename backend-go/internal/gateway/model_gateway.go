@@ -30,12 +30,13 @@ const (
 	ModelFast   ModelType = "fast"
 )
 
-// modelConfig holds per-model settings.
-type modelConfig struct {
-	Name              string
-	CostPer1KInput    float64
-	CostPer1KOutput   float64
-	MaxTokens         int
+// providerURLs kept for backward compat with getActiveProvider/getAPIKey.
+// New code uses LLMProvider interface instead.
+var providerURLs = map[config.LLMProvider]string{
+	config.ProviderOpenRouter: "https://openrouter.ai/api/v1",
+	config.ProviderDeepSeek:   "https://api.deepseek.com/v1",
+	config.ProviderAnthropic:  "https://api.anthropic.com/v1",
+	config.ProviderGemini:     "https://generativelanguage.googleapis.com/v1beta/openai",
 }
 
 // LLMRequest is the input to the model gateway.
