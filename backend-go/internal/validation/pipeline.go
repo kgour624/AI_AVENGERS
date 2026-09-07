@@ -128,7 +128,7 @@ func (p *Pipeline) Validate(ctx context.Context, req ArtifactRequest) *PipelineR
 		)
 
 		// All revision rounds exhausted
-		if round == MaxRevisionRounds {
+		if round == maxRevisionRounds {
 			return &PipelineResult{
 				Passed:         false,
 				Language:       lang,
