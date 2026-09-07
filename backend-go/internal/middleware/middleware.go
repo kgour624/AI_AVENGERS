@@ -27,11 +27,45 @@ import (
 // Frontend runs on localhost:3000, backend on localhost:8080.
 // Different ports = different origin = browser enforces CORS.
 // Without this, every API call fails with "Network Error" in browser.
+// isPrivateIP returns true if the host part of an origin is a private network IP.
+// Used to auto-allow local network origins in development mode.
+func isPrivateIP(origin string) bool {
+	// Strip scheme and port: "http://192.168.1.7:3000" -> "192.168.1.7"
+	host := origin
+	if idx := strings.Index(host, "://"); idx != -1 {
+		host = host[idx+3:]
+	}
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	return strings.HasPrefix(host, "192.168.") ||
+		strings.HasPrefix(host, "10.") ||
+		strings.HasPrefix(host, "172.16.") ||
+		strings.HasPrefix(host, "172.17.") ||
+		strings.HasPrefix(host, "172.18.") ||
+		strings.HasPrefix(host, "172.19.") ||
+		strings.HasPrefix(host, "172.2") ||
+		strings.HasPrefix(host, "172.30.") ||
+		strings.HasPrefix(host, "172.31.")
+}
+
+// matchesWildcard checks if origin matches a wildcard pattern like "http://192.168.1.*:3000".
+func matchesWildcard(origin, pattern string) bool {
+	if !strings.Contains(pattern, "*") {
+		return false
+	}
+	parts := strings.SplitN(pattern, "*", 2)
+	return strings.HasPrefix(origin, parts[0]) && strings.HasSuffix(origin, parts[1])
+}
+
 func CORSMiddleware(allowedOrigins []string) gin.HandlerFunc {
 	allowedSet := make(map[string]bool, len(allowedOrigins))
 	for _, o := range allowedOrigins {
 		allowedSet[strings.TrimRight(o, "/")] = true
 	}
+
+	// Detect development mode: if "*" is in the list or SERVER_ENV=development
+	devMode := allowedSet["*"]
 
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
@@ -40,8 +74,25 @@ func CORSMiddleware(allowedOrigins []string) gin.HandlerFunc {
 		allowOrigin := ""
 		if allowedSet[origin] {
 			allowOrigin = origin
-		} else if len(allowedOrigins) == 1 && allowedOrigins[0] == "*" {
+		} else if devMode {
 			allowOrigin = "*"
+		} else if isPrivateIP(origin) && c.GetHeader("X-Dev-Mode") == "" {
+			// Auto-allow private network IPs in development
+			// Check if any allowed origin is also a private IP (signals dev setup)
+			for allowed := range allowedSet {
+				if isPrivateIP(allowed) || strings.Contains(allowed, "localhost") {
+					allowOrigin = origin
+					break
+				}
+			}
+		} else {
+			// Check wildcard patterns like "http://192.168.1.*:3000"
+			for allowed := range allowedSet {
+				if matchesWildcard(origin, allowed) {
+					allowOrigin = origin
+					break
+				}
+			}
 		}
 
 		if allowOrigin != "" {
