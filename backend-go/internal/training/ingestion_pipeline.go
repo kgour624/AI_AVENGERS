@@ -222,6 +222,54 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.logger.Warn("failed to update expert stats", zap.Error(err))
 	}
 
+	// Step 10: Smoke test — verify the expert is actually retrievable.
+	// WHY here: chunks + capabilities are in DB, so retrieval is possible.
+	// WHY before marking complete: training_status must reflect real state.
+	smokeTestPassed, smokePassCount, smokeErr := p.runSmokeTest(ctx, expertID, expertName)
+	if smokeErr != nil {
+		p.logger.Warn("smoke test error (non-fatal, expert stays draft)",
+			zap.String("expert_id", expertID.String()),
+			zap.Error(smokeErr),
+		)
+	}
+
+	if smokeTestPassed {
+		// Mark expert as trained and publicly visible.
+		_, err = p.db.Exec(ctx,
+			`UPDATE experts SET
+				training_status = 'trained',
+				is_training = FALSE,
+				updated_at = NOW()
+			 WHERE id = $1`,
+			expertID,
+		)
+		if err != nil {
+			p.logger.Warn("failed to set training_status=trained", zap.Error(err))
+		}
+		p.logger.Info("smoke test PASSED — expert is trained",
+			zap.String("expert_id", expertID.String()),
+			zap.Int("probes_passed", smokePassCount),
+		)
+	} else {
+		// Keep expert in draft — ingestion succeeded but retrieval is weak.
+		// Admin should upload more transcripts and re-ingest.
+		_, err = p.db.Exec(ctx,
+			`UPDATE experts SET
+				training_status = 'draft',
+				is_training = FALSE,
+				updated_at = NOW()
+			 WHERE id = $1`,
+			expertID,
+		)
+		if err != nil {
+			p.logger.Warn("failed to reset training_status=draft", zap.Error(err))
+		}
+		p.logger.Warn("smoke test FAILED — expert stays in draft, upload more transcripts",
+			zap.String("expert_id", expertID.String()),
+			zap.Int("probes_passed", smokePassCount),
+		)
+	}
+
 	duration := time.Since(start).Milliseconds()
 	p.updateJobStatus(ctx, jobID, "complete", "", len(chunks), len(chunks))
 
@@ -230,6 +278,7 @@ func (p *IngestionPipeline) IngestTranscript(
 		zap.Int("chunks", len(chunks)),
 		zap.Int("topics", uniqueTopics),
 		zap.Int64("duration_ms", duration),
+		zap.Bool("smoke_test_passed", smokeTestPassed),
 	)
 
 	return &IngestionResult{
