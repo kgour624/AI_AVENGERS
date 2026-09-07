@@ -52,12 +52,38 @@ type JWTConfig struct {
 	RefreshExpiryDays   int
 }
 
+// LLMProvider identifies which LLM provider to use.
+// openrouter = single key, multiple models (default)
+// deepseek   = direct DeepSeek API
+// anthropic  = direct Anthropic API
+// gemini     = direct Google Gemini API
+type LLMProvider string
+
+const (
+	ProviderOpenRouter LLMProvider = "openrouter"
+	ProviderDeepSeek   LLMProvider = "deepseek"
+	ProviderAnthropic  LLMProvider = "anthropic"
+	ProviderGemini     LLMProvider = "gemini"
+)
+
 type LLMConfig struct {
-	OpenRouterAPIKey string
+	// OpenRouter (default multi-model gateway)
+	OpenRouterAPIKey  string
 	OpenRouterBaseURL string
-	ModelCheap       string
-	ModelStrong      string
-	ModelFast        string
+
+	// Direct provider keys (optional — used when Provider != openrouter)
+	DeepSeekAPIKey  string
+	AnthropicAPIKey string
+	GeminiAPIKey    string
+
+	// Active provider — can be overridden from admin panel via system_settings
+	// Default: openrouter
+	Provider LLMProvider
+
+	// Model names per tier
+	ModelCheap  string
+	ModelStrong string
+	ModelFast   string
 }
 
 type MLConfig struct {
