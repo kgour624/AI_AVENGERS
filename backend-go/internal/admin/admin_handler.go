@@ -532,6 +532,9 @@ func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 			&j.ID, &j.Status, &j.SourcePath,
 			&j.TotalChunks, &j.ProcessedChunks,
 			&j.ErrorMessage, &j.StartedAt, &j.CompletedAt, &j.CreatedAt,
+			&j.CurrentStage, &j.StageDetail,
+			&j.CostUsd, &j.EstimatedSecondsRemaining,
+			&j.ResumedFromCheckpoint,
 		); err != nil {
 			continue
 		}
