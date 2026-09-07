@@ -48,13 +48,48 @@ func NewAdminHandler(
 // EXPERT MANAGEMENT
 // ============================================================
 
+// adminExpertRow is the admin-facing view of an expert.
+// Includes all config fields from migration 006 that are admin-only.
+// WHY separate from ExpertPublic in expert/handler.go:
+//   Clients must NOT see model_tier, temperature, loop_pattern, etc.
+//   These are internal config. Separation enforces this at the type level.
+type adminExpertRow struct {
+	ID                 uuid.UUID       `json:"id"`
+	Name               string          `json:"name"`
+	Slug               string          `json:"slug"`
+	Domain             string          `json:"domain"`
+	Description        string          `json:"description"`
+	TotalChunks        int             `json:"total_chunks"`
+	TotalTopics        int             `json:"total_topics"`
+	AvgDepth           float64         `json:"avg_depth_level"`
+	AvgRating          float64         `json:"avg_rating"`
+	TotalRatings       int             `json:"total_ratings"`
+	IsActive           bool            `json:"is_active"`
+	IsTraining         bool            `json:"is_training"`
+	// Migration 006 fields
+	ModelTier          string          `json:"model_tier"`
+	Temperature        float64         `json:"temperature"`
+	TopP               float64         `json:"top_p"`
+	LoopPattern        string          `json:"loop_pattern"`
+	MaxLoopIterations  int             `json:"max_loop_iterations"`
+	AllowedTools       json.RawMessage `json:"allowed_tools"`
+	TrainingStatus     string          `json:"training_status"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+}
+
 // ListExperts GET /admin/experts
+// Returns all experts (including draft/deprecated) with full config.
 func (h *AdminHandler) ListExperts(c *gin.Context) {
 	rows, err := h.db.Query(c.Request.Context(), `
 		SELECT id, name, slug, domain, COALESCE(description,''),
 		       total_chunks, total_topics, COALESCE(avg_depth_level,0),
 		       COALESCE(avg_rating,0), total_ratings,
-		       is_active, is_training, created_at, updated_at
+		       is_active, is_training,
+		       model_tier, temperature, top_p,
+		       loop_pattern, max_loop_iterations, allowed_tools,
+		       training_status,
+		       created_at, updated_at
 		FROM experts
 		WHERE deleted_at IS NULL
 		ORDER BY created_at DESC`)
@@ -65,38 +100,26 @@ func (h *AdminHandler) ListExperts(c *gin.Context) {
 	}
 	defer rows.Close()
 
-	type expertRow struct {
-		ID           uuid.UUID `json:"id"`
-		Name         string    `json:"name"`
-		Slug         string    `json:"slug"`
-		Domain       string    `json:"domain"`
-		Description  string    `json:"description"`
-		TotalChunks  int       `json:"total_chunks"`
-		TotalTopics  int       `json:"total_topics"`
-		AvgDepth     float64   `json:"avg_depth_level"`
-		AvgRating    float64   `json:"avg_rating"`
-		TotalRatings int       `json:"total_ratings"`
-		IsActive     bool      `json:"is_active"`
-		IsTraining   bool      `json:"is_training"`
-		CreatedAt    time.Time `json:"created_at"`
-		UpdatedAt    time.Time `json:"updated_at"`
-	}
-
-	var experts []expertRow
+	var experts []adminExpertRow
 	for rows.Next() {
-		var e expertRow
+		var e adminExpertRow
 		if err := rows.Scan(
 			&e.ID, &e.Name, &e.Slug, &e.Domain, &e.Description,
 			&e.TotalChunks, &e.TotalTopics, &e.AvgDepth,
 			&e.AvgRating, &e.TotalRatings,
-			&e.IsActive, &e.IsTraining, &e.CreatedAt, &e.UpdatedAt,
+			&e.IsActive, &e.IsTraining,
+			&e.ModelTier, &e.Temperature, &e.TopP,
+			&e.LoopPattern, &e.MaxLoopIterations, &e.AllowedTools,
+			&e.TrainingStatus,
+			&e.CreatedAt, &e.UpdatedAt,
 		); err != nil {
+			h.logger.Warn("scan expert row failed", zap.Error(err))
 			continue
 		}
 		experts = append(experts, e)
 	}
 	if experts == nil {
-		experts = []expertRow{}
+		experts = []adminExpertRow{}
 	}
 	response.OK(c, experts)
 }
