@@ -91,8 +91,9 @@ function AdminExperts() {
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null)
   const [isCreateOpen, setIsCreateOpen] = useState(false)
   const [charterTargetId, setCharterTargetId] = useState<string | null>(null)
-  // A12: config edit modal
   const [configTargetId, setConfigTargetId] = useState<string | null>(null)
+  // Pipeline progress modal
+  const [pipelineJob, setPipelineJob] = useState<IngestionJob | null>(null)
 
   return (
     <div className="p-6">
