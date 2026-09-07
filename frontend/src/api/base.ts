@@ -123,10 +123,10 @@ baseAPI.interceptors.response.use(
     const isUnauthorized = error.response?.status === 401
     const alreadyRetried = config?._retry === true
     const isRefreshCall = config?.url?.includes('/auth/refresh')
+    const isAuthCall = config?.url?.includes('/auth/login') || config?.url?.includes('/auth/register') || config?.url?.includes('/auth/admin/login')
 
-    if (!isUnauthorized || alreadyRetried || !config || isRefreshCall) {
-      // Not a recoverable 401, already tried once, or this WAS the
-      // refresh call failing - propagate as-is in every case.
+    if (!isUnauthorized || alreadyRetried || !config || isRefreshCall || isAuthCall) {
+      // Not a recoverable 401, already tried once, or this is a login/register call failing - propagate as-is.
       return Promise.reject(error)
     }
 
