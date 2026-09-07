@@ -64,8 +64,9 @@ Based on file-inspection audit of existing repo:
 | A6 | Migration: `006_collaboration_layer.down.sql` (reversible) | `backend-go/migrations/006_collaboration_layer.down.sql` | ✅ COMPLETE (2026-09-07) | Reverses everything in strict child-before-parent order. Preserves existing `is_training` column (not owned by this migration) |
 | A7 | Update `internal/expert/handler.go` to accept new fields | `backend-go/internal/expert/handler.go` | ⏳ NOT STARTED | Preserve backward compatibility |
 | A8 | Update `internal/admin/admin_handler.go` expert CRUD | `backend-go/internal/admin/admin_handler.go` | ⏳ NOT STARTED | Admin UI must surface these fields |
-| A9 | Chunk deduplication in `internal/training/chunker.go` | `backend-go/internal/training/chunker.go` | ⏳ NOT STARTED | Per §6.3 of design doc: SHA-256 hash, skip if already exists for this expert |
-| A10 | Smoke test step in ingestion pipeline | `backend-go/internal/training/ingestion_pipeline.go` (likely path) | ⏳ NOT STARTED | 5 hand-crafted questions must return non-REFUSE with citations |
+| A9 | Chunk deduplication in `internal/training/chunker.go` + `ingestion_pipeline.go` | `backend-go/internal/training/chunker.go`, `ingestion_pipeline.go` | ✅ COMPLETE (2026-09-07) | SHA-256 hash on every chunk. ON CONFLICT DO NOTHING dedup. replaceExisting bool param added. |
+| A9b | Caller update: `admin_handler.go` → pass `replaceExisting=false` | `backend-go/internal/admin/admin_handler.go` | ✅ COMPLETE (2026-09-07) | **Broken build fixed.** Was 6-arg call, now 7-arg with false (append mode). |
+| A10 | Smoke test step in ingestion pipeline | `backend-go/internal/training/ingestion_pipeline.go` | ⏳ NOT STARTED | 5 hand-crafted questions must return non-REFUSE with citations |
 | A11 | Rewrite `HANDOFF.md` top-level status table with verified truth | `HANDOFF.md` | ⏳ NOT STARTED | Requires smoke-testing existing Phase 2–6 code path first |
 | A12 | Frontend: expert form fields for new config | `frontend/src/pages/admin/**`, `frontend/src/components/admin/**` | ⏳ NOT STARTED | Depends on A7/A8 API surface |
 
