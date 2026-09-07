@@ -327,6 +327,17 @@ func buildRouter(
 		{
 			messages.POST("/:id/rate", ratingHandler.Rate)
 		}
+
+		// Workflow routes (Phase C — collaboration layer)
+		workflows := protected.Group("/workflows")
+		{
+			workflows.POST("", wfHandler.CreateWorkflow)
+			workflows.GET("/:id", wfHandler.GetWorkflow)
+			workflows.POST("/:id/start", wfHandler.StartWorkflow)
+			workflows.GET("/:id/blackboard", wfHandler.GetBlackboard)
+			workflows.GET("/:id/kanban", wfHandler.GetKanban)
+			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
+		}
 	}
 
 	// ============================================================
