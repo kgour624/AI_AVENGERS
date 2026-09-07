@@ -3,11 +3,35 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>AI Avengers</title>
+    <title>AI Avengers ⚡</title>
+    <meta name="description" content="Neural Command Center — Multi-Agent Domain Expert Simulator" />
+
+    <!-- Preconnect for faster font loading -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+
+    <!-- Inter variable font (100-900 weight range) + JetBrains Mono -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&family=JetBrains+Mono:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Prevent flash of unstyled content -->
+    <style>
+      html { background-color: oklch(6% 0.015 285); }
+      body { opacity: 0; transition: opacity 0.15s ease; }
+      body.loaded { opacity: 1; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
     <div id="modal-container"></div>
     <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Remove FOUC guard once JS loads
+      document.addEventListener('DOMContentLoaded', () => {
+        document.body.classList.add('loaded')
+      })
+    </script>
   </body>
 </html>
