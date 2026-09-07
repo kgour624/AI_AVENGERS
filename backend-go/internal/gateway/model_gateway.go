@@ -105,55 +105,75 @@ var providerURLs = map[config.LLMProvider]string{
 }
 
 // ModelGateway is the single interface for all LLM calls.
-// Handles: model routing, cost tracking, caching, retry with backoff.
-// Supports multiple LLM providers — active provider read from DB at call time.
+// Delegates all provider-specific concerns to LLMProvider interface.
+// To add a new provider: implement LLMProvider, register in buildProvider().
 type ModelGateway struct {
 	cfg        config.LLMConfig
-	db         *pgxpool.Pool // nil = use env config only (no DB override)
+	db         *pgxpool.Pool
 	httpClient *http.Client
-	models     map[ModelType]modelConfig
 	cache      sync.Map
 	totalCost  atomic.Value
 	callCount  atomic.Int64
 	logger     *zap.Logger
+	// provider is built lazily and cached. Rebuilt when active provider changes.
+	providerMu   sync.RWMutex
+	providerName string      // last built provider name
+	provider     LLMProvider // current active implementation
 }
 
 // NewModelGateway creates a new model gateway.
 func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 	g := &ModelGateway{
-		cfg: cfg,
-		httpClient: &http.Client{
-			Timeout: 120 * time.Second, // LLM calls can be slow
-		},
-		logger: logger,
+		cfg:        cfg,
+		httpClient: &http.Client{Timeout: 120 * time.Second},
+		logger:     logger,
 	}
-
-	// Initialize total cost
 	g.totalCost.Store(float64(0))
-
-	// Model configurations
-	g.models = map[ModelType]modelConfig{
-		ModelCheap: {
-			Name:            cfg.ModelCheap,
-			CostPer1KInput:  0.0005,
-			CostPer1KOutput: 0.0015,
-			MaxTokens:       4096,
-		},
-		ModelStrong: {
-			Name:            cfg.ModelStrong,
-			CostPer1KInput:  0.003,
-			CostPer1KOutput: 0.015,
-			MaxTokens:       8192,
-		},
-		ModelFast: {
-			Name:            cfg.ModelFast,
-			CostPer1KInput:  0.00025,
-			CostPer1KOutput: 0.00075,
-			MaxTokens:       8192,
-		},
-	}
-
 	return g
+}
+
+// buildProvider creates the correct LLMProvider implementation.
+// Called when provider changes or on first use.
+// WHY factory here not in constructor:
+//   Active provider may change at runtime (admin panel).
+//   DB is not available at construction time.
+func (g *ModelGateway) buildProvider(ctx context.Context) LLMProvider {
+	providerName := string(g.getActiveProvider(ctx))
+	apiKey := g.getAPIKey(ctx, config.LLMProvider(providerName))
+
+	switch config.LLMProvider(providerName) {
+	case config.ProviderDeepSeek:
+		return providers.NewDeepSeekProvider(apiKey, g.httpClient)
+	case config.ProviderAnthropic:
+		return providers.NewAnthropicProvider(apiKey, g.httpClient)
+	case config.ProviderGemini:
+		return providers.NewGeminiProvider(apiKey, g.httpClient)
+	default: // openrouter
+		return providers.NewOpenRouterProvider(apiKey, g.cfg.OpenRouterBaseURL, g.httpClient)
+	}
+}
+
+// getProvider returns the cached provider, rebuilding if active provider changed.
+func (g *ModelGateway) getProvider(ctx context.Context) LLMProvider {
+	currentName := string(g.getActiveProvider(ctx))
+
+	g.providerMu.RLock()
+	if g.provider != nil && g.providerName == currentName {
+		p := g.provider
+		g.providerMu.RUnlock()
+		return p
+	}
+	g.providerMu.RUnlock()
+
+	// Rebuild
+	newProvider := g.buildProvider(ctx)
+	g.providerMu.Lock()
+	g.provider = newProvider
+	g.providerName = currentName
+	g.providerMu.Unlock()
+
+	g.logger.Info("LLM provider switched", zap.String("provider", currentName))
+	return newProvider
 }
 
 // Call makes an LLM call via OpenRouter.
