@@ -67,8 +67,8 @@ Based on file-inspection audit of existing repo:
 | A9 | Chunk deduplication in `internal/training/chunker.go` + `ingestion_pipeline.go` | `backend-go/internal/training/chunker.go`, `ingestion_pipeline.go` | ✅ COMPLETE (2026-09-07) | SHA-256 hash on every chunk. ON CONFLICT DO NOTHING dedup. replaceExisting bool param added. |
 | A9b | Caller update: `admin_handler.go` → pass `replaceExisting=false` | `backend-go/internal/admin/admin_handler.go` | ✅ COMPLETE (2026-09-07) | **Broken build fixed.** Was 6-arg call, now 7-arg with false (append mode). |
 | A10 | Smoke test step in ingestion pipeline | `backend-go/internal/training/ingestion_pipeline.go` | ✅ COMPLETE (2026-09-07) | `runSmokeTest()` added as Step 10. Probes top-5 topics via embed→vector search→rerank. Pass if ≥3/5 probes score ≥0.35. On pass: `training_status='trained'`. On fail: stays `'draft'`. Job always `'complete'`. |
-| A11 | Rewrite `HANDOFF.md` top-level status table with verified truth | `HANDOFF.md` | ⏳ NOT STARTED | Requires smoke-testing existing Phase 2–6 code path first |
-| A12 | Frontend: expert form fields for new config | `frontend/src/pages/admin/**`, `frontend/src/components/admin/**` | ⏳ NOT STARTED | Depends on A7/A8 API surface |
+| A11 | Rewrite `HANDOFF.md` top-level status table with verified truth | `HANDOFF.md` | ✅ COMPLETE (2026-09-07) | Three-section table: Backend / Collaboration Layer / Frontend. Evidence column on every row. Critical open actions listed. |
+| A12 | Frontend: expert form fields for new config | `frontend/src/pages/admin/**`, `frontend/src/components/admin/**` | ⏳ NOT STARTED | Depends on A7/A8 (now complete). Next task. |
 
 ### Decisions made in Phase A (log)
 
