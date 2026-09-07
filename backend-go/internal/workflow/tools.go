@@ -28,15 +28,12 @@ const askExpertTimeout = 60 * time.Second
 
 // Tools provides the 4 blackboard tool implementations.
 // Injected into the expert execution loop so experts can call them.
-//
-// WHY a struct not package-level functions:
-//   Tools need access to the blackboard store and workflow engine.
-//   Struct injection makes dependencies explicit and testable.
 type Tools struct {
-	store  *blackboard.Store
-	engine *Engine
-	sub    *blackboard.Subscriber
-	logger *zap.Logger
+	store      *blackboard.Store
+	engine     *Engine
+	sub        *blackboard.Subscriber
+	validation *validation.Pipeline
+	logger     *zap.Logger
 }
 
 // NewTools creates a new Tools instance.
@@ -44,13 +41,15 @@ func NewTools(
 	store *blackboard.Store,
 	engine *Engine,
 	sub *blackboard.Subscriber,
+	vp *validation.Pipeline,
 	logger *zap.Logger,
 ) *Tools {
 	return &Tools{
-		store:  store,
-		engine: engine,
-		sub:    sub,
-		logger: logger,
+		store:      store,
+		engine:     engine,
+		sub:        sub,
+		validation: vp,
+		logger:     logger,
 	}
 }
 
