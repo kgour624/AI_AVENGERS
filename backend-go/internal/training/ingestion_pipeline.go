@@ -128,47 +128,185 @@ func (p *IngestionPipeline) IngestTranscript(
 	// Update job status to running
 	p.updateJobStatus(ctx, jobID, "running", "", 0, 0)
 
-	// Step 1: Chunk text
-	chunks := p.chunker.Chunk(transcript)
-	if len(chunks) == 0 {
-		err := fmt.Errorf("no chunks created from transcript")
-		p.updateJobStatus(ctx, jobID, "failed", err.Error(), 0, 0)
-		return nil, err
+	// ============================================================
+	// STEP 1: CHUNKING
+	// ============================================================
+	// If resuming from topic_extraction or later, load chunks from DB
+	// instead of re-chunking (chunking is deterministic but expensive for large transcripts).
+	var chunks []TextChunk
+	if isResume && StageOrder[cp.Stage] >= StageOrder[StageTopicExtraction] {
+		// Load existing chunks from DB
+		chunks, err = p.loadChunksFromDB(ctx, expertID)
+		if err != nil || len(chunks) == 0 {
+			p.logger.Warn("could not load chunks from DB, re-chunking", zap.Error(err))
+			chunks = p.chunker.Chunk(transcript)
+		}
+		p.logger.Info("resume: loaded chunks from DB", zap.Int("count", len(chunks)))
+	} else {
+		p.updateStage(ctx, jobID, StageChunking, "Splitting transcript...")
+		chunks = p.chunker.Chunk(transcript)
+		if len(chunks) == 0 {
+			err := fmt.Errorf("no chunks created from transcript")
+			p.updateJobStatus(ctx, jobID, "failed", err.Error(), 0, 0)
+			return nil, err
+		}
 	}
 	p.logger.Info("chunking complete", zap.Int("chunks", len(chunks)))
 
-	// Step 2: Extract topics (batched)
-	topicResults, err := p.topics.ExtractBatch(ctx, chunks)
-	if err != nil {
-		p.logger.Warn("topic extraction failed, using fallback", zap.Error(err))
-		topicResults = make([]TopicResult, len(chunks))
-		for i := range topicResults {
-			topicResults[i] = TopicResult{Topic: "general", Confidence: 0.5}
+	// Init progress tracker and checkpoint writer
+	tracker := NewProgressTracker(p.db, jobID, len(chunks), p.logger)
+	cpWriter := NewCheckpointWriter(p.db, jobID, p.logger)
+	if isResume && cp != nil {
+		tracker.costUSD = cp.CostUSDSoFar // restore accumulated cost
+	}
+
+	// ============================================================
+	// STEP 2: TOPIC EXTRACTION (batched, resumable)
+	// ============================================================
+	p.updateStage(ctx, jobID, StageTopicExtraction,
+		fmt.Sprintf("0/%d chunks tagged", len(chunks)))
+
+	topicResults := make([]TopicResult, len(chunks))
+	// Default fallback for all chunks
+	for i := range topicResults {
+		topicResults[i] = TopicResult{Topic: "general", Confidence: 0.5}
+	}
+
+	const topicBatchSize = 50
+	resumeTopicBatch := 0
+	if isResume && cp != nil && cp.Stage == StageTopicExtraction {
+		resumeTopicBatch = cp.LastBatchIndex
+		p.logger.Info("resume: skipping topic batches", zap.Int("skip_to_batch", resumeTopicBatch))
+	}
+
+	for batchStart := 0; batchStart < len(chunks); batchStart += topicBatchSize {
+		batchIdx := batchStart / topicBatchSize
+		// Skip already-processed batches on resume
+		if batchIdx < resumeTopicBatch {
+			continue
+		}
+
+		batchEnd := batchStart + topicBatchSize
+		if batchEnd > len(chunks) {
+			batchEnd = len(chunks)
+		}
+		batch := chunks[batchStart:batchEnd]
+
+		batchResults, batchErr := p.topics.ExtractBatch(ctx, batch)
+		if batchErr != nil {
+			p.logger.Warn("topic batch failed, using fallback",
+				zap.Int("batch", batchIdx), zap.Error(batchErr))
+		} else {
+			copy(topicResults[batchStart:batchEnd], batchResults)
+		}
+
+		// Checkpoint every batch
+		if batchIdx%1 == 0 { // every batch for topics (they're expensive)
+			cpWriter.Write(ctx, JobCheckpoint{
+				Stage:          StageTopicExtraction,
+				ChunksDone:     batchEnd,
+				ChunksTotal:    len(chunks),
+				LastBatchIndex: batchIdx + 1,
+				CostUSDSoFar:   tracker.TotalCost(),
+				StartedAt:      start,
+			})
+			tracker.UpdateDB(ctx, batchEnd, StageTopicExtraction,
+				fmt.Sprintf("%d/%d chunks tagged", batchEnd, len(chunks)))
 		}
 	}
 	p.logger.Info("topic extraction complete")
 
-	// Step 3: Extract charters
-	charter, err := p.charters.Extract(ctx, transcript, expertName)
-	if err != nil {
-		p.logger.Warn("charter extraction failed, using default", zap.Error(err))
-		charter = &Charter{
-			ReasoningCharter:     defaultReasoningCharter(expertName),
-			ClarificationCharter: defaultClarificationCharter(),
+	// ============================================================
+	// STEP 3: CHARTER EXTRACTION (single call, resumable)
+	// ============================================================
+	var charter *Charter
+	charterAlreadyDone := isResume && cp != nil && cp.CharterExtracted
+
+	if charterAlreadyDone {
+		// Load existing charter from DB
+		charter, err = p.loadCharterFromDB(ctx, expertID)
+		if err != nil || charter == nil {
+			p.logger.Warn("could not load charter from DB, re-extracting", zap.Error(err))
+			charterAlreadyDone = false
+		} else {
+			p.logger.Info("resume: charter loaded from DB")
 		}
+	}
+
+	if !charterAlreadyDone {
+		p.updateStage(ctx, jobID, StageCharterExtraction, "Extracting expert charter...")
+		charter, err = p.charters.Extract(ctx, transcript, expertName)
+		if err != nil {
+			p.logger.Warn("charter extraction failed, using default", zap.Error(err))
+			charter = &Charter{
+				ReasoningCharter:     defaultReasoningCharter(expertName),
+				ClarificationCharter: defaultClarificationCharter(),
+			}
+		}
+		// Checkpoint: charter done
+		cpWriter.Write(ctx, JobCheckpoint{
+			Stage:            StageCharterExtraction,
+			ChunksDone:       len(chunks),
+			ChunksTotal:      len(chunks),
+			CharterExtracted: true,
+			LastBatchIndex:   0,
+			CostUSDSoFar:     tracker.TotalCost(),
+			StartedAt:        start,
+		})
 	}
 	p.logger.Info("charter extraction complete")
 
-	// Step 4: Generate embeddings
-	texts := make([]string, len(chunks))
-	for i, c := range chunks {
-		texts[i] = c.Text
+	// ============================================================
+	// STEP 4: EMBEDDING (batched, resumable)
+	// ============================================================
+	p.updateStage(ctx, jobID, StageEmbedding,
+		fmt.Sprintf("0/%d embeddings generated", len(chunks)))
+
+	embeddings := make([][]float32, len(chunks))
+
+	const embedBatchSize = 100
+	resumeEmbedBatch := 0
+	if isResume && cp != nil && cp.Stage == StageEmbedding {
+		resumeEmbedBatch = cp.LastBatchIndex
+		p.logger.Info("resume: skipping embed batches", zap.Int("skip_to_batch", resumeEmbedBatch))
 	}
 
-	embeddings, err := p.ml.Embed(ctx, texts)
-	if err != nil {
-		p.updateJobStatus(ctx, jobID, "failed", "ML sidecar unavailable: "+err.Error(), 0, 0)
-		return nil, fmt.Errorf("embedding generation failed: %w", err)
+	for batchStart := 0; batchStart < len(chunks); batchStart += embedBatchSize {
+		batchIdx := batchStart / embedBatchSize
+		if batchIdx < resumeEmbedBatch {
+			continue
+		}
+
+		batchEnd := batchStart + embedBatchSize
+		if batchEnd > len(chunks) {
+			batchEnd = len(chunks)
+		}
+
+		texts := make([]string, batchEnd-batchStart)
+		for i, c := range chunks[batchStart:batchEnd] {
+			texts[i] = c.Text
+		}
+
+		batchEmbeds, embedErr := p.ml.Embed(ctx, texts)
+		if embedErr != nil {
+			p.updateJobStatus(ctx, jobID, "failed",
+				"ML sidecar unavailable: "+embedErr.Error(), batchStart, len(chunks))
+			return nil, fmt.Errorf("embedding batch %d failed: %w", batchIdx, embedErr)
+		}
+		copy(embeddings[batchStart:batchEnd], batchEmbeds)
+
+		// Checkpoint every batch
+		cpWriter.Write(ctx, JobCheckpoint{
+			Stage:            StageEmbedding,
+			ChunksDone:       batchEnd,
+			ChunksTotal:      len(chunks),
+			CharterExtracted: true,
+			LastBatchIndex:   batchIdx + 1,
+			CostUSDSoFar:     tracker.TotalCost(),
+			StartedAt:        start,
+		})
+		tracker.UpdateDB(ctx, batchEnd, StageEmbedding,
+			fmt.Sprintf("%d/%d embeddings generated", batchEnd, len(chunks)))
 	}
 	p.logger.Info("embeddings generated", zap.Int("count", len(embeddings)))
 
