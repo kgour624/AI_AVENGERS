@@ -45,6 +45,67 @@ func NewCostMonitor(
 	}
 }
 
+// WorkflowCostReport holds per-workflow cost data.
+type WorkflowCostReport struct {
+	WorkflowID      string  `json:"workflow_id"`
+	CostSpentUSD    float64 `json:"cost_spent_usd"`
+	CostBudgetUSD   float64 `json:"cost_budget_usd"`
+	SoftLimitPct    float64 `json:"soft_limit_pct"`
+	HardLimitPct    float64 `json:"hard_limit_pct"`
+	SoftLimitHit    bool    `json:"soft_limit_hit"`
+	HardLimitHit    bool    `json:"hard_limit_hit"`
+	MessageCount    int     `json:"message_count"`
+}
+
+// GetWorkflowCost returns cost breakdown for a specific workflow.
+// Uses SUM(messages.cost_usd) for accuracy in reporting.
+func (m *CostMonitor) GetWorkflowCost(ctx context.Context, workflowID string) (*WorkflowCostReport, error) {
+	var report WorkflowCostReport
+	report.WorkflowID = workflowID
+
+	// Get workflow budget fields
+	err := m.db.QueryRow(ctx,
+		`SELECT cost_spent_usd, cost_budget_usd, cost_soft_limit_pct, cost_hard_limit_pct
+		 FROM workflows WHERE id = $1`,
+		workflowID,
+	).Scan(&report.CostSpentUSD, &report.CostBudgetUSD, &report.SoftLimitPct, &report.HardLimitPct)
+	if err != nil {
+		return nil, fmt.Errorf("get workflow cost: %w", err)
+	}
+
+	// Get message count for this workflow
+	m.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM messages WHERE workflow_id = $1`,
+		workflowID,
+	).Scan(&report.MessageCount)
+
+	// Check limits
+	softThreshold := report.CostBudgetUSD * (report.SoftLimitPct / 100.0)
+	hardThreshold := report.CostBudgetUSD * (report.HardLimitPct / 100.0)
+	report.SoftLimitHit = report.CostSpentUSD >= softThreshold
+	report.HardLimitHit = report.CostSpentUSD >= hardThreshold
+
+	return &report, nil
+}
+
+// CheckWorkflowLimits checks if a workflow has hit its cost limits.
+// Fast path: reads cost_spent_usd from workflows table (no aggregation).
+// Called after every LLM call in a workflow context.
+func (m *CostMonitor) CheckWorkflowLimits(ctx context.Context, workflowID string) (softHit, hardHit bool, err error) {
+	var spent, budget, softPct, hardPct float64
+	err = m.db.QueryRow(ctx,
+		`SELECT cost_spent_usd, cost_budget_usd, cost_soft_limit_pct, cost_hard_limit_pct
+		 FROM workflows WHERE id = $1`,
+		workflowID,
+	).Scan(&spent, &budget, &softPct, &hardPct)
+	if err != nil {
+		return false, false, fmt.Errorf("check workflow limits: %w", err)
+	}
+	softHit = spent >= budget*(softPct/100.0)
+	hardHit = spent >= budget*(hardPct/100.0)
+	return softHit, hardHit, nil
+}
+
 // CostReport holds cost breakdown.
 type CostReport struct {
 	TotalCostUSD     float64            `json:"total_cost_usd"`
