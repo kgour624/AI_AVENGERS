@@ -96,6 +96,34 @@ Owner: Kiran (has DB access). I can prepare the exact commands as a runbook when
 
 ---
 
+## Resume-Capable Ingestion Pipeline ✅ COMPLETE (2026-09-07)
+
+### What was built
+
+| Component | File | Status |
+|---|---|---|
+| Migration 007 | `backend-go/migrations/007_ingestion_resume.up.sql` | ✅ |
+| Checkpoint data structure | `backend-go/internal/training/checkpoint.go` | ✅ |
+| Resume logic in pipeline | `backend-go/internal/training/ingestion_pipeline.go` | ✅ |
+| Admin API new fields | `backend-go/internal/admin/admin_handler.go` | ✅ |
+| Pipeline UI modal | `frontend/src/components/admin/IngestionPipelineModal.tsx` | ✅ |
+| AdminExperts wired | `frontend/src/pages/admin/AdminExperts.tsx` | ✅ |
+
+### Resume algorithm
+- Checkpoint written every 50 chunks (per-batch)
+- On crash: load checkpoint_data from DB, skip completed stages/batches
+- Chunks already in DB: ON CONFLICT DO NOTHING = idempotent
+- Charter already extracted: load from experts table, skip re-extraction
+
+### Frontend pipeline UI
+- 6-stage animated visualization with pulse ring on active stage
+- Live cost badge ($X.XX / ₹YYY)
+- ETA countdown from estimatedSecondsRemaining
+- Speed indicator (chunks/sec)
+- Resume badge if job was resumed from checkpoint
+
+---
+
 ## Phase B — First 3 Experts (not started)
 
 **Goal:** create PM, System Design, and Backend experts with real trained corpora. Prove end-to-end training + retrieval + response flow with 3 experts before scaling to 10.
