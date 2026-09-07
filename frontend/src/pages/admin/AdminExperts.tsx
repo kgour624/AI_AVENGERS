@@ -8,7 +8,9 @@ import { Skeleton } from '@/components/ui/Skeleton'
 import { TranscriptUploadModal } from '@/components/admin/TranscriptUploadModal'
 import { CreateExpertModal } from '@/components/admin/CreateExpertModal'
 import { EditCharterModal } from '@/components/admin/EditCharterModal'
+import { EditExpertConfigModal } from '@/components/admin/EditExpertConfigModal'
 import { useIngestionStatus } from '@/hooks/useIngestionStatus'
+import { trainingStatusLabel } from '@/types/expert'
 
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 11 ("Admin Expert
