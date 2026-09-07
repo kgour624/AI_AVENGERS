@@ -17,6 +17,26 @@ import (
 	"ai_avengers/backend/internal/gateway/providers"
 )
 
+// openRouterRequest/Response kept temporarily for getActiveProvider/getAPIKey
+// which still read from DB. Will be cleaned up in next pass.
+type openRouterRequest struct {
+	Model       string              `json:"model"`
+	Messages    []openRouterMessage `json:"messages"`
+	MaxTokens   int                 `json:"max_tokens"`
+	Temperature float64             `json:"temperature"`
+}
+type openRouterMessage struct {
+	Role         string        `json:"role"`
+	Content      string        `json:"content"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+type cacheControl struct { Type string `json:"type"` }
+type openRouterResponse struct {
+	Choices []struct { Message struct { Content string `json:"content"` } `json:"message"` } `json:"choices"`
+	Usage   struct { PromptTokens int `json:"prompt_tokens"`; CompletionTokens int `json:"completion_tokens"` } `json:"usage"`
+	Model   string `json:"model"`
+}
+
 // ModelType identifies which LLM to use.
 // WHY three tiers:
 // cheap  — fast, low cost, for metadata/tagging/coverage checks
