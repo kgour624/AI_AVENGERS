@@ -45,6 +45,32 @@ export interface Expert extends PublicExpert {
   totalRatings?: number
   isActive?: boolean
   isTraining?: boolean
+  // Migration 006 config fields — present on admin endpoint, absent on public.
+  // WHY optional: public GET /experts never returns these. Admin GET /admin/experts does.
+  // Keeping them optional on Expert means both endpoints can use the same type
+  // without fabricating fields that don't exist on the public response.
+  modelTier?: 'cheap' | 'strong' | 'fast'
+  temperature?: number
+  topP?: number
+  loopPattern?: 'ota' | 'react' | 'plan_execute'
+  maxLoopIterations?: number
+  allowedTools?: string[]
+  trainingStatus?: 'draft' | 'ingesting' | 'trained' | 'deprecated'
+}
+
+/**
+ * Human-readable label for trainingStatus badge.
+ * WHY a function not a map: avoids importing a map at module level
+ * when most consumers only need one value at a time.
+ */
+export function trainingStatusLabel(status: Expert['trainingStatus']): string {
+  switch (status) {
+    case 'trained':    return '\u2705 Trained'
+    case 'ingesting':  return '\u23f3 Ingesting'
+    case 'deprecated': return '\u26a0\ufe0f Deprecated'
+    case 'draft':
+    default:           return '\u270f\ufe0f Draft'
+  }
 }
 
 /**
