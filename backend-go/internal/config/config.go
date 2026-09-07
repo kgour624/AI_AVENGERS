@@ -298,10 +298,18 @@ func (c *Config) applyDefaults() {
 		c.Database.MaxConnLifetime = 60 * time.Minute
 	}
 	if c.JWT.AccessExpiryMinutes == 0 {
-		c.JWT.AccessExpiryMinutes = 15
+		// WHY 480 (8 hours) not 15 minutes:
+		//   15-min tokens cause frequent logouts in dev:
+		//   - Docker restart clears Redis → refresh fails
+		//   - Page reload + cross-port cookie delay → bootstrap race
+		//   - Concurrent requests on expiry → UX disruption every 15 min
+		//   8 hours = one working session. Access token is in-memory
+		//   (XSS safe) so longer expiry is acceptable for single-admin.
+		//   Production: set JWT_ACCESS_EXPIRY_MINUTES=15 in .env explicitly.
+		c.JWT.AccessExpiryMinutes = 480
 	}
 	if c.JWT.RefreshExpiryDays == 0 {
-		c.JWT.RefreshExpiryDays = 7
+		c.JWT.RefreshExpiryDays = 30
 	}
 	if c.LLM.OpenRouterBaseURL == "" {
 		c.LLM.OpenRouterBaseURL = "https://openrouter.ai/api/v1"
