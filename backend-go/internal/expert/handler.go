@@ -38,13 +38,26 @@ func NewHandler(db *pgxpool.Pool, logger *zap.Logger) *Handler {
 }
 
 // ListActive GET /experts
+// Returns only experts that are active AND fully trained.
+// WHY training_status='trained' filter:
+//   Migration 006 adds training_status (default 'draft').
+//   An expert is only ready for client use after ingestion pipeline
+//   completes smoke test and sets training_status='trained' (A10).
+//   Without this filter, draft experts with no chunks appear publicly
+//   and return REFUSE on every question — bad client experience.
+// WHY keep is_training=FALSE:
+//   Belt-and-suspenders. Existing code sets is_training=TRUE during
+//   ingestion. Both conditions must be true for public visibility.
 func (h *Handler) ListActive(c *gin.Context) {
 	rows, err := h.db.Query(c.Request.Context(), `
 		SELECT id, name, slug, domain, COALESCE(description,''),
 		       total_chunks, total_topics,
 		       COALESCE(avg_depth_level,0), COALESCE(avg_rating,0), created_at
 		FROM experts
-		WHERE is_active=TRUE AND is_training=FALSE AND deleted_at IS NULL
+		WHERE is_active=TRUE
+		  AND is_training=FALSE
+		  AND training_status='trained'
+		  AND deleted_at IS NULL
 		ORDER BY avg_rating DESC, total_chunks DESC`)
 	if err != nil {
 		h.logger.Error("list experts failed", zap.Error(err))
