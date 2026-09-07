@@ -681,6 +681,369 @@ Never write code without first reading the surrounding code.
 
 ---
 
+# Part IX — Deep Dives (New — Added 2026-09-07)
+
+This section captures concepts from the 6 source courses that were not fully represented in Parts I–VIII. Read this alongside the earlier parts.
+
+## 9.1 Post-Training in Full Detail (Byte Byte AI Week 1)
+
+### SFT (Supervised Fine-Tuning)
+
+Goal: convert a base model (next-token predictor) into an instruction-follower.
+
+**How:**
+1. Curate demonstration data: `{prompt, response}` pairs in a special-token format.
+   ```
+   <|prompt|> Give three tips for staying healthy. <|response|> 1. Exercise daily...
+   ```
+2. Continue training the base model on this data using the same cross-entropy loss.
+3. Result: SFT model that answers questions instead of continuing them.
+
+**Applied in AI Avengers as:** we do NOT fine-tune model weights. We simulate SFT via:
+- Charter as system prompt (extracted by `internal/training/charter_extractor.go`).
+- RAG grounding (retrieved chunks injected by `internal/context/assembler.go`).
+- Few-shot examples in the prompt.
+
+### RLHF (Reinforcement Learning from Human Feedback)
+
+Goal: make the model prefer responses humans rate higher.
+
+**How:**
+1. Collect human preference data: for the same prompt, show two responses, human picks better one.
+2. Train a **reward model** on this preference data.
+3. Use RL (PPO algorithm) to update the SFT model to maximize reward model score.
+4. Result: model that is more helpful, harmless, honest.
+
+**Applied in AI Avengers as:** the rating system (`internal/rating/handler.go`) collects preference data. `boost_factor` on `course_chunks` is a lightweight analog — chunks cited in high-rated responses get boosted. Full RLHF is future scope.
+
+### Thinking Models (o1/o3 style — Test-Time Compute)
+
+Instead of generating the answer directly, the model generates a long chain-of-thought ("thinking") before the final answer. More compute at inference time = better answers on hard problems.
+
+**Rule:** use thinking models (Claude Sonnet with extended thinking, or o3) for:
+- Complex multi-step reasoning (architecture decisions, security analysis).
+- Problems where the intermediate reasoning is as valuable as the answer.
+
+**Do NOT use** for: simple lookups, tagging, metadata extraction — wasteful.
+
+**Applied in AI Avengers as:** `ModelStrong` (claude-3-5-sonnet) is used for answer generation and charter extraction. If extended thinking is enabled, it applies here. `ModelCheap` (deepseek) is used for everything else.
+
+## 9.2 Sampling Algorithms — Complete Reference (Byte Byte AI Week 1)
+
+### The full hierarchy
+
+```
+Deterministic:
+  Greedy search    — always pick highest-probability token. Fast, repetitive.
+  Beam search      — keep top-K paths, pick best cumulative. Better than greedy, still repetitive.
+
+Stochastic:
+  Multinomial      — sample proportional to probability. Random but can pick very unlikely tokens.
+  Top-K sampling   — restrict to K highest tokens, then multinomial. Fixed K is limiting.
+  Top-P (nucleus)  — restrict to smallest set with cumulative prob >= P, then multinomial. STANDARD.
+```
+
+### Why greedy fails in production
+
+Greedy picks the highest-probability token at every step. Because some sequences are very common on the internet ("I'm not sure if I'll ever be able to..."), greedy loops on them. Never use greedy for user-facing text generation.
+
+### Why Top-P is the standard
+
+Top-P dynamically adjusts K based on the model's confidence:
+- When model is very confident (one token has 89% probability): K=1, only that token considered.
+- When model is uncertain (many tokens each ~10%): K=many, more exploration.
+
+This is better than fixed Top-K because it adapts to the distribution shape.
+
+### Temperature — what it actually does
+
+Temperature scales the raw logits BEFORE softmax:
+- `T < 1.0` → sharper distribution → more deterministic → model picks its top choice more often.
+- `T > 1.0` → flatter distribution → more random → model explores more.
+- `T = 0` → equivalent to greedy.
+
+**Rule table (from course + applied in AI Avengers):**
+
+| Task | Temperature | Top-P | Why |
+|---|---|---|---|
+| Code generation | 0.1–0.2 | 0.1 | Must compile; determinism helps OTA loop converge |
+| Architecture decisions | 0.3–0.5 | 0.5 | Some exploration acceptable |
+| Charter extraction | 0.3 | 0.5 | Need consistent rules, not creative |
+| Clarifying questions | 0.6–0.8 | 0.9 | Diverse questions are better |
+| Coverage check / linting | 0.1 | 0.1 | Consistent verdicts |
+
+## 9.3 Agentic Patterns — Deep Dive (Arpit Masterclass)
+
+### The core insight: agents are just while loops
+
+> "AI agent is just an expensive while loop." — Arpit Bhiyani
+
+Every agent framework (Claude Agent SDK, Anti-Gravity SDK, LangGraph) is an implementation of this loop with conveniences. If you can write the loop in ~50 lines, do that. Frameworks are opaque, slow, and expensive in tokens.
+
+### OTA vs Ralph — when to use which
+
+**OTA (Observe → Think → Act):**
+- Context grows each iteration (observation + thought appended).
+- Best when: you can cheaply run the code and observe the result. Short feedback loops.
+- Example: fix a Python syntax error. Run → see error → fix → run again.
+- Context fills up over many iterations → expensive for long tasks.
+
+**Ralph loop:**
+- Each iteration starts with a FRESH context. State lives on disk/filesystem, not in LLM window.
+- Best when: long-running tasks where context would blow up. Codebase migrations, bulk refactors.
+- Key property: `while not done: fresh_context = read_from_disk(); llm(prompt + fresh_context)`.
+- WHY it works: file system IS the context. Changes persist to disk. Next iteration reads fresh.
+- Downside: each iteration re-reads and re-processes. Higher per-iteration cost.
+
+**Rule:** OTA for short loops where you can observe. Ralph for long-running tasks where context would overflow. You can nest: Ralph at top level, OTA inside each Ralph iteration.
+
+### React — when thought is precious
+
+React makes the model's reasoning trace a first-class citizen in the context:
+```
+loop:
+    llm outputs: "Thought: I need to search for X. Action: search(X)"
+    execute search(X)
+    observation = result
+    append observation to context
+    llm outputs next Thought + Action
+    if final answer: break
+```
+
+**WHY it works:** the thought is in the context. The next token generation is conditioned on the reasoning. This dramatically improves accuracy on multi-step problems.
+
+**When thought is precious:** exploratory tasks, open-ended problems, multi-step reasoning where intermediate steps depend on each other.
+
+**When thought is NOT precious:** simple lookups, deterministic tasks. Wasteful.
+
+### Plan-and-Execute — when to decompose
+
+```
+plan = llm.plan(task)  // outputs list of steps
+for step in plan:
+    result = execute_step(step, prior_context)
+    prior_context.append(result)
+```
+
+**When to use:** task decomposes cleanly into a known sequence. Trip planning, itemized cost breakdown, structured report writing, DB schema design table-by-table.
+
+**Key danger:** if a step depends on information only discovered mid-execution, and the plan didn't anticipate it, plan becomes stale. Mitigation: allow re-planning after every N steps, or on step failure.
+
+**Parallel execution:** if steps are independent, spin up sub-agents in parallel. This is where Plan-and-Execute beats React for structured tasks.
+
+**Rule:** always smaller tasks. Larger context = more hallucination. Break into chunks, verify each, move forward.
+
+### Human-in-the-Loop — implementation patterns
+
+Three ways to implement HITL:
+
+1. **Top-level confirmation:** before every high-stakes action, ask. Like Claude asking before running bash commands.
+2. **Confidence-based:** if model confidence < threshold, pause and ask. Good for support tickets, medical triage.
+3. **Exception-based:** run autonomously, pause only when something unexpected happens (tool call fails, cost threshold hit, ambiguous requirement).
+
+**Implementation:** HITL is a tool call. Agent calls `AskClient(question, options)`. Workflow pauses. Client responds. Workflow resumes.
+
+**Rule for AI Avengers:** no auto-approval on timeout. Workflow stays paused indefinitely. Client's explicit response required.
+
+### Checkpoint & Resume — production requirement
+
+Every long-running agent MUST be resumable. Reasons:
+- Server crashes mid-run.
+- Deployment (rolling restart).
+- Client paused, came back a week later.
+- Cost budget hit.
+- Idempotency: don't make the same phone call twice.
+
+**Implementation (from Arpit's example):**
+```python
+# After every successful step:
+save_checkpoint({
+    "history": full_context,  # all messages so far
+    "metadata": {"model_config": ..., "task_definition": ..., "file_timestamps": ...},
+    "step_index": current_step
+})
+
+# On restart:
+if checkpoint_exists():
+    context = load_checkpoint()["history"]
+    resume_from_step = load_checkpoint()["step_index"]
+```
+
+**What to store:** full context (all messages), metadata (model config, task definition, file timestamps), step index.
+
+**Optimization:** you can skip tool call responses that are already consumed by later steps. But be careful — if you miss it, you need another round-trip to re-fetch. Prompt caching makes keeping everything cheaper than selective pruning.
+
+**Applied in AI Avengers as:** two-level checkpointing. Phase-level snapshots in `workflow_checkpoints` table. Event replay from `blackboard_events` for fine-grained resume.
+
+### File System as Context (Ralph loop detail)
+
+When an agent reads a file, it should track metadata:
+- File path
+- Last modified timestamp
+
+On next iteration: if file is already in context AND timestamp hasn't changed → don't reload. If file was modified → reload.
+
+This prevents bloating context with redundant re-reads of unchanged files.
+
+**Applied in AI Avengers as:** future scope for the code-generating experts (Backend, Frontend, DB). When they read repo files, they should track this metadata.
+
+## 9.4 Distributed Task Scheduler — Design Pattern (System Design Master Class 1)
+
+This is the canonical pattern for any system that needs to execute tasks at a scheduled time with a strict SLA.
+
+### The three phases: Store → Pick → Execute
+
+**Store:**
+```sql
+CREATE TABLE tasks (
+    id          UUID PRIMARY KEY,
+    command     JSONB NOT NULL,      -- what to execute
+    scheduled_at BIGINT NOT NULL,    -- Unix epoch, minute-level granularity
+    status      VARCHAR(20) DEFAULT 'pending',  -- pending/in_progress/completed/failed
+    picked_at   TIMESTAMPTZ,
+    started_at  TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ
+);
+```
+
+**Pick (the critical part):**
+```sql
+-- Pickers run every 30 seconds, grab tasks due in next 30s
+SELECT id, command FROM tasks
+WHERE scheduled_at <= EXTRACT(EPOCH FROM NOW()) + 30
+  AND status = 'pending'
+ORDER BY scheduled_at ASC
+LIMIT 100
+FOR UPDATE SKIP LOCKED;  -- CRITICAL: concurrent pickers don't block each other
+
+UPDATE tasks SET status='in_progress', picked_at=NOW()
+WHERE id = ANY($1);
+```
+
+**Execute:** separate worker pool consumes from queue, executes, updates status.
+
+### Key insight: recurring task = one-time task scheduled multiple times
+
+Solve one-time execution really well first. Then recurring is just: after a task completes, schedule the next occurrence. Don't try to solve both at once.
+
+### SLA design principle
+
+You cannot guarantee completion time (task might run for hours). You CAN guarantee start time. Design your SLA around what you can control.
+
+**Applied in AI Avengers as:** the workflow engine uses this exact pattern for phase task dispatch. `workflow_tasks` table has `picked_at`, `started_at`, `completed_at`. Pickers use `SELECT FOR UPDATE SKIP LOCKED`.
+
+## 9.5 Message Broker on RDBMS (System Design Master Class 1)
+
+Building a message broker on a relational DB teaches you what properties you need from ANY storage layer.
+
+**Core table:**
+```sql
+CREATE TABLE messages (
+    id          BIGSERIAL PRIMARY KEY,  -- sequential for ordering
+    topic       VARCHAR(255) NOT NULL,
+    payload     JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+    -- NO deleted_at: messages are consumed, not deleted
+);
+
+CREATE TABLE consumer_offsets (
+    consumer_group  VARCHAR(255),
+    topic           VARCHAR(255),
+    last_offset     BIGINT DEFAULT 0,
+    PRIMARY KEY (consumer_group, topic)
+);
+```
+
+**Consumer reads:**
+```sql
+SELECT id, payload FROM messages
+WHERE topic = $1 AND id > $2  -- $2 = last_offset for this consumer group
+ORDER BY id ASC
+LIMIT 100;
+```
+
+**Key properties needed from storage:**
+- Sequential ordering (BIGSERIAL gives this).
+- Efficient range scan by offset (B-tree index on id).
+- Concurrent consumers don't interfere (each has its own offset).
+- Append-only (never update a message).
+
+**Applied in AI Avengers as:** `blackboard_events` table is effectively a message broker. `sequence_number BIGSERIAL` gives ordering. Experts consume from their last-seen sequence number. Redis pub-sub provides real-time notification; Postgres provides durability.
+
+## 9.6 Go Layering — Mental Model (Ultimate Go Course)
+
+The Ultimate Go course's core teaching: **mental model is everything**. If your mental model of the codebase is wrong, every change you make will be wrong.
+
+### The refactoring philosophy
+
+1. **Compiler-driven refactoring:** make a change, let things go red, follow the red. The compiler tells you every place that needs updating. Never try to find all callers manually.
+2. **Move things to where they belong:** auth is an app-layer concern, not a business-layer concern. By the time you're in the business layer, auth should already be done.
+3. **Precision in naming:** if you have `authenticateService` and `authenticateLocal`, you've lost the mental model. Rename to `authenticate` (client call) and `bearer`/`basic` (protocol-specific). Now it's obvious.
+4. **Function type over interface for callbacks:** don't create an interface for a single-method callback. Use a function type. It's simpler and more composable.
+
+### Layer violations to watch for
+
+- `net/http` imported in business layer → violation. HTTP is protocol, belongs in API layer.
+- Auth logic in business layer → violation. Auth is app-layer concern.
+- DB test depending on auth package → violation. DB tests should not care about auth.
+
+**Applied in AI Avengers as:** `internal/api/` is the only layer that imports `net/http`. `internal/middleware/` handles auth. Business logic in `internal/{orchestrator,decision,chinawall,memory,context}/` is protocol-agnostic.
+
+## 9.7 Storage Internals — S3 and LSM Trees (System Design Master Class 3)
+
+### Why S3 is fast (log-structured storage)
+
+S3 stores data in append-only files on cheap magnetic disks. The key insight:
+- **Magnetic disk sequential write:** ~200 MB/s.
+- **Magnetic disk random write:** ~1 MB/s.
+- **Conclusion:** never random-write to magnetic disk. Always append.
+
+S3 maintains an index (byte offset per key) for fast reads. Writes are always appends. Compaction periodically merges old files and drops stale versions.
+
+### LSM Trees (Log-Structured Merge Trees)
+
+Used by RocksDB, Cassandra, LevelDB. The write path:
+1. Write to in-memory buffer (MemTable).
+2. When MemTable is full, flush to disk as an immutable SSTable (Sorted String Table).
+3. SSTables are sorted by key, so range scans are fast.
+4. Compaction: periodically merge SSTables, drop deleted/stale versions.
+
+**Read path:** check MemTable → check Bloom filter (is key in this SSTable?) → binary search SSTable.
+
+**Bloom filter:** probabilistic data structure. "Is this key definitely NOT in this SSTable?" If yes, skip the SSTable. Reduces disk reads dramatically.
+
+**Applied in AI Avengers as:** we use Postgres (B-tree indexes, not LSM). But the mental model applies to `blackboard_events` and `master_event_log` — both are append-only, never updated. Future: if we move to Cassandra or RocksDB for event storage, LSM tree properties apply directly.
+
+## 9.8 Anti-Patterns Discovered in This Session (2026-09-07)
+
+These are NEW anti-patterns not in the original §6.3 or §7.4. Add them to your checklist.
+
+### Anti-pattern: Signature change without caller update
+
+**What happened:** `IngestTranscript` signature was extended with `replaceExisting bool` (7th param). The commit was made. The caller in `admin_handler.go` was not updated in the same commit. Build broke on `main`.
+
+**Rule:** WHEN changing a function signature → DO grep for all callers BEFORE committing → BECAUSE Go will not compile with mismatched call sites. The compiler is your friend — use it before committing, not after.
+
+**Correct process:**
+1. Change the function signature.
+2. `grep -r "FunctionName(" internal/` to find all callers.
+3. Update every caller in the SAME commit.
+4. Only then commit.
+
+### Anti-pattern: Trusting design doc SQL without cross-checking schema
+
+**What happened:** `DOMAIN_EXPERT_COLLABORATION_DESIGN.md` §15 referenced `ALTER TABLE llm_calls ADD COLUMN workflow_id`. The `llm_calls` table does not exist in the schema. Cost tracking is on `messages.cost_usd`.
+
+**Rule:** WHEN writing a migration → DO read every existing migration file first → BECAUSE design docs are written before implementation and may reference tables that were never created or were renamed.
+
+### Anti-pattern: Trusting handoff file top-level status over per-component tables
+
+**What happened:** `HANDOFF.md` top-level table said "Phase 2: ✅ COMPLETE" but per-component table said "⏳ PENDING" for the same phase.
+
+**Rule:** WHEN reading handoff files → DO trust the per-component tables over the top-level summary → BECAUSE top-level summaries are often updated optimistically while per-component tables reflect actual state.
+
+---
+
 # Part VIII — Worked Examples
 
 ## 8.1 Example: "Add a new tool for experts to call"
