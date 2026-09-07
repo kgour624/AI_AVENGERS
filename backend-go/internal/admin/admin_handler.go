@@ -506,15 +506,21 @@ func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 	defer rows.Close()
 
 	type jobRow struct {
-		ID              uuid.UUID  `json:"id"`
-		Status          string     `json:"status"`
-		SourcePath      string     `json:"source_path"`
-		TotalChunks     int        `json:"total_chunks"`
-		ProcessedChunks int        `json:"processed_chunks"`
-		ErrorMessage    string     `json:"error_message,omitempty"`
-		StartedAt       *time.Time `json:"started_at"`
-		CompletedAt     *time.Time `json:"completed_at"`
-		CreatedAt       time.Time  `json:"created_at"`
+		ID                      uuid.UUID  `json:"id"`
+		Status                  string     `json:"status"`
+		SourcePath              string     `json:"source_path"`
+		TotalChunks             int        `json:"total_chunks"`
+		ProcessedChunks         int        `json:"processed_chunks"`
+		ErrorMessage            string     `json:"error_message,omitempty"`
+		StartedAt               *time.Time `json:"started_at"`
+		CompletedAt             *time.Time `json:"completed_at"`
+		CreatedAt               time.Time  `json:"created_at"`
+		// Migration 007 fields
+		CurrentStage            string     `json:"current_stage"`
+		StageDetail             string     `json:"stage_detail"`
+		CostUsd                 float64    `json:"cost_usd"`
+		EstimatedSecondsRemaining *int     `json:"estimated_seconds_remaining"`
+		ResumedFromCheckpoint   bool       `json:"resumed_from_checkpoint"`
 	}
 	var jobs []jobRow
 	for rows.Next() {
