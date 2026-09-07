@@ -467,20 +467,39 @@ const refreshTokenCookieName = "refresh_token"
 // Lax allows it. Correct for a web app.
 func setRefreshCookie(c *gin.Context, refreshToken string, expiryDays int) {
 	maxAge := expiryDays * 24 * 60 * 60 // seconds
+
+	// WHY Path=/ not /api/v1/auth/refresh:
+	//   Restricted path caused cookie to not be sent on cross-origin
+	//   requests from 192.168.1.7:3000 -> 192.168.1.7:8080.
+	//   Path=/ ensures browser sends cookie on all backend requests.
+	//   Security is maintained by httpOnly (JS can't read) + token
+	//   validation on the refresh endpoint.
 	c.SetCookie(
 		refreshTokenCookieName,
 		refreshToken,
 		maxAge,
-		"/api/v1/auth/refresh", // Path — only sent to refresh endpoint
-		"",                     // Domain — empty = current domain
-		false,                  // Secure — set true in production (HTTPS)
-		true,                   // HttpOnly — JS cannot read this
+		"/",   // Path — send on all requests to this domain
+		"",    // Domain — empty = current domain only
+		false, // Secure — false for HTTP local dev; set true in production
+		true,  // HttpOnly — JS cannot read this cookie
 	)
+
+	// WHY manual SameSite header:
+	//   Gin's c.SetCookie() does not expose SameSite parameter.
+	//   We append it to the Set-Cookie header directly.
+	//   SameSite=Lax: cookie sent on same-host requests (same IP,
+	//   different port counts as same-site in most browsers).
+	//   This fixes the 192.168.1.7:3000 -> :8080 cross-port scenario.
+	existing := c.Writer.Header().Get("Set-Cookie")
+	if existing != "" {
+		c.Writer.Header().Set("Set-Cookie", existing+"; SameSite=Lax")
+	}
 }
 
 // clearRefreshCookie removes the refresh token cookie on logout.
 func clearRefreshCookie(c *gin.Context) {
-	c.SetCookie(refreshTokenCookieName, "", -1, "/api/v1/auth/refresh", "", false, true)
+	// Path must match setRefreshCookie — both use /
+	c.SetCookie(refreshTokenCookieName, "", -1, "/", "", false, true)
 }
 
 // buildAuthResponse builds the response the frontend expects.
