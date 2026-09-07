@@ -819,6 +819,143 @@ func (h *AdminHandler) UpdateSetting(c *gin.Context) {
 	response.OK(c, map[string]string{"status": "updated", "key": key})
 }
 
+// ============================================================
+// LLM SETTINGS (provider + API keys from admin panel)
+// ============================================================
+
+// GetLLMSettings GET /admin/llm-settings
+// Returns current provider and masked API keys.
+// Keys are masked (last 4 chars only) — never returned in full.
+func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	// Read provider from system_settings
+	provider := "openrouter" // default
+	var providerJSON []byte
+	if err := h.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'llm_provider'`,
+	).Scan(&providerJSON); err == nil {
+		var p string
+		if json.Unmarshal(providerJSON, &p) == nil && p != "" {
+			provider = p
+		}
+	}
+
+	// Read API keys from system_settings (masked)
+	maskedKeys := map[string]string{}
+	var keysJSON []byte
+	if err := h.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'llm_api_keys'`,
+	).Scan(&keysJSON); err == nil {
+		var keys map[string]string
+		if json.Unmarshal(keysJSON, &keys) == nil {
+			for k, v := range keys {
+				if len(v) > 4 {
+					maskedKeys[k] = "****" + v[len(v)-4:]
+				} else if v != "" {
+					maskedKeys[k] = "****"
+				}
+			}
+		}
+	}
+
+	response.OK(c, map[string]interface{}{
+		"active_provider": provider,
+		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini"},
+		"api_keys_configured": maskedKeys,
+		"note": "API keys are masked. To update, POST to this endpoint with new values.",
+	})
+}
+
+// UpdateLLMSettings POST /admin/llm-settings
+// Body: {provider: "deepseek", api_keys: {"deepseek": "sk-xxx"}}
+// Saves provider + keys to system_settings. Takes effect immediately.
+func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
+	var req struct {
+		Provider string            `json:"provider"`
+		APIKeys  map[string]string `json:"api_keys"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+
+	validProviders := map[string]bool{
+		"openrouter": true, "deepseek": true,
+		"anthropic": true, "gemini": true,
+	}
+	if req.Provider != "" && !validProviders[req.Provider] {
+		response.BadRequest(c, "INVALID_PROVIDER",
+			"provider must be: openrouter, deepseek, anthropic, gemini")
+		return
+	}
+
+	ctx := c.Request.Context()
+	adminID := c.MustGet("user_id").(uuid.UUID)
+
+	// Save provider
+	if req.Provider != "" {
+		providerJSON, _ := json.Marshal(req.Provider)
+		_, err := h.db.Exec(ctx,
+			`INSERT INTO system_settings (key, value, updated_by)
+			 VALUES ('llm_provider', $1, $2)
+			 ON CONFLICT (key) DO UPDATE SET
+				value = EXCLUDED.value,
+				updated_by = EXCLUDED.updated_by,
+				updated_at = NOW()`,
+			string(providerJSON), adminID,
+		)
+		if err != nil {
+			h.logger.Error("save llm provider failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+	}
+
+	// Save API keys (merge with existing, don't overwrite unset keys)
+	if len(req.APIKeys) > 0 {
+		// Load existing keys first
+		existing := map[string]string{}
+		var existingJSON []byte
+		if err := h.db.QueryRow(ctx,
+			`SELECT value FROM system_settings WHERE key = 'llm_api_keys'`,
+		).Scan(&existingJSON); err == nil {
+			json.Unmarshal(existingJSON, &existing)
+		}
+		// Merge: new values override existing
+		for k, v := range req.APIKeys {
+			if v != "" {
+				existing[k] = v
+			}
+		}
+		mergedJSON, _ := json.Marshal(existing)
+		_, err := h.db.Exec(ctx,
+			`INSERT INTO system_settings (key, value, updated_by)
+			 VALUES ('llm_api_keys', $1, $2)
+			 ON CONFLICT (key) DO UPDATE SET
+				value = EXCLUDED.value,
+				updated_by = EXCLUDED.updated_by,
+				updated_at = NOW()`,
+			string(mergedJSON), adminID,
+		)
+		if err != nil {
+			h.logger.Error("save llm api keys failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+	}
+
+	h.logger.Info("LLM settings updated",
+		zap.String("provider", req.Provider),
+		zap.Int("keys_updated", len(req.APIKeys)),
+	)
+	response.OK(c, map[string]string{
+		"status":   "updated",
+		"provider": req.Provider,
+		"note":     "Changes take effect on next LLM call. No restart needed.",
+	})
+}
+
 // isUniqueViolation checks if error is a PostgreSQL unique constraint violation.
 func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unique")
