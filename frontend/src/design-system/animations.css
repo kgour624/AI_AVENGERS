@@ -1,57 +1,153 @@
-/* ARC-51 §3: modal open/close is now handled by framer-motion
-   (components/ui/Modal.tsx + design-system/motion.ts's modalSpring),
-   not CSS keyframes - the .modal-enter/.modal-closing classes and
-   their keyframes that used to live here were removed since nothing
-   references them anymore (verified no other component used them
-   before deleting, not just assumed). */
+/* ============================================================
+   2051 ANIMATIONS
+   ============================================================ */
 
+/* Thinking indicator — used by StreamingIndicator */
 @keyframes pulse-thinking {
-  0%,
-  100% {
-    opacity: 0.4;
-  }
-  50% {
-    opacity: 1;
-  }
+  0%, 100% { opacity: 0.4; }
+  50%       { opacity: 1;   }
 }
-
 .thinking-indicator {
   animation: pulse-thinking 1.4s ease-in-out infinite;
 }
 
-/* ARC-51 — ExpertAvatar status ring (components/expert/ExpertAvatar.tsx).
-   CSS, not framer-motion, per docs/ARC51_UI_CONTRACT.md §3: this runs
-   continuously per-card, so a JS-driven animation would be needless
-   overhead for a purely decorative infinite loop. */
+/* Expert avatar status ring */
 @keyframes arc-ring-rotate {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
 }
-
 .arc-avatar-ring-analyzing {
   animation: arc-ring-rotate 2.2s linear infinite;
 }
 
 @keyframes arc-ring-pulse-once {
-  0% {
-    box-shadow: 0 0 0 0 currentColor;
-    opacity: 1;
-  }
-  100% {
-    box-shadow: 0 0 0 8px transparent;
-    opacity: 0.9;
-  }
+  0%   { box-shadow: 0 0 0 0 currentColor; opacity: 1; }
+  100% { box-shadow: 0 0 0 8px transparent; opacity: 0.9; }
 }
-
 .arc-avatar-ring-responded {
-  animation: arc-ring-pulse-once 500ms var(--ease-arc, ease-out) 1;
+  animation: arc-ring-pulse-once 500ms cubic-bezier(0.16, 1, 0.3, 1) 1;
 }
 
+/* ============================================================
+   AURORA DRIFT — background glow orbs
+   ============================================================ */
+@keyframes aurora-drift {
+  0%   { transform: translate(0%,  0%)  scale(1);    }
+  33%  { transform: translate(3%,  -2%) scale(1.06); }
+  66%  { transform: translate(-2%, 3%)  scale(0.96); }
+  100% { transform: translate(1%,  -1%) scale(1.03); }
+}
+.aurora-orb {
+  animation: aurora-drift 20s ease-in-out infinite alternate;
+  will-change: transform;
+}
+.aurora-orb-slow {
+  animation: aurora-drift 32s ease-in-out infinite alternate-reverse;
+  will-change: transform;
+}
+
+/* ============================================================
+   SCAN LINE — horizontal sweep across page
+   ============================================================ */
+@keyframes scan-sweep {
+  0%   { transform: translateY(-4px); opacity: 0; }
+  5%   { opacity: 1; }
+  95%  { opacity: 1; }
+  100% { transform: translateY(100vh); opacity: 0; }
+}
+.scan-line {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    oklch(68% 0.28 295 / 0.6) 30%,
+    oklch(78% 0.18 200 / 0.8) 50%,
+    oklch(68% 0.28 295 / 0.6) 70%,
+    transparent 100%
+  );
+  animation: scan-sweep 12s linear infinite;
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* ============================================================
+   NEON PULSE — for active/highlighted elements
+   ============================================================ */
+@keyframes neon-pulse {
+  0%, 100% {
+    box-shadow: 0 0 8px  oklch(68% 0.28 295 / 0.4),
+                0 0 20px oklch(68% 0.28 295 / 0.2);
+  }
+  50% {
+    box-shadow: 0 0 16px oklch(68% 0.28 295 / 0.7),
+                0 0 40px oklch(68% 0.28 295 / 0.35),
+                0 0 80px oklch(68% 0.28 295 / 0.15);
+  }
+}
+.neon-pulse {
+  animation: neon-pulse 3s ease-in-out infinite;
+}
+
+/* ============================================================
+   HOLOGRAPHIC SHIMMER — gradient text/border animation
+   ============================================================ */
+@keyframes holo-shimmer {
+  0%   { background-position: 0%   50%; }
+  50%  { background-position: 100% 50%; }
+  100% { background-position: 0%   50%; }
+}
+.holo-text {
+  background: linear-gradient(
+    135deg,
+    oklch(68% 0.28 295),
+    oklch(78% 0.18 200),
+    oklch(65% 0.30 320),
+    oklch(70% 0.25 340),
+    oklch(68% 0.28 295)
+  );
+  background-size: 300% 300%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: holo-shimmer 5s ease-in-out infinite;
+}
+
+/* ============================================================
+   DATA STREAM — upward floating particles
+   ============================================================ */
+@keyframes data-stream {
+  0%   { transform: translateY(0);     opacity: 0.8; }
+  100% { transform: translateY(-24px); opacity: 0;   }
+}
+.data-particle {
+  animation: data-stream 2s linear infinite;
+}
+
+/* ============================================================
+   FADE UP — entrance animation
+   ============================================================ */
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0);   }
+}
+.fade-up {
+  animation: fade-up 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* ============================================================
+   REDUCED MOTION
+   ============================================================ */
 @media (prefers-reduced-motion: reduce) {
+  .aurora-orb,
+  .aurora-orb-slow,
+  .scan-line,
+  .neon-pulse,
+  .holo-text,
+  .data-particle,
   .arc-avatar-ring-analyzing,
   .arc-avatar-ring-responded {
     animation: none;
