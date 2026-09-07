@@ -2,15 +2,6 @@ import type { ResponseMode } from '@/types/expert'
 import { getModeBadgeConfig } from '@/types/expert'
 import { cn } from '@/utils/cn'
 
-/**
- * Renders a ResponseMode as a colored chip.
- * WHY this is a thin wrapper around getModeBadgeConfig rather than
- * its own switch statement: keeps exactly one place
- * (types/expert.ts::getModeBadgeConfig) that has to change if the
- * backend ever adds a 6th ResponseMode - the `never` exhaustiveness
- * check there will fail to compile, and this component inherits that
- * safety automatically without needing its own separate check.
- */
 export interface ModeBadgeProps {
   mode: ResponseMode
   className?: string
@@ -18,39 +9,39 @@ export interface ModeBadgeProps {
 
 export function ModeBadge({ mode, className }: ModeBadgeProps) {
   const config = getModeBadgeConfig(mode)
-
   return (
-    <span
-      className={cn(
-        'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium',
-        config.color,
-        config.bgClass,
-        className
-      )}
-    >
+    <span className={cn(
+      'inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium',
+      'backdrop-blur-sm',
+      config.color, config.bgClass,
+      className
+    )}>
       <span aria-hidden="true">{config.icon}</span>
       {config.label}
     </span>
   )
 }
 
-/** Generic pill badge for non-mode use cases (e.g. depth level, domain tag). */
 export interface BadgeProps {
   children: React.ReactNode
-  variant?: 'neutral' | 'brand'
+  variant?: 'neutral' | 'brand' | 'success' | 'warn' | 'danger'
   className?: string
 }
 
 export function Badge({ children, variant = 'neutral', className }: BadgeProps) {
   return (
-    <span
-      className={cn(
-        'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium',
-        variant === 'neutral' && 'bg-surface-overlay text-text-secondary',
-        variant === 'brand' && 'bg-brand/10 text-brand',
-        className
-      )}
-    >
+    <span className={cn(
+      'inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium backdrop-blur-sm',
+      variant === 'neutral' && 'border-surface-border bg-surface-overlay/60 text-text-secondary',
+      variant === 'brand'   && [
+        'border-glow-purple/30 bg-glow-purple/10 text-glow-purple',
+        'shadow-[0_0_8px_oklch(68%_0.28_295_/_0.2)]',
+      ],
+      variant === 'success' && 'border-mode-advise/30 bg-mode-advise/10 text-mode-advise',
+      variant === 'warn'    && 'border-mode-warn/30 bg-mode-warn/10 text-mode-warn',
+      variant === 'danger'  && 'border-mode-refuse/30 bg-mode-refuse/10 text-mode-refuse',
+      className
+    )}>
       {children}
     </span>
   )
