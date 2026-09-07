@@ -213,6 +213,14 @@ func buildRouter(
 	repoHandler := repo.NewHandler(repoSvc, logger)
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, logger)
 
+	// Collaboration layer (Phase C)
+	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
+	bbSubscriber := blackboard.NewSubscriber(bbStore, redisClient.Client, logger)
+	wfEngine := workflow.NewEngine(postgres.Pool, logger)
+	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, logger)
+	_ = wfTools // used by expert execution loop (Phase D)
+	wfHandler := workflow.NewHandler(wfEngine, bbStore, logger)
+
 	// ============================================================
 	// Health check — no auth required
 	// ============================================================
