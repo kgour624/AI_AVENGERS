@@ -362,6 +362,9 @@ func buildRouter(
 		adminGroup.GET("/ratings", adminHandler.GetRatings)
 		adminGroup.GET("/settings", adminHandler.GetSettings)
 		adminGroup.PATCH("/settings/:key", adminHandler.UpdateSetting)
+		// LLM provider + API key management (no env file needed)
+		adminGroup.GET("/llm-settings", adminHandler.GetLLMSettings)
+		adminGroup.POST("/llm-settings", adminHandler.UpdateLLMSettings)
 	}
 
 	return router
