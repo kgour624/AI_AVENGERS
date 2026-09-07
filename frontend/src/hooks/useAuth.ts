@@ -33,25 +33,39 @@ export function useAuthBootstrap() {
     }
 
     let cancelled = false
-    refreshSession()
+
+    // WHY tryRefresh helper:
+    //   On page reload, the browser may take a moment to send the
+    //   httpOnly cookie on a cross-port request (3001 → 8080).
+    //   We retry once after 800ms before giving up.
+    //   This prevents spurious logouts on reload without masking
+    //   genuine "not logged in" cases.
+    const tryRefresh = async (attempt: number): Promise<string> => {
+      try {
+        return await refreshSession()
+      } catch (err) {
+        if (attempt === 0 && !cancelled) {
+          // First attempt failed — wait 800ms and retry once
+          await new Promise((resolve) => setTimeout(resolve, 800))
+          if (!cancelled) return tryRefresh(1)
+        }
+        throw err
+      }
+    }
+
+    tryRefresh(0)
       .then(async (token) => {
-        // Bug 1.3 fix (docs bug list): populate the full user profile
-        // (fullName, email) so Header can display it - previously
-        // only `role` was ever recoverable after a reload, via the
-        // JWT-decode stopgap in authStore.isAdmin(), even though
-        // GET /auth/me exists precisely to restore the rest.
         try {
           const user = await getMe()
           if (!cancelled) useAuthStore.getState().setAuth(user, token)
         } catch {
-          // /me failed but the refresh itself succeeded - stay logged
-          // in with role-only info (the JWT-decode fallback still
-          // covers isAdmin()); not fatal enough to log the user out.
+          // /me failed but refresh succeeded — stay logged in with
+          // role-only info from JWT decode fallback.
         }
       })
       .catch(() => {
-        // No valid refresh cookie - this is the normal "not logged in"
-        // case, not an error. AuthGuard will redirect to /login.
+        // No valid refresh cookie after retry — genuinely not logged in.
+        // AuthGuard will redirect to /login.
       })
       .finally(() => {
         if (!cancelled) setIsBootstrapping(false)
