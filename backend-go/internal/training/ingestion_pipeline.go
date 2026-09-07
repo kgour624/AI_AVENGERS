@@ -594,6 +594,64 @@ func (p *IngestionPipeline) storeCapabilities(ctx context.Context, expertID uuid
 	}
 }
 
+// updateStage writes the current pipeline stage to the DB.
+// Called at every stage transition for live UI updates.
+func (p *IngestionPipeline) updateStage(ctx context.Context, jobID uuid.UUID, stage, detail string) {
+	_, err := p.db.Exec(ctx,
+		`UPDATE ingestion_jobs SET current_stage=$1, stage_detail=$2 WHERE id=$3`,
+		stage, detail, jobID,
+	)
+	if err != nil {
+		p.logger.Warn("updateStage failed", zap.String("stage", stage), zap.Error(err))
+	}
+}
+
+// loadChunksFromDB loads existing TextChunks for an expert from the DB.
+// Used on resume to skip re-chunking.
+func (p *IngestionPipeline) loadChunksFromDB(ctx context.Context, expertID uuid.UUID) ([]TextChunk, error) {
+	rows, err := p.db.Query(ctx,
+		`SELECT chunk_text, chunk_index, COALESCE(chunk_hash,'') FROM course_chunks
+		 WHERE expert_id=$1 ORDER BY chunk_index ASC`,
+		expertID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("loadChunksFromDB: %w", err)
+	}
+	defer rows.Close()
+
+	var chunks []TextChunk
+	for rows.Next() {
+		var c TextChunk
+		if err := rows.Scan(&c.Text, &c.Index, &c.ChunkHash); err != nil {
+			continue
+		}
+		chunks = append(chunks, c)
+	}
+	return chunks, rows.Err()
+}
+
+// loadCharterFromDB loads the existing charter from the experts table.
+// Used on resume to skip re-extraction.
+func (p *IngestionPipeline) loadCharterFromDB(ctx context.Context, expertID uuid.UUID) (*Charter, error) {
+	var reasoningCharter string
+	var clarificationJSON []byte
+	err := p.db.QueryRow(ctx,
+		`SELECT COALESCE(reasoning_charter,''), COALESCE(clarification_charter,'{}') FROM experts WHERE id=$1`,
+		expertID,
+	).Scan(&reasoningCharter, &clarificationJSON)
+	if err != nil {
+		return nil, fmt.Errorf("loadCharterFromDB: %w", err)
+	}
+	var clarification map[string][]string
+	if err := json.Unmarshal(clarificationJSON, &clarification); err != nil {
+		clarification = defaultClarificationCharter()
+	}
+	return &Charter{
+		ReasoningCharter:     reasoningCharter,
+		ClarificationCharter: clarification,
+	}, nil
+}
+
 // updateJobStatus updates the ingestion job status.
 func (p *IngestionPipeline) updateJobStatus(
 	ctx context.Context,
