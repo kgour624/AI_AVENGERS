@@ -106,6 +106,25 @@ func (p *IngestionPipeline) IngestTranscript(
 		zap.Int("transcript_length", len(transcript)),
 	)
 
+	// ============================================================
+	// CHECKPOINT LOAD: resume from last known good state
+	// ============================================================
+	cp, err := LoadCheckpoint(ctx, p.db, jobID)
+	if err != nil {
+		p.logger.Warn("checkpoint load failed, starting fresh", zap.Error(err))
+		cp = nil
+	}
+	isResume := cp != nil && cp.Stage != StagePending
+	if isResume {
+		p.logger.Info("resuming from checkpoint",
+			zap.String("stage", cp.Stage),
+			zap.Int("chunks_done", cp.ChunksDone),
+			zap.Int("last_batch", cp.LastBatchIndex),
+		)
+		_, _ = p.db.Exec(ctx,
+			`UPDATE ingestion_jobs SET resumed_from_checkpoint=TRUE WHERE id=$1`, jobID)
+	}
+
 	// Update job status to running
 	p.updateJobStatus(ctx, jobID, "running", "", 0, 0)
 
