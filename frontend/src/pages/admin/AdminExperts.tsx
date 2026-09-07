@@ -186,6 +186,20 @@ function AdminExperts() {
         />
       )}
 
+      {/* Pipeline progress modal */}
+      <IngestionPipelineModal
+        isOpen={pipelineJob !== null}
+        onClose={() => setPipelineJob(null)}
+        job={pipelineJob}
+        expertName={
+          pipelineJob
+            ? experts?.find((e) =>
+                useIngestionStatus(e.id).data?.[0]?.id === pipelineJob.id
+              )?.name ?? 'Expert'
+            : ''
+        }
+      />
+
       {/* A12: Edit Config modal — pre-fills from expert object */}
       {configTargetId && (() => {
         const expert = experts?.find((e) => e.id === configTargetId)
