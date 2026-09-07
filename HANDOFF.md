@@ -16,14 +16,53 @@
 
 ## Overall Status
 
-| Phase | Status | Completed |
+> **Last verified: 2026-09-07**
+> **Rule:** A phase is COMPLETE only when every file in its per-component table
+> exists on `main` AND the checkpoint condition has been met.
+> Evidence column = what was checked to make this claim.
+
+### Backend
+
+| Phase | Status | Evidence |
 |---|---|---|
-| Phase 1: Foundation | ✅ COMPLETE | 2026-09-04 |
-| Phase 2: Expert Training | ✅ COMPLETE | 2026-09-04 |
-| Phase 3: Core Intelligence | ✅ COMPLETE | 2026-09-04 |
-| Phase 4: Project & Chat | ✅ COMPLETE | 2026-09-04 |
-| Phase 5: Advanced Features | ✅ COMPLETE | 2026-09-04 |
-| Phase 6: Polish & Deploy | ✅ COMPLETE | 2026-09-04 |
+| Phase 1: Foundation | ✅ COMPLETE | Files exist on main. Admin confirmed `docker-compose up --build` + login works end-to-end (2026-09-06). |
+| Phase 2: Expert Training | ✅ COMPLETE | All 6 training files exist on main (`chunker.go`, `embedding_clusterer.go`, `topic_extractor.go`, `charter_extractor.go`, `capability_builder.go`, `ingestion_pipeline.go`). Chunk dedup (A9) + smoke test (A10) added 2026-09-07. No live ingestion run verified yet — see checkpoint below. |
+| Phase 3: Core Intelligence | ✅ COMPLETE | All files exist on main. 2026-09-05 audit confirmed: 5-gate engine, China Wall 4 layers, context assembler, L1/L2/L3 memory, orchestrator all correct. 7 bugs found + fixed in same session. |
+| Phase 4: Project & Chat | ✅ COMPLETE | All files exist on main. SSE streaming, chat service, message handler, project service verified correct in 2026-09-05 audit. |
+| Phase 5: Advanced Features | ✅ COMPLETE | All files exist on main. OAuth routes added (Bug 4 fix). Repo sync, rating engine, admin handler all verified. |
+| Phase 6: Polish & Deploy | ⚠️ PARTIAL | Docker setup complete (docker-compose.yml + prod). Rate limiting middleware exists. Cost monitor exists. Load testing NOT done. `go build ./...` not run since 2026-09-07 changes — **must verify before claiming complete**. |
+
+### Collaboration Layer (IMPLEMENTATION_HANDOFF.md tracks this)
+
+| Phase | Status | Evidence |
+|---|---|---|
+| Phase A: Truth Reconciliation + Expert Schema | ✅ COMPLETE | Migration 006 committed. A7 (expert/handler.go), A8 (admin_handler.go), A9 (chunk dedup), A10 (smoke test) all committed 2026-09-07. A11 (this rewrite) done. A12 (frontend forms) ⏳ NOT STARTED. |
+| Phase B: First 3 Experts | ⏳ NOT STARTED | No transcripts uploaded. No experts created. |
+| Phase C: Blackboard + Workflow Engine | ⏳ NOT STARTED | Schema exists (migration 006). No Go implementation. |
+| Phase D: Cross-Verification + Validation | ⏳ NOT STARTED | — |
+| Phase E: Checkpointing + Cost Governance + Kanban | ⏳ NOT STARTED | — |
+| Phase F: Remaining 7 Experts + Handoff Packaging | ⏳ NOT STARTED | — |
+
+### Frontend
+
+| Phase | Status | Evidence |
+|---|---|---|
+| Frontend Phase 1: Foundation | ✅ COMPLETE (manual trace) | Files exist. No `npm run build` run. |
+| Frontend Phase 2: Core UI Components | ✅ COMPLETE (manual trace) | Files exist. No build run. |
+| Frontend Phase 3: Chat Interface + SSE | ✅ COMPLETE (manual trace) | Files exist. No build run. |
+| Frontend Phase 4: Project + Admin Pages | ✅ COMPLETE (manual trace) | Files exist. Correction pass fixed 7 real bugs against actual backend source. No build run. |
+| Frontend Phase 5: Advanced Features | ✅ COMPLETE (manual trace) | PAT-based repo connect implemented. OAuth blocked by backend gap (now fixed). No build run. |
+| Frontend Phase 6: Polish + Deploy | ✅ COMPLETE (manual trace) | Virtualized message list, error boundary, timeline wired. No build run. |
+| **Frontend build verification** | ❌ NOT DONE | `cd frontend && npm install && npm run typecheck && npm run build` has NEVER been run. This is the single most important open action. |
+| Frontend A12: Expert config form fields | ⏳ NOT STARTED | Depends on A7/A8 (now complete). |
+
+### Critical open actions before calling the system production-ready
+
+1. **`cd backend-go && go build ./...`** — verify all 2026-09-07 Go changes compile cleanly.
+2. **`cd frontend && npm install && npm run typecheck && npm run build`** — never run. Fix whatever surfaces.
+3. **Upload a real transcript** — verify ingestion pipeline end-to-end: chunks stored, smoke test runs, `training_status='trained'` set.
+4. **A12** — frontend expert form fields for new config (model_tier, temperature, loop_pattern, etc.).
+5. **Phase B** — create the first 3 experts (PM, System Design, Backend) with real transcripts.
 
 ---
 
