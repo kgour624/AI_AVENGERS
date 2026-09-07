@@ -34,6 +34,7 @@ import (
 	"ai_avengers/backend/internal/rating"
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 )
 
