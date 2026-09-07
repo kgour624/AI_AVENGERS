@@ -344,11 +344,7 @@ func referencesEvent(event blackboard.Event, targetID uuid.UUID) bool {
 	return false
 }
 
-// marshalJSON is a thin wrapper used internally.
+// marshalJSON is a thin wrapper around json.Marshal used internally.
 func marshalJSON(v interface{}) ([]byte, error) {
-	import_json_marshal := func(v interface{}) ([]byte, error) {
-		import "encoding/json"
-		return json.Marshal(v)
-	}
-	return import_json_marshal(v)
+	return json.Marshal(v)
 }
