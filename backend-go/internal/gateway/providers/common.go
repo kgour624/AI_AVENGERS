@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"ai_avengers/backend/internal/gateway"
+	gtypes "ai_avengers/backend/internal/gateway/types"
 )
 
 // openAICompatibleResponse is the shared response format used by
@@ -24,8 +24,8 @@ type openAICompatibleResponse struct {
 }
 
 // doOpenAICompatibleCall executes an HTTP request and parses the
-// OpenAI-compatible response format. Shared by OpenRouter, DeepSeek, Gemini.
-func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName string) (*gateway.ProviderResponse, error) {
+// OpenAI-compatible response. Shared by OpenRouter, DeepSeek, Gemini.
+func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName string) (*gtypes.ProviderResponse, error) {
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http call failed: %w", err)
@@ -49,7 +49,7 @@ func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName st
 		usedModel = modelName
 	}
 
-	return &gateway.ProviderResponse{
+	return &gtypes.ProviderResponse{
 		Content:      result.Choices[0].Message.Content,
 		InputTokens:  result.Usage.PromptTokens,
 		OutputTokens: result.Usage.CompletionTokens,
