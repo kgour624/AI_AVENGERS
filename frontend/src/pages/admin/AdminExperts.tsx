@@ -74,22 +74,37 @@ function AdminExperts() {
           <Card key={expert.id} glow="cyan">
             <div className="flex items-center justify-between">
               <p className="font-medium text-text-primary">{expert.name}</p>
-              <Badge variant={expert.isActive ? 'brand' : 'neutral'}>
-                {expert.isActive ? '\u2705 Active' : '\u23f8 Disabled'}
-              </Badge>
+              <div className="flex items-center gap-2">
+                {/* A12: training status badge */}
+                <Badge variant="neutral" className="text-xs">
+                  {trainingStatusLabel(expert.trainingStatus)}
+                </Badge>
+                <Badge variant={expert.isActive ? 'brand' : 'neutral'}>
+                  {expert.isActive ? '\u2705 Active' : '\u23f8 Disabled'}
+                </Badge>
+              </div>
             </div>
             <p className="mt-1 text-xs text-text-secondary">
               Chunks: {expert.totalChunks} | Rating: {expert.avgRating}
+              {expert.modelTier && (
+                <span className="ml-2 text-text-disabled">
+                  | {expert.modelTier} / {expert.loopPattern}
+                </span>
+              )}
             </p>
             <ExpertRow expertId={expert.id} />
 
-            <div className="mt-3 flex gap-2">
+            <div className="mt-3 flex flex-wrap gap-2">
               <Button variant="secondary" size="sm" onClick={() => setUploadTargetId(expert.id)}>
                 Upload Transcript
               </Button>
               {/* Feature #1 fix (docs bug list): was permanently disabled. */}
               <Button variant="ghost" size="sm" onClick={() => setCharterTargetId(expert.id)}>
                 Edit Charter
+              </Button>
+              {/* A12: new config edit button */}
+              <Button variant="ghost" size="sm" onClick={() => setConfigTargetId(expert.id)}>
+                Edit Config
               </Button>
             </div>
           </Card>
