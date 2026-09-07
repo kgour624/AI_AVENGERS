@@ -65,11 +65,49 @@ export interface CreateExpertRequest {
   slug: string
   domain: string
   description?: string
+  // Migration 006 config fields — all optional, backend defaults apply when omitted.
+  // Defaults: modelTier='strong', temperature=0.30, topP=0.50,
+  //           loopPattern='react', maxLoopIterations=5, allowedTools=[]
+  modelTier?: 'cheap' | 'strong' | 'fast'
+  temperature?: number
+  topP?: number
+  loopPattern?: 'ota' | 'react' | 'plan_execute'
+  maxLoopIterations?: number
+  allowedTools?: string[]
 }
 
 export const createExpert = (req: CreateExpertRequest) =>
   baseAPI
     .post<ApiResponse<{ id: string; slug: string }>>('/api/v1/admin/experts', req)
+    .then((res) => res.data.data!)
+
+/**
+ * General-purpose PATCH for all expert fields.
+ * All fields optional — only provided fields are updated.
+ * WHY separate from updateExpertCharter:
+ *   updateExpertCharter is a narrow single-field function used by
+ *   EditCharterModal. updateExpert is the general PATCH used by
+ *   EditExpertConfigModal. Keeping them separate avoids breaking
+ *   the charter modal's call site.
+ */
+export interface UpdateExpertRequest {
+  name?: string
+  description?: string
+  isActive?: boolean
+  reasoningCharter?: string
+  // Migration 006 config fields
+  modelTier?: 'cheap' | 'strong' | 'fast'
+  temperature?: number
+  topP?: number
+  loopPattern?: 'ota' | 'react' | 'plan_execute'
+  maxLoopIterations?: number
+  allowedTools?: string[]
+  trainingStatus?: 'draft' | 'ingesting' | 'trained' | 'deprecated'
+}
+
+export const updateExpert = (expertId: string, req: UpdateExpertRequest) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/experts/${expertId}`, req)
     .then((res) => res.data.data!)
 
 export const ingestTranscript = (expertId: string, file: File) => {
