@@ -276,6 +276,143 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 	return nil, fmt.Errorf("all LLM attempts failed: %w", lastErr)
 }
 
+// SetDB wires the database pool for runtime settings override.
+// Called from main.go after DB connects.
+// WHY separate from constructor: gateway is created before DB connects.
+func (g *ModelGateway) SetDB(db *pgxpool.Pool) {
+	g.db = db
+}
+
+// getActiveProvider reads the active LLM provider from DB system_settings.
+// Falls back to cfg.Provider (env var). Falls back to openrouter.
+func (g *ModelGateway) getActiveProvider(ctx context.Context) config.LLMProvider {
+	if g.db != nil {
+		var valueJSON []byte
+		err := g.db.QueryRow(ctx,
+			`SELECT value FROM system_settings WHERE key = 'llm_provider'`,
+		).Scan(&valueJSON)
+		if err == nil && len(valueJSON) > 0 {
+			// value is JSONB string like "\"openrouter\"" or "\"deepseek\""
+			var provider string
+			if json.Unmarshal(valueJSON, &provider) == nil && provider != "" {
+				return config.LLMProvider(provider)
+			}
+		}
+	}
+	if g.cfg.Provider != "" {
+		return g.cfg.Provider
+	}
+	return config.ProviderOpenRouter
+}
+
+// getAPIKey returns the API key for the given provider.
+// DB value (from admin panel) takes precedence over env var.
+func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvider) string {
+	// Check DB override first
+	if g.db != nil {
+		var valueJSON []byte
+		err := g.db.QueryRow(ctx,
+			`SELECT value FROM system_settings WHERE key = 'llm_api_keys'`,
+		).Scan(&valueJSON)
+		if err == nil && len(valueJSON) > 0 {
+			var keys map[string]string
+			if json.Unmarshal(valueJSON, &keys) == nil {
+				if key, ok := keys[string(provider)]; ok && key != "" {
+					return key
+				}
+			}
+		}
+	}
+	// Fall back to env var
+	switch provider {
+	case config.ProviderDeepSeek:
+		return g.cfg.DeepSeekAPIKey
+	case config.ProviderAnthropic:
+		return g.cfg.AnthropicAPIKey
+	case config.ProviderGemini:
+		return g.cfg.GeminiAPIKey
+	default: // openrouter
+		return g.cfg.OpenRouterAPIKey
+	}
+}
+
+// callProvider routes an LLM call to the correct provider.
+// Replaces callOpenRouter() — same OpenAI-compatible format for all providers.
+func (g *ModelGateway) callProvider(
+	ctx context.Context,
+	modelName string,
+	messages []openRouterMessage,
+	maxTokens int,
+	temperature float64,
+) (*openRouterResponse, error) {
+	provider := g.getActiveProvider(ctx)
+	apiKey := g.getAPIKey(ctx, provider)
+	if apiKey == "" {
+		return nil, fmt.Errorf("no API key configured for provider %s", provider)
+	}
+
+	baseURL, ok := providerURLs[provider]
+	if !ok {
+		baseURL = providerURLs[config.ProviderOpenRouter]
+	}
+	// Allow env override of base URL (for OpenRouter custom endpoints)
+	if provider == config.ProviderOpenRouter && g.cfg.OpenRouterBaseURL != "" {
+		baseURL = strings.TrimRight(g.cfg.OpenRouterBaseURL, "/")
+	}
+
+	reqBody := openRouterRequest{
+		Model:       modelName,
+		Messages:    messages,
+		MaxTokens:   maxTokens,
+		Temperature: temperature,
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(
+		ctx, http.MethodPost,
+		baseURL+"/chat/completions",
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	// Anthropic uses x-api-key; everyone else uses Authorization: Bearer
+	if provider == config.ProviderAnthropic {
+		httpReq.Header.Set("x-api-key", apiKey)
+		httpReq.Header.Set("anthropic-version", "2023-06-01")
+	} else {
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+	}
+	if provider == config.ProviderOpenRouter {
+		httpReq.Header.Set("HTTP-Referer", "https://ai-avengers.app")
+		httpReq.Header.Set("X-Title", "AI Avengers")
+	}
+
+	resp, err := g.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("provider %s returned status %d", provider, resp.StatusCode)
+	}
+
+	var result openRouterResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	if len(result.Choices) == 0 {
+		return nil, fmt.Errorf("no choices in response from %s", provider)
+	}
+	return &result, nil
+}
+
 // GetStats returns usage statistics.
 func (g *ModelGateway) GetStats() map[string]interface{} {
 	return map[string]interface{}{
