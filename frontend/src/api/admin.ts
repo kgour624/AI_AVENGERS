@@ -236,3 +236,27 @@ export const updateAdminSetting = (key: string, value: Record<string, unknown>) 
     .patch<ApiResponse<{ status: string; key: string }>>(`/api/v1/admin/settings/${key}`, { value })
     .then((res) => res.data.data!)
 
+// LLM Settings — provider + API keys from admin panel
+export interface LLMSettingsResponse {
+  activeProvider: string
+  availableProviders: string[]
+  apiKeysConfigured: Record<string, string> // masked keys
+  note: string
+}
+
+export const getLLMSettings = () =>
+  baseAPI
+    .get<ApiResponse<LLMSettingsResponse>>('/api/v1/admin/llm-settings')
+    .then((res) => res.data.data!)
+
+export const updateLLMSettings = (req: {
+  provider: string
+  apiKeys: Record<string, string>
+}) =>
+  baseAPI
+    .post<ApiResponse<{ status: string; provider: string; note: string }>>(
+      '/api/v1/admin/llm-settings',
+      req
+    )
+    .then((res) => res.data.data!)
+
