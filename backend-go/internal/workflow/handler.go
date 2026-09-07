@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"encoding/json"
-	"net/http"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
