@@ -82,6 +82,7 @@ func main() {
 	jwtService := auth.NewJWTService(cfg.JWT, redisClient.Client, logger)
 	authService := auth.NewAuthService(postgres.Pool, jwtService, logger)
 	modelGateway := gateway.NewModelGateway(cfg.LLM, logger)
+	modelGateway.SetDB(postgres.Pool) // enables runtime provider override from admin panel
 	mlClient := ml.NewSidecarClient(cfg.ML, logger)
 
 	// Verify ML sidecar is running
