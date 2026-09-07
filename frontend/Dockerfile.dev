@@ -14,10 +14,8 @@ WORKDIR /app
 COPY package.json package-lock.json* ./
 RUN npm install --silent
 
-# WHY not COPY . . here:
-# docker-compose.yml mounts ./frontend:/app as a volume.
-# Source changes on host are reflected instantly in container.
-# This enables Vite HMR (Hot Module Replacement).
+# Copy application source code into the container
+COPY . .
 
 EXPOSE 3000
 
