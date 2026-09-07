@@ -176,6 +176,10 @@ func Load() (*Config, error) {
 		LLM: LLMConfig{
 			OpenRouterAPIKey:  v.GetString("OPENROUTER_API_KEY"),
 			OpenRouterBaseURL: v.GetString("OPENROUTER_BASE_URL"),
+			DeepSeekAPIKey:    v.GetString("DEEPSEEK_API_KEY"),
+			AnthropicAPIKey:   v.GetString("ANTHROPIC_API_KEY"),
+			GeminiAPIKey:      v.GetString("GEMINI_API_KEY"),
+			Provider:          LLMProvider(v.GetString("LLM_PROVIDER")),
 			ModelCheap:        v.GetString("LLM_MODEL_CHEAP"),
 			ModelStrong:       v.GetString("LLM_MODEL_STRONG"),
 			ModelFast:         v.GetString("LLM_MODEL_FAST"),
