@@ -1,13 +1,11 @@
 package gateway
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/config"
+	"ai_avengers/backend/internal/gateway/providers"
 )
 
 // ModelType identifies which LLM to use.
