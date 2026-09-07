@@ -4,6 +4,7 @@ import { Input } from '@/components/ui/Input'
 import { Button } from '@/components/ui/Button'
 import { createExpert } from '@/api/admin'
 import { handleAPIError } from '@/utils/errors'
+import { cn } from '@/utils/cn'
 
 export interface CreateExpertModalProps {
   isOpen: boolean
@@ -20,18 +21,28 @@ function slugify(name: string): string {
 }
 
 /**
- * Bug 1.5 fix (docs bug list): backend route + (now-added) API
- * function existed, but AdminExperts.tsx had no way to create a new
- * expert at all - only "Upload Transcript" for experts that already
- * exist. Slug auto-fills from name (editable) since CreateExpert's
- * real handler requires it and rejects duplicates with 409.
+ * A12: CreateExpertModal extended with Advanced Config section.
+ * New fields: modelTier, loopPattern, temperature, topP,
+ * maxLoopIterations, allowedTools.
+ * All behind a collapsible toggle — simple case stays simple.
  */
 export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertModalProps) {
+  // Required fields
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
   const [slugEdited, setSlugEdited] = useState(false)
   const [domain, setDomain] = useState('')
   const [description, setDescription] = useState('')
+
+  // Advanced config fields — defaults match backend migration 006 defaults
+  const [showAdvanced, setShowAdvanced] = useState(false)
+  const [modelTier, setModelTier] = useState<'cheap' | 'strong' | 'fast'>('strong')
+  const [loopPattern, setLoopPattern] = useState<'ota' | 'react' | 'plan_execute'>('react')
+  const [temperature, setTemperature] = useState('0.30')
+  const [topP, setTopP] = useState('0.50')
+  const [maxLoopIterations, setMaxLoopIterations] = useState('5')
+  const [allowedToolsRaw, setAllowedToolsRaw] = useState('')
+
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
 
@@ -41,6 +52,13 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
     setSlugEdited(false)
     setDomain('')
     setDescription('')
+    setShowAdvanced(false)
+    setModelTier('strong')
+    setLoopPattern('react')
+    setTemperature('0.30')
+    setTopP('0.50')
+    setMaxLoopIterations('5')
+    setAllowedToolsRaw('')
     setError('')
     onClose()
   }
@@ -56,6 +74,30 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
       setError('Name, slug, and domain are all required')
       return
     }
+
+    // Validate numeric fields
+    const tempNum = parseFloat(temperature)
+    const topPNum = parseFloat(topP)
+    const maxIter = parseInt(maxLoopIterations, 10)
+    if (isNaN(tempNum) || tempNum < 0 || tempNum > 2) {
+      setError('Temperature must be between 0.0 and 2.0')
+      return
+    }
+    if (isNaN(topPNum) || topPNum < 0 || topPNum > 1) {
+      setError('Top-P must be between 0.0 and 1.0')
+      return
+    }
+    if (isNaN(maxIter) || maxIter < 1 || maxIter > 50) {
+      setError('Max loop iterations must be between 1 and 50')
+      return
+    }
+
+    // Parse allowedTools: comma-separated string → trimmed string[]
+    const allowedTools = allowedToolsRaw
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean)
+
     setIsSubmitting(true)
     setError('')
     try {
@@ -64,6 +106,12 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
         slug: slug.trim(),
         domain: domain.trim(),
         description: description.trim() || undefined,
+        modelTier,
+        loopPattern,
+        temperature: tempNum,
+        topP: topPNum,
+        maxLoopIterations: maxIter,
+        allowedTools: allowedTools.length > 0 ? allowedTools : undefined,
       })
       onCreated()
       handleClose()
