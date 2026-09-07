@@ -173,6 +173,10 @@ func Load() (*Config, error) {
 			AccessExpiryMinutes: v.GetInt("JWT_ACCESS_EXPIRY_MINUTES"),
 			RefreshExpiryDays:   v.GetInt("JWT_REFRESH_EXPIRY_DAYS"),
 		},
+		// WHY defaults set here not in .env.example:
+		//   viper.SetDefault applies when env var is missing.
+		//   .env.example shows the value but doesn't set it.
+		//   This ensures dev works out-of-box without editing .env.
 		LLM: LLMConfig{
 			OpenRouterAPIKey:  v.GetString("OPENROUTER_API_KEY"),
 			OpenRouterBaseURL: v.GetString("OPENROUTER_BASE_URL"),
