@@ -124,25 +124,108 @@ func (h *AdminHandler) ListExperts(c *gin.Context) {
 	response.OK(c, experts)
 }
 
+// validModelTiers is the set of allowed model_tier values.
+// Must match the CHECK constraint in migration 006.
+var validModelTiers = map[string]bool{"cheap": true, "strong": true, "fast": true}
+
+// validLoopPatterns is the set of allowed loop_pattern values.
+// Must match the CHECK constraint in migration 006.
+var validLoopPatterns = map[string]bool{"ota": true, "react": true, "plan_execute": true}
+
 // CreateExpert POST /admin/experts
+// Required: name, slug, domain.
+// Optional (migration 006 config fields): model_tier, temperature, top_p,
+// loop_pattern, max_loop_iterations, allowed_tools.
+// Omitting optional fields uses the DB column defaults.
 func (h *AdminHandler) CreateExpert(c *gin.Context) {
 	var req struct {
+		// Required
 		Name        string `json:"name" binding:"required"`
 		Slug        string `json:"slug" binding:"required"`
 		Domain      string `json:"domain" binding:"required"`
 		Description string `json:"description"`
+		// Optional — migration 006 config fields
+		ModelTier         *string  `json:"model_tier"`
+		Temperature       *float64 `json:"temperature"`
+		TopP              *float64 `json:"top_p"`
+		LoopPattern       *string  `json:"loop_pattern"`
+		MaxLoopIterations *int     `json:"max_loop_iterations"`
+		AllowedTools      []string `json:"allowed_tools"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
 		return
 	}
 
+	// Validate optional enum/range fields before hitting the DB.
+	// WHY validate here and not rely on DB CHECK:
+	//   DB CHECK gives a cryptic pgx error. We return a clear 400.
+	if req.ModelTier != nil && !validModelTiers[*req.ModelTier] {
+		response.BadRequest(c, "INVALID_MODEL_TIER", "model_tier must be cheap, strong, or fast")
+		return
+	}
+	if req.Temperature != nil && (*req.Temperature < 0.0 || *req.Temperature > 2.0) {
+		response.BadRequest(c, "INVALID_TEMPERATURE", "temperature must be between 0.0 and 2.0")
+		return
+	}
+	if req.TopP != nil && (*req.TopP < 0.0 || *req.TopP > 1.0) {
+		response.BadRequest(c, "INVALID_TOP_P", "top_p must be between 0.0 and 1.0")
+		return
+	}
+	if req.LoopPattern != nil && !validLoopPatterns[*req.LoopPattern] {
+		response.BadRequest(c, "INVALID_LOOP_PATTERN", "loop_pattern must be ota, react, or plan_execute")
+		return
+	}
+	if req.MaxLoopIterations != nil && (*req.MaxLoopIterations < 1 || *req.MaxLoopIterations > 50) {
+		response.BadRequest(c, "INVALID_MAX_LOOP_ITERATIONS", "max_loop_iterations must be between 1 and 50")
+		return
+	}
+
+	// Serialize allowed_tools to JSON.
+	// WHY: Postgres JSONB column expects a JSON string, not a Go slice.
+	allowedToolsJSON := []byte("[]")
+	if len(req.AllowedTools) > 0 {
+		var err error
+		allowedToolsJSON, err = json.Marshal(req.AllowedTools)
+		if err != nil {
+			response.BadRequest(c, "INVALID_ALLOWED_TOOLS", "allowed_tools must be a valid JSON array")
+			return
+		}
+	}
+
+	// Apply defaults for omitted optional fields.
+	modelTier := "strong"
+	if req.ModelTier != nil {
+		modelTier = *req.ModelTier
+	}
+	temperature := 0.30
+	if req.Temperature != nil {
+		temperature = *req.Temperature
+	}
+	topP := 0.50
+	if req.TopP != nil {
+		topP = *req.TopP
+	}
+	loopPattern := "react"
+	if req.LoopPattern != nil {
+		loopPattern = *req.LoopPattern
+	}
+	maxLoopIterations := 5
+	if req.MaxLoopIterations != nil {
+		maxLoopIterations = *req.MaxLoopIterations
+	}
+
 	var id uuid.UUID
 	err := h.db.QueryRow(c.Request.Context(),
-		`INSERT INTO experts (name, slug, domain, description)
-		 VALUES ($1, $2, $3, $4)
+		`INSERT INTO experts
+		  (name, slug, domain, description,
+		   model_tier, temperature, top_p,
+		   loop_pattern, max_loop_iterations, allowed_tools)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 RETURNING id`,
 		req.Name, req.Slug, req.Domain, req.Description,
+		modelTier, temperature, topP,
+		loopPattern, maxLoopIterations, string(allowedToolsJSON),
 	).Scan(&id)
 	if err != nil {
 		if isUniqueViolation(err) {
