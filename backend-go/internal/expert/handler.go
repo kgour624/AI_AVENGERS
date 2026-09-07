@@ -89,11 +89,18 @@ func (h *Handler) GetByID(c *gin.Context) {
 		return
 	}
 	var e ExpertPublic
+	// WHY training_status='trained': same as ListActive — only fully trained
+	// experts are visible to clients. Draft/ingesting experts are admin-only.
 	err = h.db.QueryRow(c.Request.Context(), `
 		SELECT id, name, slug, domain, COALESCE(description,''),
 		       total_chunks, total_topics,
 		       COALESCE(avg_depth_level,0), COALESCE(avg_rating,0), created_at
-		FROM experts WHERE id=$1 AND is_active=TRUE AND deleted_at IS NULL`, id,
+		FROM experts
+		WHERE id=$1
+		  AND is_active=TRUE
+		  AND is_training=FALSE
+		  AND training_status='trained'
+		  AND deleted_at IS NULL`, id,
 	).Scan(&e.ID, &e.Name, &e.Slug, &e.Domain, &e.Description,
 		&e.TotalChunks, &e.TotalTopics, &e.AvgDepthLevel, &e.AvgRating, &e.CreatedAt)
 	if err != nil {
