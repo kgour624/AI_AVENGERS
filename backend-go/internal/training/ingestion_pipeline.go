@@ -470,6 +470,202 @@ func (p *IngestionPipeline) updateJobStatus(
 	}
 }
 
+// ============================================================
+// SMOKE TEST
+// ============================================================
+
+// Smoke test constants.
+// WHY named constants not magic numbers: KNOWLEDGE_HUB.md §7.4 anti-pattern checklist.
+const (
+	// smokeTestProbeCount is the number of topics to probe.
+	// 5 gives a representative sample without being expensive.
+	smokeTestProbeCount = 5
+
+	// smokeTestPassThreshold is the minimum number of probes that must
+	// return a chunk with rerank score >= smokeTestRerankThreshold.
+	// Majority (3/5) allows lightly-covered topics to fail without
+	// blocking the expert from being marked trained.
+	smokeTestPassThreshold = 3
+
+	// smokeTestRerankThreshold is the minimum rerank score for a probe
+	// to be considered "passing". Matches China Wall Layer 1 threshold.
+	smokeTestRerankThreshold = float32(0.35)
+
+	// smokeTestTopK is the number of vector-search candidates to fetch
+	// per probe before reranking. 10 gives the reranker enough to work with.
+	smokeTestTopK = 10
+)
+
+// runSmokeTest verifies that the expert's corpus is retrievable.
+//
+// Algorithm:
+// 1. Load top-N topics from expert_capabilities (by depth_level DESC).
+// 2. For each topic, build a generic probe question.
+// 3. Embed the probe question.
+// 4. Vector-search course_chunks for this expert (top smokeTestTopK).
+// 5. Rerank candidates against the probe.
+// 6. Pass if best rerank score >= smokeTestRerankThreshold.
+// 7. Return (passed, passCount, err).
+//    passed = passCount >= smokeTestPassThreshold.
+//
+// Mental execution:
+// Input: expertID="abc", expertName="Arpit — System Design"
+// Load topics: ["system_design", "databases", "caching", "load_balancing", "microservices"]
+// Probe 0: "What does Arpit — System Design teach about system_design?"
+//   embed -> [0.1, 0.3, ...] (768D)
+//   vector search -> 10 chunks
+//   rerank -> best score 0.72 -> PASS
+// Probe 1: "What does Arpit — System Design teach about databases?"
+//   ... best score 0.41 -> PASS
+// ... (5 probes total)
+// passCount=4 >= 3 -> passed=true
+func (p *IngestionPipeline) runSmokeTest(
+	ctx context.Context,
+	expertID uuid.UUID,
+	expertName string,
+) (passed bool, passCount int, err error) {
+
+	p.logger.Info("smoke test starting",
+		zap.String("expert_id", expertID.String()),
+		zap.String("expert_name", expertName),
+	)
+
+	// Step 1: Load top topics from expert_capabilities.
+	// WHY expert_capabilities not course_chunks:
+	//   capabilities are already aggregated by topic with depth_level.
+	//   Picking by depth_level DESC gives us the best-covered topics first.
+	rows, err := p.db.Query(ctx,
+		`SELECT topic FROM expert_capabilities
+		 WHERE expert_id = $1
+		 ORDER BY depth_level DESC, chunk_count DESC
+		 LIMIT $2`,
+		expertID, smokeTestProbeCount,
+	)
+	if err != nil {
+		return false, 0, fmt.Errorf("smoke test: failed to load topics: %w", err)
+	}
+	defer rows.Close()
+
+	var topics []string
+	for rows.Next() {
+		var topic string
+		if scanErr := rows.Scan(&topic); scanErr == nil {
+			topics = append(topics, topic)
+		}
+	}
+	if err = rows.Err(); err != nil {
+		return false, 0, fmt.Errorf("smoke test: topic scan error: %w", err)
+	}
+
+	// If no capabilities yet (edge case: capability build failed), fall back
+	// to a single generic probe about the expert's domain.
+	if len(topics) == 0 {
+		p.logger.Warn("smoke test: no capabilities found, using generic probe",
+			zap.String("expert_id", expertID.String()),
+		)
+		topics = []string{"general"}
+	}
+
+	// Step 2–6: Probe each topic.
+	passCount = 0
+	for i, topic := range topics {
+		probeQuestion := fmt.Sprintf(
+			"What does %s teach about %s?",
+			expertName, topic,
+		)
+
+		// Step 3: Embed the probe question.
+		embeddings, embedErr := p.ml.Embed(ctx, []string{probeQuestion})
+		if embedErr != nil {
+			p.logger.Warn("smoke test: embed failed for probe",
+				zap.Int("probe_index", i),
+				zap.String("topic", topic),
+				zap.Error(embedErr),
+			)
+			// ML sidecar failure is infrastructure, not corpus quality.
+			// Return error so caller can decide (non-fatal).
+			return false, passCount, fmt.Errorf("smoke test: ML sidecar unavailable: %w", embedErr)
+		}
+		queryVec := pgvector.NewVector(embeddings[0])
+
+		// Step 4: Vector search — fetch top-K candidates for this expert.
+		chunkRows, searchErr := p.db.Query(ctx,
+			`SELECT chunk_text
+			 FROM course_chunks
+			 WHERE expert_id = $1
+			 ORDER BY embedding <=> $2
+			 LIMIT $3`,
+			expertID, queryVec, smokeTestTopK,
+		)
+		if searchErr != nil {
+			p.logger.Warn("smoke test: vector search failed",
+				zap.Int("probe_index", i),
+				zap.Error(searchErr),
+			)
+			continue // Skip this probe, don't fail the whole test
+		}
+
+		var candidates []string
+		for chunkRows.Next() {
+			var text string
+			if scanErr := chunkRows.Scan(&text); scanErr == nil {
+				candidates = append(candidates, text)
+			}
+		}
+		chunkRows.Close()
+
+		if len(candidates) == 0 {
+			p.logger.Warn("smoke test: no candidates returned",
+				zap.Int("probe_index", i),
+				zap.String("topic", topic),
+			)
+			continue
+		}
+
+		// Step 5: Rerank candidates against the probe question.
+		rankResults, rerankErr := p.ml.Rerank(ctx, probeQuestion, candidates, len(candidates))
+		if rerankErr != nil {
+			p.logger.Warn("smoke test: rerank failed",
+				zap.Int("probe_index", i),
+				zap.Error(rerankErr),
+			)
+			// Rerank failure = ML sidecar issue, return error.
+			return false, passCount, fmt.Errorf("smoke test: rerank unavailable: %w", rerankErr)
+		}
+
+		// Step 6: Check if best rerank score meets threshold.
+		bestScore := float32(0)
+		for _, r := range rankResults {
+			if r.Score > bestScore {
+				bestScore = r.Score
+			}
+		}
+
+		probePassed := bestScore >= smokeTestRerankThreshold
+		if probePassed {
+			passCount++
+		}
+
+		p.logger.Debug("smoke test probe result",
+			zap.Int("probe_index", i),
+			zap.String("topic", topic),
+			zap.Float32("best_score", bestScore),
+			zap.Bool("passed", probePassed),
+		)
+	}
+
+	passed = passCount >= smokeTestPassThreshold
+
+	p.logger.Info("smoke test complete",
+		zap.String("expert_id", expertID.String()),
+		zap.Int("probes_run", len(topics)),
+		zap.Int("probes_passed", passCount),
+		zap.Bool("passed", passed),
+	)
+
+	return passed, passCount, nil
+}
+
 // updateJobProgress updates processed chunk count.
 func (p *IngestionPipeline) updateJobProgress(ctx context.Context, jobID uuid.UUID, processed, total int) {
 	_, _ = p.db.Exec(ctx,
