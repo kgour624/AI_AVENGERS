@@ -189,48 +189,34 @@ func (g *ModelGateway) getProvider(ctx context.Context) LLMProvider {
 // 5. Track cost
 // 6. Cache result
 // 7. Return content
+// Call makes an LLM call via the active provider.
+// Provider resolved at call time — switching in admin panel takes effect immediately.
 func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, error) {
-	// Check cache
 	if req.UseCache {
-		cacheKey := g.cacheKey(req)
-		if cached, ok := g.cache.Load(cacheKey); ok {
+		if cached, ok := g.cache.Load(g.cacheKey(req)); ok {
 			result := cached.(*LLMResponse)
 			result.Cached = true
 			return result, nil
 		}
 	}
 
-	// Get model config
-	modelCfg, ok := g.models[req.Model]
-	if !ok {
-		return nil, fmt.Errorf("unknown model type: %s", req.Model)
-	}
+	provider := g.getProvider(ctx)
 
-	// Set max tokens
 	maxTokens := req.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 2000 // Sensible default
-	}
-	if maxTokens > modelCfg.MaxTokens {
-		maxTokens = modelCfg.MaxTokens
-	}
+	if maxTokens <= 0 { maxTokens = 2000 }
+	if provMax := provider.MaxTokens(req.Model); maxTokens > provMax { maxTokens = provMax }
 
-	// Build messages
-	messages := []openRouterMessage{}
+	var messages []ProviderMessage
 	if req.SystemPrompt != "" {
-		messages = append(messages, openRouterMessage{
-			Role:    "system",
-			Content: req.SystemPrompt,
-		})
+		messages = append(messages, ProviderMessage{Role: "system", Content: req.SystemPrompt})
 	}
-	messages = append(messages, openRouterMessage{
-		Role:    "user",
-		Content: req.UserPrompt,
-	})
+	messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
 
-	// Retry with exponential backoff
-	// WHY 3 retries: LLM APIs have transient failures (rate limits, timeouts)
-	// Exponential backoff: 1s, 2s, 4s — avoids hammering a struggling API
+	provReq := ProviderRequest{
+		ModelTier: req.Model, Messages: messages,
+		MaxTokens: maxTokens, Temperature: req.Temperature, EnableCache: req.UseCache,
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
@@ -243,56 +229,38 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 		}
 
 		start := time.Now()
-		openRouterResp, err := g.callProvider(ctx, modelCfg.Name, messages, maxTokens, req.Temperature)
+		provResp, err := provider.Call(ctx, provReq)
 		if err != nil {
 			lastErr = err
 			g.logger.Warn("LLM call attempt failed",
 				zap.Int("attempt", attempt+1),
-				zap.String("model", string(req.Model)),
-				zap.Error(err),
-			)
+				zap.String("provider", provider.Name()),
+				zap.Error(err))
 			continue
 		}
 
 		duration := time.Since(start)
+		inCost, outCost := provider.CostPer1K(req.Model)
+		cost := float64(provResp.InputTokens)/1000*inCost + float64(provResp.OutputTokens)/1000*outCost
 
-		// Calculate cost
-		cost := g.calculateCost(modelCfg,
-			openRouterResp.Usage.PromptTokens,
-			openRouterResp.Usage.CompletionTokens,
-		)
-
-		// Update stats
 		currentCost := g.totalCost.Load().(float64)
 		g.totalCost.Store(currentCost + cost)
 		g.callCount.Add(1)
 
 		result := &LLMResponse{
-			Content:      openRouterResp.Choices[0].Message.Content,
-			InputTokens:  openRouterResp.Usage.PromptTokens,
-			OutputTokens: openRouterResp.Usage.CompletionTokens,
-			CostUSD:      cost,
-			ModelUsed:    modelCfg.Name,
-			DurationMs:   float64(duration.Milliseconds()),
+			Content: provResp.Content, InputTokens: provResp.InputTokens,
+			OutputTokens: provResp.OutputTokens, CostUSD: cost,
+			ModelUsed: provResp.ModelUsed, DurationMs: float64(duration.Milliseconds()),
 		}
-
 		g.logger.Info("LLM call complete",
-			zap.String("model", string(req.Model)),
-			zap.Int("input_tokens", result.InputTokens),
-			zap.Int("output_tokens", result.OutputTokens),
+			zap.String("provider", provider.Name()),
+			zap.String("tier", string(req.Model)),
 			zap.Float64("cost_usd", cost),
-			zap.Float64("duration_ms", result.DurationMs),
-		)
+			zap.Float64("duration_ms", result.DurationMs))
 
-		// Cache result
-		if req.UseCache {
-			cacheKey := g.cacheKey(req)
-			g.cache.Store(cacheKey, result)
-		}
-
+		if req.UseCache { g.cache.Store(g.cacheKey(req), result) }
 		return result, nil
 	}
-
 	return nil, fmt.Errorf("all LLM attempts failed: %w", lastErr)
 }
 
