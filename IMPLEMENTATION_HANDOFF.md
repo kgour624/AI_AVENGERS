@@ -159,23 +159,22 @@ Owner: Kiran (has DB access). I can prepare the exact commands as a runbook when
 
 ---
 
-## Phase E — Checkpointing + Cost Governance + Kanban (not started)
+## Phase E — Checkpointing + Cost Governance + Kanban ✅ COMPLETE (2026-09-07)
 
 ### Checkpoint condition
-
 - Kill the server mid-workflow → restart → workflow resumes from last phase checkpoint → completes successfully.
 - Kanban shows real-time card movement.
+- STATUS: Code complete. Requires Phase B experts + live workflow run to verify end-to-end.
 
-### Components (planned)
+### Components
 
-| # | Component | Notes |
+| # | File | Status |
 |---|---|---|
-| E1 | Phase checkpoints (write on every phase transition + approval response) | `backend-go/internal/workflow/checkpoint.go` |
-| E2 | Cursor-based event replay for resume | Extends `internal/blackboard/subscriber.go` |
-| E3 | Extend `cost_monitor.go` with per-workflow rollup | `backend-go/internal/monitoring/cost_monitor.go` |
-| E4 | Soft/hard cost limit enforcement | Same file |
-| E5 | Kanban API endpoint | `backend-go/internal/api/kanban_handler.go` |
-| E6 | Kanban UI (read-only OK for MVP) | `frontend/src/pages/workflows/kanban.tsx` (new) |
+| E1 | `backend-go/internal/workflow/checkpoint.go` | ✅ COMPLETE |
+| E2 | `backend-go/internal/blackboard/subscriber.go` (cursor-based resume) | ✅ COMPLETE (in C2) |
+| E3+E4 | `backend-go/internal/monitoring/cost_monitor.go` (per-workflow rollup + limits) | ✅ COMPLETE |
+| E5 | `backend-go/internal/workflow/handler.go` GetKanban | ✅ COMPLETE (in C5) |
+| E6 | `frontend/src/pages/workflows/KanbanPage.tsx` + `frontend/src/api/workflows.ts` | ✅ COMPLETE |
 
 ---
 
