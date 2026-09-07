@@ -1,12 +1,6 @@
 import { forwardRef, type ButtonHTMLAttributes } from 'react'
 import { cn } from '@/utils/cn'
 
-/**
- * WHY forwardRef: react-hook-form-style libraries and focus-management
- * code (e.g. "focus the send button after Cmd+Enter") need a real DOM
- * ref, not just props. Every ui/ primitive in this file set follows
- * the same forwardRef pattern for that reason.
- */
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger'
 export type ButtonSize = 'sm' | 'md' | 'lg'
 
@@ -17,16 +11,49 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const variantClasses: Record<ButtonVariant, string> = {
-  primary: 'bg-brand text-white hover:bg-brand-hover',
-  secondary: 'bg-surface-overlay text-text-primary hover:bg-surface-border',
-  ghost: 'bg-transparent text-text-secondary hover:text-text-primary hover:bg-surface-overlay',
-  danger: 'bg-mode-refuse text-white hover:bg-mode-refuse-hover',
+  // Primary — electric violet with neon glow
+  primary: [
+    'bg-brand text-white',
+    'border border-brand/60',
+    'shadow-[0_0_12px_oklch(68%_0.28_295_/_0.35)]',
+    'hover:bg-brand-hover',
+    'hover:shadow-[0_0_20px_oklch(68%_0.28_295_/_0.55),_0_0_40px_oklch(68%_0.28_295_/_0.2)]',
+    'hover:border-brand/80',
+  ].join(' '),
+
+  // Secondary — glass morphism
+  secondary: [
+    'bg-surface-overlay/60 text-text-primary',
+    'border border-glass-border',
+    'backdrop-blur-md',
+    'hover:bg-surface-float/70',
+    'hover:border-glow-purple/30',
+    'hover:shadow-[0_0_12px_oklch(68%_0.28_295_/_0.15)]',
+  ].join(' '),
+
+  // Ghost — transparent with subtle hover
+  ghost: [
+    'bg-transparent text-text-secondary',
+    'border border-transparent',
+    'hover:text-text-primary',
+    'hover:bg-surface-overlay/50',
+    'hover:border-glass-border',
+  ].join(' '),
+
+  // Danger — red neon
+  danger: [
+    'bg-mode-refuse/20 text-mode-refuse',
+    'border border-mode-refuse/40',
+    'hover:bg-mode-refuse/30',
+    'hover:border-mode-refuse/70',
+    'hover:shadow-[0_0_16px_oklch(62%_0.22_25_/_0.4)]',
+  ].join(' '),
 }
 
 const sizeClasses: Record<ButtonSize, string> = {
-  sm: 'px-2.5 py-1.5 text-xs',
-  md: 'px-4 py-2 text-sm',
-  lg: 'px-6 py-3 text-base',
+  sm: 'px-3 py-1.5 text-xs gap-1.5',
+  md: 'px-4 py-2 text-sm gap-2',
+  lg: 'px-6 py-3 text-base gap-2.5',
 }
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
@@ -34,21 +61,16 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     return (
       <button
         ref={ref}
-        // WHY also disable while isLoading, not just when `disabled` is
-        // explicitly passed: without this, a double-click during an
-        // in-flight request (e.g. login submit) would fire the request
-        // twice. Cross-questioned this scenario before finalizing.
         disabled={disabled || isLoading}
         className={cn(
-          // ARC-51 §5: press/hover polish. transition-[...] lists exact
-          // properties (background-color, transform, box-shadow) rather
-          // than transition-all, so this never accidentally animates a
-          // layout-affecting property. active:scale-95 is the "spring
-          // press" feel; disabled buttons don't scale since clicking
-          // them does nothing anyway.
-          'inline-flex items-center justify-center gap-2 rounded-md font-medium transition-[background-color,transform,box-shadow] duration-150 ease-arc active:scale-95',
-          'disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand focus-visible:ring-offset-2 focus-visible:ring-offset-surface-base',
+          'inline-flex items-center justify-center rounded-md font-medium',
+          'transition-[background-color,border-color,box-shadow,transform,opacity]',
+          'duration-150 ease-arc',
+          'active:scale-95',
+          'disabled:cursor-not-allowed disabled:opacity-40 disabled:active:scale-100',
+          'disabled:shadow-none',
+          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand',
+          'focus-visible:ring-offset-2 focus-visible:ring-offset-surface-void',
           variantClasses[variant],
           sizeClasses[size],
           className
