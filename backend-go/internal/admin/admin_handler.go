@@ -239,7 +239,17 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 	response.Created(c, map[string]interface{}{"id": id, "slug": req.Slug})
 }
 
+// validTrainingStatuses is the set of allowed training_status values.
+// Must match the CHECK constraint in migration 006.
+var validTrainingStatuses = map[string]bool{
+	"draft": true, "ingesting": true, "trained": true, "deprecated": true,
+}
+
 // UpdateExpert PATCH /admin/experts/:id
+// All fields are optional. Only provided fields are updated.
+// Existing fields: name, description, is_active, reasoning_charter.
+// New fields (migration 006): model_tier, temperature, top_p,
+// loop_pattern, max_loop_iterations, allowed_tools, training_status.
 func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -247,27 +257,145 @@ func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 		return
 	}
 	var req struct {
+		// Existing fields
 		Name             *string `json:"name"`
 		Description      *string `json:"description"`
 		IsActive         *bool   `json:"is_active"`
 		ReasoningCharter *string `json:"reasoning_charter"`
+		// Migration 006 config fields
+		ModelTier         *string  `json:"model_tier"`
+		Temperature       *float64 `json:"temperature"`
+		TopP              *float64 `json:"top_p"`
+		LoopPattern       *string  `json:"loop_pattern"`
+		MaxLoopIterations *int     `json:"max_loop_iterations"`
+		AllowedTools      []string `json:"allowed_tools"`
+		TrainingStatus    *string  `json:"training_status"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
 		return
 	}
+
+	// Validate new fields before any DB writes.
+	if req.ModelTier != nil && !validModelTiers[*req.ModelTier] {
+		response.BadRequest(c, "INVALID_MODEL_TIER", "model_tier must be cheap, strong, or fast")
+		return
+	}
+	if req.Temperature != nil && (*req.Temperature < 0.0 || *req.Temperature > 2.0) {
+		response.BadRequest(c, "INVALID_TEMPERATURE", "temperature must be between 0.0 and 2.0")
+		return
+	}
+	if req.TopP != nil && (*req.TopP < 0.0 || *req.TopP > 1.0) {
+		response.BadRequest(c, "INVALID_TOP_P", "top_p must be between 0.0 and 1.0")
+		return
+	}
+	if req.LoopPattern != nil && !validLoopPatterns[*req.LoopPattern] {
+		response.BadRequest(c, "INVALID_LOOP_PATTERN", "loop_pattern must be ota, react, or plan_execute")
+		return
+	}
+	if req.MaxLoopIterations != nil && (*req.MaxLoopIterations < 1 || *req.MaxLoopIterations > 50) {
+		response.BadRequest(c, "INVALID_MAX_LOOP_ITERATIONS", "max_loop_iterations must be between 1 and 50")
+		return
+	}
+	if req.TrainingStatus != nil && !validTrainingStatuses[*req.TrainingStatus] {
+		response.BadRequest(c, "INVALID_TRAINING_STATUS", "training_status must be draft, ingesting, trained, or deprecated")
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Existing fields
 	if req.Name != nil {
-		_, _ = h.db.Exec(c.Request.Context(),
-			`UPDATE experts SET name=$1, updated_at=NOW() WHERE id=$2`, *req.Name, id)
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET name=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.Name, id); err != nil {
+			h.logger.Error("update expert name failed", zap.Error(err))
+		}
+	}
+	if req.Description != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET description=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.Description, id); err != nil {
+			h.logger.Error("update expert description failed", zap.Error(err))
+		}
 	}
 	if req.IsActive != nil {
-		_, _ = h.db.Exec(c.Request.Context(),
-			`UPDATE experts SET is_active=$1, updated_at=NOW() WHERE id=$2`, *req.IsActive, id)
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET is_active=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.IsActive, id); err != nil {
+			h.logger.Error("update expert is_active failed", zap.Error(err))
+		}
 	}
 	if req.ReasoningCharter != nil {
-		_, _ = h.db.Exec(c.Request.Context(),
-			`UPDATE experts SET reasoning_charter=$1, updated_at=NOW() WHERE id=$2`, *req.ReasoningCharter, id)
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET reasoning_charter=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.ReasoningCharter, id); err != nil {
+			h.logger.Error("update expert reasoning_charter failed", zap.Error(err))
+		}
 	}
+
+	// Migration 006 config fields
+	if req.ModelTier != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET model_tier=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.ModelTier, id); err != nil {
+			h.logger.Error("update expert model_tier failed", zap.Error(err))
+		}
+	}
+	if req.Temperature != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET temperature=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.Temperature, id); err != nil {
+			h.logger.Error("update expert temperature failed", zap.Error(err))
+		}
+	}
+	if req.TopP != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET top_p=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.TopP, id); err != nil {
+			h.logger.Error("update expert top_p failed", zap.Error(err))
+		}
+	}
+	if req.LoopPattern != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET loop_pattern=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.LoopPattern, id); err != nil {
+			h.logger.Error("update expert loop_pattern failed", zap.Error(err))
+		}
+	}
+	if req.MaxLoopIterations != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET max_loop_iterations=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.MaxLoopIterations, id); err != nil {
+			h.logger.Error("update expert max_loop_iterations failed", zap.Error(err))
+		}
+	}
+	if req.AllowedTools != nil {
+		allowedToolsJSON, err := json.Marshal(req.AllowedTools)
+		if err != nil {
+			response.BadRequest(c, "INVALID_ALLOWED_TOOLS", "allowed_tools must be a valid JSON array")
+			return
+		}
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET allowed_tools=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			string(allowedToolsJSON), id); err != nil {
+			h.logger.Error("update expert allowed_tools failed", zap.Error(err))
+		}
+	}
+	if req.TrainingStatus != nil {
+		// WHY also sync is_training:
+		//   is_training=TRUE means ingestion is in progress.
+		//   When admin manually sets training_status='trained' or 'deprecated',
+		//   is_training must be FALSE so the expert appears in public listings.
+		isTraining := *req.TrainingStatus == "ingesting"
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET training_status=$1, is_training=$2, updated_at=NOW()
+			 WHERE id=$3 AND deleted_at IS NULL`,
+			*req.TrainingStatus, isTraining, id); err != nil {
+			h.logger.Error("update expert training_status failed", zap.Error(err))
+		}
+	}
+
 	response.OK(c, map[string]string{"status": "updated"})
 }
 
