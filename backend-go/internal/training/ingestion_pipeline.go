@@ -66,17 +66,28 @@ type IngestionResult struct {
 // IngestTranscript runs the full ingestion pipeline for a transcript.
 // Called by background worker after admin uploads a transcript.
 //
+// replaceExisting controls how the expert's existing corpus is treated:
+//   - true: DELETE all existing chunks for this expert first, then insert new.
+//     Use for full retraining when the source material is being replaced
+//     end-to-end.
+//   - false: append mode. New chunks are inserted; any chunk whose
+//     (expert_id, chunk_hash) already exists is silently skipped via
+//     ON CONFLICT ... DO NOTHING. Use when adding supplementary transcripts
+//     to an existing corpus. This is the DEFAULT behavior per
+//     DOMAIN_EXPERT_COLLABORATION_DESIGN.md §5.4.
+//
 // Mental execution:
-// Input: expertID, transcript text
+// Input: expertID, transcript text, replaceExisting
 // 1. Update job status to "running"
-// 2. Clean and chunk text
+// 2. Chunk text (chunker computes ChunkHash on every chunk)
 // 3. Extract topics (batched LLM calls)
 // 4. Extract charters (strong LLM call)
 // 5. Generate embeddings (ML sidecar)
-// 6. Store chunks in DB
-// 7. Build capability table
-// 8. Update expert stats
-// 9. Update job status to "complete"
+// 6. If replaceExisting=true: DELETE existing chunks for expert
+// 7. Store chunks with ON CONFLICT DO NOTHING (dedup)
+// 8. Build capability table
+// 9. Update expert stats
+// 10. Update job status to "complete"
 // On any error: update job status to "failed", cleanup partial data
 func (p *IngestionPipeline) IngestTranscript(
 	ctx context.Context,
@@ -85,6 +96,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	expertName string,
 	transcript string,
 	sourceFile string,
+	replaceExisting bool,
 ) (*IngestionResult, error) {
 	start := time.Now()
 
@@ -141,17 +153,26 @@ func (p *IngestionPipeline) IngestTranscript(
 	}
 	p.logger.Info("embeddings generated", zap.Int("count", len(embeddings)))
 
-	// Step 5: Delete existing chunks (re-ingestion support)
-	_, err = p.db.Exec(ctx,
-		`DELETE FROM course_chunks WHERE expert_id = $1`,
-		expertID,
-	)
-	if err != nil {
-		p.updateJobStatus(ctx, jobID, "failed", "cleanup failed: "+err.Error(), 0, 0)
-		return nil, fmt.Errorf("cleanup failed: %w", err)
+	// Step 5: Optional cleanup for full-replace mode.
+	// Append-mode (replaceExisting=false) is the default and preserves the
+	// existing corpus, relying on ON CONFLICT (expert_id, chunk_hash) DO NOTHING
+	// in storeChunks() to skip duplicates.
+	if replaceExisting {
+		_, err = p.db.Exec(ctx,
+			`DELETE FROM course_chunks WHERE expert_id = $1`,
+			expertID,
+		)
+		if err != nil {
+			p.updateJobStatus(ctx, jobID, "failed", "cleanup failed: "+err.Error(), 0, 0)
+			return nil, fmt.Errorf("cleanup failed: %w", err)
+		}
+		p.logger.Info("replaceExisting=true: existing chunks deleted",
+			zap.String("expert_id", expertID.String()),
+		)
 	}
 
-	// Step 6: Store chunks
+	// Step 6: Store chunks. In append mode, ON CONFLICT dedups against
+	// existing (expert_id, chunk_hash) pairs so repeat ingestion is idempotent.
 	chunkIDs, err := p.storeChunks(ctx, expertID, chunks, topicResults, embeddings, sourceFile)
 	if err != nil {
 		p.updateJobStatus(ctx, jobID, "failed", "storage failed: "+err.Error(), 0, 0)
@@ -223,10 +244,18 @@ func (p *IngestionPipeline) IngestTranscript(
 // storeChunks inserts all chunks into the database.
 // Links prev/next chunk IDs for context navigation.
 //
+// Dedup: uses ON CONFLICT (expert_id, chunk_hash) DO NOTHING. If a chunk
+// with the same hash already exists for this expert, INSERT is a no-op
+// and RETURNING id returns no rows (pgx.QueryRow -> pgx.ErrNoRows).
+// In that case, look up the existing chunk's id and use it — this keeps
+// prev/next linking intact even when partially-duplicate transcripts are
+// re-ingested. In practice, this is rare in replace mode (table was just
+// wiped) and common in append mode (that's the whole point).
+//
 // Mental execution:
-// Insert chunk 0 -> get ID
-// Insert chunk 1 -> get ID, set prev_chunk_id = chunk 0 ID
-// Update chunk 0 -> set next_chunk_id = chunk 1 ID
+// Insert chunk 0 (new) -> get new ID
+// Insert chunk 1 (dup) -> ON CONFLICT, no rows returned -> lookup existing ID
+// Update chunk 0 -> set next_chunk_id = chunk 1's existing ID
 // ... repeat for all chunks
 func (p *IngestionPipeline) storeChunks(
 	ctx context.Context,
@@ -247,16 +276,43 @@ func (p *IngestionPipeline) storeChunks(
 
 		embedding := pgvector.NewVector(embeddings[i])
 
+		// Safety: chunker should always populate ChunkHash, but if a caller
+		// bypassed the chunker and constructed TextChunk directly, compute it
+		// here so the dedup key is never NULL.
+		if chunk.ChunkHash == "" {
+			chunk.ChunkHash = HashChunkText(chunk.Text)
+		}
+
 		var chunkID uuid.UUID
 		err := p.db.QueryRow(ctx,
 			`INSERT INTO course_chunks
-				(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+				(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding, chunk_hash)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 ON CONFLICT (expert_id, chunk_hash) DO NOTHING
 			 RETURNING id`,
-			expertID, chunk.Text, chunk.Index, topic, subtopic, sourceFile, embedding,
+			expertID, chunk.Text, chunk.Index, topic, subtopic, sourceFile, embedding, chunk.ChunkHash,
 		).Scan(&chunkID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to insert chunk %d: %w", i, err)
+			// ON CONFLICT DO NOTHING + RETURNING id yields zero rows on conflict,
+			// which pgx surfaces as pgx.ErrNoRows. Treat that as "duplicate":
+			// look up the existing chunk id and continue.
+			if err.Error() == "no rows in result set" {
+				lookupErr := p.db.QueryRow(ctx,
+					`SELECT id FROM course_chunks
+					 WHERE expert_id = $1 AND chunk_hash = $2
+					 LIMIT 1`,
+					expertID, chunk.ChunkHash,
+				).Scan(&chunkID)
+				if lookupErr != nil {
+					return nil, fmt.Errorf("dedup lookup failed for chunk %d: %w", i, lookupErr)
+				}
+				p.logger.Debug("chunk deduplicated",
+					zap.Int("index", i),
+					zap.String("chunk_hash", chunk.ChunkHash),
+				)
+			} else {
+				return nil, fmt.Errorf("failed to insert chunk %d: %w", i, err)
+			}
 		}
 
 		chunkIDs[i] = chunkID

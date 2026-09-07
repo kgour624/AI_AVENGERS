@@ -5,18 +5,28 @@ package training
 // Priority: \n\n (paragraph) -> \n (line) -> sentence -> word
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"regexp"
 	"strings"
 	"unicode"
 )
 
 // TextChunk represents a single chunk of text with metadata.
+//
+// ChunkHash: SHA-256 (hex) of the normalized chunk text. Used by the
+// ingestion pipeline to deduplicate chunks across re-ingestion runs
+// (DOMAIN_EXPERT_COLLABORATION_DESIGN.md §6.3). Normalization is:
+// lowercase + collapse all whitespace runs to a single space + trim.
+// This means trivial whitespace or case differences do NOT produce a
+// different hash, but any real content change does.
 type TextChunk struct {
 	Text       string
 	Index      int
 	StartChar  int
 	EndChar    int
 	TokenCount int
+	ChunkHash  string
 }
 
 // ChunkerConfig holds chunking parameters.
@@ -65,7 +75,7 @@ func NewTextChunker(cfg ChunkerConfig) *TextChunker {
 	}
 }
 
-// Chunk splits text into overlapping chunks.
+// Chunk splits text into overlapping chunks and computes ChunkHash for each.
 func (c *TextChunker) Chunk(text string) []TextChunk {
 	text = cleanText(text)
 	if text == "" {
@@ -75,7 +85,42 @@ func (c *TextChunker) Chunk(text string) []TextChunk {
 	if len(pieces) == 0 {
 		return nil
 	}
-	return c.mergeIntoChunks(pieces)
+	chunks := c.mergeIntoChunks(pieces)
+	// Populate ChunkHash on every chunk. Keeping this here (rather than
+	// making the caller compute it) guarantees no chunk ever leaves the
+	// chunker without a hash, which is what the ingestion pipeline relies on.
+	for i := range chunks {
+		chunks[i].ChunkHash = HashChunkText(chunks[i].Text)
+	}
+	return chunks
+}
+
+// HashChunkText returns the SHA-256 (hex) of normalized chunk text.
+// Normalization: lowercase, collapse whitespace runs to single space, trim.
+//
+// WHY normalize before hashing:
+// - Chunking is not perfectly reproducible across chunker config changes
+//   or across different runs of the recursive splitter for minor input
+//   variations. Whitespace and case differences would silently produce
+//   "new" chunks that are semantically identical.
+// - Normalization catches those cases while still detecting any real
+//   content change (character additions/removals/substitutions).
+//
+// This is called by the chunker for every produced chunk, and can also
+// be called by callers (e.g., ingestion pipeline) to hash arbitrary text
+// and check against the DB before inserting.
+func HashChunkText(text string) string {
+	normalized := normalizeForHash(text)
+	sum := sha256.Sum256([]byte(normalized))
+	return hex.EncodeToString(sum[:])
+}
+
+var hashWhitespaceRe = regexp.MustCompile(`\s+`)
+
+func normalizeForHash(text string) string {
+	text = strings.ToLower(text)
+	text = hashWhitespaceRe.ReplaceAllString(text, " ")
+	return strings.TrimSpace(text)
 }
 
 // recursiveSplit splits text using the first separator that produces
