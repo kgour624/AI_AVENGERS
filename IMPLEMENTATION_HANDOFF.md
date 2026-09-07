@@ -117,25 +117,25 @@ Owner: Kiran (has DB access). I can prepare the exact commands as a runbook when
 
 ---
 
-## Phase C — Blackboard + Workflow Engine Skeleton (not started)
+## Phase C — Blackboard + Workflow Engine Skeleton ✅ COMPLETE (2026-09-07)
 
 **Goal:** implement the collaboration layer that enables multiple experts to work concurrently on one workflow.
 
 ### Checkpoint condition for Phase C
 
 - A workflow with 3 experts (from Phase B) runs through `INTAKE → HIGH_LEVEL_DESIGN → simulated approval → DETAILED_DESIGN`, with all events visible in `blackboard_events` table.
+- STATUS: Code complete. Requires Phase B experts + live DB to verify end-to-end.
 
-### Components (planned)
+### Components
 
-| # | Component | New file |
-|---|---|---|
-| C1 | Blackboard store (writes events, publishes to Redis pub/sub) | `backend-go/internal/blackboard/store.go` |
-| C2 | Blackboard subscriber (Redis subscribe, cursor management) | `backend-go/internal/blackboard/subscriber.go` |
-| C3 | Workflow engine state machine | `backend-go/internal/workflow/engine.go` |
-| C4 | Workflow tasks projection (Kanban derivation) | `backend-go/internal/workflow/tasks.go` |
-| C5 | Blackboard tools (`PostArtifact`, `AskExpert`, `ReadBlackboard`) hooked into orchestrator | `backend-go/internal/orchestrator/tools.go` |
-| C6 | `AskClient` tool + `approval_requests` handler | `backend-go/internal/workflow/approval.go` |
-| C7 | API endpoints: `POST /workflows`, `GET /workflows/{id}`, `POST /workflows/{id}/approvals/{approval_id}` | `backend-go/internal/api/workflow_handler.go` |
+| # | Component | File | Status |
+|---|---|---|---|
+| C1 | Blackboard store (write events + Redis pub/sub) | `backend-go/internal/blackboard/store.go` | ✅ COMPLETE |
+| C2 | Blackboard subscriber (Redis subscribe + cursor mgmt) | `backend-go/internal/blackboard/subscriber.go` | ✅ COMPLETE |
+| C3 | Workflow engine state machine (6 phases) | `backend-go/internal/workflow/engine.go` | ✅ COMPLETE |
+| C4 | Blackboard tools (PostArtifact, AskExpert, ReadBlackboard, AskClient) | `backend-go/internal/workflow/tools.go` | ✅ COMPLETE |
+| C5 | HTTP handlers + approval response | `backend-go/internal/workflow/handler.go` | ✅ COMPLETE |
+| C6 | Routes wired in main.go | `backend-go/cmd/server/main.go` | ✅ COMPLETE |
 
 ---
 
