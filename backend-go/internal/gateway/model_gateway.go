@@ -223,7 +223,7 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 		}
 
 		start := time.Now()
-		openRouterResp, err := g.callOpenRouter(ctx, modelCfg.Name, messages, maxTokens, req.Temperature)
+		openRouterResp, err := g.callProvider(ctx, modelCfg.Name, messages, maxTokens, req.Temperature)
 		if err != nil {
 			lastErr = err
 			g.logger.Warn("LLM call attempt failed",
