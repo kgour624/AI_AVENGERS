@@ -19,6 +19,12 @@ const (
 	LangUnknown    = "unknown"
 )
 
+// maxRevisionRounds is the maximum OTA revision rounds before giving up.
+// WHY defined here (not imported from workflow package):
+//   validation package must not import workflow — circular dependency.
+//   Value matches workflow.MaxRevisionRounds = 3 by design.
+const maxRevisionRounds = 3
+
 // ArtifactRequest is the input to the validation pipeline.
 type ArtifactRequest struct {
 	Filename string // e.g. "handler.go", "api.ts"
