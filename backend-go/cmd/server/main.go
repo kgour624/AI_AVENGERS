@@ -706,9 +706,20 @@ func handleRefresh(jwtService *auth.JWTService) gin.HandlerFunc {
 			return
 		}
 
-		// Only revoke the old refresh token now that the new one is
-		// confirmed issued and stored.
-		_ = jwtService.RevokeRefreshToken(c.Request.Context(), refreshToken)
+		// Revoke old refresh token with a 5-second grace period.
+		// WHY grace period (not immediate delete):
+		//   Race condition: if 3 requests 401 simultaneously, single-flight
+		//   in base.ts ensures only 1 refresh call. But any request that
+		//   was already in-flight with the OLD access token may arrive at
+		//   the backend AFTER rotation. If the old refresh token is already
+		//   gone from Redis, that in-flight request's retry (with new token)
+		//   works fine — but if it somehow needs to re-validate the old
+		//   refresh token, it would fail. 5s grace covers all in-flight
+		//   requests without meaningful security impact.
+		go func() {
+			time.Sleep(5 * time.Second)
+			_ = jwtService.RevokeRefreshToken(context.Background(), refreshToken)
+		}()
 
 		// Rotate cookie — new refresh token replaces old
 		setRefreshCookie(c, tokens.RefreshToken, jwtService.RefreshExpiryDays())
