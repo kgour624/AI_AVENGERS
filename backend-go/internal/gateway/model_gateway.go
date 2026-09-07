@@ -107,7 +107,7 @@ var providerURLs = map[config.LLMProvider]string{
 // Supports multiple LLM providers — active provider read from DB at call time.
 type ModelGateway struct {
 	cfg        config.LLMConfig
-	db         interface{ QueryRow(ctx context.Context, sql string, args ...interface{}) interface{ Scan(dest ...interface{}) error } } // pgxpool.Pool interface
+	db         *pgxpool.Pool // nil = use env config only (no DB override)
 	httpClient *http.Client
 	models     map[ModelType]modelConfig
 	cache      sync.Map
