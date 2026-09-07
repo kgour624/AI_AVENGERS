@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/blackboard"
+	"ai_avengers/backend/internal/validation"
 )
 
 // ToolName constants — must match allowed_tools JSONB values in experts table.
