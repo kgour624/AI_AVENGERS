@@ -139,22 +139,23 @@ Owner: Kiran (has DB access). I can prepare the exact commands as a runbook when
 
 ---
 
-## Phase D — Cross-Verification + Validation Pipeline (not started)
+## Phase D — Cross-Verification + Validation Pipeline ✅ COMPLETE (2026-09-07)
 
 ### Checkpoint condition
 
 - Backend expert produces a Go file with a deliberate syntax error → validation rejects → OTA loop fixes → passes → Code Reviewer approves → artifact goes `final`.
+- STATUS: Code complete. Requires Phase B experts + live workflow run to verify end-to-end.
 
-### Components (planned)
+### Components
 
-| # | Component | Notes |
-|---|---|---|
-| D1 | Reviewer matrix config | `backend-go/internal/workflow/reviewers.go` (per §8.1 of design doc) |
-| D2 | Validation pipeline orchestrator | `backend-go/internal/validation/pipeline.go` |
-| D3 | Go validators (syntax via `go/parser`, lint via `staticcheck` subprocess) | `backend-go/internal/validation/go_validator.go` |
-| D4 | TS validators (`@babel/parser` and `tsc` subprocess) | `backend-go/internal/validation/ts_validator.go` |
-| D5 | Sandbox wrapper (CPU/mem/time limits via `exec.CommandContext`) | `backend-go/internal/validation/sandbox.go` |
-| D6 | Revision loop (max 3 rounds) | Integrated in D2 |
+| # | Component | File | Status |
+|---|---|---|---|
+| D1 | Reviewer matrix config | `backend-go/internal/workflow/reviewers.go` | ✅ COMPLETE |
+| D2 | Validation pipeline + OTA revision loop | `backend-go/internal/validation/pipeline.go` | ✅ COMPLETE |
+| D3 | Go validator (go/parser + go vet + gofmt) | `backend-go/internal/validation/go_validator.go` | ✅ COMPLETE |
+| D4 | TS/JS validator (tsc + prettier) | `backend-go/internal/validation/ts_validator.go` | ✅ COMPLETE |
+| D5 | Sandbox wrapper (subprocess + memory limits) | `backend-go/internal/validation/sandbox.go` | ✅ COMPLETE |
+| D6 | Revision loop (max 3 rounds, LLM fix via ModelCheap) | Integrated in pipeline.go + tools.go | ✅ COMPLETE |
 
 ---
 
