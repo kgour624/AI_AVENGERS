@@ -16,6 +16,7 @@ import (
 
 	adminpkg "ai_avengers/backend/internal/admin"
 	"ai_avengers/backend/internal/auth"
+	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/config"
@@ -33,6 +34,7 @@ import (
 	"ai_avengers/backend/internal/rating"
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/workflow"
 )
 
 func main() {
