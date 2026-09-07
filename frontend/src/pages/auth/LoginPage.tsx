@@ -9,31 +9,8 @@ import { Input } from '@/components/ui/Input'
 import { ExpertAvatar } from '@/components/expert/ExpertAvatar'
 import { ARC_MOTION } from '@/design-system/motion'
 
-/**
- * ARC-51 decorative expert constellation - purely presentational,
- * aria-hidden, NO API call (see docs/ARC51_UI_CONTRACT.md §6: /experts
- * requires a JWT this unauthenticated page doesn't have - fetching a
- * real list here would be a scope violation, not a nice-to-have).
- * Domain strings are real ones this product actually has (system
- * design/database/security/architecture), not invented placeholders.
- */
 const CONSTELLATION_DOMAINS = ['system_design', 'database', 'security', 'architecture']
 
-/**
- * Source: FRONTEND_SYSTEM_DESIGN.md section 10 wireframe ("Login Page").
- *
- * Cross-questioned before writing:
- * - What if login succeeds but the user navigates away before the
- *   promise resolves (e.g. double-clicked back button)? navigate()
- *   after an unmount is a no-op in React Router, not a crash - safe.
- * - What if the email field has leading/trailing whitespace? Trimmed
- *   before submit - a pasted email with a trailing newline is a real,
- *   common failure mode, not a hypothetical.
- * - What happens to the password field's value if login fails? Left
- *   as-is (NOT cleared) - clearing it on every failed attempt would
- *   punish a user who made a one-character typo by making them retype
- *   the whole password. Email is also left as-is for the same reason.
- */
 export default function LoginPage() {
   const navigate = useNavigate()
   const setAuth = useAuthStore((s) => s.setAuth)
@@ -47,13 +24,8 @@ export default function LoginPage() {
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
     setError(null)
-
     const trimmedEmail = email.trim()
-    if (!trimmedEmail || !password) {
-      setError('Email and password are required.')
-      return
-    }
-
+    if (!trimmedEmail || !password) { setError('Email and password are required.'); return }
     setIsSubmitting(true)
     try {
       const { user, tokenPair } = await login({ email: trimmedEmail, password })
@@ -68,30 +40,33 @@ export default function LoginPage() {
 
   return (
     <div className="relative flex h-screen items-center justify-center overflow-hidden bg-surface-void">
-      {/* Ambient drifting glow - CSS keyframes, NOT mouse-tracked, per
-          contract §6 (avoids input-lag risk on low-end hardware). */}
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute -left-1/4 -top-1/4 h-[70vh] w-[70vh] rounded-full bg-glow-purple/10 blur-3xl"
-        style={{ animation: 'arc-ring-rotate 40s linear infinite' }}
+
+      {/* Aurora orbs — decorative, aria-hidden */}
+      <div aria-hidden="true"
+        className="aurora-orb pointer-events-none absolute -left-1/3 -top-1/3 h-[80vh] w-[80vh] rounded-full"
+        style={{ background: 'radial-gradient(circle, oklch(68% 0.28 295 / 0.12) 0%, transparent 70%)' }}
       />
-      <div
-        aria-hidden="true"
-        className="pointer-events-none absolute -bottom-1/4 -right-1/4 h-[60vh] w-[60vh] rounded-full bg-glow-cyan/10 blur-3xl"
-        style={{ animation: 'arc-ring-rotate 55s linear infinite reverse' }}
+      <div aria-hidden="true"
+        className="aurora-orb-slow pointer-events-none absolute -bottom-1/3 -right-1/3 h-[70vh] w-[70vh] rounded-full"
+        style={{ background: 'radial-gradient(circle, oklch(78% 0.18 200 / 0.10) 0%, transparent 70%)' }}
+      />
+      <div aria-hidden="true"
+        className="pointer-events-none absolute left-1/2 top-1/2 h-[40vh] w-[40vh] -translate-x-1/2 -translate-y-1/2 rounded-full"
+        style={{ background: 'radial-gradient(circle, oklch(70% 0.25 340 / 0.05) 0%, transparent 70%)' }}
       />
 
-      {/* Decorative expert constellation - see header comment. */}
+      {/* Scan-line */}
+      <div aria-hidden="true" className="scan-line" />
+
+      {/* Expert constellation */}
       <div aria-hidden="true" className="pointer-events-none absolute inset-0">
         {CONSTELLATION_DOMAINS.map((domain, i) => (
-          <div
-            key={domain}
-            className="absolute opacity-40"
+          <div key={domain} className="absolute opacity-30"
             style={{
-              top: `${15 + i * 20}%`,
-              left: i % 2 === 0 ? '8%' : undefined,
-              right: i % 2 === 1 ? '8%' : undefined,
-              animation: `pulse-thinking ${4 + i}s ease-in-out infinite`,
+              top: `${12 + i * 22}%`,
+              left: i % 2 === 0 ? '6%' : undefined,
+              right: i % 2 === 1 ? '6%' : undefined,
+              animation: `pulse-thinking ${4 + i * 0.8}s ease-in-out infinite`,
             }}
           >
             <ExpertAvatar domain={domain} status="idle" size="lg" />
@@ -99,56 +74,72 @@ export default function LoginPage() {
         ))}
       </div>
 
+      {/* Login card */}
       <motion.div
-        initial={reduceMotion ? undefined : { opacity: 0, scale: 0.96, y: 8 }}
+        initial={reduceMotion ? undefined : { opacity: 0, scale: 0.94, y: 12 }}
         animate={{ opacity: 1, scale: 1, y: 0 }}
         transition={{ duration: ARC_MOTION.panel, ease: ARC_MOTION.ease }}
-        className="relative w-full max-w-sm rounded-lg border border-glass-border bg-surface-raised/80 p-8 backdrop-blur-xl"
+        className="relative w-full max-w-sm"
       >
-        <h1 className="mb-1 text-center text-2xl font-semibold tracking-wide text-text-primary [text-shadow:0_0_20px_var(--glow-purple)]">
-          {'\u26A1'} AI AVENGERS
-        </h1>
-        <p className="mb-6 text-center text-sm text-text-secondary">
-          Neural Command Center {'\u2014'} Multi-Agent Domain Expert Simulator
-        </p>
+        {/* Holographic border glow */}
+        <div aria-hidden="true"
+          className="pointer-events-none absolute -inset-px rounded-xl"
+          style={{
+            background: 'linear-gradient(135deg, oklch(68% 0.28 295 / 0.4), oklch(78% 0.18 200 / 0.3), oklch(65% 0.30 320 / 0.4))',
+            borderRadius: 'inherit',
+          }}
+        />
 
-        <form onSubmit={handleSubmit} className="flex flex-col gap-4">
-          <Input
-            label="Email"
-            type="email"
-            name="email"
-            autoComplete="email"
-            placeholder="you@company.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            disabled={isSubmitting}
-            required
-          />
-          <Input
-            label="Password"
-            type="password"
-            name="password"
-            autoComplete="current-password"
-            placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            disabled={isSubmitting}
-            required
-          />
+        <div className="relative rounded-xl border border-glass-border bg-surface-raised/85 p-8 backdrop-blur-2xl shadow-float">
+          {/* Brand */}
+          <div className="mb-6 text-center">
+            <h1 className="holo-text mb-1 text-3xl font-bold tracking-[0.12em] uppercase">
+              {'\u26A1'} AI Avengers
+            </h1>
+            <p className="text-xs font-medium uppercase tracking-[0.2em] text-text-disabled">
+              Neural Command Center
+            </p>
+            <div className="mx-auto mt-3 h-px w-24"
+              style={{ background: 'linear-gradient(90deg, transparent, oklch(68% 0.28 295 / 0.6), transparent)' }}
+            />
+          </div>
 
-          {error && <p className="text-sm text-mode-refuse">{error}</p>}
+          <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+            <Input
+              label="Email"
+              type="email" name="email" autoComplete="email"
+              placeholder="you@company.com"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              disabled={isSubmitting} required
+            />
+            <Input
+              label="Password"
+              type="password" name="password" autoComplete="current-password"
+              placeholder="{'\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022'}"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              disabled={isSubmitting} required
+            />
 
-          <Button type="submit" isLoading={isSubmitting} className="mt-2 w-full">
-            Sign In
-          </Button>
-        </form>
+            {error && (
+              <p className="rounded-md border border-mode-refuse/30 bg-mode-refuse/10 px-3 py-2 text-xs text-mode-refuse">
+                {error}
+              </p>
+            )}
 
-        <p className="mt-6 text-center text-sm text-text-secondary">
-          Don't have an account?{' '}
-          <Link to="/register" className="text-brand hover:text-brand-hover">
-            Register
-          </Link>
-        </p>
+            <Button type="submit" isLoading={isSubmitting} className="mt-1 w-full">
+              Sign In
+            </Button>
+          </form>
+
+          <p className="mt-5 text-center text-xs text-text-disabled">
+            No account?{' '}
+            <Link to="/register" className="text-glow-purple/80 transition-colors hover:text-glow-purple">
+              Register
+            </Link>
+          </p>
+        </div>
       </motion.div>
     </div>
   )
