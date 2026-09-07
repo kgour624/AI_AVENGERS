@@ -59,9 +59,9 @@ Based on file-inspection audit of existing repo:
 | A1 | Design doc: collaboration layer | `DOMAIN_EXPERT_COLLABORATION_DESIGN.md` | ✅ COMMITTED | commit 2026-09-07 |
 | A2 | Knowledge Hub | `KNOWLEDGE_HUB.md` | ✅ COMMITTED | this commit |
 | A3 | This handoff file | `IMPLEMENTATION_HANDOFF.md` | ✅ COMMITTED | this commit |
-| A4 | Verify existing schema (`001_initial_schema.up.sql`) | `backend-go/migrations/001_initial_schema.up.sql` | ⏳ NOT STARTED | Need to read full file to confirm exact column types/names before writing 004 migration |
-| A5 | Migration: `004_collaboration_layer.up.sql` (new tables + ALTERs) | `backend-go/migrations/004_collaboration_layer.up.sql` | ⏳ NOT STARTED | Must not conflict with existing schema; verify after A4 |
-| A6 | Migration: `004_collaboration_layer.down.sql` (reversible) | `backend-go/migrations/004_collaboration_layer.down.sql` | ⏳ NOT STARTED | Every up needs a down |
+| A4 | Verify existing schema (`001` through `005` migrations) | `backend-go/migrations/*.sql` | ✅ COMPLETE (2026-09-07) | All 5 existing migrations read; verified experts/course_chunks/messages/system_settings columns; found that migration numbers 004 and 005 are already taken, and that `llm_calls` table does NOT exist (cost tracked on messages) |
+| A5 | Migration: `006_collaboration_layer.up.sql` (new tables + ALTERs) | `backend-go/migrations/006_collaboration_layer.up.sql` | ✅ COMPLETE (2026-09-07) | Renumbered from 004→006. Additive-only. IF NOT EXISTS everywhere, safe to re-run. Adds: experts config columns, course_chunks.chunk_hash, workflows, blackboard_events, workflow_tasks, workflow_checkpoints, approval_requests, messages.workflow_id, two system_settings rows |
+| A6 | Migration: `006_collaboration_layer.down.sql` (reversible) | `backend-go/migrations/006_collaboration_layer.down.sql` | ✅ COMPLETE (2026-09-07) | Reverses everything in strict child-before-parent order. Preserves existing `is_training` column (not owned by this migration) |
 | A7 | Update `internal/expert/handler.go` to accept new fields | `backend-go/internal/expert/handler.go` | ⏳ NOT STARTED | Preserve backward compatibility |
 | A8 | Update `internal/admin/admin_handler.go` expert CRUD | `backend-go/internal/admin/admin_handler.go` | ⏳ NOT STARTED | Admin UI must surface these fields |
 | A9 | Chunk deduplication in `internal/training/chunker.go` | `backend-go/internal/training/chunker.go` | ⏳ NOT STARTED | Per §6.3 of design doc: SHA-256 hash, skip if already exists for this expert |
@@ -79,6 +79,18 @@ Based on file-inspection audit of existing repo:
 
 - **Trust-but-verify failure in existing `HANDOFF.md`:** top-level status table said "all complete" but per-component tables said "pending" for the same phases. Fix: rewrite top-level table (item A11) with per-component evidence.
 - **No repo access in first design pass:** initial design plan (before repo access was granted) assumed Next.js + Prisma. Reality is Go + Python + React + Vite. Fix: `DOMAIN_EXPERT_COLLABORATION_DESIGN.md` now matches actual stack.
+- **Fabricated table reference in own design doc:** `DOMAIN_EXPERT_COLLABORATION_DESIGN.md` §15.2 originally said `ALTER TABLE llm_calls ADD COLUMN workflow_id`, but that table does not exist in the schema. Cost tracking is on `messages.cost_usd`, not a separate `llm_calls` table. If I had blindly written the migration without reading `001_initial_schema.up.sql` first, it would have failed on apply. Fix: (a) migration 006 correctly adds `workflow_id` to the real `messages` table; (b) design doc §15.2 updated with the correction and a comment noting the fix, so future readers see how this class of error is caught. Lesson: never trust a design doc's SQL without cross-checking against actual migration files first.
+- **Migration number collision avoided:** initial plan was to create `004_collaboration_layer`. Ground-truth check revealed `004_messages_warning_fields` and `005_seed_admin` already occupied 004 and 005. Renumbered to 006. Lesson: `list_repository_tree` on the migrations directory before choosing a migration number is mandatory.
+
+### Verification steps still owed for Phase A
+
+- [ ] Run migration 006 up against a live Postgres. Confirm no errors.
+- [ ] Run migration 006 down. Confirm all new tables/columns gone, existing tables untouched (`is_training` still present on experts).
+- [ ] Run 006 up again. Confirm idempotent (all IF NOT EXISTS guards work).
+- [ ] `SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'experts';` — confirm new columns present with expected types.
+- [ ] `SELECT * FROM system_settings WHERE key IN ('workflow_engine', 'blackboard');` — confirm defaults inserted.
+
+Owner: Kiran (has DB access). I can prepare the exact commands as a runbook when needed.
 
 ---
 

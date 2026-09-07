@@ -764,18 +764,26 @@ ALTER TABLE experts
     CHECK (training_status IN ('draft','ingesting','trained','deprecated'));
 
 -- Cost tracking per workflow.
-ALTER TABLE llm_calls
+-- CORRECTION: an earlier draft of this doc referenced a table named
+-- `llm_calls`. That table does not exist. In the actual schema, cost
+-- and tokens are tracked directly on the `messages` table
+-- (messages.cost_usd, messages.tokens_used, messages.model_used).
+-- Per-workflow cost rollup is therefore:
+--   SELECT SUM(cost_usd) FROM messages WHERE workflow_id = $1;
+ALTER TABLE messages
   ADD COLUMN IF NOT EXISTS workflow_id UUID REFERENCES workflows(id) ON DELETE SET NULL;
-CREATE INDEX IF NOT EXISTS idx_llm_calls_workflow ON llm_calls(workflow_id) WHERE workflow_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_messages_workflow ON messages(workflow_id) WHERE workflow_id IS NOT NULL;
 
--- Per-expert namespacing for chunks (if not already present).
--- If course_chunks already has expert_id, this is a no-op. If not, add it.
+-- Per-expert namespacing for chunks. course_chunks already has expert_id
+-- (verified against 001_initial_schema.up.sql). Only need to add chunk_hash.
 ALTER TABLE course_chunks
-  ADD COLUMN IF NOT EXISTS chunk_hash TEXT;  -- for dedup (§6.3)
-CREATE INDEX IF NOT EXISTS idx_cc_expert_hash ON course_chunks(expert_id, chunk_hash);
+  ADD COLUMN IF NOT EXISTS chunk_hash CHAR(64);  -- SHA-256 hex, for dedup (§6.3)
+CREATE INDEX IF NOT EXISTS idx_chunks_expert_hash ON course_chunks(expert_id, chunk_hash) WHERE chunk_hash IS NOT NULL;
 ```
 
-**Verification step before applying:** admin should `\d experts`, `\d course_chunks`, `\d llm_calls` in psql to confirm existing schema before running this migration. If any column already exists with a different type, adjust the migration.
+**Actual migration file:** `backend-go/migrations/006_collaboration_layer.up.sql` (up) and `.down.sql` (reverse). Migration number is 006 because 004_messages_warning_fields and 005_seed_admin already exist in main. The up file contains the CHECK constraints, indexes, and system_settings inserts in addition to the DDL shown here.
+
+**Verification step before applying:** admin should `\d experts`, `\d course_chunks`, `\d messages`, and `\d system_settings` in psql to confirm the existing schema before running this migration. The migration uses `ADD COLUMN IF NOT EXISTS` and `CREATE TABLE IF NOT EXISTS` throughout, so re-runs are safe.
 
 ---
 
