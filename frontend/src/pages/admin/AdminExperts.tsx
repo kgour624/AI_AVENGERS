@@ -27,17 +27,58 @@ import { trainingStatusLabel } from '@/types/expert'
  * as a clearly-labeled disabled button rather than silently omitted,
  * so it's visible as a known gap, not an invisible one.
  */
-function ExpertRow({ expertId }: { expertId: string }) {
+const STAGE_LABELS: Record<string, string> = {
+  pending: 'Waiting to start',
+  chunking: 'Step 1/6: Splitting transcript',
+  topic_extraction: 'Step 2/6: Extracting topics (LLM)',
+  charter_extraction: 'Step 3/6: Extracting charter (LLM)',
+  embedding: 'Step 4/6: Generating embeddings',
+  storing: 'Step 5/6: Saving to database',
+  smoke_test: 'Step 6/6: Running smoke test',
+  complete: 'Complete',
+  failed: 'Failed',
+}
+
+function ExpertRow({
+  expertId,
+  onViewProgress,
+}: {
+  expertId: string
+  onViewProgress: (job: IngestionJob) => void
+}) {
   const { data: jobs } = useIngestionStatus(expertId)
   const latestJob = jobs?.[0]
 
   if (!latestJob) return null
 
+  const isActive = latestJob.status === 'running' || latestJob.status === 'pending'
+  const stageLabel = STAGE_LABELS[latestJob.currentStage ?? latestJob.status] ?? latestJob.status
+
   return (
-    <p className="mt-1 text-xs text-text-secondary">
-      Last ingestion: {latestJob.status === 'complete' ? '\u2705' : latestJob.status === 'failed' ? '\u274c' : '\u23f3'}{' '}
-      {latestJob.status} ({latestJob.processedChunks}/{latestJob.totalChunks} chunks)
-    </p>
+    <div className="mt-1 flex items-center justify-between">
+      <p className="text-xs text-text-secondary">
+        {latestJob.status === 'complete' ? '\u2705' : latestJob.status === 'failed' ? '\u274c' : '\u23f3'}{' '}
+        {stageLabel}
+        {latestJob.processedChunks > 0 && (
+          <span className="ml-1 text-text-disabled">
+            ({latestJob.processedChunks}/{latestJob.totalChunks})
+          </span>
+        )}
+        {latestJob.costUsd && latestJob.costUsd > 0 && (
+          <span className="ml-2 text-glow-amber/70">${latestJob.costUsd.toFixed(3)}</span>
+        )}
+      </p>
+      {(isActive || latestJob.status === 'failed') && (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => onViewProgress(latestJob)}
+          className="text-[10px] px-2 py-0.5"
+        >
+          View Progress
+        </Button>
+      )}
+    </div>
   )
 }
 
