@@ -94,7 +94,7 @@ func (p *Pipeline) Validate(ctx context.Context, req ArtifactRequest) *PipelineR
 
 	currentCode := req.Code
 
-	for round := 0; round <= MaxRevisionRounds; round++ {
+	for round := 0; round <= maxRevisionRounds; round++ {
 		// Run validator for this language
 		var result *ValidationResult
 		switch lang {
