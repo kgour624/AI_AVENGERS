@@ -137,19 +137,27 @@ function AdminExperts() {
           onClose={() => setCharterTargetId(null)}
           expertId={charterTargetId}
           expertName={experts?.find((e) => e.id === charterTargetId)?.name ?? ''}
-          // WHY '' not experts?.find(...)?.reasoningCharter: the admin
-          // experts list endpoint (getAdminExperts) does not select
-          // reasoning_charter at all (verified against ListExperts'
-          // SQL - only stats columns), so there is nothing to seed the
-          // textarea with beyond empty. Editing still works (PATCH
-          // replaces the value); this only means the admin can't see
-          // the CURRENT charter text before overwriting it, which is a
-          // real remaining gap worth a follow-up (add reasoning_charter
-          // to ListExperts' SELECT) rather than something fixable here.
           currentCharter=""
           onSaved={() => queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })}
         />
       )}
+
+      {/* A12: Edit Config modal — pre-fills from expert object */}
+      {configTargetId && (() => {
+        const expert = experts?.find((e) => e.id === configTargetId)
+        if (!expert) return null
+        return (
+          <EditExpertConfigModal
+            isOpen
+            onClose={() => setConfigTargetId(null)}
+            expert={expert}
+            onSaved={() => {
+              queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
+              setConfigTargetId(null)
+            }}
+          />
+        )
+      })()}
     </div>
   )
 }
