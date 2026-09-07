@@ -61,6 +61,7 @@ const router = createBrowserRouter([
               { path: 'clients', lazy: () => import('@/pages/admin/AdminClients') },
               { path: 'stats', lazy: () => import('@/pages/admin/AdminStats') },
               { path: 'settings', lazy: () => import('@/pages/admin/AdminSettings') },
+              { path: 'llm-settings', lazy: () => import('@/pages/admin/AdminLLMSettings') },
             ],
           },
         ],
