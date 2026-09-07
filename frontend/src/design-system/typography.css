@@ -2,25 +2,58 @@
   --font-sans: 'Inter', system-ui, sans-serif;
   --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
 
-  --text-xs: 11px;
-  --text-sm: 13px;
+  --text-xs:   11px;
+  --text-sm:   13px;
   --text-base: 14px;
-  --text-lg: 16px;
-  --text-xl: 20px;
-  --text-2xl: 24px;
+  --text-lg:   16px;
+  --text-xl:   20px;
+  --text-2xl:  24px;
+  --text-3xl:  30px;
 
-  --leading-tight: 1.25;
-  --leading-normal: 1.5;
+  --leading-tight:   1.2;
+  --leading-normal:  1.5;
   --leading-relaxed: 1.75;
+
+  /* 2051: tighter letter-spacing for headings */
+  --tracking-tight:  -0.02em;
+  --tracking-normal:  0em;
+  --tracking-wide:    0.05em;
+  --tracking-wider:   0.1em;
+  --tracking-widest:  0.2em;
 }
 
 body {
   font-family: var(--font-sans);
   font-size: var(--text-base);
   line-height: var(--leading-normal);
+  letter-spacing: 0.01em;
 }
 
-code,
-pre {
+code, pre {
   font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+/* Heading utilities */
+h1, h2, h3, h4, h5, h6 {
+  letter-spacing: var(--tracking-tight);
+  font-weight: 600;
+}
+
+/* Monospace code blocks */
+pre {
+  background: oklch(9% 0.018 285);
+  border: 1px solid oklch(28% 0.025 285);
+  border-radius: 10px;
+  padding: 1rem;
+  overflow-x: auto;
+}
+
+code:not(pre code) {
+  background: oklch(17% 0.022 285);
+  border: 1px solid oklch(28% 0.025 285);
+  border-radius: 4px;
+  padding: 0.1em 0.4em;
+  font-size: 0.85em;
+  color: oklch(78% 0.18 200);
 }
