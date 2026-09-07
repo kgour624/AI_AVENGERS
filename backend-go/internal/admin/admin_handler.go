@@ -495,7 +495,10 @@ func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 	rows, err := h.db.Query(c.Request.Context(), `
 		SELECT id, status, COALESCE(source_path,''),
 		       total_chunks, processed_chunks,
-		       COALESCE(error_message,''), started_at, completed_at, created_at
+		       COALESCE(error_message,''), started_at, completed_at, created_at,
+		       COALESCE(current_stage,'pending'), COALESCE(stage_detail,''),
+		       COALESCE(cost_usd,0), estimated_seconds_remaining,
+		       COALESCE(resumed_from_checkpoint,false)
 		FROM ingestion_jobs
 		WHERE expert_id=$1
 		ORDER BY created_at DESC LIMIT 20`, expertID)
