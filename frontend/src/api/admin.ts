@@ -134,6 +134,12 @@ export interface IngestionJob {
   startedAt?: string
   completedAt?: string
   createdAt: string
+  // Migration 007 fields
+  currentStage?: string
+  stageDetail?: string
+  costUsd?: number
+  estimatedSecondsRemaining?: number
+  resumedFromCheckpoint?: boolean
 }
 
 export const getIngestionJobs = (expertId: string) =>
