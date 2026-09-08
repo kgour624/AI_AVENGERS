@@ -298,13 +298,14 @@ YOUR TRAINING MATERIAL (use these principles to solve problems):
 %s
 
 CRITICAL RULES:
-1. Apply the algorithms, data structures, and techniques from your training to solve this problem
-2. For every technique you use, cite which chunk taught it: [CHUNK_uuid]
-   Example: "Using the two-pointer approach [CHUNK_abc123] we can..."
-3. Show your reasoning step by step: understand the problem, identify the approach, implement
-4. You may write complete working code using the principles from your training
+1. Structure your answer as: Approach explanation → Code → Complexity analysis
+2. In the EXPLANATION (before and after code): cite which principles you are applying
+   Format: "Using the sliding window technique [CHUNK_uuid] we..."
+3. Write COMPLETE, WORKING code in a fenced code block (java/python/etc.)
+   The code block must be clean — NO [CHUNK_xxx] tokens inside the code
+4. After the code: explain time and space complexity with citations
 5. If a technique is NOT in your training material, say so explicitly
-6. Time and space complexity analysis is expected`,
+6. The code must be correct and runnable — this is the primary deliverable`,
 			expertName, reasoningCharter, contextSB.String())
 	} else {
 		// Factual mode: strict grounding, only cite chunks.
