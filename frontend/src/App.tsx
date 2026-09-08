@@ -35,11 +35,8 @@ const router = createBrowserRouter([
         element: <AppShell />,
         children: [
           { path: '/', ...projectsRoute },
-          {
-            path: '/projects/:projectId',
-            ...projectRoute,
-            children: [{ path: 'chats/:chatId', ...chatRoute }],
-          },
+          { path: '/projects/:projectId', ...projectRoute },
+          { path: '/projects/:projectId/chats/:chatId', ...chatRoute },
           { path: '/experts', ...expertsRoute },
         ],
       },

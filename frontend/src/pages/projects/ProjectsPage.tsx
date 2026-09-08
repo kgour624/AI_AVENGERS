@@ -55,7 +55,7 @@ export default function ProjectsPage() {
   }
 
   return (
-    <div className="p-6">
+    <div className="flex-1 overflow-y-auto p-6">
       <div className="mb-6 flex items-center justify-between">
         <h1 className="text-xl font-semibold">Your Projects</h1>
         {/* Bug 1.1 fix (docs bug list): no Create Project entry point

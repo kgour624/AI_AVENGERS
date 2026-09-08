@@ -23,7 +23,7 @@ export default function ExpertsPage() {
   const [topicsTargetId, setTopicsTargetId] = useState<string | null>(null)
 
   return (
-    <div className="p-6">
+    <div className="flex-1 overflow-y-auto p-6">
       <h1 className="mb-6 text-xl font-semibold">Available Domain Experts</h1>
       {experts.length === 0 ? (
         <p className="text-text-secondary">No experts available yet.</p>

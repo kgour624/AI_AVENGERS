@@ -147,7 +147,7 @@ export default function ChatPage() {
   }
 
   return (
-    <div className="flex h-full flex-col">
+    <div className="flex h-full flex-col overflow-hidden">
       <div className="flex items-center gap-3 border-b border-surface-border px-6 py-4">
         <Link
           to={`/projects/${projectId}`}

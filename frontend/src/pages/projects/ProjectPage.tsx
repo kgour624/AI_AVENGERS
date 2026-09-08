@@ -55,7 +55,7 @@ export default function ProjectPage() {
   }
 
   return (
-    <div className="p-6">
+    <div className="flex-1 overflow-y-auto p-6">
       <Link
         to="/"
         className="mb-3 inline-flex items-center gap-1 text-sm text-text-secondary hover:text-text-primary"
@@ -108,8 +108,6 @@ export default function ProjectPage() {
       <div className="mt-6">
         <RepoStatus projectId={project.id} />
       </div>
-
-      <Outlet />
     </div>
   )
 }
