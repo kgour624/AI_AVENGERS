@@ -103,6 +103,16 @@ type adminExpertRow struct {
 	MaxLoopIterations  int             `json:"max_loop_iterations"`
 	AllowedTools       json.RawMessage `json:"allowed_tools"`
 	TrainingStatus     string          `json:"training_status"`
+	// CategoryID (migration 010, CT-A4): nullable. FIX (2026-09-08): this
+	// field existed on the DB row and was already PATCH-able via
+	// UpdateExpert (category_id below), but was never SELECTed/returned
+	// here — the admin UI had no way to SEE or edit which category an
+	// expert is in, so a mismatch introduced by direct-SQL retrofitting
+	// an existing expert into a category (done once, manually, before
+	// this admin UI existed) was invisible and uncorrectable from the
+	// panel. Read-side gap only, same class of bug as ReasoningCharter
+	// above.
+	CategoryID         *uuid.UUID      `json:"category_id"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 }
@@ -118,7 +128,7 @@ func (h *AdminHandler) ListExperts(c *gin.Context) {
 		       is_active, is_training,
 		       model_tier, temperature, top_p,
 		       loop_pattern, max_loop_iterations, allowed_tools,
-		       training_status,
+		       training_status, category_id,
 		       created_at, updated_at
 		FROM experts
 		WHERE deleted_at IS NULL
@@ -141,7 +151,7 @@ func (h *AdminHandler) ListExperts(c *gin.Context) {
 			&e.IsActive, &e.IsTraining,
 			&e.ModelTier, &e.Temperature, &e.TopP,
 			&e.LoopPattern, &e.MaxLoopIterations, &e.AllowedTools,
-			&e.TrainingStatus,
+			&e.TrainingStatus, &e.CategoryID,
 			&e.CreatedAt, &e.UpdatedAt,
 		); err != nil {
 			h.logger.Warn("scan expert row failed", zap.Error(err))
