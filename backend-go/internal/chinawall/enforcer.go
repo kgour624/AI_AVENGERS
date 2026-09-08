@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/config"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
@@ -31,6 +32,12 @@ type EnforceResult struct {
 	Confidence  float64
 	LayerFailed int        // 0 = all passed
 	Reason      string
+	// TemplateSections is set ONLY when the expert's category has a
+	// non-empty template_schema (CT-B, CATEGORY_TEMPLATE_HANDOFF.md §4).
+	// nil/empty for every flat-text expert (CT-L2 fallback) — Answer
+	// is the only populated field in that case, exactly as before this
+	// feature existed.
+	TemplateSections []TemplateSectionResult
 }
 
 // Citation links a claim to a source chunk.
@@ -87,6 +94,13 @@ func (e *Enforcer) Enforce(
 	expertDomain string,
 	reasoningCharter string,
 	attempt int,
+	// templateSections/defaultLanguage (CT-B) are nil/"" for every expert
+	// with no category or an empty template_schema — the entire flat-text
+	// code path below this point is untouched and behaves identically to
+	// before this feature (CT-L2). Only decision/engine.go passes these
+	// through from expert.TemplateSections/expert.DefaultLanguage.
+	templateSections []category.TemplateSection,
+	defaultLanguage string,
 ) (*EnforceResult, error) {
 	// Load domain profile from registry.
 	// O(1) lookup. Falls back to BaseProfile for unknown domains.
@@ -146,7 +160,7 @@ func (e *Enforcer) Enforce(
 
 	// LAYER 3: Generate with mandatory citations
 	// Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
-	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, profile)
+	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, profile, templateSections, defaultLanguage)
 	if err != nil {
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
@@ -157,6 +171,16 @@ func (e *Enforcer) Enforce(
 			return e.buildRefusal("citation_failure", "Could not generate properly cited answer"), nil
 		}
 		return &EnforceResult{Status: "retry", LayerFailed: 3}, nil
+	}
+
+	// STRUCTURED PATH (CT-B1/B2): category had a non-empty template_schema,
+	// so generateWithCitations took the structured branch and returned
+	// per-section results instead of one flat Answer. Handled entirely
+	// separately from the flat path below so the flat path's existing
+	// logic (including its BaseProfile safety net) stays byte-for-byte
+	// unchanged for every non-categorized expert (CT-L2).
+	if len(generated.TemplateSections) > 0 {
+		return e.enforceStructured(ctx, question, chunks, expertName, reasoningCharter, profile, generated, coverage, bestScore, templateSections, defaultLanguage)
 	}
 
 	// LAYER 4: Strip uncited claims
@@ -216,6 +240,95 @@ func (e *Enforcer) Enforce(
 		Citations:  generated.Citations,
 		Coverage:   coverage,
 		Confidence: float64(bestScore),
+	}, nil
+}
+
+// enforceStructured runs Layer 4 (per-section) and the BaseProfile safety
+// net for the structured (categorized-expert) path. Mirrors the flat
+// path's conflict-resolution logic in Enforce() above, but scoped to
+// sections instead of one Answer string:
+//   - prose sections: existing per-domain StripMode logic (unchanged
+//     stripUncited call), applied to that section's text only.
+//   - code / test_cases sections: structurally exempt (CT-B2) — never
+//     passed through stripUncited, same principle as StripModeCodeExempt
+//     for whole answers, just correctly scoped per-section instead of
+//     accidentally exempting an entire prose answer that merely
+//     contains one code block.
+//   - if every section ends up empty AND this is not already BaseProfile:
+//     retry once with BaseProfile, same safety net rationale as the flat
+//     path ("domain rules over-relaxed something upstream").
+func (e *Enforcer) enforceStructured(
+	ctx context.Context,
+	question string,
+	chunks []CourseChunk,
+	expertName string,
+	reasoningCharter string,
+	profile *DomainProfile,
+	generated *generatedAnswer,
+	coverage string,
+	bestScore float32,
+	templateSections []category.TemplateSection,
+	defaultLanguage string,
+) (*EnforceResult, error) {
+	strippedCount := 0
+	anyContent := false
+	for i := range generated.TemplateSections {
+		s := &generated.TemplateSections[i]
+		if s.Type == category.SectionTypeProse {
+			clean, n := e.stripUncited(s.Content, profile.StripMode)
+			s.Content = clean
+			strippedCount += n
+		}
+		if strings.TrimSpace(s.Content) != "" {
+			anyContent = true
+		}
+	}
+	if strippedCount > 0 {
+		e.logger.Warn("Layer 4 (structured): stripped uncited prose sections",
+			zap.Int("count", strippedCount),
+		)
+	}
+
+	if anyContent {
+		return &EnforceResult{
+			Status:           "success",
+			TemplateSections: generated.TemplateSections,
+			Citations:        generated.Citations,
+			Coverage:         coverage,
+			Confidence:       float64(bestScore),
+		}, nil
+	}
+
+	if profile.Domain == BaseProfile.Domain {
+		return e.buildRefusal("empty_after_strip", "Could not generate a properly cited structured answer"), nil
+	}
+
+	e.logger.Warn("Layer 4 (structured): all sections empty, retrying with BaseProfile",
+		zap.String("domain", profile.Domain),
+	)
+	baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, BaseProfile, templateSections, defaultLanguage)
+	if err != nil {
+		return nil, fmt.Errorf("base profile structured generation failed: %w", err)
+	}
+	stillEmpty := true
+	for i := range baseGenerated.TemplateSections {
+		s := &baseGenerated.TemplateSections[i]
+		if s.Type == category.SectionTypeProse {
+			s.Content, _ = e.stripUncited(s.Content, BaseProfile.StripMode)
+		}
+		if strings.TrimSpace(s.Content) != "" {
+			stillEmpty = false
+		}
+	}
+	if stillEmpty {
+		return e.buildRefusal("empty_after_strip", "Could not generate a properly cited structured answer"), nil
+	}
+	return &EnforceResult{
+		Status:           "success",
+		TemplateSections: baseGenerated.TemplateSections,
+		Citations:        baseGenerated.Citations,
+		Coverage:         coverage,
+		Confidence:       float64(bestScore),
 	}, nil
 }
 
@@ -338,10 +451,20 @@ NO = chunks do not cover this question`)
 type generatedAnswer struct {
 	Answer    string
 	Citations []Citation
+	// TemplateSections is set ONLY by the structured branch (len(templateSections) > 0
+	// on the call into generateWithCitations below). nil for every flat-text call —
+	// callers must check len(TemplateSections) > 0, never assume Answer is unset.
+	TemplateSections []TemplateSectionResult
 }
 
 // generateWithCitations calls strong LLM with mandatory citation requirement.
 // Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
+//
+// templateSections/defaultLanguage (CT-B1): when non-empty, this function
+// takes the structured JSON branch (generateStructured) instead of the
+// existing flat-text branch below. Flat-text branch is completely
+// unmodified from before this feature — same variables, same prompts,
+// same gateway call (CT-L2).
 func (e *Enforcer) generateWithCitations(
 	ctx context.Context,
 	question string,
@@ -349,12 +472,18 @@ func (e *Enforcer) generateWithCitations(
 	expertName string,
 	reasoningCharter string,
 	profile *DomainProfile,
+	templateSections []category.TemplateSection,
+	defaultLanguage string,
 ) (*generatedAnswer, error) {
 
 	// Build context with chunk IDs
 	var contextSB strings.Builder
 	for _, c := range chunks {
 		contextSB.WriteString(fmt.Sprintf("[CHUNK_%s]\n%s\n\n", c.ID, c.Text))
+	}
+
+	if len(templateSections) > 0 {
+		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, contextSB.String(), templateSections, defaultLanguage)
 	}
 
 	var systemPrompt string
@@ -418,6 +547,93 @@ COURSE CONTENT:
 	return &generatedAnswer{
 		Answer:    resp.Content,
 		Citations: citations,
+	}, nil
+}
+
+// generateStructured is the CT-B1 structured JSON generation branch.
+// Called from generateWithCitations only when the expert's category has
+// a non-empty template_schema. Builds a JSON-only prompt (template.go's
+// buildStructuredPrompt), calls the strong model once, parses the result
+// into per-section text (template.go's parseStructuredResponse), then
+// extracts citations independently per section so Layer 4 can strip each
+// prose section on its own (CT-B2) without touching code/test_cases text.
+//
+// Mental execution:
+// sections = [pattern(prose), idea(prose), code(code), walkthrough(prose), test_cases(test_cases)]
+// LLM returns valid JSON with all 5 keys -> parseStructuredResponse succeeds
+//   -> 5 TemplateSectionResult entries, citations extracted per prose section
+//   -> allCitations = union of pattern/idea/walkthrough citations (code/test_cases
+//      sections are not expected to contain [CHUNK_xxx] tokens per the prompt's
+//      rule #4, so extractCitations on them normally returns empty, which is
+//      correct — not a bug).
+// Edge case: LLM returns malformed JSON (parseStructuredResponse errors) ->
+//   fall back to flat citation extraction on the raw response so Layer 3's
+//   "no citations" check still has real signal instead of silently returning
+//   an empty structured answer that would masquerade as "success" with zero content.
+func (e *Enforcer) generateStructured(
+	ctx context.Context,
+	question string,
+	expertName string,
+	reasoningCharter string,
+	chunks []CourseChunk,
+	contextText string,
+	sections []category.TemplateSection,
+	defaultLanguage string,
+) (*generatedAnswer, error) {
+	if defaultLanguage == "" {
+		defaultLanguage = "java" // CT-L5: hardcoded default, admin-overridable per category
+	}
+
+	systemPrompt := buildStructuredPrompt(expertName, reasoningCharter, contextText, sections, defaultLanguage)
+
+	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
+		Model:        gateway.ModelStrong,
+		SystemPrompt: systemPrompt,
+		UserPrompt:   question,
+		// WHY 2000 not flat path's 1500: a structured answer must fit
+		// prose + a full code block + test case buckets all inside one
+		// JSON payload, which is larger than a single flat prose+code answer.
+		MaxTokens:   2000,
+		Temperature: 0.4,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	parsed, parseErr := parseStructuredResponse(resp.Content, sections)
+	if parseErr != nil {
+		e.logger.Warn("structured response parse failed, falling back to flat citation extraction on raw content",
+			zap.Error(parseErr),
+		)
+		citations := e.extractCitations(resp.Content, chunks)
+		return &generatedAnswer{Answer: resp.Content, Citations: citations}, nil
+	}
+
+	var allCitations []Citation
+	seen := make(map[string]bool)
+	resultSections := make([]TemplateSectionResult, 0, len(sections))
+	for _, s := range sections {
+		text := parsed[s.Key]
+		secCitations := e.extractCitations(text, chunks)
+		for _, c := range secCitations {
+			key := c.ChunkID.String()
+			if !seen[key] {
+				seen[key] = true
+				allCitations = append(allCitations, c)
+			}
+		}
+		resultSections = append(resultSections, TemplateSectionResult{
+			Key:       s.Key,
+			Label:     s.Label,
+			Type:      s.Type,
+			Content:   text,
+			Citations: secCitations,
+		})
+	}
+
+	return &generatedAnswer{
+		Citations:        allCitations,
+		TemplateSections: resultSections,
 	}, nil
 }
 
