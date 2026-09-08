@@ -2,6 +2,7 @@ import { useCallback, useRef, useState, type KeyboardEvent } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { ExpertPicker } from '@/components/expert/ExpertPicker'
 import { Button } from '@/components/ui/Button'
+import { useReplyStore } from '@/stores/replyStore'
 import type { ProjectExpert } from '@/types/project'
 import { cn } from '@/utils/cn'
 
