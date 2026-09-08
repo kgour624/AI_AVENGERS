@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { IngestionJob } from '@/api/admin'
 import { useAuthStore } from '@/stores/authStore'
+import { camelizeKeys } from '@/utils/casing'
 
 export type StreamEvent =
   | { type: 'update' | 'complete' | 'failed'; job: IngestionJob; ts: string }
@@ -85,7 +86,8 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
 
       es.onmessage = (event) => {
         try {
-          const data = JSON.parse(event.data) as StreamEvent
+          const raw = JSON.parse(event.data)
+          const data = camelizeKeys<StreamEvent>(raw)
 
           if (data.type === 'heartbeat') {
             // Heartbeat — connection alive, no state change needed
