@@ -110,6 +110,15 @@ export interface UpdateExpertRequest {
   maxLoopIterations?: number
   allowedTools?: string[]
   trainingStatus?: 'draft' | 'ingesting' | 'trained' | 'deprecated'
+  // CT-A4 / 2026-09-08 admin-UI fix: backend's UpdateExpert already
+  // accepted category_id (validated against h.categoryReg.Get) - this
+  // was simply never wired into the admin UI's request shape. No
+  // pointer-to-pointer "explicit clear to NULL" support here, matching
+  // this handler's OWN documented convention (see admin_handler.go's
+  // UpdateExpert comment on CategoryID: "only supports set-if-present,
+  // never explicit-clear") - passing a category ID here changes the
+  // expert's category, omitting this field leaves it unchanged.
+  categoryId?: string
 }
 
 export const updateExpert = (expertId: string, req: UpdateExpertRequest) =>
