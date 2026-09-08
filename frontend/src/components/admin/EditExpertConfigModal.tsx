@@ -47,6 +47,18 @@ export function EditExpertConfigModal({
   const [trainingStatus, setTrainingStatus] = useState<
     'draft' | 'ingesting' | 'trained' | 'deprecated'
   >(expert.trainingStatus ?? 'draft')
+  // 2026-09-08: category is admin-editable now - previously only
+  // settable via direct SQL (the retrofit that first introduced
+  // category_id on pre-existing experts, before this UI existed).
+  // '' sentinel = "no category" (flat-text, CT-L2) - matches how
+  // <option value=""> is rendered below and how the submit handler
+  // decides whether to include categoryId in the PATCH body at all.
+  const [categoryId, setCategoryId] = useState<string>(expert.categoryId ?? '')
+
+  const { data: categories } = useQuery({
+    queryKey: ['admin', 'expert-categories'],
+    queryFn: getExpertCategories,
+  })
 
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
