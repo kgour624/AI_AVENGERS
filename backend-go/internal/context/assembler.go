@@ -184,10 +184,39 @@ func (a *Assembler) Assemble(
 	// 5. Course chunks (35% budget — most important)
 	if tokensUsed < budget*90/100 {
 		chunks, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
-		if err == nil {
+		if err != nil {
+			// FIX (2026-09-08 RCA): this error was previously swallowed
+			// completely silently — zero chunks reached decision.Engine's
+			// Gate 2, which then refused with "This topic is not in my
+			// training material", indistinguishable from a genuine
+			// coverage gap. An admin debugging that refusal had no way to
+			// tell "ML sidecar down / embedding failed" apart from "this
+			// expert genuinely never trained on this topic" without this
+			// log line. Warn (not Error): a single question failing
+			// retrieval is degraded service, not a crash — matches this
+			// file's existing severity convention (getReplyThread already
+			// Warns on its own non-fatal failures).
+			a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
+				zap.String("expert_id", expertID.String()),
+				zap.Error(err),
+			)
+		} else {
 			assembled.CourseChunks = chunks
 			for _, c := range chunks {
 				tokensUsed += estimateTokens(c.Text)
+			}
+			if len(chunks) == 0 {
+				// No error, but genuinely zero candidates found (vector
+				// search itself returned 0 rows for this expert_id — e.g.
+				// wrong/stale expert_id, or the table really is empty).
+				// Distinct from the err!=nil branch above: this is NOT a
+				// transient failure, it is a real "no candidates" result —
+				// logging it separately so the two causes are never
+				// conflated when reading logs later.
+				a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content and matches the expert actually selected",
+					zap.String("expert_id", expertID.String()),
+					zap.String("question_preview", question[:minInt(80, len(question))]),
+				)
 			}
 		}
 	}
@@ -206,7 +235,18 @@ func (a *Assembler) Assemble(
 	// scoped by project_id (indexed), so it simply returns 0 rows.
 	if tokensUsed < budget*95/100 {
 		repoChunks, err := a.getRepoChunks(ctx, projectID, question, a.chunksTopK)
-		if err == nil && len(repoChunks) > 0 {
+		if err != nil {
+			// Same fix as getCourseChunks above — was silently swallowed.
+			// Warn only (not the same "likely causing a refusal" wording):
+			// repo chunks are additive/optional context, a project with no
+			// connected repo is EXPECTED to have this return nothing, so
+			// this failure alone should never be read as the cause of a
+			// Gate 2 refusal the way a course-chunk failure would be.
+			a.logger.Warn("getRepoChunks failed — continuing without connected-repo context",
+				zap.String("project_id", projectID.String()),
+				zap.Error(err),
+			)
+		} else if len(repoChunks) > 0 {
 			assembled.CourseChunks = append(assembled.CourseChunks, repoChunks...)
 			for _, c := range repoChunks {
 				tokensUsed += estimateTokens(c.Text)
@@ -705,4 +745,14 @@ func estimateTokens(text string) int {
 		return 0
 	}
 	return len(text) / 4
+}
+
+// minInt is a tiny local helper — avoids importing another package
+// just for a two-value min, matching the pattern used in decision/
+// engine.go and chinawall/enforcer.go's own package-local minInt.
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
