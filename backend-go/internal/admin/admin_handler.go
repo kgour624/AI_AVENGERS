@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
@@ -21,26 +22,36 @@ import (
 // AdminHandler handles all admin panel HTTP requests.
 // All routes require admin role (enforced by AdminMiddleware).
 type AdminHandler struct {
-	db         *pgxpool.Pool
-	gateway    *gateway.ModelGateway
-	mlClient   *ml.SidecarClient
-	ingestion  *training.IngestionPipeline
-	logger     *zap.Logger
+	db          *pgxpool.Pool
+	gateway     *gateway.ModelGateway
+	mlClient    *ml.SidecarClient
+	ingestion   *training.IngestionPipeline
+	categoryReg *category.Registry
+	logger      *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
+//
+// categoryReg is used by the expert-category CRUD handlers (CT-A3) and
+// by CreateExpert/UpdateExpert's category_id validation (CT-A4). It is
+// the SAME registry instance wired at startup in cmd/server/main.go —
+// writes here must call categoryReg.Reload(ctx) afterward so the cache
+// used elsewhere (e.g. future chinawall/decision-engine lookups) never
+// goes stale relative to what admin just wrote.
 func NewAdminHandler(
 	db *pgxpool.Pool,
 	gw *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
+	categoryReg *category.Registry,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
-		db:        db,
-		gateway:   gw,
-		mlClient:  mlClient,
-		ingestion: training.NewIngestionPipeline(db, mlClient, gw, logger),
-		logger:    logger,
+		db:          db,
+		gateway:     gw,
+		mlClient:    mlClient,
+		ingestion:   training.NewIngestionPipeline(db, mlClient, gw, logger),
+		categoryReg: categoryReg,
+		logger:      logger,
 	}
 }
 
@@ -136,6 +147,10 @@ var validLoopPatterns = map[string]bool{"ota": true, "react": true, "plan_execut
 // Required: name, slug, domain.
 // Optional (migration 006 config fields): model_tier, temperature, top_p,
 // loop_pattern, max_loop_iterations, allowed_tools.
+// Optional (migration 010, CT-A4): category_id. NULLABLE at the DB level
+// per CATEGORY_TEMPLATE_HANDOFF.md CT-L2 — omitting it is valid and keeps
+// the expert on flat-text behavior. If provided, it must reference an
+// existing expert_categories row or this returns 400.
 // Omitting optional fields uses the DB column defaults.
 func (h *AdminHandler) CreateExpert(c *gin.Context) {
 	var req struct {
@@ -151,6 +166,8 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 		LoopPattern       *string  `json:"loop_pattern"`
 		MaxLoopIterations *int     `json:"max_loop_iterations"`
 		AllowedTools      []string `json:"allowed_tools"`
+		// Optional — migration 010 field (CT-A4)
+		CategoryID *uuid.UUID `json:"category_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -178,6 +195,15 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 	}
 	if req.MaxLoopIterations != nil && (*req.MaxLoopIterations < 1 || *req.MaxLoopIterations > 50) {
 		response.BadRequest(c, "INVALID_MAX_LOOP_ITERATIONS", "max_loop_iterations must be between 1 and 50")
+		return
+	}
+	// WHY check registry cache, not a fresh DB query: category_id
+	// validity check happens on every expert create — using the
+	// already-loaded in-memory cache (category.Registry.Get) avoids an
+	// extra round trip and matches how chinawall.DomainRegistry.Get is
+	// used as the hot-path lookup elsewhere in this codebase.
+	if req.CategoryID != nil && h.categoryReg.Get(*req.CategoryID) == nil {
+		response.BadRequest(c, "INVALID_CATEGORY_ID", "category_id does not reference an existing category")
 		return
 	}
 
@@ -220,12 +246,12 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 		`INSERT INTO experts
 		  (name, slug, domain, description,
 		   model_tier, temperature, top_p,
-		   loop_pattern, max_loop_iterations, allowed_tools)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		   loop_pattern, max_loop_iterations, allowed_tools, category_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 RETURNING id`,
 		req.Name, req.Slug, req.Domain, req.Description,
 		modelTier, temperature, topP,
-		loopPattern, maxLoopIterations, string(allowedToolsJSON),
+		loopPattern, maxLoopIterations, string(allowedToolsJSON), req.CategoryID,
 	).Scan(&id)
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -270,9 +296,21 @@ func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 		MaxLoopIterations *int     `json:"max_loop_iterations"`
 		AllowedTools      []string `json:"allowed_tools"`
 		TrainingStatus    *string  `json:"training_status"`
+		// Migration 010 field (CT-A4). Pointer-to-pointer would be needed
+		// to distinguish "omit" from "explicitly clear to NULL" — but this
+		// handler's existing convention (see every other *T field above)
+		// only supports set-if-present, never explicit-clear, so category_id
+		// follows that same convention for consistency. Clearing a category
+		// assignment is not a requirement from CATEGORY_TEMPLATE_HANDOFF.md
+		// and can be added later as its own explicit endpoint if needed.
+		CategoryID *uuid.UUID `json:"category_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	if req.CategoryID != nil && h.categoryReg.Get(*req.CategoryID) == nil {
+		response.BadRequest(c, "INVALID_CATEGORY_ID", "category_id does not reference an existing category")
 		return
 	}
 
@@ -394,6 +432,271 @@ func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 			*req.TrainingStatus, isTraining, id); err != nil {
 			h.logger.Error("update expert training_status failed", zap.Error(err))
 		}
+	}
+	if req.CategoryID != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET category_id=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.CategoryID, id); err != nil {
+			h.logger.Error("update expert category_id failed", zap.Error(err))
+		}
+	}
+
+	response.OK(c, map[string]string{"status": "updated"})
+}
+
+// ============================================================
+// EXPERT CATEGORIES (migration 010, CT-A3)
+// ============================================================
+
+// categoryRow is the wire shape for a single expert_categories row.
+// WHY a distinct struct from category.Category: the registry's
+// in-memory type is optimized for lookup (unexported cache fields
+// live alongside it in registry.go); this is the explicit JSON
+// response contract for the admin API, matching the same separation
+// already used elsewhere in this file (adminExpertRow vs the DB-layer
+// expertRecord type in orchestrator.go).
+type categoryRow struct {
+	ID                     uuid.UUID       `json:"id"`
+	Name                   string          `json:"name"`
+	Slug                   string          `json:"slug"`
+	Description            string          `json:"description"`
+	TemplateSchema         json.RawMessage `json:"template_schema"`
+	DefaultLanguage        string          `json:"default_language"`
+	AskStructurePermission bool            `json:"ask_structure_permission"`
+	CreatedAt              time.Time       `json:"created_at"`
+	UpdatedAt              time.Time       `json:"updated_at"`
+}
+
+// ListExpertCategories GET /admin/expert-categories
+func (h *AdminHandler) ListExpertCategories(c *gin.Context) {
+	rows, err := h.db.Query(c.Request.Context(), `
+		SELECT id, name, slug, COALESCE(description,''), template_schema,
+		       default_language, ask_structure_permission, created_at, updated_at
+		FROM expert_categories
+		ORDER BY created_at DESC`)
+	if err != nil {
+		h.logger.Error("list expert categories failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	defer rows.Close()
+
+	var categories []categoryRow
+	for rows.Next() {
+		var cat categoryRow
+		if err := rows.Scan(
+			&cat.ID, &cat.Name, &cat.Slug, &cat.Description, &cat.TemplateSchema,
+			&cat.DefaultLanguage, &cat.AskStructurePermission, &cat.CreatedAt, &cat.UpdatedAt,
+		); err != nil {
+			h.logger.Warn("scan category row failed", zap.Error(err))
+			continue
+		}
+		categories = append(categories, cat)
+	}
+	if categories == nil {
+		categories = []categoryRow{}
+	}
+	response.OK(c, categories)
+}
+
+// GetExpertCategory GET /admin/expert-categories/:id
+func (h *AdminHandler) GetExpertCategory(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid category ID")
+		return
+	}
+	var cat categoryRow
+	err = h.db.QueryRow(c.Request.Context(), `
+		SELECT id, name, slug, COALESCE(description,''), template_schema,
+		       default_language, ask_structure_permission, created_at, updated_at
+		FROM expert_categories WHERE id=$1`, id,
+	).Scan(
+		&cat.ID, &cat.Name, &cat.Slug, &cat.Description, &cat.TemplateSchema,
+		&cat.DefaultLanguage, &cat.AskStructurePermission, &cat.CreatedAt, &cat.UpdatedAt,
+	)
+	if err != nil {
+		response.NotFound(c, "category")
+		return
+	}
+	response.OK(c, cat)
+}
+
+// templateSchemaInput is the request shape for template_schema on
+// create/update. Validated against category.ValidSectionTypes before
+// any DB write — a category with an invalid section type would let an
+// expert silently fall back to flat-text generation later (CT-B scope)
+// with no clear error at the point the mistake was actually made.
+type templateSchemaInput struct {
+	Sections []struct {
+		Key      string `json:"key"`
+		Label    string `json:"label"`
+		Type     string `json:"type"`
+		Required bool   `json:"required"`
+	} `json:"sections"`
+}
+
+// validateTemplateSchema checks every section's "type" against
+// category.ValidSectionTypes (prose | code | test_cases) and that key
+// values are non-empty and unique. Returns a human-readable error on
+// the first problem found, or nil if the schema is well-formed.
+// An empty/omitted sections list is valid — it means "no structured
+// template", the documented flat-text fallback (CT-L2).
+func validateTemplateSchema(schema templateSchemaInput) error {
+	seenKeys := make(map[string]bool)
+	for _, s := range schema.Sections {
+		if s.Key == "" {
+			return fmt.Errorf("every section must have a non-empty key")
+		}
+		if seenKeys[s.Key] {
+			return fmt.Errorf("duplicate section key: %s", s.Key)
+		}
+		seenKeys[s.Key] = true
+		if !category.ValidSectionTypes[category.SectionType(s.Type)] {
+			return fmt.Errorf("section %q has invalid type %q — must be prose, code, or test_cases", s.Key, s.Type)
+		}
+	}
+	return nil
+}
+
+// CreateExpertCategory POST /admin/expert-categories
+func (h *AdminHandler) CreateExpertCategory(c *gin.Context) {
+	var req struct {
+		Name                   string              `json:"name" binding:"required"`
+		Slug                   string              `json:"slug" binding:"required"`
+		Description            string              `json:"description"`
+		TemplateSchema         templateSchemaInput `json:"template_schema"`
+		DefaultLanguage        *string             `json:"default_language"`
+		AskStructurePermission bool                `json:"ask_structure_permission"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	if err := validateTemplateSchema(req.TemplateSchema); err != nil {
+		response.BadRequest(c, "INVALID_TEMPLATE_SCHEMA", err.Error())
+		return
+	}
+
+	// WHY default "java" here at the code level, not required from the
+	// admin request: CATEGORY_TEMPLATE_HANDOFF.md CT-L5 — "default_language
+	// ... set at the code level (not admin-required input), overridable
+	// per category". Matches the DB column default exactly so behavior is
+	// identical whether or not this field is included in the request body.
+	defaultLanguage := "java"
+	if req.DefaultLanguage != nil && *req.DefaultLanguage != "" {
+		defaultLanguage = *req.DefaultLanguage
+	}
+
+	schemaJSON, err := json.Marshal(req.TemplateSchema)
+	if err != nil {
+		response.BadRequest(c, "INVALID_TEMPLATE_SCHEMA", "template_schema must be valid JSON")
+		return
+	}
+
+	adminID := c.MustGet("user_id").(uuid.UUID)
+
+	var id uuid.UUID
+	err = h.db.QueryRow(c.Request.Context(),
+		`INSERT INTO expert_categories
+			(name, slug, description, template_schema, default_language, ask_structure_permission, created_by)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+		 RETURNING id`,
+		req.Name, req.Slug, req.Description, string(schemaJSON),
+		defaultLanguage, req.AskStructurePermission, adminID,
+	).Scan(&id)
+	if err != nil {
+		if isUniqueViolation(err) {
+			response.Conflict(c, "slug already exists")
+			return
+		}
+		h.logger.Error("create expert category failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	// Refresh the shared registry cache so the newly created category is
+	// immediately visible to Get()/GetBySlug() callers without a restart.
+	// Non-fatal if this fails — the row is already durably in Postgres;
+	// the cache will self-heal on the next natural Reload() or restart.
+	if err := h.categoryReg.Reload(c.Request.Context()); err != nil {
+		h.logger.Warn("category registry reload after create failed", zap.Error(err))
+	}
+
+	response.Created(c, map[string]interface{}{"id": id, "slug": req.Slug})
+}
+
+// UpdateExpertCategory PATCH /admin/expert-categories/:id
+// All fields optional. Only provided fields are updated.
+func (h *AdminHandler) UpdateExpertCategory(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid category ID")
+		return
+	}
+	var req struct {
+		Name                   *string              `json:"name"`
+		Description            *string              `json:"description"`
+		TemplateSchema         *templateSchemaInput `json:"template_schema"`
+		DefaultLanguage        *string              `json:"default_language"`
+		AskStructurePermission *bool                `json:"ask_structure_permission"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	if req.TemplateSchema != nil {
+		if err := validateTemplateSchema(*req.TemplateSchema); err != nil {
+			response.BadRequest(c, "INVALID_TEMPLATE_SCHEMA", err.Error())
+			return
+		}
+	}
+
+	ctx := c.Request.Context()
+
+	if req.Name != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE expert_categories SET name=$1, updated_at=NOW() WHERE id=$2`,
+			*req.Name, id); err != nil {
+			h.logger.Error("update category name failed", zap.Error(err))
+		}
+	}
+	if req.Description != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE expert_categories SET description=$1, updated_at=NOW() WHERE id=$2`,
+			*req.Description, id); err != nil {
+			h.logger.Error("update category description failed", zap.Error(err))
+		}
+	}
+	if req.TemplateSchema != nil {
+		schemaJSON, err := json.Marshal(*req.TemplateSchema)
+		if err != nil {
+			response.BadRequest(c, "INVALID_TEMPLATE_SCHEMA", "template_schema must be valid JSON")
+			return
+		}
+		if _, err := h.db.Exec(ctx,
+			`UPDATE expert_categories SET template_schema=$1, updated_at=NOW() WHERE id=$2`,
+			string(schemaJSON), id); err != nil {
+			h.logger.Error("update category template_schema failed", zap.Error(err))
+		}
+	}
+	if req.DefaultLanguage != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE expert_categories SET default_language=$1, updated_at=NOW() WHERE id=$2`,
+			*req.DefaultLanguage, id); err != nil {
+			h.logger.Error("update category default_language failed", zap.Error(err))
+		}
+	}
+	if req.AskStructurePermission != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE expert_categories SET ask_structure_permission=$1, updated_at=NOW() WHERE id=$2`,
+			*req.AskStructurePermission, id); err != nil {
+			h.logger.Error("update category ask_structure_permission failed", zap.Error(err))
+		}
+	}
+
+	if err := h.categoryReg.Reload(ctx); err != nil {
+		h.logger.Warn("category registry reload after update failed", zap.Error(err))
 	}
 
 	response.OK(c, map[string]string{"status": "updated"})
