@@ -106,10 +106,13 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
 
   const segments = splitContentByCitations(response.content, response.citations)
 
-  // Build chunkId → 1-based index map so inline citations match the
+  // Build chunkId -> 1-based index map so inline citations match the
   // bottom citations list. Both use the same numbering.
+  // 2026-09-08 RCA: `?? []` guard - see splitContentByCitations' own
+  // doc comment (parseCitations.ts) for the full incident this
+  // defends against (a nil backend slice marshaling as JSON null).
   const citationIndexMap = new Map(
-    response.citations.map((c, i) => [c.chunkId, i + 1])
+    (response.citations ?? []).map((c, i) => [c.chunkId, i + 1])
   )
 
   return (
