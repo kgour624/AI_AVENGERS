@@ -180,23 +180,13 @@ func (e *Engine) Process(
 func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 	questionLower := strings.ToLower(question)
 
-	// Domain bypass: DSA/coding/algorithm questions are always specific enough.
-	// "what is python", "what is a linked list", "explain recursion" are clear
-	// questions for a DSA expert. No clarification needed.
-	// WHY bypass: Gate 1 is for genuinely ambiguous questions. DSA questions
-	// are never ambiguous — the expert knows exactly what to answer.
-	dsaBypassKeywords := []string{
-		"what is", "explain", "how does", "define", "describe",
-		"algorithm", "data structure", "complexity", "sort", "search",
-		"array", "linked list", "tree", "graph", "stack", "queue",
-		"hash", "heap", "recursion", "dynamic programming", "greedy",
-		"python", "java", "c++", "javascript", "code", "function",
-		"write", "implement", "solve", "leetcode", "problem",
-	}
-	for _, kw := range dsaBypassKeywords {
-		if strings.Contains(questionLower, kw) {
-			return nil // Clear enough for a technical expert
-		}
+	// Domain bypass: problem-solving domain experts (DSA, coding, etc.)
+	// never need clarification — every technical question is specific enough.
+	// WHY domain not question: the expert's domain determines its behavior.
+	// A DSA expert answers "what is python" directly. A medical expert might
+	// need clarification on "what is python" (snake? programming language?).
+	if chinawall.IsProblemSolvingDomain(expert.Domain) {
+		return nil // Problem-solving experts skip Gate 1 entirely
 	}
 
 	// Fast check: obvious vague indicators
