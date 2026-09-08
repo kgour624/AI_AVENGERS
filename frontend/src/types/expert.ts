@@ -77,6 +77,18 @@ export interface Expert extends PublicExpert {
   maxLoopIterations?: number
   allowedTools?: string[]
   trainingStatus?: 'draft' | 'ingesting' | 'trained' | 'deprecated'
+  /**
+   * Fix (2026-09-08): backend's admin ListExperts now selects
+   * category_id (see admin_handler.go's adminExpertRow) — previously
+   * missing entirely, so the admin panel had no way to see which
+   * category an expert is in, or fix a mismatch introduced by a
+   * direct-SQL category retrofit (done once, manually, before this
+   * admin category-edit UI existed). null = flat-text expert, no
+   * category (CT-L2). Optional (not `| null` required) for the same
+   * reason as every other admin-only field on this type: the public
+   * GET /experts endpoint never returns it at all.
+   */
+  categoryId?: string | null
 }
 
 /**
