@@ -47,11 +47,30 @@ export interface ExpertResponseProps {
   response: ExpertResponseType
   persistedMessageId?: string
   isStreaming?: boolean
+  /**
+   * CT-D5: required to key replyStore (CT-D3). Optional in the type
+   * only because some historical call sites may not have it yet —
+   * the reply button silently does nothing without it, never throws.
+   */
+  chatId?: string
 }
 
-export function ExpertResponse({ response, persistedMessageId, isStreaming }: ExpertResponseProps) {
+export function ExpertResponse({ response, persistedMessageId, isStreaming, chatId }: ExpertResponseProps) {
   const [showReasoning, setShowReasoning] = useState(false)
   const reduceMotion = useReducedMotion()
+  const setReplyTarget = useReplyStore((s) => s.setReplyTarget)
+
+  function handleReplyClick() {
+    if (!chatId || !persistedMessageId) return
+    const preview =
+      response.content.length > 80 ? `${response.content.slice(0, 80)}…` : response.content
+    setReplyTarget(chatId, {
+      messageId: persistedMessageId,
+      preview: preview || '(structured answer)',
+      expertId: response.expertId,
+      expertName: response.expertName,
+    })
+  }
 
   // WHY guard on response.error before rendering the normal body: a
   // partially-failed expert (one expert's goroutine errored while
