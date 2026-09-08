@@ -356,6 +356,7 @@ func buildRouter(
 		adminGroup.POST("/experts/:id/ingest", adminHandler.IngestTranscript)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
+		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
 		adminGroup.GET("/stats", adminHandler.GetStats)
