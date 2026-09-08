@@ -151,7 +151,16 @@ export interface TemplateSectionResult {
   label: string
   type: 'prose' | 'code' | 'test_cases'
   content: string
-  citations: Citation[]
+  /**
+   * 2026-09-08 RCA: typed nullable to match reality - backend fixed
+   * to always send [] (see chinawall's extractCitations), but rows
+   * persisted before that fix, and any future backend regression of
+   * the same shape, can still send null. Every consumer
+   * (splitContentByCitations, ExpertResponse.tsx) already guards for
+   * this; the type now says so honestly instead of promising a
+   * guarantee the wire data does not actually keep.
+   */
+  citations: Citation[] | null
 }
 
 export interface ExpertResponse {
