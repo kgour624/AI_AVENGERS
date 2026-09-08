@@ -188,7 +188,7 @@ func isProblemSolvingDomain(domain string) bool {
 //   solve "Longest Common Prefix" by applying string traversal principles.
 //   Asking "does the transcript mention Longest Common Prefix?" is wrong —
 //   it would refuse every new problem, defeating the purpose of DSA education.
-func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []CourseChunk) (string, error) {
+func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []CourseChunk, isProblemSolving bool) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("Question: " + question + "\n\nAvailable Knowledge:\n")
 	for i, c := range chunks {
