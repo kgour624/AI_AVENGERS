@@ -327,7 +327,13 @@ func (c *Config) applyDefaults() {
 		c.ML.SidecarURL = "http://localhost:8001"
 	}
 	if c.ML.TimeoutSeconds == 0 {
-		c.ML.TimeoutSeconds = 30
+		// WHY 300 not 30:
+		//   bge-base-en-v1.5 on CPU for 25 chunks ≈ 8-12s.
+		//   Old default of 30s caused timeouts when batch size was 100
+		//   (100 chunks × ~0.4s/chunk = 40s > 30s timeout).
+		//   300s = 5 minutes. Even under heavy load, 25-chunk batches
+		//   will never approach this limit.
+		c.ML.TimeoutSeconds = 300
 	}
 	if c.ChinaWall.RerankerThreshold == 0 {
 		c.ChinaWall.RerankerThreshold = 0.35
