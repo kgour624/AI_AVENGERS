@@ -1423,3 +1423,35 @@ This exactly explains the "sometimes shows something (freshly asked, still on sc
 Re-read every changed file in full from `main` after each commit (struct field name/JSON tag, INSERT column list matches parameter count and order, SELECT column list matches `Scan()` argument order and count exactly, frontend field name matches what `camelizeKeys()` produces from the backend's `template_sections` JSON key - same conversion already verified working for other nested JSON fields like `categoryRow.templateSchema`). **No live `go build`, no live migration run against a real Postgres instance, no live HTTP round trip, no `npm run build`/`typecheck` was performed.** Admin should re-run `docker-compose up --build` (migration 011 auto-applies via the `migrate` service, matching every other migration's deploy path) and confirm the SAME categorized-expert answer looks identical immediately after asking AND after a page reload.
 
 *Last updated: 2026-09-08 (bug fix batch, round 7)*
+
+---
+
+## BUG FIX - 2026-09-08 (round 8) - `Cannot read properties of null (reading 'map')` crash in ExpertResponse, triggered by scrolling to a categorized expert's structured answer
+
+> Admin (Kiran) rebuilt with round 7 live, then hit a hard React crash (full error boundary trigger, `RenderErrorBoundary`) while scrolling a chat to see a DSA answer that had just finished streaming. Stack trace pointed at `parseCitations.ts:39` inside `splitContentByCitations`, called from `ExpertResponse.tsx:157` (the structured/categorized-answer render branch). The "only crashes on scroll" behavior was a strong clue that this was specific to ONE message rendering for the first time (virtualized/lazy list behavior), not a global regression - consistent with the bug being tied to one particular section type of one particular structured answer, not every message.
+
+### Root cause
+
+Go's zero-value for an uninitialized `[]Citation` slice is `nil`, and `encoding/json` marshals a nil slice as JSON `null`, not `[]`. `chinawall/enforcer.go`'s `extractCitations` declared `var citations []Citation` and only ever `append`ed to it inside a loop over regex matches - if the input text had **zero** `[CHUNK_xxx]` tokens, the function returned `nil` untouched. This is exactly what happens for a categorized expert's **code**-type template section: per `stripUncited`'s own `CODE_EXEMPT` documentation, code sections are never expected to contain citation tokens by design. So every code section's `TemplateSectionResult.Citations` was `null` on the wire, and `frontend/src/utils/parseCitations.ts`'s `splitContentByCitations(content, citations)` unconditionally called `citations.map(...)` at line 39 with no null-check - `null.map()` throws, and because this call happens directly inside `ExpertResponse.tsx`'s render body (not inside a try/catch or an event handler), React's render-time exception propagates straight to the nearest error boundary, taking down the whole message list, not just the one broken message.
+
+### Fix (backend root cause + frontend defense-in-depth, both done - not one or the other)
+
+- **`chinawall/enforcer.go`**: `extractCitations` now initializes `citations := []Citation{}` instead of `var citations []Citation` - every return path, including the zero-matches case, now marshals as JSON `[]`. Same fix applied to `generateStructured`'s `allCitations` accumulator (identical bug shape - a structured answer with zero prose citations, e.g. only code/test_cases sections, would also have sent `null`).
+- **`frontend/src/utils/parseCitations.ts`**: `splitContentByCitations`'s `citations` parameter is now typed `Citation[] | null | undefined` and defaults to `[]` via `citations ?? []` before use. Kept as defense-in-depth even after the backend fix, for two concrete reasons: (1) rows already persisted to `messages.template_sections`/`messages.citations` **before** this backend fix deployed still have literal `null` sitting in their JSONB columns today - migration 011 (round 7) does not retroactively rewrite existing data; (2) any future backend regression of the same shape (Go's nil-slice-marshals-as-null footgun is easy to reintroduce) should degrade gracefully in the UI, not crash the whole component tree.
+- **`ExpertResponse.tsx`**: the two other unguarded `response.citations` usages (the inline-citation index map, and the bottom "Citations:" list's `.length > 0 &&` check) are now both null-guarded (`response.citations ?? []` / `response.citations && response.citations.length > 0`) for the same defense-in-depth reason.
+- **`types/expert.ts`**: `TemplateSectionResult.citations` retyped `Citation[] | null` (was `Citation[]`) - the type now honestly reflects what the wire can actually send, instead of promising a non-null guarantee the data doesn't keep.
+
+**Files:** `backend-go/internal/chinawall/enforcer.go` (`extractCitations`, `generateStructured`), `frontend/src/utils/parseCitations.ts` (`splitContentByCitations`), `frontend/src/components/chat/ExpertResponse.tsx`, `frontend/src/types/expert.ts` (`TemplateSectionResult`)
+
+### Mental execution (performed before committing)
+
+- Scenario 1 (code-type section, zero citations): `extractCitations` finds zero `[CHUNK_xxx]` matches -> returns `[]Citation{}` (not nil) -> JSON `[]` -> frontend `section.citations` is `[]`, `splitContentByCitations` maps over an empty array fine, zero crash, zero visible content change (there were never any citation chips to render here anyway - code sections are citation-exempt by design).
+- Scenario 2 (prose-type section, some citations): unchanged - `append` still populates the slice exactly as before, non-empty result, identical rendering to before this fix.
+- Scenario 3 (a message persisted BEFORE this fix, with `null` already stored in its `citations` JSONB column): backend fix cannot retroactively change already-stored data - but the frontend's `?? []` guard means this old row now renders safely too (empty citation list for that section, no crash), instead of requiring a data migration to fully resolve.
+- Edge case (both fixes reverted independently in the future): each fix stands alone - backend-only would have fixed all NEW messages but left old/future-regression cases exposed; frontend-only would have papered over every case without fixing the root cause. Both were kept intentionally, not as redundant work.
+
+### Verification caveat
+
+Re-read every changed file in full from `main` after each commit (confirmed `extractCitations` has multiple call sites, all unaffected by the initialization change since `append` behaves identically on a nil vs empty slice; confirmed `splitContentByCitations`'s only two call sites in `ExpertResponse.tsx` both pass through the new nullable parameter type correctly). **No live `go build`, no live browser reproduction of the original crash, no `npm run build`/`typecheck` was performed.** Admin should rebuild and confirm scrolling to a categorized expert's answer (especially one with a code-type section) no longer crashes the chat page.
+
+*Last updated: 2026-09-08 (bug fix batch, round 8)*
