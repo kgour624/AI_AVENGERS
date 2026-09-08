@@ -119,6 +119,7 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
         slug: slug.trim(),
         domain: domain.trim(),
         description: description.trim() || undefined,
+        categoryId: categoryId || undefined,
         modelTier,
         loopPattern,
         temperature: tempNum,
