@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { Highlight, themes, type Language } from 'prism-react-renderer'
 
 /**
@@ -17,6 +18,7 @@ export function CodeBlock({ className, children }: { className?: string; childre
   const match = /language-(\w+)/.exec(className ?? '')
   const language = (match?.[1] ?? 'tsx') as Language
   const code = String(children).replace(/\n$/, '')
+  const [copied, setCopied] = useState(false)
 
   if (!className) {
     // Inline code (single backtick) - no fence, no block styling.
