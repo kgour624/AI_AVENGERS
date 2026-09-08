@@ -192,15 +192,29 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
           </span>
         )}
 
-        {response.gateStopped > 0 && (
-          <button
-            type="button"
-            onClick={() => setShowReasoning((v) => !v)}
-            className="text-xs text-text-secondary hover:text-text-primary"
-          >
-            {showReasoning ? '\u25bc' : '\u25b6'} Why did I stop here?
-          </button>
-        )}
+        <div className="flex items-center gap-3">
+          {/* CT-D5: reply button. Disabled until this response is
+              persisted (same gating RatingWidget already uses above). */}
+          {chatId && persistedMessageId && (
+            <button
+              type="button"
+              onClick={handleReplyClick}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >
+              Reply
+            </button>
+          )}
+
+          {response.gateStopped > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowReasoning((v) => !v)}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >
+              {showReasoning ? '\u25bc' : '\u25b6'} Why did I stop here?
+            </button>
+          )}
+        </div>
       </div>
 
       {showReasoning && (
