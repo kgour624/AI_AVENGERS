@@ -88,6 +88,8 @@ export function IngestionPipelineModal({
 }: IngestionPipelineModalProps) {
   const stream = useIngestionStream(isOpen ? expertId : null)
   const logRef = useRef<HTMLDivElement>(null)
+  const [isResuming, setIsResuming] = useState(false)
+  const [resumeError, setResumeError] = useState<string | null>(null)
 
   // Auto-scroll log to top (newest first)
   useEffect(() => {
@@ -103,6 +105,22 @@ export function IngestionPipelineModal({
     : 0
   const isDone = job?.status === 'complete'
   const isFailed = job?.status === 'failed'
+
+  const handleResume = async () => {
+    if (!expertId || !job?.id) return
+    setIsResuming(true)
+    setResumeError(null)
+    try {
+      await resumeIngestionJob(expertId, job.id)
+      // SSE stream will auto-reconnect and show live progress
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: { message?: string } } } })
+        ?.response?.data?.error?.message ?? 'Resume failed'
+      setResumeError(msg)
+    } finally {
+      setIsResuming(false)
+    }
+  }
 
   return (
     <Modal isOpen={isOpen} onClose={onClose}>
