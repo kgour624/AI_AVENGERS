@@ -553,7 +553,7 @@ COURSE CONTENT:
 		Model:        gateway.ModelStrong,
 		SystemPrompt: systemPrompt,
 		UserPrompt:   question,
-		MaxTokens:    1500,
+		MaxTokens:    resolveMaxTokens(profile.MaxTokensFlat, DefaultMaxTokensFlat),
 		Temperature:  0.4,
 	})
 	if err != nil {
