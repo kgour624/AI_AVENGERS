@@ -193,7 +193,7 @@ export default function ChatPage() {
                         </div>
                       )
                     }
-                    return <ExpertResponse response={asExpertResponse} persistedMessageId={m.id} />
+                    return <ExpertResponse response={asExpertResponse} persistedMessageId={m.id} chatId={chat.id} />
                   })()
                 )}
               </div>
