@@ -83,9 +83,19 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     const trimmed = message.trim()
     if (!trimmed || selectedIds.size === 0 || isSending) return
 
-    onSend(trimmed, Array.from(selectedIds), attachedFile ?? undefined)
+    onSend(
+      trimmed,
+      Array.from(selectedIds),
+      attachedFile ?? undefined,
+      replyState?.target.messageId,
+      replyState?.includeFullThread
+    )
     setMessage('')
     setAttachedFile(null)
+    // CT-D4: clear the reply target on successful send — same moment
+    // ChatPage.tsx clears pendingUserText, so "replying to" state never
+    // outlives the turn it was drafted for.
+    clearReply(chatId)
     // Reset height after clearing content - otherwise a tall textarea
     // from a long message stays tall even after the text is gone.
     requestAnimationFrame(() => {
