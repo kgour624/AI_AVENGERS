@@ -877,6 +877,18 @@ func isHeadingOrTransition(s string) bool {
 	return false
 }
 
+// resolveMaxTokens returns override if it is a positive value, or
+// fallback otherwise. Centralizes the "0 means use default" contract
+// documented on DomainProfile.MaxTokensFlat/MaxTokensStructured, so
+// every call site (generateFlatText, generateStructured) applies it
+// identically instead of duplicating an inline if-check.
+func resolveMaxTokens(override, fallback int) int {
+	if override > 0 {
+		return override
+	}
+	return fallback
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
