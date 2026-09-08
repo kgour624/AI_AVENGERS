@@ -170,8 +170,14 @@ var problemSolvingDomains = map[string]bool{
 	"competitive_programming": true,
 }
 
-func isProblemSolvingDomain(domain string) bool {
+// IsProblemSolvingDomain is exported for use by decision/engine.go Gate 1.
+func IsProblemSolvingDomain(domain string) bool {
 	return problemSolvingDomains[strings.ToLower(domain)]
+}
+
+// internal alias for use within this package
+func isProblemSolvingDomain(domain string) bool {
+	return IsProblemSolvingDomain(domain)
 }
 
 // checkCoverage asks cheap LLM if chunks can answer the question.
