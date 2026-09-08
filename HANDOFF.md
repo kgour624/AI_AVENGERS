@@ -1186,12 +1186,46 @@ See `docs/INTERFACE_FIRST_CONTRACT.md` \u00a79 for the full audit.
 
 ### Known follow-up gaps (documented, not silently worked around)
 
-- `AdminExperts.tsx`'s Edit Charter modal cannot pre-fill the current charter text - `ListExperts` doesn't select `reasoning_charter`. Editing still works (PATCH replaces the value); seeing the current value first needs that column added to `ListExperts`' SELECT.
+- ~~`AdminExperts.tsx`'s Edit Charter modal cannot pre-fill the current charter text - `ListExperts` doesn't select `reasoning_charter`.~~ **FIXED 2026-09-08** - see "BUG FIX BATCH - 2026-09-08" section below.
 - `UpdateExpert`'s `description` field is bindable but silently never applied in any UPDATE statement (found while reading the handler, out of scope for this batch - not touched).
 - Archived chats (`ChatList.tsx`) may still appear in the list after archiving if `ListChats`' backend query doesn't filter `is_archived` - not verified in this batch, worth a quick check.
 
 ### Also fixed in this batch (same root cause found and fixed 3 times)
 
 Bare `\uXXXX` escapes as unquoted JSX children text (does not get interpreted by the JS engine - only real string literals do) turned up 3 more times while writing this batch's own new code (`AdminClients.tsx`, `ProjectMemoryPanel.tsx`) - same class of bug as Header.tsx/AdminLayout.tsx/AdminDashboard.tsx earlier. All wrapped in `{'...'}` expression containers now.
+
+---
+
+## BUG FIX BATCH - 2026-09-08
+
+> Found independently while auditing the ingestion pipeline for the Category/Template feature work (tracked separately in `CATEGORY_TEMPLATE_HANDOFF.md`). Not part of that feature's scope - these are pre-existing bugs in already-shipped code. Logged here per this file's existing convention instead of polluting the feature-specific handoff.
+
+### Bug 1: Ingestion modal stuck forever at old progress (e.g. "57% / embedding")
+
+**Root cause:** `ingestion_pipeline.go`'s `updateJobStatus()` built an UPDATE where parameter `$1` was used twice with two different implicit types - once as a bare positional param (`status = $1`) and once with an explicit cast inside a `CASE WHEN` (`$1::text`). PostgreSQL rejected the whole query with **SQLSTATE 42P08** ("inconsistent types deduced for parameter $1"). Because the UPDATE silently failed on every call, the `ingestion_jobs` row never advanced past whatever status/stage it had when this bug was introduced - even though `IngestTranscript` kept running to completion and correctly set `experts.training_status = 'trained'` further down the pipeline. The frontend's ingestion modal polls `ingestion_jobs`, not `experts`, so it displayed stale progress indefinitely regardless of actual training success.
+
+**Fix:** Cast `$1` the same way (`$1::varchar`, matching the real column type per `migrations/001_initial_schema.up.sql`) in both usages so the query planner sees one consistent type.
+
+**File:** `backend-go/internal/training/ingestion_pipeline.go` (`updateJobStatus`)
+
+### Bug 2: Capability storage warnings on every ingestion (SQLSTATE 22P02)
+
+**Root cause:** `storeCapabilities()` called `json.Marshal()` on `CanHandle`, `CannotHandle`, and `ExampleQuestions` (`[]string` fields on `CapabilityResult`) and passed the resulting JSON string (e.g. `["a","b"]`) as the value for `can_handle`/`cannot_handle`/`example_questions` columns. Those columns are native Postgres `TEXT[]` arrays per `001_initial_schema.up.sql`, not JSONB - a JSON string is not valid Postgres array literal syntax (`{"a","b"}` would be), so every insert/update logged "malformed array literal" (SQLSTATE 22P02) and the capability row silently kept its old (or empty) array values.
+
+**Fix:** Removed the `json.Marshal()` calls entirely; pass the `[]string` slices directly - pgx/v5 (used throughout this codebase via `pgxpool.Pool`) natively encodes Go `[]string` as a Postgres `text[]` parameter. Added nil-safety defaulting to `[]string{}` instead of leaving NULL.
+
+**File:** `backend-go/internal/training/ingestion_pipeline.go` (`storeCapabilities`)
+
+### Bug 3: Edit Charter modal always opened blank (resolves the gap noted above)
+
+**Root cause:** Two-part gap. (1) `ListExperts` in `admin_handler.go` never selected `reasoning_charter`, and `adminExpertRow` had no field for it - even though the ingestion pipeline correctly saves the charter to the DB in `IngestTranscript`'s Step 7. (2) `AdminExperts.tsx` hardcoded `currentCharter=""` when opening `EditCharterModal` instead of reading it from the fetched expert data.
+
+**Fix:** Added `reasoning_charter` to `ListExperts`' SELECT + `adminExpertRow.ReasoningCharter`. Added `reasoningCharter?: string` to the frontend `Expert` type. Changed `AdminExperts.tsx` to pass `experts?.find((e) => e.id === charterTargetId)?.reasoningCharter ?? ''`.
+
+**Files:** `backend-go/internal/admin/admin_handler.go` (`ListExperts`, `adminExpertRow`), `frontend/src/types/expert.ts` (`Expert`), `frontend/src/pages/admin/AdminExperts.tsx`
+
+### Verification caveat (same as every other entry in this file)
+
+All three fixes were verified by re-reading the committed files from `main` after each push (correct SQL cast present, `encoding/json` import still used elsewhere so no unused-import break, struct field + SELECT column match, frontend prop wiring matches the pattern used two lines above it for `expertName`). **No live `go build`, no live migration/DB run, no live HTTP request, no `npm run build`/`typecheck` was performed** - this session has no Go toolchain, Postgres, or Node environment available. These remain open verification items, consistent with every other unverified item already listed in "Critical open actions" above.
 
 *Last updated: 2026-09-06 (7-feature batch)*
