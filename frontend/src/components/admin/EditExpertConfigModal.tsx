@@ -238,7 +238,33 @@ export function EditExpertConfigModal({
           />
         </div>
 
-        {/* Training Status — manual override */}
+        {/* Category field (2026-09-08): previously only settable via
+            direct SQL. A mismatched/stale category here silently
+            changes how this expert generates answers (flat text vs
+            structured JSON template) with no visible signal in the
+            admin panel until now. */}
+        <div className="flex flex-col gap-1.5">
+          <label className="text-sm text-text-secondary">
+            Category
+            <span className="ml-1 text-xs text-text-disabled">
+              (structured JSON template applied to this expert's answers)
+            </span>
+          </label>
+          <select
+            value={categoryId}
+            onChange={(e) => setCategoryId(e.target.value)}
+            className={selectClass}
+          >
+            <option value="">(none - flat-text answers)</option>
+            {categories?.map((cat) => (
+              <option key={cat.id} value={cat.id}>
+                {cat.name}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        {/* Training Status - manual override */}
         <div className="flex flex-col gap-1.5">
           <label className="text-sm text-text-secondary">
             Training Status
