@@ -195,11 +195,11 @@ function AdminExperts() {
         />
       )}
 
-      {/* Pipeline progress modal */}
+      {/* Pipeline progress modal — SSE-driven, no polling */}
       <IngestionPipelineModal
-        isOpen={pipelineJob !== null}
-        onClose={() => setPipelineJob(null)}
-        job={pipelineJob}
+        isOpen={pipelineExpertId !== null}
+        onClose={() => { setPipelineExpertId(null); setPipelineExpertName('') }}
+        expertId={pipelineExpertId}
         expertName={pipelineExpertName}
       />
 
