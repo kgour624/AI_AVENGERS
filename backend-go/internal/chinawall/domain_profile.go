@@ -1,5 +1,21 @@
 package chinawall
 
+// Default MaxTokens values used when a DomainProfile does not specify
+// its own override (MaxTokensFlat/MaxTokensStructured == 0). Named
+// constants, not magic numbers scattered in enforcer.go, so admin
+// panel guidance and code stay in sync at one source of truth.
+//
+// WHY two separate defaults: a flat prose+code answer fits comfortably
+// in far fewer tokens than a structured JSON answer, which must pack
+// prose + a full code block + 4 test-case buckets into ONE JSON object
+// (see CATEGORY_TEMPLATE_HANDOFF.md §4 and the 2026-09-08 RCA in
+// HANDOFF.md documenting a real truncation bug this exact setting
+// caused for a DSA expert).
+const (
+	DefaultMaxTokensFlat       = 1500
+	DefaultMaxTokensStructured = 3500
+)
+
 // CoverageMode controls how Layer 2 checks if chunks can answer the question.
 type CoverageMode string
 
