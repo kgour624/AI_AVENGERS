@@ -340,13 +340,15 @@ type generatedAnswer struct {
 	Citations []Citation
 }
 
+// generateWithCitations calls strong LLM with mandatory citation requirement.
+// Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
 func (e *Enforcer) generateWithCitations(
 	ctx context.Context,
 	question string,
 	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
-	isProblemSolving bool,
+	profile *DomainProfile,
 ) (*generatedAnswer, error) {
 
 	// Build context with chunk IDs
@@ -356,11 +358,11 @@ func (e *Enforcer) generateWithCitations(
 	}
 
 	var systemPrompt string
-	if isProblemSolving {
-		// Problem-solving mode: apply principles to solve new problems.
-		// WHY different prompt: DSA education = learn principles, apply to new problems.
+	if profile.CitationMode == CitationModeLoose {
+		// Loose citation mode: cite principles in explanation, code blocks exempt.
+		// WHY: DSA/coding education = learn principles, apply to new problems.
 		// Strict "only cite chunks" would refuse every new LeetCode problem.
-		systemPrompt = fmt.Sprintf(`You are %s, a domain expert in algorithms and data structures.
+		systemPrompt = fmt.Sprintf(`You are %s, a domain expert.
 
 REASONING CHARTER:
 %s
@@ -376,10 +378,12 @@ CRITICAL RULES:
    The code block must be clean — NO [CHUNK_xxx] tokens inside the code
 4. After the code: explain time and space complexity with citations
 5. If a technique is NOT in your training material, say so explicitly
-6. The code must be correct and runnable — this is the primary deliverable`,
-			expertName, reasoningCharter, contextSB.String())
+6. The code must be correct and runnable — this is the primary deliverable
+%s`,
+			expertName, reasoningCharter, contextSB.String(), profile.SystemPromptExt)
 	} else {
-		// Factual mode: strict grounding, only cite chunks.
+		// Strict citation mode: every factual claim must have inline citation.
+		// WHY: medical/legal/finance — no uncited claims allowed.
 		systemPrompt = fmt.Sprintf(`You are %s, a domain expert.
 
 REASONING CHARTER:
@@ -390,10 +394,11 @@ CRITICAL RULES:
 2. If information is not in the provided chunks, say so
 3. Never use general knowledge — only what is in the chunks
 4. If you cannot cite a claim, do not make it
+%s
 
 COURSE CONTENT:
 %s`,
-			expertName, reasoningCharter, contextSB.String())
+			expertName, reasoningCharter, profile.SystemPromptExt, contextSB.String())
 	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
