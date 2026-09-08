@@ -282,7 +282,31 @@ func (e *Enforcer) generateWithCitations(
 		contextSB.WriteString(fmt.Sprintf("[CHUNK_%s]\n%s\n\n", c.ID, c.Text))
 	}
 
-	systemPrompt := fmt.Sprintf(`You are %s, a domain expert.
+	var systemPrompt string
+	if isProblemSolvingQuestion(question) {
+		// Problem-solving mode: apply principles to solve new problems.
+		// WHY different prompt: DSA education = learn principles, apply to new problems.
+		// Strict "only cite chunks" would refuse every new LeetCode problem.
+		systemPrompt = fmt.Sprintf(`You are %s, a domain expert in algorithms and data structures.
+
+REASONING CHARTER:
+%s
+
+YOUR TRAINING MATERIAL (use these principles to solve problems):
+%s
+
+CRITICAL RULES:
+1. Apply the algorithms, data structures, and techniques from your training to solve this problem
+2. For every technique you use, cite which chunk taught it: [CHUNK_uuid]
+   Example: "Using the two-pointer approach [CHUNK_abc123] we can..."
+3. Show your reasoning step by step: understand the problem, identify the approach, implement
+4. You may write complete working code using the principles from your training
+5. If a technique is NOT in your training material, say so explicitly
+6. Time and space complexity analysis is expected`,
+			expertName, reasoningCharter, contextSB.String())
+	} else {
+		// Factual mode: strict grounding, only cite chunks.
+		systemPrompt = fmt.Sprintf(`You are %s, a domain expert.
 
 REASONING CHARTER:
 %s
@@ -295,7 +319,8 @@ CRITICAL RULES:
 
 COURSE CONTENT:
 %s`,
-		expertName, reasoningCharter, contextSB.String())
+			expertName, reasoningCharter, contextSB.String())
+	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelStrong,
