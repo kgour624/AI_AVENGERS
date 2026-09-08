@@ -123,7 +123,10 @@ func (e *Enforcer) Enforce(
 	}
 
 	// LAYER 2: Coverage check
-	coverage, err := e.checkCoverage(ctx, question, chunks, isProblemSolving)
+	// Behavior controlled by profile.CoverageMode:
+	//   APPLY_PRINCIPLES: can expert apply principles to solve? (DSA, coding)
+	//   LITERAL_MATCH:    do chunks contain the answer? (medical, legal, finance)
+	coverage, err := e.checkCoverage(ctx, question, chunks, profile.CoverageMode)
 	if err != nil {
 		e.logger.Warn("Layer 2 check failed, assuming PARTIAL", zap.Error(err))
 		coverage = "PARTIAL"
@@ -142,7 +145,8 @@ func (e *Enforcer) Enforce(
 	}
 
 	// LAYER 3: Generate with mandatory citations
-	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, isProblemSolving)
+	// Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
+	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, profile)
 	if err != nil {
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
@@ -156,14 +160,54 @@ func (e *Enforcer) Enforce(
 	}
 
 	// LAYER 4: Strip uncited claims
-	// Problem-solving mode: keep code blocks + explanation lines unconditionally.
-	// Factual mode: strict citation enforcement per sentence.
-	cleanAnswer, strippedCount := e.stripUncited(generated.Answer, isProblemSolving)
+	// Behavior controlled by profile.StripMode:
+	//   CODE_EXEMPT: fenced code blocks kept unconditionally (DSA, coding)
+	//   FULL_STRIP:  every sentence without citation is stripped (medical, legal)
+	cleanAnswer, strippedCount := e.stripUncited(generated.Answer, profile.StripMode)
 
 	if strippedCount > 0 {
 		e.logger.Warn("Layer 4: stripped uncited claims",
 			zap.Int("count", strippedCount),
 		)
+	}
+
+	// CONFLICT RESOLUTION: Base wall safety net.
+	// IF domain rules produced empty output AND domain is strict (FULL_STRIP):
+	//   → domain rules over-relaxed something upstream, retry with BaseProfile.
+	// IF domain is CODE_EXEMPT AND output has a code block:
+	//   → valid DSA answer, domain rules win even with no prose.
+	// WHY structural not LLM: no extra cost, no circular judgment.
+	if strings.TrimSpace(cleanAnswer) == "" {
+		if profile.StripMode == StripModeCodeExempt && strings.Contains(generated.Answer, "```") {
+			// Code block present but strip removed prose — restore full answer.
+			// This means citations were in code (wrong) — keep answer as-is.
+			cleanAnswer = generated.Answer
+			e.logger.Warn("Layer 4: output empty but code block present, restoring",
+				zap.String("domain", profile.Domain),
+			)
+		} else if profile.Domain != BaseProfile.Domain {
+			// Domain rules produced empty output — safety net: retry with BaseProfile.
+			e.logger.Warn("Layer 4: domain rules produced empty output, retrying with BaseProfile",
+				zap.String("domain", profile.Domain),
+			)
+			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, BaseProfile)
+			if err != nil {
+				return nil, fmt.Errorf("base profile generation failed: %w", err)
+			}
+			cleanAnswer, _ = e.stripUncited(baseGenerated.Answer, BaseProfile.StripMode)
+			if strings.TrimSpace(cleanAnswer) == "" {
+				return e.buildRefusal("empty_after_strip", "Could not generate a properly cited answer"), nil
+			}
+			return &EnforceResult{
+				Status:     "success",
+				Answer:     cleanAnswer,
+				Citations:  baseGenerated.Citations,
+				Coverage:   coverage,
+				Confidence: float64(bestScore),
+			}, nil
+		} else {
+			return e.buildRefusal("empty_after_strip", "Could not generate a properly cited answer"), nil
+		}
 	}
 
 	return &EnforceResult{
