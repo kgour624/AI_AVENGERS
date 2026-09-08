@@ -362,13 +362,112 @@ matching the category's schema keys, each properly citation-processed.
 |---|---|---|---|
 | CT-C1 | `reply_to_message_id` accepted on send + persisted | `backend-go/internal/message/handler.go`, `backend-go/internal/chat/service.go` | DONE (2026-09-08) |
 | CT-C2 | `ReplyThread` context source (pinned or full-chain, depth-capped) | `backend-go/internal/context/assembler.go` | DONE (2026-09-08) |
-| CT-C3 | Multi-expert loop-in on reply passes thread context to all selected experts | `backend-go/internal/orchestrator/orchestrator.go` | \u23f3 NOT STARTED |
-| CT-C4 | Structure-permission ASK gate + reply-to-ASK detection | `backend-go/internal/decision/engine.go` | \u23f3 NOT STARTED |
+| CT-C3 | Multi-expert loop-in on reply passes thread context to all selected experts | `backend-go/internal/orchestrator/orchestrator.go` | DONE (2026-09-08) |
+| CT-C4 | Structure-permission ASK gate + reply-to-ASK detection | `backend-go/internal/decision/engine.go`, `backend-go/internal/orchestrator/orchestrator.go`, `backend-go/internal/message/handler.go` | DONE (2026-09-08) |
 
-**Checkpoint CT-C:** replying to a specific past message with thread-off
-changes only that Q&A's context; toggling thread-on and setting depth=3
-demonstrably includes 3 ancestor turns; killing the server mid-chat and
-resuming does not break reply resolution (existing message table is durable).
+**Evidence (commits on main, 2026-09-08, verified by re-reading each file
+from main after push):**
+
+1. feat(chat): CT-C1 -- Message.ReplyToMessageID added (additive,
+   nil-safe for every existing caller), persisted in SaveMessage,
+   returned by ListMessages.
+2. feat(message): CT-C1 completion -- Send() accepts optional
+   reply_to_message_id + include_full_thread, persists on the user
+   message, threads both into OrchestratorRequest.
+3. feat(context): CT-C2 -- new ReplyThread context source in Assembler.
+   Pinned message by default (CT-L6); explicit full-thread opt-in walks
+   reply_to_message_id upward, capped by
+   system_settings.reply_thread_max_depth (falls back to 10 if the
+   setting row is missing/unparseable). Assemble() gained 2 trailing
+   params (replyToMessageID, includeFullThread) -- both nil/false for
+   every fresh question, so sources 1-6 (rolling summary, L2 memory,
+   recent messages, semantic history, course chunks, repo chunks) are
+   completely unaffected. New source 7 runs regardless of the soft
+   token-budget checkpoints used by sources 1-6, since a reply is an
+   explicit client action.
+4. fix(orchestrator): CT-C2 wiring -- OrchestratorRequest gained
+   ReplyToMessageID/IncludeFullThread; Assemble()'s call site updated
+   to its new 7-arg signature in the SAME commit (would have failed to
+   compile otherwise).
+5. feat(decision): CT-C4 part 1 -- Expert.AskStructurePermission +
+   Process() gained a new Gate 0 (gateStructurePermission) and a
+   replyToMessageID param. No-op for every non-categorized expert or
+   category without the flag.
+6. feat(decision): CT-C4 part 2 -- implemented gateStructurePermission
+   itself (part 1's commit called it but never defined it -- caught by
+   re-reading the file immediately after, before it could reach a
+   build step). Reuses the reply mechanism entirely (CT-L9): a fresh
+   question to a structure-permission category emits an ASK message;
+   the client's answer arrives as a reply to THAT ASK; the gate
+   recognizes this via decision_mode + expert_id + exact content match
+   on the parent row, walks one more level up via the ASK's OWN
+   reply_to_message_id to recover the original question, and appends
+   the client's stated preference before continuing to Gate 1.
+7. fix(orchestrator): CT-C4 wiring, round 1 -- updated
+   decisionEng.Process's call site to the new 7-arg signature,
+   resolved askStructurePermission from the category alongside the
+   existing templateSections/defaultLanguage lookup.
+8. **fix(orchestrator): CT-C4 wiring, round 2 (self-correction)** --
+   round 1's commit referenced a non-existent
+   ExpertResponse.ReplyToUserMessageID field and a placeholder function
+   that always returned nil, which would have failed to compile
+   (unknown struct field) AND been logically incomplete even if it had
+   compiled. Caught by re-reading orchestrator.go immediately after
+   committing, before moving on. Fixed by adding the real
+   ExpertResponse.ReplyToUserMessageID field, a real
+   OrchestratorRequest.UserMessageID field, and a real
+   structurePermissionAskParent(gateStopped, userMessageID) that
+   returns a non-nil pointer exactly when gateStopped==-1 (the
+   structure-permission ASK's own sentinel value, chosen to be
+   distinct from every existing Gate 1-5 stop reason).
+9. feat(message): CT-C4 completion -- wired
+   orchestratorReq.UserMessageID = userMsgID (the already-saved user
+   message id, available before orchestrator.Process runs), and
+   saveAssistantMessage now sets ReplyToMessageID: resp.ReplyToUserMessageID
+   when saving each expert's response -- closing the loop so a
+   structure-permission ASK message is itself saved as a reply to the
+   original question, which is exactly what gateStructurePermission's
+   parent-walk (item 6 above) depends on to recover that question
+   later.
+
+**Checkpoint CT-C -- honest status:** the full request/response wiring
+for reply-to-message (pinned + full-thread), multi-expert loop-in (free
+via the existing per-expert-ID loop -- every selected expert receives
+the identical ReplyToMessageID/IncludeFullThread from the same
+OrchestratorRequest, satisfying CT-C3's checkpoint with no additional
+code beyond CT-C1/C2), and the structure-permission ASK round-trip is
+committed end-to-end and self-consistent by manual tracing. **This has
+NOT been verified against a live running server, a real DB, or a real
+reply sent through the UI** -- same toolchain limitation as every other
+phase in this file. Two real bugs (a called-but-undefined function, and
+a reference to a non-existent struct field) were caught and fixed in
+this same session by re-reading files immediately after each commit --
+demonstrating why that re-read step is mandatory, not optional, even
+when a change feels straightforward.
+
+**Owed before this phase can be called done:**
+- [ ] cd backend-go && go build ./... -- confirm the package compiles.
+      Given 2 real bugs were already caught this way in CT-C alone (on
+      top of 3 in CT-B), manual tracing should not be treated as a
+      substitute for this.
+- [ ] Send a fresh message, then reply to it with thread-off -- confirm
+      only that one pinned message appears in the assembled prompt
+      (add temporary logging of FormatForPrompt's output if needed).
+- [ ] Reply with thread-on, depth=3 -- confirm exactly 3 ancestor turns
+      are included, not more.
+- [ ] Create a category with ask_structure_permission=true, ask it a
+      fresh question -- confirm the ASK message appears, then reply to
+      it with a preference -- confirm the full structured answer
+      reflects that stated preference and Gate 1-5 ran on the ORIGINAL
+      question, not the short preference text.
+- [ ] Confirm gateStructurePermission's parent-matching heuristic
+      (decision_mode='ASK' + same expert_id + exact content string
+      match) does not misfire against a Gate 1 clarification ASK from
+      the SAME expert -- this is a known, documented heuristic
+      limitation (see gateStructurePermission's own comment), not
+      verified against a real conversation yet.
+
+Owner: Kiran (has DB + running-server access). Runbook commands available on request.
 
 ### Phase CT-D \u2014 Frontend
 
