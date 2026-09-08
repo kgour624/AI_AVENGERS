@@ -231,13 +231,51 @@ export function IngestionPipelineModal({
           })}
         </div>
 
-        {/* Error box */}
-        {(isFailed || stream.error) && (
-          <div className="rounded-lg border border-mode-refuse/40 bg-mode-refuse/10 p-3">
-            <p className="text-xs font-semibold text-mode-refuse">\u274c Error</p>
-            <p className="mt-1 font-mono text-[11px] text-mode-refuse/90 break-all">
-              {job?.errorMessage || stream.error || 'Unknown error'}
-            </p>
+        {/* Failed state — with Resume button */}
+        {isFailed && (
+          <div className="flex flex-col gap-2">
+            {/* Error details */}
+            <div className="rounded-lg border border-mode-refuse/40 bg-mode-refuse/10 p-3">
+              <p className="text-xs font-semibold text-mode-refuse">\u274c Failed</p>
+              <p className="mt-1 font-mono text-[11px] text-mode-refuse/90 break-all">
+                {job?.errorMessage || stream.error || 'Unknown error'}
+              </p>
+            </div>
+
+            {/* Resume section */}
+            <div className="rounded-lg border border-glow-amber/30 bg-glow-amber/5 p-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs font-semibold text-glow-amber">\u21ba Resume Available</p>
+                  {job?.currentStage && job.currentStage !== 'pending' && (
+                    <p className="mt-0.5 text-[10px] text-text-secondary">
+                      Checkpoint: <span className="font-mono text-glow-amber/80">{job.currentStage}</span>
+                      {' '}\u2014 no re-upload needed
+                    </p>
+                  )}
+                </div>
+                <button
+                  onClick={handleResume}
+                  disabled={isResuming}
+                  className={cn(
+                    'rounded-md border border-glow-amber/40 bg-glow-amber/10 px-3 py-1.5',
+                    'text-xs font-medium text-glow-amber',
+                    'transition-all duration-150 ease-arc',
+                    'hover:bg-glow-amber/20 hover:border-glow-amber/60',
+                    'disabled:opacity-50 disabled:cursor-not-allowed',
+                  )}
+                >
+                  {isResuming ? 'Resuming...' : 'Resume from checkpoint'}
+                </button>
+              </div>
+              {resumeError && (
+                <p className="mt-2 text-[10px] text-mode-refuse">
+                  {resumeError.includes('TRANSCRIPT_REQUIRED')
+                    ? '\u26a0\ufe0f Transcript not stored for this job. Please re-upload the transcript file.'
+                    : resumeError}
+                </p>
+              )}
+            </div>
           </div>
         )}
 
