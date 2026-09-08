@@ -453,6 +453,14 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 		return
 	}
 
+	// Store transcript content for resume support (migration 009)
+	// WHY: If job fails during chunking, resume needs the original text.
+	// Non-fatal if this fails — resume will require re-upload in that case.
+	_, _ = h.db.Exec(c.Request.Context(),
+		`UPDATE ingestion_jobs SET transcript_content=$1 WHERE id=$2`,
+		string(content), jobID,
+	)
+
 	// Mark expert as training
 	_, _ = h.db.Exec(c.Request.Context(),
 		`UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
