@@ -573,9 +573,9 @@ COURSE CONTENT:
 func (e *Enforcer) generateStructured(
 	ctx context.Context,
 	question string,
+	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
-	chunks []CourseChunk,
 	contextText string,
 	sections []category.TemplateSection,
 	defaultLanguage string,
