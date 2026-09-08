@@ -143,7 +143,7 @@ func (e *Enforcer) Enforce(
 	// LAYER 4: Strip uncited claims
 	// Problem-solving mode: keep code blocks + explanation lines unconditionally.
 	// Factual mode: strict citation enforcement per sentence.
-	cleanAnswer, strippedCount := e.stripUncited(generated.Answer, isProblemSolvingQuestion(question))
+	cleanAnswer, strippedCount := e.stripUncited(generated.Answer, isProblemSolving)
 
 	if strippedCount > 0 {
 		e.logger.Warn("Layer 4: stripped uncited claims",
