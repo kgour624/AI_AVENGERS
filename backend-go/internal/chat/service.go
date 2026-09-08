@@ -53,6 +53,14 @@ type Message struct {
 	// on this struct so every existing SaveMessage/ListMessages call site
 	// that does not set it keeps working unchanged — zero regression.
 	ReplyToMessageID     *uuid.UUID `json:"reply_to_message_id,omitempty"`
+	// TemplateSections (migration 011, 2026-09-08 RCA round 7): JSONB
+	// mirroring chinawall.TemplateSectionResult. nil for every flat-text
+	// message (CT-L2). Stored as interface{} (raw JSON), not a typed
+	// slice, matching this struct's existing convention for Citations
+	// above - chat/service.go intentionally has no dependency on the
+	// chinawall package, so the concrete shape lives at the call site
+	// (message/handler.go) that already imports chinawall.
+	TemplateSections     interface{} `json:"template_sections,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 }
 
@@ -176,12 +184,14 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 	err := s.db.QueryRow(ctx,
 		`INSERT INTO messages
 			(chat_id, role, content, turn_number, expert_id, decision_mode,
-			 confidence, warning_text, clarifying_questions, citations, reply_to_message_id)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+			 confidence, warning_text, clarifying_questions, citations,
+			 reply_to_message_id, template_sections)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
 		msg.ExpertID, decisionMode, msg.Confidence,
 		warningText, msg.ClarifyingQuestions, msg.Citations, msg.ReplyToMessageID,
+		msg.TemplateSections,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)
@@ -209,6 +219,7 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		        COALESCE(clarifying_questions,'[]'::jsonb),
 		        COALESCE(citations,'[]'::jsonb),
 		        reply_to_message_id,
+		        template_sections,
 		        created_at
 		 FROM messages
 		 WHERE chat_id=$1
@@ -227,13 +238,14 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		// Bug 3.4 fix: citations JSONB is now selected and scanned back
 		// into m.Citations (as []map[string]interface{}, matching the
 		// pattern already used for clarifying_questions below).
-		var clarifyingJSON, citationsJSON []byte
+		var clarifyingJSON, citationsJSON, templateSectionsJSON []byte
 		if err := rows.Scan(
 			&m.ID, &m.ChatID, &m.Role, &m.Content, &m.TurnNumber,
 			&m.ExpertID, &m.DecisionMode, &m.Confidence,
 			&m.TokensUsed, &m.CostUSD,
 			&m.WarningText, &clarifyingJSON, &citationsJSON,
 			&m.ReplyToMessageID,
+			&templateSectionsJSON,
 			&m.CreatedAt,
 		); err != nil {
 			continue
@@ -250,6 +262,19 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 			var cit []map[string]interface{}
 			_ = json.Unmarshal(citationsJSON, &cit)
 			m.Citations = cit
+		}
+		// Migration 011 (2026-09-08 RCA round 7): unmarshal
+		// template_sections JSONB -> generic slice, same pattern as
+		// citations above. NULL column (flat-text message, or any row
+		// saved before migration 011) leaves templateSectionsJSON empty
+		// and m.TemplateSections stays nil - the frontend adapter's
+		// existing `templateSections && length > 0` check already
+		// handles nil/undefined correctly, zero regression for flat
+		// messages.
+		if len(templateSectionsJSON) > 0 {
+			var sections []map[string]interface{}
+			_ = json.Unmarshal(templateSectionsJSON, &sections)
+			m.TemplateSections = sections
 		}
 		messages = append(messages, m)
 	}
