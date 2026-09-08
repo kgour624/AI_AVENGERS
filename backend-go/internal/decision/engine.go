@@ -126,8 +126,10 @@ func (e *Engine) Process(
 	}
 
 	// GATE 5: Generate Answer (China Wall)
+	// Pass expert.Domain so China Wall uses domain-based mode,
+	// not question-based keyword detection.
 	enforceResult, err := e.chinaWall.Enforce(
-		ctx, question, chunks, expert.Name, expert.ReasoningCharter, attempt,
+		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, attempt,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gate 5 failed: %w", err)
