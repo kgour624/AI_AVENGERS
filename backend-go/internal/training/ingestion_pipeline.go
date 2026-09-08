@@ -360,7 +360,13 @@ func (p *IngestionPipeline) IngestTranscript(
 	// Step 8: Build capability table
 	capabilities, err := p.capability.Build(ctx, chunks, topicResults)
 	if err != nil {
-		p.logger.Warn("capability build failed", zap.Error(err))
+		p.logger.Warn("capability build failed (LLM), falling back to chunk-based capabilities",
+			zap.Error(err),
+		)
+		// Fallback: populate capabilities directly from course_chunks topic data.
+		// WHY: Chunks are stored with topics (Step 2). Capability table is just
+		// an aggregation. We can compute it without LLM — less detailed but correct.
+		p.buildCapabilitiesFromChunks(ctx, expertID)
 	} else {
 		p.storeCapabilities(ctx, expertID, capabilities)
 	}
