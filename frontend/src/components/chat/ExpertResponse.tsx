@@ -57,8 +57,25 @@ export interface ExpertResponseProps {
 
 export function ExpertResponse({ response, persistedMessageId, isStreaming, chatId }: ExpertResponseProps) {
   const [showReasoning, setShowReasoning] = useState(false)
+  const [copied, setCopied] = useState(false)
   const reduceMotion = useReducedMotion()
   const setReplyTarget = useReplyStore((s) => s.setReplyTarget)
+
+  function handleCopyResponse() {
+    const text =
+      response.templateSections && response.templateSections.length > 0
+        ? response.templateSections.map((s) => s.label + ':\n' + s.content).join('\n\n')
+        : response.content
+    navigator.clipboard
+      .writeText(text)
+      .then(() => {
+        setCopied(true)
+        setTimeout(() => setCopied(false), 1500)
+      })
+      .catch((err) => {
+        console.warn('copy to clipboard failed', err)
+      })
+  }
 
   function handleReplyClick() {
     if (!chatId || !persistedMessageId) return
