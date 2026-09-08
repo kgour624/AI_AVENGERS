@@ -436,18 +436,69 @@ func (a *Assembler) getReplyThread(ctx context.Context, pinnedID uuid.UUID, incl
 
 // loadOneThreadMessage loads role/content/turn_number for one message,
 // plus its own parent pointer (for continuing the walk upward).
+//
+// FIX (2026-09-08 RCA, round 9): previously selected ONLY `content`,
+// which is the empty string for every categorized (structured-JSON)
+// expert's answer - the structured generation path only ever
+// populates chinawall.EnforceResult.TemplateSections, never Answer/
+// Content (see round 7's HANDOFF entry for the same underlying fact,
+// applied there to the messages table's own persistence gap). Replying
+// to a structured answer therefore pinned a genuinely EMPTY string as
+// context - the new expert's prompt got "## Replying To\nASSISTANT
+// (turn N): " with nothing after the colon, so it had no real basis to
+// continue the conversation and understandably asked "what are we
+// talking about?" or refused. Fix: also select template_sections, and
+// when content is empty but sections exist, flatten them into a single
+// readable text block so the reply thread always carries the real
+// answer, structured or flat.
 func (a *Assembler) loadOneThreadMessage(ctx context.Context, id uuid.UUID) (ReplyThreadEntry, *uuid.UUID, error) {
 	var e ReplyThreadEntry
 	var parent *uuid.UUID
+	var templateSectionsJSON []byte
 	err := a.db.QueryRow(ctx,
-		`SELECT role, content, turn_number, reply_to_message_id
+		`SELECT role, content, turn_number, reply_to_message_id, template_sections
 		 FROM messages WHERE id=$1`,
 		id,
-	).Scan(&e.Role, &e.Content, &e.TurnNumber, &parent)
+	).Scan(&e.Role, &e.Content, &e.TurnNumber, &parent, &templateSectionsJSON)
 	if err != nil {
 		return ReplyThreadEntry{}, nil, err
 	}
+	if strings.TrimSpace(e.Content) == "" && len(templateSectionsJSON) > 0 {
+		if flattened := flattenTemplateSections(templateSectionsJSON); flattened != "" {
+			e.Content = flattened
+		}
+	}
 	return e, parent, nil
+}
+
+// flattenTemplateSections converts a messages.template_sections JSONB
+// value (array mirroring chinawall.TemplateSectionResult) into a single
+// human-readable text block, so reply-thread context (and any other
+// consumer needing plain text) has a real, complete answer to work
+// with instead of an empty Content string. Returns "" on any parse
+// failure or empty input - callers already handle "" as "nothing to
+// add", matching every other non-fatal-degradation pattern in this file.
+func flattenTemplateSections(raw []byte) string {
+	var sections []struct {
+		Label   string `json:"label"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &sections); err != nil {
+		return ""
+	}
+	var sb strings.Builder
+	for _, s := range sections {
+		if strings.TrimSpace(s.Content) == "" {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString(s.Label)
+		sb.WriteString(":\n")
+		sb.WriteString(s.Content)
+	}
+	return sb.String()
 }
 
 // getReplyThreadMaxDepth reads system_settings.reply_thread_max_depth.
