@@ -114,7 +114,11 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming }: Ex
                 {segment.value}
               </ReactMarkdown>
             ) : (
-              <CitationChip key={i} citation={segment.citation} />
+              <CitationChip
+                key={i}
+                citation={segment.citation}
+                index={citationIndexMap.get(segment.citation.chunkId) ?? i + 1}
+              />
             )
           )}
         </div>
