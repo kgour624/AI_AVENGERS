@@ -3,43 +3,57 @@ import type { Citation } from '@/types/expert'
 import { Tooltip } from '@/components/ui/Tooltip'
 import { Modal } from '@/components/ui/Modal'
 
+export interface CitationChipProps {
+  citation: Citation
+  /** 1-based index for human-readable label: Source 1, Source 2, etc. */
+  index: number
+}
+
 /**
- * Source: FRONTEND_SYSTEM_DESIGN.md section 9
- * ("Renders [CHUNK_abc] as clickable chip. On hover: shows chunk text
- * in tooltip. On click: opens citation detail modal. WHY: Citations
- * are the trust mechanism of AI Avengers.")
+ * Renders a citation as a human-readable [Source N] chip.
+ * Hover: shows chunk text preview in tooltip.
+ * Click: opens modal with full chunk text + relevance score.
  *
- * WHY this component gets its own click-to-open-modal state instead
- * of relying on a shared "which citation is open" store: each
- * CitationChip instance is independent - a message can render several
- * citation chips, and opening one should never affect another's
- * state. Lifting this to a shared store (like streamStore) would add
- * complexity for zero benefit, since nothing outside this component
- * needs to know or control which citation modal is open - the
- * opposite reasoning from ExpertPicker's lifted state, and
- * deliberately so.
+ * WHY [Source N] not [CHUNK_hash]:
+ *   UUID hashes are machine identifiers — meaningless to students.
+ *   "Source 1" is immediately understandable: "this claim came from
+ *   the first source the expert cited."
+ *   The full chunkId is still shown in the modal for admin/debug use.
  */
-export function CitationChip({ citation }: { citation: Citation }) {
+export function CitationChip({ citation, index }: CitationChipProps) {
   const [isModalOpen, setIsModalOpen] = useState(false)
+
+  // Truncate tooltip preview to first 120 chars
+  const preview = citation.text.length > 120
+    ? citation.text.slice(0, 120) + '...'
+    : citation.text
 
   return (
     <>
-      <Tooltip content={citation.text}>
+      <Tooltip content={preview}>
         <button
           type="button"
           onClick={() => setIsModalOpen(true)}
-          className="rounded border border-glass-border bg-surface-overlay px-1.5 py-0.5 text-xs font-mono text-glow-cyan transition-[border-color,box-shadow] duration-150 ease-arc hover:border-glow-cyan/50 hover:bg-glow-cyan/10 hover:shadow-[0_0_12px_-4px_var(--glow-cyan)]"
+          className="rounded border border-glass-border bg-surface-overlay px-1.5 py-0.5 text-xs font-medium text-glow-cyan transition-[border-color,box-shadow] duration-150 ease-arc hover:border-glow-cyan/50 hover:bg-glow-cyan/10 hover:shadow-[0_0_12px_-4px_var(--glow-cyan)]"
+          aria-label={`View source ${index}`}
         >
-          [CHUNK_{citation.chunkId.slice(0, 8)}]
+          Source {index}
         </button>
       </Tooltip>
 
       <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)}>
-        <h3 className="mb-2 text-sm font-medium text-text-secondary">Citation detail</h3>
-        <p className="text-sm text-text-primary">{citation.text}</p>
-        <p className="mt-3 text-xs text-text-disabled">
-          Chunk ID: {citation.chunkId} {'\u00b7'} Relevance score: {citation.score.toFixed(3)}
-        </p>
+        <h3 className="mb-3 text-sm font-semibold text-glow-cyan">Source {index}</h3>
+        <div className="rounded-lg border border-surface-border bg-surface-void p-3">
+          <p className="text-sm leading-relaxed text-text-primary">{citation.text}</p>
+        </div>
+        <div className="mt-3 flex items-center justify-between">
+          <span className="text-xs text-text-disabled">
+            Relevance: {(citation.score * 100).toFixed(1)}%
+          </span>
+          <span className="font-mono text-[10px] text-text-disabled">
+            {citation.chunkId.slice(0, 8)}
+          </span>
+        </div>
       </Modal>
     </>
   )
