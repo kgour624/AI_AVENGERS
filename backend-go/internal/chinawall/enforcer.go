@@ -375,38 +375,59 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 }
 
 // stripUncited removes sentences without citations, while preserving
-// markdown/code structure (Bug 3.1 fix - see splitSentences below for
-// the actual splitting logic; this function only changed its join).
-func (e *Enforcer) stripUncited(answer string) (string, int) {
+// markdown/code structure.
+//
+// isProblemSolving: when true, entire fenced code blocks are kept
+// unconditionally. Code is the APPLICATION of cited principles —
+// it doesn't need per-line citations. The explanation before/after
+// the code block cites which principles are being applied.
+func (e *Enforcer) stripUncited(answer string, isProblemSolving bool) (string, int) {
 	citationPattern := regexp.MustCompile(`\[CHUNK_[a-f0-9-]+\]`)
 	sentences := splitSentences(answer)
 
 	var clean []string
 	stripped := 0
+	inCodeBlock := false
 
 	for _, sentence := range sentences {
 		trimmed := strings.TrimSpace(sentence)
-		if trimmed == "" {
-			// Blank-line marker from splitSentences - always keep, this
-			// is what preserves paragraph spacing between kept lines.
+
+		// Track fenced code block boundaries
+		if strings.HasPrefix(trimmed, "```") {
+			inCodeBlock = !inCodeBlock
 			clean = append(clean, sentence)
 			continue
 		}
+
+		// Inside a code block: always keep (problem-solving mode)
+		// or keep if protected (factual mode — protectCode already handled it)
+		if inCodeBlock {
+			clean = append(clean, sentence)
+			continue
+		}
+
+		if trimmed == "" {
+			// Blank-line marker — always keep for paragraph spacing.
+			clean = append(clean, sentence)
+			continue
+		}
+
 		hasCitation := citationPattern.MatchString(sentence)
 		isShort := len(trimmed) < 25
 		isStructural := isHeadingOrTransition(trimmed)
 
 		if hasCitation || isShort || isStructural {
 			clean = append(clean, sentence)
+		} else if isProblemSolving {
+			// In problem-solving mode, keep explanation lines even without
+			// inline citations — the approach explanation is part of the answer.
+			// Citations appear at the start of the explanation, not per-sentence.
+			clean = append(clean, sentence)
 		} else {
 			stripped++
 		}
 	}
 
-	// WHY Join with "" not " ": every surviving sentence already carries
-	// its own trailing separator (". ", or "\n" at line end) from
-	// splitSentences - adding another separator here would double up
-	// whitespace. This is what lets markdown/code survive round-trip.
 	return strings.Join(clean, ""), stripped
 }
 
