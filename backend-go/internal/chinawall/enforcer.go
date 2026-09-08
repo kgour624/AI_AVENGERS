@@ -689,7 +689,12 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 	}
 
 	seen := make(map[string]bool)
-	var citations []Citation
+	// 2026-09-08 RCA: initialized non-nil (not "var citations []Citation")
+	// so zero matches marshals as JSON [] not null - a nil slice here
+	// crashed the frontend's citations.map() (parseCitations.ts) whenever
+	// a section/answer had zero [CHUNK_xxx] tokens, e.g. a code-type
+	// template section, which by design never contains citation tokens.
+	citations := []Citation{}
 	for _, match := range matches {
 		chunkIDStr := match[1]
 		if seen[chunkIDStr] {
