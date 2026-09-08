@@ -127,6 +127,14 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
         <div className="flex items-center gap-2">
           <ModeBadge mode={response.mode} />
           <span className="text-xs text-text-secondary">{Math.round(response.confidence * 100)}%</span>
+          <button
+            type="button"
+            onClick={handleCopyResponse}
+            aria-label="Copy response"
+            className="text-xs text-text-secondary hover:text-text-primary"
+          >
+            {copied ? 'Copied!' : 'Copy'}
+          </button>
         </div>
       </div>
 
