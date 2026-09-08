@@ -190,7 +190,12 @@ function AdminExperts() {
           onClose={() => setCharterTargetId(null)}
           expertId={charterTargetId}
           expertName={experts?.find((e) => e.id === charterTargetId)?.name ?? ''}
-          currentCharter=""
+          // Fix (2026-09-08): was hardcoded to "" — backend now returns
+          // reasoningCharter on GET /admin/experts (see types/expert.ts),
+          // so the modal opens pre-filled with the real saved charter
+          // instead of always looking empty even after a successful
+          // training run.
+          currentCharter={experts?.find((e) => e.id === charterTargetId)?.reasoningCharter ?? ''}
           onSaved={() => queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })}
         />
       )}

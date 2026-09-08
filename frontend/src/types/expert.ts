@@ -45,6 +45,15 @@ export interface Expert extends PublicExpert {
   totalRatings?: number
   isActive?: boolean
   isTraining?: boolean
+  /**
+   * Fix (2026-09-08): backend's admin ListExperts now selects
+   * reasoning_charter (see admin_handler.go's adminExpertRow) — it was
+   * saved correctly by the ingestion pipeline all along, just never
+   * read back on this list endpoint. Optional because the PUBLIC
+   * GET /experts endpoint still never returns this (admin-only field,
+   * same reasoning as modelTier/temperature/etc. below).
+   */
+  reasoningCharter?: string
   // Migration 006 config fields — present on admin endpoint, absent on public.
   // WHY optional: public GET /experts never returns these. Admin GET /admin/experts does.
   // Keeping them optional on Expert means both endpoints can use the same type
