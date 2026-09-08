@@ -66,6 +66,11 @@ export interface CreateExpertRequest {
   slug: string
   domain: string
   description?: string
+  // CT-D2: optional expert_categories FK. Omit/undefined = flat-text
+  // fallback (CT-L2, nullable at the DB level). snake_case category_id
+  // on the wire — baseAPI's snakeifyKeys request interceptor converts
+  // this camelCase key automatically, same as every other field here.
+  categoryId?: string
   // Migration 006 config fields — all optional, backend defaults apply when omitted.
   // Defaults: modelTier='strong', temperature=0.30, topP=0.50,
   //           loopPattern='react', maxLoopIterations=5, allowedTools=[]
