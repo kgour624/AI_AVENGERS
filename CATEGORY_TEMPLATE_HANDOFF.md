@@ -350,7 +350,7 @@ HANDOFF.md.
 - [ ] Confirm reload-from-DB gap (documented above) matches expectation
       -- decide whether to fix now or defer to a dedicated follow-up.
 
-Owner: Kiran (has DB + running-server access). Runbook commands available on request. \u23f3 NOT STARTED |
+Owner: Kiran (has DB + running-server access). Runbook commands available on request.
 
 **Checkpoint CT-B:** a categorized expert with a template answers a coding
 question and the raw API response contains a `template_sections` array
@@ -360,8 +360,8 @@ matching the category's schema keys, each properly citation-processed.
 
 | # | Component | File | Status |
 |---|---|---|---|
-| CT-C1 | `reply_to_message_id` accepted on send + persisted | `backend-go/internal/message/handler.go`, `backend-go/internal/chat/service.go` | \u23f3 NOT STARTED |
-| CT-C2 | `ReplyThread` context source (pinned or full-chain, depth-capped) | `backend-go/internal/context/assembler.go` | \u23f3 NOT STARTED |
+| CT-C1 | `reply_to_message_id` accepted on send + persisted | `backend-go/internal/message/handler.go`, `backend-go/internal/chat/service.go` | DONE (2026-09-08) |
+| CT-C2 | `ReplyThread` context source (pinned or full-chain, depth-capped) | `backend-go/internal/context/assembler.go` | DONE (2026-09-08) |
 | CT-C3 | Multi-expert loop-in on reply passes thread context to all selected experts | `backend-go/internal/orchestrator/orchestrator.go` | \u23f3 NOT STARTED |
 | CT-C4 | Structure-permission ASK gate + reply-to-ASK detection | `backend-go/internal/decision/engine.go` | \u23f3 NOT STARTED |
 
