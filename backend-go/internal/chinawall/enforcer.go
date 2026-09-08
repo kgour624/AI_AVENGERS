@@ -282,7 +282,7 @@ func (e *Enforcer) generateWithCitations(
 	}
 
 	var systemPrompt string
-	if isProblemSolvingQuestion(question) {
+	if isProblemSolving {
 		// Problem-solving mode: apply principles to solve new problems.
 		// WHY different prompt: DSA education = learn principles, apply to new problems.
 		// Strict "only cite chunks" would refuse every new LeetCode problem.
