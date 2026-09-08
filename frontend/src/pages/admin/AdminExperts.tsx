@@ -202,13 +202,7 @@ function AdminExperts() {
         isOpen={pipelineJob !== null}
         onClose={() => setPipelineJob(null)}
         job={pipelineJob}
-        expertName={
-          pipelineJob
-            ? experts?.find((e) =>
-                useIngestionStatus(e.id).data?.[0]?.id === pipelineJob.id
-              )?.name ?? 'Expert'
-            : ''
-        }
+        expertName={pipelineExpertName}
       />
 
       {/* A12: Edit Config modal — pre-fills from expert object */}
