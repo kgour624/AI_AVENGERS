@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { IngestionJob } from '@/api/admin'
+import { useAuthStore } from '@/stores/authStore'
 
 export type StreamEvent =
   | { type: 'update' | 'complete' | 'failed'; job: IngestionJob; ts: string }
