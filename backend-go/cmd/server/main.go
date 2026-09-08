@@ -172,6 +172,7 @@ func buildRouter(
 	authService *auth.AuthService,
 	modelGateway *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
+	domainRegistry *chinawall.DomainRegistry,
 ) *gin.Engine {
 	router := gin.New()
 
