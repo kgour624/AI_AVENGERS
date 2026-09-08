@@ -485,6 +485,115 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 	})
 }
 
+// StreamIngestionJob GET /admin/experts/:id/jobs/stream
+// SSE endpoint — pushes live job state every 1 second.
+// Closes automatically when job reaches complete or failed.
+// No polling needed on the frontend.
+func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+
+	// SSE headers
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no") // disable nginx buffering
+
+	ctx := c.Request.Context()
+	ticker := time.NewTicker(time.Second)
+	heartbeat := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	defer heartbeat.Stop()
+
+	sendEvent := func(eventType string, job interface{}) {
+		payload := map[string]interface{}{
+			"type": eventType,
+			"job":  job,
+			"ts":   time.Now().UTC().Format(time.RFC3339Nano),
+		}
+		data, _ := json.Marshal(payload)
+		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+		c.Writer.Flush()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-heartbeat.C:
+			// Keep connection alive through proxies
+			fmt.Fprintf(c.Writer, "data: {\"type\":\"heartbeat\",\"ts\":\"%s\"}\n\n",
+				time.Now().UTC().Format(time.RFC3339Nano))
+			c.Writer.Flush()
+
+		case <-ticker.C:
+			// Read latest job state from DB
+			var job struct {
+				ID                        uuid.UUID  `json:"id"`
+				Status                    string     `json:"status"`
+				SourcePath                string     `json:"source_path"`
+				TotalChunks               int        `json:"total_chunks"`
+				ProcessedChunks           int        `json:"processed_chunks"`
+				ErrorMessage              string     `json:"error_message"`
+				StartedAt                 *time.Time `json:"started_at"`
+				CompletedAt               *time.Time `json:"completed_at"`
+				CreatedAt                 time.Time  `json:"created_at"`
+				CurrentStage              string     `json:"current_stage"`
+				StageDetail               string     `json:"stage_detail"`
+				CostUsd                   float64    `json:"cost_usd"`
+				EstimatedSecondsRemaining *int       `json:"estimated_seconds_remaining"`
+				ResumedFromCheckpoint     bool       `json:"resumed_from_checkpoint"`
+			}
+
+			err := h.db.QueryRow(ctx, `
+				SELECT id, status, COALESCE(source_path,''),
+				       total_chunks, processed_chunks,
+				       COALESCE(error_message,''), started_at, completed_at, created_at,
+				       COALESCE(current_stage,'pending'), COALESCE(stage_detail,''),
+				       COALESCE(cost_usd,0), estimated_seconds_remaining,
+				       COALESCE(resumed_from_checkpoint,false)
+				FROM ingestion_jobs
+				WHERE expert_id=$1
+				ORDER BY created_at DESC LIMIT 1`,
+				expertID,
+			).Scan(
+				&job.ID, &job.Status, &job.SourcePath,
+				&job.TotalChunks, &job.ProcessedChunks,
+				&job.ErrorMessage, &job.StartedAt, &job.CompletedAt, &job.CreatedAt,
+				&job.CurrentStage, &job.StageDetail,
+				&job.CostUsd, &job.EstimatedSecondsRemaining,
+				&job.ResumedFromCheckpoint,
+			)
+			if err != nil {
+				// No job yet — send waiting event
+				fmt.Fprintf(c.Writer, "data: {\"type\":\"waiting\",\"ts\":\"%s\"}\n\n",
+					time.Now().UTC().Format(time.RFC3339Nano))
+				c.Writer.Flush()
+				continue
+			}
+
+			// Determine event type
+			eventType := "update"
+			if job.Status == "complete" {
+				eventType = "complete"
+			} else if job.Status == "failed" {
+				eventType = "failed"
+			}
+
+			sendEvent(eventType, job)
+
+			// Close stream when job is terminal
+			if job.Status == "complete" || job.Status == "failed" {
+				return
+			}
+		}
+	}
+}
+
 // GetIngestionJobs GET /admin/experts/:id/jobs
 func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 	expertID, err := uuid.Parse(c.Param("id"))
