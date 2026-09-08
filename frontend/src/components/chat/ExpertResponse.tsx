@@ -69,6 +69,12 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming }: Ex
 
   const segments = splitContentByCitations(response.content, response.citations)
 
+  // Build chunkId → 1-based index map so inline citations match the
+  // bottom citations list. Both use the same numbering.
+  const citationIndexMap = new Map(
+    response.citations.map((c, i) => [c.chunkId, i + 1])
+  )
+
   return (
     <motion.div
       initial={reduceMotion ? undefined : { opacity: 0, y: 8 }}
