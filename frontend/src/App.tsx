@@ -58,6 +58,7 @@ const router = createBrowserRouter([
             children: [
               { index: true, lazy: () => import('@/pages/admin/AdminDashboard') },
               { path: 'experts', lazy: () => import('@/pages/admin/AdminExperts') },
+              { path: 'categories', lazy: () => import('@/pages/admin/AdminCategories') },
               { path: 'clients', lazy: () => import('@/pages/admin/AdminClients') },
               { path: 'stats', lazy: () => import('@/pages/admin/AdminStats') },
               { path: 'settings', lazy: () => import('@/pages/admin/AdminSettings') },
