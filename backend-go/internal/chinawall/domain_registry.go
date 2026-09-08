@@ -135,6 +135,34 @@ func (r *DomainRegistry) Invalidate(domain string) {
 	r.logger.Info("domain_registry: invalidated", zap.String("domain", key))
 }
 
+// GetExact returns the exact cached profile for domain, or nil if no
+// profile exists for it. Unlike Get, this does NOT fall back to
+// BaseProfile — callers that need to distinguish "domain has its own
+// stored profile" from "domain falls back to base" (e.g. the admin
+// API's update handler, deciding whether to start a PATCH from an
+// existing profile or from BaseProfile's defaults) must use this
+// instead of Get.
+func (r *DomainRegistry) GetExact(domain string) *DomainProfile {
+	key := strings.ToLower(strings.TrimSpace(domain))
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.profiles[key]
+}
+
+// List returns a snapshot of every cached domain profile. Does NOT
+// include BaseProfile — that is the unknown-domain fallback, not a
+// stored profile. Used by the admin API to render the full
+// domain-profile editor (WHEN [admin] DO [list all editable domains]).
+func (r *DomainRegistry) List() []*DomainProfile {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]*DomainProfile, 0, len(r.profiles))
+	for _, p := range r.profiles {
+		out = append(out, p)
+	}
+	return out
+}
+
 // Reload reloads all profiles from DB into memory.
 // Can be called from admin panel to pick up external DB changes.
 func (r *DomainRegistry) Reload(ctx context.Context) error {
