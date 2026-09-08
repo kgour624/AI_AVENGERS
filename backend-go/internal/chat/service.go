@@ -47,6 +47,12 @@ type Message struct {
 	// ClarifyingQuestions is the Gate 1 ASK question list.
 	// Empty means no clarification was needed.
 	ClarifyingQuestions  []string   `json:"clarifying_questions,omitempty"`
+	// ReplyToMessageID (CT-C1, migration 010): immediate parent message
+	// this one replies to. nil = fresh question, not a reply (the vast
+	// majority of messages, both before and after this feature). Optional
+	// on this struct so every existing SaveMessage/ListMessages call site
+	// that does not set it keeps working unchanged — zero regression.
+	ReplyToMessageID     *uuid.UUID `json:"reply_to_message_id,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 }
 
@@ -170,12 +176,12 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 	err := s.db.QueryRow(ctx,
 		`INSERT INTO messages
 			(chat_id, role, content, turn_number, expert_id, decision_mode,
-			 confidence, warning_text, clarifying_questions, citations)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			 confidence, warning_text, clarifying_questions, citations, reply_to_message_id)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
 		msg.ExpertID, decisionMode, msg.Confidence,
-		warningText, msg.ClarifyingQuestions, msg.Citations,
+		warningText, msg.ClarifyingQuestions, msg.Citations, msg.ReplyToMessageID,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)
@@ -202,6 +208,7 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		        COALESCE(warning_text,''),
 		        COALESCE(clarifying_questions,'[]'::jsonb),
 		        COALESCE(citations,'[]'::jsonb),
+		        reply_to_message_id,
 		        created_at
 		 FROM messages
 		 WHERE chat_id=$1
@@ -226,6 +233,7 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 			&m.ExpertID, &m.DecisionMode, &m.Confidence,
 			&m.TokensUsed, &m.CostUSD,
 			&m.WarningText, &clarifyingJSON, &citationsJSON,
+			&m.ReplyToMessageID,
 			&m.CreatedAt,
 		); err != nil {
 			continue
