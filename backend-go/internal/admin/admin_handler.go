@@ -594,6 +594,127 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 	}
 }
 
+// ResumeIngestionJob POST /admin/experts/:id/jobs/:jobID/resume
+// Resumes a failed ingestion job from its last checkpoint.
+// Admin does NOT need to re-upload the transcript.
+func (h *AdminHandler) ResumeIngestionJob(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	jobID, err := uuid.Parse(c.Param("jobID"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_JOB_ID", "invalid job ID")
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load job — verify it belongs to this expert and is in a resumable state
+	var job struct {
+		ID                uuid.UUID
+		Status            string
+		SourcePath        string
+		TranscriptContent string // may be empty for old jobs
+		CheckpointStage   string
+	}
+	err = h.db.QueryRow(ctx,
+		`SELECT id, status, COALESCE(source_path,''),
+		        COALESCE(transcript_content,''),
+		        COALESCE(current_stage,'pending')
+		 FROM ingestion_jobs
+		 WHERE id=$1 AND expert_id=$2`,
+		jobID, expertID,
+	).Scan(&job.ID, &job.Status, &job.SourcePath, &job.TranscriptContent, &job.CheckpointStage)
+	if err != nil {
+		response.NotFound(c, "job")
+		return
+	}
+
+	// Only failed jobs can be resumed
+	if job.Status != "failed" {
+		response.BadRequest(c, "NOT_RESUMABLE",
+			fmt.Sprintf("job status is '%s' — only failed jobs can be resumed", job.Status))
+		return
+	}
+
+	// Get expert name
+	var expertName string
+	h.db.QueryRow(ctx, `SELECT name FROM experts WHERE id=$1`, expertID).Scan(&expertName)
+
+	// Determine if we have enough to resume without re-uploading
+	// If checkpoint stage >= topic_extraction: chunks are in DB, no transcript needed
+	// If checkpoint stage < topic_extraction: need transcript text
+	checkpointStageOrder := map[string]int{
+		"pending": 0, "chunking": 1, "topic_extraction": 2,
+		"charter_extraction": 3, "embedding": 4, "storing": 5,
+		"smoke_test": 6, "complete": 7,
+	}
+	needsTranscript := checkpointStageOrder[job.CheckpointStage] < checkpointStageOrder["topic_extraction"]
+
+	var transcriptContent string
+	if needsTranscript {
+		if job.TranscriptContent == "" {
+			response.BadRequest(c, "TRANSCRIPT_REQUIRED",
+				"Job failed before chunking completed and transcript was not stored. "+
+					"Please re-upload the transcript file to restart ingestion.")
+			return
+		}
+		transcriptContent = job.TranscriptContent
+	}
+	// If chunks are in DB, transcript can be empty — IngestTranscript will load from DB
+
+	// Reset job to resumable state
+	_, err = h.db.Exec(ctx,
+		`UPDATE ingestion_jobs SET
+			status        = 'pending',
+			error_message = NULL,
+			completed_at  = NULL,
+			updated_at    = NOW()
+		 WHERE id = $1`,
+		jobID,
+	)
+	if err != nil {
+		h.logger.Error("reset job for resume failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	// Mark expert as training again
+	_, _ = h.db.Exec(ctx, `UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
+
+	// Resume in background with SAME jobID — LoadCheckpoint() will find the checkpoint
+	go func() {
+		_, err := h.ingestion.IngestTranscript(
+			context.Background(),
+			jobID, expertID, expertName,
+			transcriptContent, // empty if chunks already in DB
+			job.SourcePath,
+			false,
+		)
+		if err != nil {
+			h.logger.Error("resume ingestion failed",
+				zap.String("job_id", jobID.String()),
+				zap.Error(err),
+			)
+		}
+	}()
+
+	h.logger.Info("ingestion job resumed",
+		zap.String("job_id", jobID.String()),
+		zap.String("expert_id", expertID.String()),
+		zap.String("checkpoint_stage", job.CheckpointStage),
+	)
+
+	response.OK(c, map[string]interface{}{
+		"job_id":           jobID,
+		"status":           "resuming",
+		"checkpoint_stage": job.CheckpointStage,
+		"message":          fmt.Sprintf("Resuming from stage: %s", job.CheckpointStage),
+	})
+}
+
 // GetIngestionJobs GET /admin/experts/:id/jobs
 func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 	expertID, err := uuid.Parse(c.Param("id"))
