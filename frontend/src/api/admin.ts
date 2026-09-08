@@ -1,6 +1,7 @@
 import { baseAPI } from './base'
 import type { ApiResponse } from '@/types/api'
 import type { Expert } from '@/types/expert'
+import type { ExpertCategory, CategoryTemplateSchema } from '@/types/category'
 
 /**
  * Admin-only endpoints. Route guard (AuthGuard) + backend 403 both
@@ -271,5 +272,52 @@ export const updateLLMSettings = (req: {
       '/api/v1/admin/llm-settings',
       req
     )
+    .then((res) => res.data.data!)
+
+// ============================================================
+// EXPERT CATEGORIES (CT-D1, CATEGORY_TEMPLATE_HANDOFF.md §8)
+// ============================================================
+// Matches admin_handler.go's ListExpertCategories/CreateExpertCategory/
+// GetExpertCategory/UpdateExpertCategory exactly — read directly from
+// source before writing these, not guessed from the design doc alone
+// (same discipline as every other function in this file per the
+// header comment's "PHASE 4 CORRECTION" note).
+
+export const getExpertCategories = () =>
+  baseAPI
+    .get<ApiResponse<ExpertCategory[]>>('/api/v1/admin/expert-categories')
+    .then((res) => res.data.data!)
+
+export const getExpertCategory = (categoryId: string) =>
+  baseAPI
+    .get<ApiResponse<ExpertCategory>>(`/api/v1/admin/expert-categories/${categoryId}`)
+    .then((res) => res.data.data!)
+
+export interface CreateExpertCategoryRequest {
+  name: string
+  slug: string
+  description?: string
+  templateSchema: CategoryTemplateSchema
+  /** Omit to use the backend's "java" default (CT-L5). */
+  defaultLanguage?: string
+  askStructurePermission?: boolean
+}
+
+export const createExpertCategory = (req: CreateExpertCategoryRequest) =>
+  baseAPI
+    .post<ApiResponse<{ id: string; slug: string }>>('/api/v1/admin/expert-categories', req)
+    .then((res) => res.data.data!)
+
+export interface UpdateExpertCategoryRequest {
+  name?: string
+  description?: string
+  templateSchema?: CategoryTemplateSchema
+  defaultLanguage?: string
+  askStructurePermission?: boolean
+}
+
+export const updateExpertCategory = (categoryId: string, req: UpdateExpertCategoryRequest) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/expert-categories/${categoryId}`, req)
     .then((res) => res.data.data!)
 
