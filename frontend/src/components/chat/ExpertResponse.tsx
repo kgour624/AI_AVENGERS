@@ -202,7 +202,7 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
         </div>
       )}
 
-      {response.citations.length > 0 && (
+      {response.citations && response.citations.length > 0 && (
         <div className="mt-3 flex flex-wrap items-center gap-1.5">
           <span className="text-xs text-text-secondary">Citations:</span>
           {response.citations.map((c, i) => (
