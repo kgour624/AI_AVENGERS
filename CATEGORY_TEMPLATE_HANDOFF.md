@@ -188,14 +188,64 @@ separate flow.
 
 | # | Component | File | Status |
 |---|---|---|---|
-| CT-A1 | Migration 010 (categories, retrofit, reply_to_message_id, system_settings) | `backend-go/migrations/010_expert_categories.up.sql` + `.down.sql` | \u23f3 NOT STARTED |
-| CT-A2 | `CategoryRegistry` (mirrors `chinawall.DomainRegistry` pattern) | `backend-go/internal/category/registry.go` | \u23f3 NOT STARTED |
-| CT-A3 | Admin category CRUD handlers + routes | `backend-go/internal/admin/admin_handler.go`, `cmd/server/main.go` | \u23f3 NOT STARTED |
-| CT-A4 | `CreateExpert`/`UpdateExpert` require/accept `category_id` | `backend-go/internal/admin/admin_handler.go` | \u23f3 NOT STARTED |
+| CT-A1 | Migration 010 (categories, retrofit, reply_to_message_id, system_settings) | `backend-go/migrations/010_expert_categories.up.sql` + `.down.sql` | \u2705 COMMITTED (2026-09-08) |
+| CT-A2 | `CategoryRegistry` (mirrors `chinawall.DomainRegistry` pattern) | `backend-go/internal/category/registry.go` | \u2705 COMMITTED (2026-09-08) |
+| CT-A3 | Admin category CRUD handlers + routes | `backend-go/internal/admin/admin_handler.go`, `cmd/server/main.go` | \u2705 COMMITTED (2026-09-08) |
+| CT-A4 | `CreateExpert`/`UpdateExpert` accept optional `category_id` | `backend-go/internal/admin/admin_handler.go` | \u2705 COMMITTED (2026-09-08) |
 
-**Checkpoint CT-A:** admin can create a category with a template schema via
-API, create/retrofit an expert into it, and `GET /admin/expert-categories`
-returns it with the schema intact.
+**Evidence (commits on `main`, 2026-09-08, verified by re-reading each file
+from `main` after push, not just "code written"):**
+
+1. `feat(category): add migration 010` \u2014 `backend-go/migrations/010_expert_categories.up.sql`
+   (169 lines, verified present on `main`) + matching `.down.sql`. Retrofit
+   domain list (dsa, algorithms, coding) cross-checked against the actual
+   DefaultProfiles entries in `backend-go/internal/chinawall/domain_profile.go`
+   (read in full first) rather than guessed.
+2. `feat(category): add CategoryRegistry` \u2014 `backend-go/internal/category/registry.go`
+   (271 lines, verified present on `main`). Lifecycle mirrors
+   `chinawall/domain_registry.go`, which was read in full first and is NOT
+   modified by this change (CT-L1).
+3. `feat(category): add admin CRUD handlers ...` \u2014 `backend-go/internal/admin/admin_handler.go`
+   (1515 lines, verified present on `main`). Added ListExpertCategories,
+   CreateExpertCategory, GetExpertCategory, UpdateExpertCategory,
+   validateTemplateSchema (rejects any section type outside prose/code/
+   test_cases). CreateExpert/UpdateExpert extended with optional
+   category_id, validated against the live CategoryRegistry cache before
+   any DB write (400 on unknown id, per CT-L2 \u2014 NOT required).
+4. `fix(category): wire CategoryRegistry into main.go ...` \u2014
+   `backend-go/cmd/server/main.go`. Necessary because commit 3 changed
+   NewAdminHandler's signature without updating its only call site, which
+   would have left main between commits 3 and 4 non-compiling. Fixed in the
+   very next commit, same session; re-read the full file from `main`
+   afterward to confirm import, registry init, buildRouter signature/call
+   site, NewAdminHandler call site, and the 4 new route registrations are
+   mutually consistent.
+
+**Checkpoint CT-A \u2014 honest status:** admin can create a category with a
+template schema via `POST /admin/expert-categories`, list/get/update it, and
+create/retrofit an expert into it via `category_id`. **This has NOT been
+verified against a live running server or database** \u2014 there is no live DB
+or Go toolchain available in this session to run `go build ./...`, apply
+migration 010, or make a real HTTP request. This mirrors the same honestly-
+stated gap already present in `HANDOFF.md` and `IMPLEMENTATION_HANDOFF.md`
+Phase A \u2014 correctness here was verified by re-reading every changed file in
+full after each commit and manually tracing signatures/call-sites/field
+names against the actual schema and existing patterns, NOT by an actual
+build or migration run.
+
+**Owed before this phase can be called done:**
+- [ ] `cd backend-go && go build ./...` \u2014 confirm the package compiles.
+- [ ] Apply migration 010 up against a live Postgres; confirm no errors;
+      confirm `SELECT * FROM expert_categories WHERE slug='coding'` returns
+      the seeded row with the 5-section template_schema intact.
+- [ ] Confirm retrofit matched the expected rows (0 matches is valid if no
+      dsa/algorithms/coding-domain expert exists yet).
+- [ ] `POST /admin/expert-categories` with a real admin JWT \u2014 confirm 201
+      and that CategoryRegistry.Reload picks it up immediately.
+- [ ] `POST /admin/experts` with an invalid category_id \u2014 confirm 400
+      INVALID_CATEGORY_ID, not a raw DB FK violation.
+
+Owner: Kiran (has DB + running-server access). Runbook commands available on request.
 
 ### Phase CT-B \u2014 Structured generation (backend)
 
