@@ -70,6 +70,14 @@ type adminExpertRow struct {
 	Slug               string          `json:"slug"`
 	Domain             string          `json:"domain"`
 	Description        string          `json:"description"`
+	// ReasoningCharter fix (2026-09-08): previously never SELECTed here,
+	// so the admin "Edit Charter" modal always opened with an empty
+	// textarea even though the charter WAS saved correctly in the DB by
+	// the ingestion pipeline (charter_extractor.go -> IngestTranscript's
+	// Step 7 UPDATE). The gap was purely on the read side: this list
+	// endpoint is the only place AdminExperts.tsx sources expert data
+	// from, and it silently omitted the column.
+	ReasoningCharter   string          `json:"reasoning_charter"`
 	TotalChunks        int             `json:"total_chunks"`
 	TotalTopics        int             `json:"total_topics"`
 	AvgDepth           float64         `json:"avg_depth_level"`
@@ -94,6 +102,7 @@ type adminExpertRow struct {
 func (h *AdminHandler) ListExperts(c *gin.Context) {
 	rows, err := h.db.Query(c.Request.Context(), `
 		SELECT id, name, slug, domain, COALESCE(description,''),
+		       COALESCE(reasoning_charter,''),
 		       total_chunks, total_topics, COALESCE(avg_depth_level,0),
 		       COALESCE(avg_rating,0), total_ratings,
 		       is_active, is_training,
@@ -116,6 +125,7 @@ func (h *AdminHandler) ListExperts(c *gin.Context) {
 		var e adminExpertRow
 		if err := rows.Scan(
 			&e.ID, &e.Name, &e.Slug, &e.Domain, &e.Description,
+			&e.ReasoningCharter,
 			&e.TotalChunks, &e.TotalTopics, &e.AvgDepth,
 			&e.AvgRating, &e.TotalRatings,
 			&e.IsActive, &e.IsTraining,
