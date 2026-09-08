@@ -17,6 +17,7 @@ import (
 	adminpkg "ai_avengers/backend/internal/admin"
 	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/blackboard"
+	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/config"
@@ -108,8 +109,19 @@ func main() {
 	// SetGlobalRegistry enables IsProblemSolvingDomain() used by Gate 1.
 	chinawall.SetGlobalRegistry(domainRegistry)
 
+	// CategoryRegistry: loads expert_categories rows into memory.
+	// Separate from domainRegistry (chinawall package) by design —
+	// CATEGORY_TEMPLATE_HANDOFF.md CT-L1 requires the existing
+	// DomainRegistry/DomainProfile to stay untouched. Must complete
+	// before buildRouter — admin category_id validation (CreateExpert/
+	// UpdateExpert) calls categoryRegistry.Get() per request.
+	categoryRegistry := category.NewRegistry(postgres.Pool, logger)
+	if err := categoryRegistry.Init(ctx); err != nil {
+		logger.Fatal("failed to initialize category registry", zap.Error(err))
+	}
+
 	// Build router — single call, single definition
-	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, domainRegistry)
+	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, domainRegistry, categoryRegistry)
 
 	// Build HTTP server
 	server := &http.Server{
@@ -173,6 +185,7 @@ func buildRouter(
 	modelGateway *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
 	domainRegistry *chinawall.DomainRegistry,
+	categoryRegistry *category.Registry,
 ) *gin.Engine {
 	router := gin.New()
 
@@ -224,7 +237,7 @@ func buildRouter(
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, categoryRegistry, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -378,6 +391,11 @@ func buildRouter(
 		// LLM provider + API key management (no env file needed)
 		adminGroup.GET("/llm-settings", adminHandler.GetLLMSettings)
 		adminGroup.POST("/llm-settings", adminHandler.UpdateLLMSettings)
+		// Expert categories (migration 010, CT-A3) — admin-owned template layer.
+		adminGroup.GET("/expert-categories", adminHandler.ListExpertCategories)
+		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)
+		adminGroup.GET("/expert-categories/:id", adminHandler.GetExpertCategory)
+		adminGroup.PATCH("/expert-categories/:id", adminHandler.UpdateExpertCategory)
 	}
 
 	return router
