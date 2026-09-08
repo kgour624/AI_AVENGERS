@@ -118,9 +118,15 @@ export default function ChatPage() {
     // content might now be below the fold.
   }, [messages.length, stream?.expertResponses.length, stream?.synthesis, pendingUserText])
 
-  async function handleSend(text: string, expertIds: string[], file?: File) {
+  async function handleSend(
+    text: string,
+    expertIds: string[],
+    file?: File,
+    replyToMessageId?: string,
+    includeFullThread?: boolean
+  ) {
     setPendingUserText(text)
-    await sendMessage({ chatId: chat.id, message: text, expertIds, file })
+    await sendMessage({ chatId: chat.id, message: text, expertIds, file, replyToMessageId, includeFullThread })
 
     // WHY re-read stream status via getState() rather than the `stream`
     // closure variable: sendMessage's promise resolves after the SSE
