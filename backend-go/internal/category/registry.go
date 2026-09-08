@@ -36,6 +36,23 @@ type TemplateSection struct {
 	Label    string      `json:"label"`
 	Type     SectionType `json:"type"`
 	Required bool        `json:"required"`
+	// Description (2026-09-08 RCA fix): optional admin-authored guidance
+	// on WHAT CONTENT belongs in this section - distinct from Label
+	// (a display name, e.g. "Pattern") which tells the model nothing
+	// about what to actually write. Root cause of a real production
+	// issue: buildStructuredPrompt (chinawall/template.go) previously
+	// gave the model only key/type/label for each section, with zero
+	// semantic guidance - unlike the flat-text path, which explicitly
+	// instructs "Structure your answer as: Approach -> Code -> Complexity".
+	// Without this, the model produced thin, citation-heavy, low-content
+	// prose sections (a DSA expert answering almost entirely via
+	// citations, near-empty Pattern/Idea/Walkthrough text). Empty string
+	// is valid - buildStructuredPrompt falls back to a built-in
+	// guidance-by-key table for common labels (pattern/idea/walkthrough/
+	// approach/complexity/etc.) when this is unset, so existing
+	// categories created before this field existed are NOT silently
+	// degraded - see buildStructuredPrompt's sectionGuidance().
+	Description string `json:"description,omitempty"`
 }
 
 // TemplateSchema is the full JSONB shape stored on expert_categories.template_schema.
