@@ -7,8 +7,20 @@
 
 export type ResponseMode = 'ASK' | 'WARN' | 'PUSH_BACK' | 'REFUSE' | 'ADVISE'
 
-/** Which of the 5 gates stopped processing. 0 means it reached Gate 5 (generated). */
-export type GateStopped = 0 | 1 | 2 | 3 | 4 | 5
+/**
+ * Which of the 5 gates stopped processing. 0 means it reached Gate 5
+ * (generated).
+ *
+ * -1 (CT-C4, CATEGORY_TEMPLATE_HANDOFF.md §6): a sentinel emitted ONLY
+ * by decision/engine.go's gateStructurePermission — means this
+ * response IS the structure-permission ASK itself ("Chahiye
+ * structure/boilerplate ya sirf logic likh doon?"), not a real Gate 1
+ * clarification ASK. Added here as a real member of the union (not
+ * silently widened to `number`) so every consumer must explicitly
+ * handle it via TypeScript's exhaustiveness checking, matching this
+ * file's existing `getModeBadgeConfig`'s `never`-branch pattern below.
+ */
+export type GateStopped = -1 | 0 | 1 | 2 | 3 | 4 | 5
 
 /**
  * PHASE 4 CORRECTION: verified against the real
@@ -113,6 +125,23 @@ export interface Citation {
   score: number
 }
 
+/**
+ * One section of a categorized expert's structured JSON answer
+ * (CT-B, CATEGORY_TEMPLATE_HANDOFF.md §4). Mirrors
+ * chinawall.TemplateSectionResult exactly — `type` intentionally
+ * reuses the same 3 values as CategoryTemplateSection['type']
+ * (category.ts) since both describe the SAME section, just at
+ * different points in the pipeline (category owns the schema
+ * definition; this is the generated, citation-processed result).
+ */
+export interface TemplateSectionResult {
+  key: string
+  label: string
+  type: 'prose' | 'code' | 'test_cases'
+  content: string
+  citations: Citation[]
+}
+
 export interface ExpertResponse {
   expertId: string
   expertName: string
@@ -127,6 +156,15 @@ export interface ExpertResponse {
   questions?: string[]
   /** Populated if this expert's processing failed but others succeeded */
   error?: string
+  /**
+   * CT-B4: populated ONLY when this expert has a category with a
+   * non-empty template_schema. undefined/omitted for every flat-text
+   * expert response (CT-L2) — consumers must check
+   * `templateSections && templateSections.length > 0` before
+   * rendering structured UI, falling back to plain `content`
+   * otherwise (same pattern the backend uses at every layer).
+   */
+  templateSections?: TemplateSectionResult[]
 }
 
 export interface Contradiction {
