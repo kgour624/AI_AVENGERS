@@ -251,9 +251,9 @@ Owner: Kiran (has DB + running-server access). Runbook commands available on req
 
 | # | Component | File | Status |
 |---|---|---|---|
-| CT-B1 | Structured JSON prompt + parse path in Layer 3 | `backend-go/internal/chinawall/enforcer.go`, `backend-go/internal/chinawall/template.go` | DONE (2026-09-08) | \u23f3 NOT STARTED |
-| CT-B2 | Per-section Layer 4 strip logic | `backend-go/internal/chinawall/enforcer.go` (`enforceStructured`) | DONE (2026-09-08) | \u23f3 NOT STARTED |
-| CT-B3 | Hardcoded test-case bucket constants | `backend-go/internal/chinawall/template.go` (new) | DONE (2026-09-08) | \u23f3 NOT STARTED |
+| CT-B1 | Structured JSON prompt + parse path in Layer 3 | `backend-go/internal/chinawall/enforcer.go`, `backend-go/internal/chinawall/template.go` | DONE (2026-09-08) |
+| CT-B2 | Per-section Layer 4 strip logic | `backend-go/internal/chinawall/enforcer.go` (`enforceStructured`) | DONE (2026-09-08) |
+| CT-B3 | Hardcoded test-case bucket constants | `backend-go/internal/chinawall/template.go` (new) | DONE (2026-09-08) |
 | CT-B4 | `DecisionResult`/`ExpertResponse` carry structured sections through decision engine + orchestrator | `backend-go/internal/decision/engine.go`, `backend-go/internal/orchestrator/orchestrator.go`, `backend-go/internal/message/handler.go`, `backend-go/cmd/server/main.go` | DONE (2026-09-08) |
 
 **Evidence (commits on main, 2026-09-08, verified by re-reading each file
