@@ -72,8 +72,9 @@ type Enforcer struct {
 }
 
 // NewEnforcer creates a new China Wall enforcer.
-func NewEnforcer(cfg config.ChinaWallConfig, gw *gateway.ModelGateway, mlClient *ml.SidecarClient, logger *zap.Logger) *Enforcer {
-	return &Enforcer{cfg: cfg, gateway: gw, ml: mlClient, logger: logger}
+// registry must be initialized (Init called) before passing here.
+func NewEnforcer(cfg config.ChinaWallConfig, gw *gateway.ModelGateway, mlClient *ml.SidecarClient, logger *zap.Logger, registry *DomainRegistry) *Enforcer {
+	return &Enforcer{cfg: cfg, gateway: gw, ml: mlClient, logger: logger, registry: registry}
 }
 
 // Enforce runs all 4 layers for a question + chunks.
@@ -87,9 +88,10 @@ func (e *Enforcer) Enforce(
 	reasoningCharter string,
 	attempt int,
 ) (*EnforceResult, error) {
-	// Determine mode from expert domain (not question text).
-	// WHY: same question to different experts = different behavior.
-	isProblemSolving := isProblemSolvingDomain(expertDomain)
+	// Load domain profile from registry.
+	// O(1) lookup. Falls back to BaseProfile for unknown domains.
+	// WHY registry not hardcoded: domain behavior is DB-driven, no redeploy needed.
+	profile := e.registry.Get(expertDomain)
 
 	// LAYER 1: Reranker threshold
 	threshold := e.cfg.RerankerThreshold
