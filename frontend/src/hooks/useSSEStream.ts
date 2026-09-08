@@ -37,6 +37,15 @@ export interface SendMessageOptions {
   message: string
   expertIds: string[]
   file?: File
+  /**
+   * CT-D4/CT-C1: optional reply target. undefined = fresh question,
+   * the existing behavior for every message sent before this feature.
+   * When set, becomes reply_to_message_id on the backend request
+   * (message/handler.go's SendMessageRequest).
+   */
+  replyToMessageId?: string
+  /** CT-L6: explicit opt-in only, ignored if replyToMessageId is unset. */
+  includeFullThread?: boolean
 }
 
 type SSEEvent =
@@ -76,7 +85,7 @@ export function useSSEStream() {
   const { startStream, setError } = useStreamStore()
 
   const sendMessage = async (options: SendMessageOptions) => {
-    const { chatId, message, expertIds, file } = options
+    const { chatId, message, expertIds, file, replyToMessageId, includeFullThread } = options
 
     startStream(chatId)
 
@@ -88,13 +97,23 @@ export function useSSEStream() {
       formData.append('message', message)
       formData.append('expert_ids', JSON.stringify(expertIds))
       formData.append('file', file)
+      // CT-D4/CT-C1: multipart branch also needs reply fields threaded
+      // through — message/handler.go's Send() reads these from
+      // c.PostForm just like message/expert_ids on this same branch.
+      if (replyToMessageId) formData.append('reply_to_message_id', replyToMessageId)
+      if (includeFullThread) formData.append('include_full_thread', 'true')
       body = formData
       // WHY no Content-Type set for FormData: the browser sets the
       // multipart boundary itself. Setting it manually (as plain
       // 'multipart/form-data' with no boundary) breaks server-side
       // parsing - a mistake easy to make when copying the JSON branch.
     } else {
-      body = JSON.stringify({ message, expert_ids: expertIds })
+      body = JSON.stringify({
+        message,
+        expert_ids: expertIds,
+        ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
+        ...(includeFullThread ? { include_full_thread: true } : {}),
+      })
       headers['Content-Type'] = 'application/json'
     }
 
