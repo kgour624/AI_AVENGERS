@@ -627,9 +627,33 @@ func (p *IngestionPipeline) storeCapabilities(ctx context.Context, expertID uuid
 	}
 
 	for _, cap := range capabilities {
-		canHandleJSON, _ := json.Marshal(cap.CanHandle)
-		cannotHandleJSON, _ := json.Marshal(cap.CannotHandle)
-		exampleQJSON, _ := json.Marshal(cap.ExampleQuestions)
+		// BUG FIX (2026-09-08): can_handle / cannot_handle / example_questions
+		// are TEXT[] columns (Postgres native array), NOT JSONB — verified
+		// against migrations/001_initial_schema.up.sql's expert_capabilities
+		// table definition. The previous code called json.Marshal() on each
+		// []string and sent the resulting JSON string (e.g. `["a","b"]`) as
+		// the value for a TEXT[] column. Postgres rejected this with
+		// SQLSTATE 22P02 "malformed array literal" because a JSON string is
+		// not valid Postgres array literal syntax (`{"a","b"}` would be).
+		// Fix: pass the []string slices directly. pgx/v5 (used throughout
+		// this codebase via pgxpool.Pool) natively encodes Go []string as
+		// a Postgres text[] parameter — no json.Marshal, no manual array
+		// literal construction needed. Nil-safety: default nil slices to
+		// an empty slice (not NULL) so admin UI / GetTopics callers always
+		// get a real (possibly empty) array back, never have to special-
+		// case NULL vs [].
+		canHandle := cap.CanHandle
+		if canHandle == nil {
+			canHandle = []string{}
+		}
+		cannotHandle := cap.CannotHandle
+		if cannotHandle == nil {
+			cannotHandle = []string{}
+		}
+		exampleQuestions := cap.ExampleQuestions
+		if exampleQuestions == nil {
+			exampleQuestions = []string{}
+		}
 
 		_, err := p.db.Exec(ctx,
 			`INSERT INTO expert_capabilities
@@ -645,7 +669,7 @@ func (p *IngestionPipeline) storeCapabilities(ctx context.Context, expertID uuid
 				example_questions = EXCLUDED.example_questions,
 				updated_at = NOW()`,
 			expertID, cap.Topic, cap.DepthLevel, cap.ChunkCount, cap.ComplexityCeiling,
-			string(canHandleJSON), string(cannotHandleJSON), string(exampleQJSON),
+			canHandle, cannotHandle, exampleQuestions,
 		)
 		if err != nil {
 			p.logger.Warn("failed to store capability",
@@ -728,14 +752,31 @@ func (p *IngestionPipeline) updateJobStatus(
 		completedAt = time.Now()
 	}
 
+	// BUG FIX (2026-09-08): PostgreSQL rejected this query with
+	// SQLSTATE 42P08 "inconsistent types deduced for parameter $1".
+	// Root cause: $1 was used twice — once as a bare positional param
+	// in `status = $1` (implicit type from the status column) and once
+	// explicitly cast as `$1::text` inside the CASE WHEN. The planner
+	// could not reconcile the implicit type from the first usage with
+	// the explicit cast in the second usage, so it rejected the whole
+	// query. Because this UPDATE never ran, the job row was permanently
+	// stuck at whatever status/stage it had before this call (e.g.
+	// "pending" / "57% embedding"), even though the pipeline had
+	// actually finished successfully and training_status was already
+	// 'trained' on the experts row — the frontend's ingestion modal
+	// reads job status from ingestion_jobs, not from experts, so it kept
+	// showing stale progress forever.
+	// Fix: cast $1 the SAME way (::varchar, matching status's actual
+	// column type per migrations/001_initial_schema.up.sql) in BOTH
+	// usages, so the planner sees one consistent type throughout.
 	_, err := p.db.Exec(ctx,
 		`UPDATE ingestion_jobs SET
-			status = $1,
+			status = $1::varchar,
 			error_message = NULLIF($2, ''),
 			processed_chunks = $3,
 			total_chunks = $4,
 			completed_at = $5,
-			started_at = CASE WHEN $1::text = 'running' THEN NOW() ELSE started_at END
+			started_at = CASE WHEN $1::varchar = 'running' THEN NOW() ELSE started_at END
 		 WHERE id = $6`,
 		status, errorMsg, processed, total, completedAt, jobID,
 	)
