@@ -147,6 +147,13 @@ export const getIngestionJobs = (expertId: string) =>
     .get<ApiResponse<IngestionJob[]>>(`/api/v1/admin/experts/${expertId}/jobs`)
     .then((res) => res.data.data!)
 
+export const resumeIngestionJob = (expertId: string, jobId: string) =>
+  baseAPI
+    .post<ApiResponse<{ jobId: string; status: string; checkpointStage: string; message: string }>>(
+      `/api/v1/admin/experts/${expertId}/jobs/${jobId}/resume`
+    )
+    .then((res) => res.data.data!)
+
 // Feature #7 fix (docs bug list): projectCount/messageCount added -
 // previously ListClients returned neither, so there was no data for
 // the frontend to show beyond the enable/disable toggle. Both are now
