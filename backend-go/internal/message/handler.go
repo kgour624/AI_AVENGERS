@@ -309,22 +309,17 @@ func (h *Handler) saveAssistantMessage(
 		return // Don't save failed responses
 	}
 
-	// KNOWN GAP (CT-B4, documented not silently worked around, same
-	// convention as HANDOFF.md's "Known follow-up gaps" section): the
-	// messages table has no column for resp.TemplateSections. A
-	// categorized expert's structured sections are streamed correctly
-	// over SSE (see sendSSE(w, SSEComplete, ...) above, which DOES
-	// include "template_sections") but are NOT persisted here — only
-	// resp.Content (empty for a structured response, since Content is
-	// only populated by the flat-text EnforceResult.Answer path) is
-	// saved. This means a page reload will show a categorized expert's
-	// past structured answer as blank/empty content, while a fresh
-	// SSE stream renders it correctly. Fixing this requires either a
-	// new messages.template_sections JSONB column (its own migration)
-	// or serializing sections into resp.Content as a fallback — neither
-	// is done here; this is explicitly out of CT-B's scope (CT-B's
-	// checkpoint per CATEGORY_TEMPLATE_HANDOFF.md §8 only requires the
-	// raw API response to contain template_sections, which it now does).
+	// FIXED 2026-09-08 (RCA round 7, migration 011): this WAS a documented
+	// KNOWN GAP - the messages table had no column for resp.TemplateSections,
+	// so a categorized expert's structured sections streamed correctly over
+	// SSE (see sendSSE(w, SSEComplete, ...) above, which DOES include
+	// "template_sections") but were never persisted. Content alone is empty
+	// for a structured response (the structured generation path only
+	// populates TemplateSections, never Answer/Content), so a page reload
+	// rendered the answer as completely blank - while the first, live SSE
+	// render looked correct. messages.template_sections (migration 011)
+	// now stores exactly what was streamed, so ListMessages/reload renders
+	// identically to the live stream.
 	expertID := resp.ExpertID
 	_, err := h.chatSvc.SaveMessage(ctx, chat.Message{
 		ChatID:              chatID,
@@ -352,6 +347,12 @@ func (h *Handler) saveAssistantMessage(
 		// (decision/engine.go's gateStructurePermission). nil for every
 		// other response — identical to before this feature existed.
 		ReplyToMessageID:    resp.ReplyToUserMessageID,
+		// nil for every flat-text response (CT-L2) - resp.TemplateSections
+		// is only non-nil for a categorized expert's structured answer.
+		// pgx encodes a nil []chinawall.TemplateSectionResult as SQL NULL
+		// for the JSONB column (interface{} field, same pattern already
+		// used for Citations above), never an empty-but-present JSON value.
+		TemplateSections:    resp.TemplateSections,
 	})
 	if err != nil {
 		h.logger.Warn("save assistant message failed",
