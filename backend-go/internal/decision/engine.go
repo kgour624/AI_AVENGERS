@@ -272,7 +272,9 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 	return nil
 }
 
-// gate1 checks if we have enough information to answer.
+// gate1WithLLM is the enhanced version using LLM for vagueness detection.
+// Called when keyword check is inconclusive.
+// Uses zero-shot structured output (Byte by Byte AI course pattern).
 func (e *Engine) gate1WithLLM(ctx context.Context, question string, expert Expert) *DecisionResult {
 	prompt := fmt.Sprintf(`Is this question specific enough to answer accurately?
 
@@ -450,6 +452,136 @@ Is this premature for this project? Reply with only YES or NO.`,
 // parseJSONDecision is a helper to unmarshal JSON for decision engine.
 func parseJSONDecision(data []byte, v interface{}) error {
 	return json.Unmarshal(data, v)
+}
+
+// gateStructurePermission implements CT-C4 / CATEGORY_TEMPLATE_HANDOFF.md §6.
+// Returns (result, rewrittenQuestion):
+//   - (nil, "") when this gate does not apply — the overwhelmingly common
+//     case (expert.AskStructurePermission is false). Caller (Process)
+//     continues with the original question exactly as before this
+//     feature existed.
+//   - (askResult, "") when a FRESH (non-reply) question arrives for an
+//     expert whose category has ask_structure_permission=true — emits
+//     an ASK-mode message asking the client's structure/boilerplate
+//     preference, and Process returns immediately without reaching
+//     Gate 1-5. Reuses the existing reply mechanism (CT-L9): the
+//     client's answer will arrive as a normal message with
+//     reply_to_message_id pointing at this ASK message's id, which is
+//     how the second branch below recognizes it.
+//   - (nil, rewrittenQuestion) when the incoming message IS a reply to
+//     a structure-permission ASK this function itself previously
+//     emitted — walks one level up via replyToMessageID to recover the
+//     ORIGINAL question (not the client's short preference answer),
+//     appends the client's stated preference to it, and returns the
+//     combined text for Process to use for Gate 1 onward. This is how
+//     "reuses the reply mechanism entirely, no separate flow" (CT-L9)
+//     is satisfied: no new message type, no new DB column beyond the
+//     one reply_to_message_id migration 010 already added.
+//
+// Mental execution (happy path, full round trip):
+// 1. Client asks categorized-with-ask_structure_permission expert:
+//    "reverse a linked list" (replyToMessageID=nil, fresh question)
+//    -> isReplyToOwnAsk=false (no replyToMessageID to check)
+//    -> emits ASK message "Chahiye structure/boilerplate ya sirf logic
+//       likh doon?", Process returns immediately, GateStopped=0 (CT-C4
+//       uses its own sentinel, not colliding with Gate 1's ASK — see
+//       gateStopped: -1 below).
+// 2. Client replies to THAT ASK message with "sirf logic"
+//    (replyToMessageID = the ASK message's id)
+//    -> isReplyToOwnAsk=true (parent row's decision_mode='ASK' AND
+//       parent.expert_id == this expert AND parent has no
+//       reply_to_message_id of its own, i.e. it's a root-level ASK,
+//       not itself a reply — distinguishing a structure-permission ASK
+//       from an unrelated ASK, e.g. Gate 1's clarification ASK, which
+//       also sets decision_mode='ASK'. Gate 1 ASKs are also technically
+//       valid parents for a generic reply, so this check alone is a
+//       heuristic, not a perfect discriminator — documented as a known
+//       limitation, not silently assumed correct)
+//    -> walks up ONE more level (parent.reply_to_message_id) to find
+//       the ORIGINAL question ("reverse a linked list")
+//    -> returns rewrittenQuestion = "reverse a linked list\n\n(Client's
+//       stated preference: sirf logic)"
+//    -> Process continues Gate 1 onward with this rewritten question.
+//
+// Edge case: client replies to the ASK but the original question's
+// parent lookup fails (deleted, or ASK was somehow a root message with
+// no reply_to_message_id of its own — should not normally happen since
+// this gate always sets it, but defensive nonetheless) -> falls back to
+// using the client's raw reply text as the question, logs a warning,
+// does not crash or return an error to the client.
+func (e *Engine) gateStructurePermission(
+	ctx context.Context,
+	question string,
+	expert Expert,
+	replyToMessageID *uuid.UUID,
+) (*DecisionResult, string) {
+	if !expert.AskStructurePermission {
+		return nil, ""
+	}
+
+	if replyToMessageID == nil {
+		// Fresh question to a structure-permission category — ask first.
+		// GateStopped=-1 (not 0/1/2/3/4/5): distinguishes this from every
+		// existing gate stop reason so a frontend/log consumer can tell
+		// "this is the structure-permission prompt" apart from a genuine
+		// Gate 1 clarification ASK, without needing a new Mode value.
+		return &DecisionResult{
+			Mode:        ModeASK,
+			Questions:   []string{"Chahiye structure/boilerplate ya sirf logic likh doon?"},
+			GateStopped: -1,
+			Content:     "Before I answer, let me know your preference.",
+		}, ""
+	}
+
+	// This message IS a reply. Check whether it's specifically a reply
+	// to THIS gate's own ASK (not some other reply chain).
+	var parentMode, parentContent string
+	var parentExpertID *uuid.UUID
+	var parentReplyTo *uuid.UUID
+	err := e.db.QueryRow(ctx,
+		`SELECT COALESCE(decision_mode,''), content, expert_id, reply_to_message_id
+		 FROM messages WHERE id=$1`,
+		*replyToMessageID,
+	).Scan(&parentMode, &parentContent, &parentExpertID, &parentReplyTo)
+	if err != nil {
+		e.logger.Warn("gateStructurePermission: parent message lookup failed, treating as fresh question",
+			zap.Error(err),
+		)
+		return nil, ""
+	}
+
+	isOwnStructureAsk := parentMode == string(ModeASK) &&
+		parentExpertID != nil && *parentExpertID == expert.ID &&
+		parentContent == "Before I answer, let me know your preference."
+	if !isOwnStructureAsk {
+		// Reply to something else (e.g. a normal answer, or a Gate 1
+		// clarification ASK) — not this gate's concern.
+		return nil, ""
+	}
+
+	if parentReplyTo == nil {
+		// Defensive: the ASK should always have been a reply to the
+		// original question (see the fresh-question branch above, which
+		// does NOT currently set reply_to_message_id on the ASK itself —
+		// see known gap noted in CATEGORY_TEMPLATE_HANDOFF.md). Fall back
+		// to the client's raw preference text rather than erroring.
+		e.logger.Warn("gateStructurePermission: ASK message has no parent question, using reply text as question")
+		return nil, question
+	}
+
+	var originalQuestion string
+	err = e.db.QueryRow(ctx,
+		`SELECT content FROM messages WHERE id=$1`,
+		*parentReplyTo,
+	).Scan(&originalQuestion)
+	if err != nil || originalQuestion == "" {
+		e.logger.Warn("gateStructurePermission: original question lookup failed, using reply text as question",
+			zap.Error(err),
+		)
+		return nil, question
+	}
+
+	return nil, fmt.Sprintf("%s\n\n(Client's stated preference: %s)", originalQuestion, question)
 }
 
 // neverRulePattern compiled once at package level for performance.
