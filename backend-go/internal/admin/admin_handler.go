@@ -722,6 +722,206 @@ func (h *AdminHandler) UpdateExpertCategory(c *gin.Context) {
 	response.OK(c, map[string]string{"status": "updated"})
 }
 
+// ============================================================
+// DOMAIN PROFILES (China Wall per-domain config, admin-configurable)
+// ============================================================
+//
+// WHY this exists (2026-09-08): MaxTokensFlat/MaxTokensStructured were
+// added to chinawall.DomainProfile so a truncated-JSON incident for one
+// domain (see HANDOFF.md's 2026-09-08 round-3 RCA) could be tuned without
+// a backend redeploy. Scoped to the WHOLE DomainProfile (not just the two
+// token fields) per admin decision: every field on this struct is already
+// admin-panel-editable in spirit (DomainRegistry.Upsert exists precisely
+// for admin overrides) but had no HTTP surface yet — this closes that gap
+// once, generically, instead of bolting on a narrow max-tokens-only route
+// now and a second broader route later.
+
+// domainProfileRow is the wire shape for a chinawall.DomainProfile.
+// Mirrors the struct field-for-field (domain_profile.go) rather than
+// reusing chinawall.DomainProfile directly as the JSON contract — same
+// separation-of-concerns rationale as categoryRow/adminExpertRow above:
+// the admin HTTP contract is explicit and stable even if the internal
+// struct's Go-side shape changes.
+type domainProfileRow struct {
+	Domain              string                    `json:"domain"`
+	Gate1Skip           bool                      `json:"gate1_skip"`
+	CoverageMode        chinawall.CoverageMode    `json:"coverage_mode"`
+	CitationMode        chinawall.CitationMode    `json:"citation_mode"`
+	StripMode           chinawall.StripMode       `json:"strip_mode"`
+	SystemPromptExt     string                    `json:"system_prompt_ext"`
+	DomainKeywords      []string                  `json:"domain_keywords"`
+	CustomRules         []chinawall.DomainRule    `json:"custom_rules"`
+	MaxTokensFlat       int                       `json:"max_tokens_flat"`
+	MaxTokensStructured int                       `json:"max_tokens_structured"`
+}
+
+func toDomainProfileRow(p *chinawall.DomainProfile) domainProfileRow {
+	row := domainProfileRow{
+		Domain:              p.Domain,
+		Gate1Skip:           p.Gate1Skip,
+		CoverageMode:        p.CoverageMode,
+		CitationMode:        p.CitationMode,
+		StripMode:           p.StripMode,
+		SystemPromptExt:     p.SystemPromptExt,
+		DomainKeywords:      p.DomainKeywords,
+		CustomRules:         p.CustomRules,
+		MaxTokensFlat:       p.MaxTokensFlat,
+		MaxTokensStructured: p.MaxTokensStructured,
+	}
+	if row.DomainKeywords == nil {
+		row.DomainKeywords = []string{}
+	}
+	if row.CustomRules == nil {
+		row.CustomRules = []chinawall.DomainRule{}
+	}
+	return row
+}
+
+// validCoverageModes / validCitationModes / validStripModes mirror the
+// CoverageMode/CitationMode/StripMode enums in domain_profile.go.
+// Validated here (400 on bad input) rather than left to fail silently
+// downstream — an invalid mode would not error anywhere else, it would
+// just make the China Wall behave unpredictably for that domain.
+var validCoverageModes = map[string]bool{
+	string(chinawall.CoverageModeApplyPrinciples): true,
+	string(chinawall.CoverageModeLiteralMatch):    true,
+}
+var validCitationModes = map[string]bool{
+	string(chinawall.CitationModeLoose):  true,
+	string(chinawall.CitationModeStrict): true,
+}
+var validStripModes = map[string]bool{
+	string(chinawall.StripModeCodeExempt): true,
+	string(chinawall.StripModeFull):       true,
+}
+
+// ListDomainProfiles GET /admin/domain-profiles
+// Returns every domain profile currently cached in the registry
+// (DB-backed, DomainRegistry.List — not BaseProfile, which is the
+// unknown-domain fallback, not a stored/editable row).
+func (h *AdminHandler) ListDomainProfiles(c *gin.Context) {
+	profiles := h.domainReg.List()
+	rows := make([]domainProfileRow, 0, len(profiles))
+	for _, p := range profiles {
+		rows = append(rows, toDomainProfileRow(p))
+	}
+	response.OK(c, rows)
+}
+
+// GetDomainProfile GET /admin/domain-profiles/:domain
+func (h *AdminHandler) GetDomainProfile(c *gin.Context) {
+	domain := c.Param("domain")
+	profile := h.domainReg.GetExact(domain)
+	if profile == nil {
+		response.NotFound(c, "domain profile")
+		return
+	}
+	response.OK(c, toDomainProfileRow(profile))
+}
+
+// UpdateDomainProfile PATCH /admin/domain-profiles/:domain
+// All fields optional — only provided fields are changed. Starts from
+// the domain's EXISTING profile if one is cached (GetExact), or from
+// chinawall.BaseProfile's defaults if this domain has no stored profile
+// yet (first-time creation via PATCH, upsert semantics — matches
+// DomainRegistry.Upsert's own doc comment: "Admin panel when updating
+// domain config"). :domain in the URL always wins over any "domain"
+// field in the body, so the path is the single source of truth for
+// which row is being written — the body cannot be used to silently
+// retarget a different domain's row.
+func (h *AdminHandler) UpdateDomainProfile(c *gin.Context) {
+	domain := c.Param("domain")
+	if domain == "" {
+		response.BadRequest(c, "INVALID_DOMAIN", "domain is required")
+		return
+	}
+
+	var req struct {
+		Gate1Skip           *bool     `json:"gate1_skip"`
+		CoverageMode        *string   `json:"coverage_mode"`
+		CitationMode        *string   `json:"citation_mode"`
+		StripMode           *string   `json:"strip_mode"`
+		SystemPromptExt     *string   `json:"system_prompt_ext"`
+		DomainKeywords      *[]string `json:"domain_keywords"`
+		MaxTokensFlat       *int      `json:"max_tokens_flat"`
+		MaxTokensStructured *int      `json:"max_tokens_structured"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+
+	if req.CoverageMode != nil && !validCoverageModes[*req.CoverageMode] {
+		response.BadRequest(c, "INVALID_COVERAGE_MODE", "coverage_mode must be APPLY_PRINCIPLES or LITERAL_MATCH")
+		return
+	}
+	if req.CitationMode != nil && !validCitationModes[*req.CitationMode] {
+		response.BadRequest(c, "INVALID_CITATION_MODE", "citation_mode must be LOOSE or STRICT")
+		return
+	}
+	if req.StripMode != nil && !validStripModes[*req.StripMode] {
+		response.BadRequest(c, "INVALID_STRIP_MODE", "strip_mode must be CODE_EXEMPT or FULL_STRIP")
+		return
+	}
+	// 0 is the documented "use default" sentinel (DefaultMaxTokensFlat/
+	// DefaultMaxTokensStructured) — negative values are never valid.
+	if req.MaxTokensFlat != nil && *req.MaxTokensFlat < 0 {
+		response.BadRequest(c, "INVALID_MAX_TOKENS_FLAT", "max_tokens_flat must be >= 0 (0 = use default)")
+		return
+	}
+	if req.MaxTokensStructured != nil && *req.MaxTokensStructured < 0 {
+		response.BadRequest(c, "INVALID_MAX_TOKENS_STRUCTURED", "max_tokens_structured must be >= 0 (0 = use default)")
+		return
+	}
+
+	// Start from the existing stored profile, or BaseProfile's defaults
+	// if this domain has never been saved before. Copy the struct value
+	// (not the pointer) so mutating fields below never corrupts the
+	// registry's live cache before Upsert — Upsert is what commits the
+	// change, not this local copy.
+	existing := h.domainReg.GetExact(domain)
+	var profile chinawall.DomainProfile
+	if existing != nil {
+		profile = *existing
+	} else {
+		profile = *chinawall.BaseProfile
+	}
+	profile.Domain = domain
+
+	if req.Gate1Skip != nil {
+		profile.Gate1Skip = *req.Gate1Skip
+	}
+	if req.CoverageMode != nil {
+		profile.CoverageMode = chinawall.CoverageMode(*req.CoverageMode)
+	}
+	if req.CitationMode != nil {
+		profile.CitationMode = chinawall.CitationMode(*req.CitationMode)
+	}
+	if req.StripMode != nil {
+		profile.StripMode = chinawall.StripMode(*req.StripMode)
+	}
+	if req.SystemPromptExt != nil {
+		profile.SystemPromptExt = *req.SystemPromptExt
+	}
+	if req.DomainKeywords != nil {
+		profile.DomainKeywords = *req.DomainKeywords
+	}
+	if req.MaxTokensFlat != nil {
+		profile.MaxTokensFlat = *req.MaxTokensFlat
+	}
+	if req.MaxTokensStructured != nil {
+		profile.MaxTokensStructured = *req.MaxTokensStructured
+	}
+
+	if err := h.domainReg.Upsert(c.Request.Context(), &profile); err != nil {
+		h.logger.Error("update domain profile failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	response.OK(c, toDomainProfileRow(&profile))
+}
+
 // IngestTranscript POST /admin/experts/:id/ingest
 // Accepts multipart form with "transcript" file.
 // Starts background ingestion job.
