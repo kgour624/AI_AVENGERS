@@ -141,8 +141,8 @@ function AdminExperts() {
             <ExpertRow
               expertId={expert.id}
               expertName={expert.name}
-              onViewProgress={(job, name) => {
-                setPipelineJob(job)
+              onViewProgress={(id, name) => {
+                setPipelineExpertId(id)
                 setPipelineExpertName(name)
               }}
             />
