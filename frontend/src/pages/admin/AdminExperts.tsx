@@ -65,7 +65,7 @@ function ExpertRow({
             ({latestJob.processedChunks}/{latestJob.totalChunks})
           </span>
         )}
-        {latestJob.costUsd && latestJob.costUsd > 0 && (
+        {(latestJob.costUsd ?? 0) > 0 && (
           <span className="ml-2 text-glow-amber/70">${latestJob.costUsd.toFixed(3)}</span>
         )}
       </p>
