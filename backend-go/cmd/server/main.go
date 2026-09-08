@@ -99,8 +99,17 @@ func main() {
 		gin.SetMode(gin.ReleaseMode)
 	}
 
+	// DomainRegistry: seed defaults, load all profiles into memory.
+	// Must complete before buildRouter — Enforce() calls registry.Get() per question.
+	domainRegistry := chinawall.NewDomainRegistry(postgres.Pool, logger)
+	if err := domainRegistry.Init(ctx); err != nil {
+		logger.Fatal("failed to initialize domain registry", zap.Error(err))
+	}
+	// SetGlobalRegistry enables IsProblemSolvingDomain() used by Gate 1.
+	chinawall.SetGlobalRegistry(domainRegistry)
+
 	// Build router — single call, single definition
-	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient)
+	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, domainRegistry)
 
 	// Build HTTP server
 	server := &http.Server{
