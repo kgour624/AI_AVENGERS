@@ -108,7 +108,7 @@ func (e *Enforcer) Enforce(
 	}
 
 	// LAYER 2: Coverage check
-	coverage, err := e.checkCoverage(ctx, question, chunks)
+	coverage, err := e.checkCoverage(ctx, question, chunks, isProblemSolving)
 	if err != nil {
 		e.logger.Warn("Layer 2 check failed, assuming PARTIAL", zap.Error(err))
 		coverage = "PARTIAL"
