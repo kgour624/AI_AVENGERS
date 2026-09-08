@@ -45,7 +45,7 @@ export function RatingWidget({ messageId }: { messageId: string }) {
             selectedScore !== null && score <= selectedScore ? 'opacity-100' : 'opacity-40 hover:opacity-70'
           )}
         >
-          \u2b50
+          {'\u2b50'}
         </button>
       ))}
       {selectedScore !== null && <span className="ml-1 text-xs text-text-secondary">Thanks!</span>}
