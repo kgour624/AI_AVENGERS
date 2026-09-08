@@ -456,11 +456,14 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 // stripUncited removes sentences without citations, while preserving
 // markdown/code structure.
 //
-// isProblemSolving: when true, entire fenced code blocks are kept
-// unconditionally. Code is the APPLICATION of cited principles —
-// it doesn't need per-line citations. The explanation before/after
-// the code block cites which principles are being applied.
-func (e *Enforcer) stripUncited(answer string, isProblemSolving bool) (string, int) {
+// StripModeCodeExempt: fenced code blocks kept unconditionally.
+//   Code is the APPLICATION of cited principles — no per-line citations needed.
+//   Explanation before/after the code block cites which principles are applied.
+//   Explanation lines also kept — citations appear at start, not per-sentence.
+//
+// StripModeFull: every sentence without citation is stripped.
+//   Correct for medical/legal/finance — strict grounding required.
+func (e *Enforcer) stripUncited(answer string, mode StripMode) (string, int) {
 	citationPattern := regexp.MustCompile(`\[CHUNK_[a-f0-9-]+\]`)
 	sentences := splitSentences(answer)
 
@@ -478,8 +481,8 @@ func (e *Enforcer) stripUncited(answer string, isProblemSolving bool) (string, i
 			continue
 		}
 
-		// Inside a code block: always keep (problem-solving mode)
-		// or keep if protected (factual mode — protectCode already handled it)
+		// Inside a code block: always keep regardless of mode.
+		// WHY: code content is never sentence-split or citation-checked.
 		if inCodeBlock {
 			clean = append(clean, sentence)
 			continue
@@ -497,12 +500,12 @@ func (e *Enforcer) stripUncited(answer string, isProblemSolving bool) (string, i
 
 		if hasCitation || isShort || isStructural {
 			clean = append(clean, sentence)
-		} else if isProblemSolving {
-			// In problem-solving mode, keep explanation lines even without
-			// inline citations — the approach explanation is part of the answer.
-			// Citations appear at the start of the explanation, not per-sentence.
+		} else if mode == StripModeCodeExempt {
+			// CODE_EXEMPT mode: keep explanation lines even without inline citations.
+			// Citations appear at the start of the explanation block, not per-sentence.
 			clean = append(clean, sentence)
 		} else {
+			// FULL_STRIP mode: strip uncited sentences.
 			stripped++
 		}
 	}
