@@ -70,9 +70,13 @@ func (e *Enforcer) Enforce(
 	question string,
 	chunks []CourseChunk,
 	expertName string,
+	expertDomain string,
 	reasoningCharter string,
 	attempt int,
 ) (*EnforceResult, error) {
+	// Determine mode from expert domain (not question text).
+	// WHY: same question to different experts = different behavior.
+	isProblemSolving := isProblemSolvingDomain(expertDomain)
 
 	// LAYER 1: Reranker threshold
 	threshold := e.cfg.RerankerThreshold
