@@ -41,6 +41,10 @@ type Expert struct {
 	// flat-text path unchanged in that case.
 	TemplateSections []category.TemplateSection
 	DefaultLanguage  string
+	// AskStructurePermission (CT-C4): true only when this expert's
+	// category has ask_structure_permission=true. false for every
+	// non-categorized expert or category without the flag (CT-L2).
+	AskStructurePermission bool
 }
 
 // DecisionResult is the output of the 5-gate system.
@@ -87,6 +91,14 @@ func NewEngine(db *pgxpool.Pool, gw *gateway.ModelGateway, cw *chinawall.Enforce
 
 // Process runs the question through all 5 gates.
 // Returns a DecisionResult with mode and content.
+//
+// replyToMessageID (CT-C4): nil for a fresh question (the vast majority
+// of calls, and always nil on Gate 5's internal retry recursion below —
+// see that call site). Non-nil only on the top-level call for an actual
+// reply. Only relevant when expert.AskStructurePermission is true;
+// otherwise gateStructurePermission is a no-op and this parameter has
+// zero effect on behavior (CT-L2-style fallback, applied to categories
+// instead of experts).
 func (e *Engine) Process(
 	ctx context.Context,
 	question string,
@@ -94,6 +106,7 @@ func (e *Engine) Process(
 	chunks []chinawall.CourseChunk,
 	projectSummary string,
 	attempt int,
+	replyToMessageID *uuid.UUID,
 ) (*DecisionResult, error) {
 
 	e.logger.Debug("decision engine processing",
@@ -101,6 +114,15 @@ func (e *Engine) Process(
 		zap.Int("attempt", attempt),
 		zap.Int("chunks", len(chunks)),
 	)
+
+	// GATE 0: Structure-permission gate (CT-C4, CATEGORY_TEMPLATE_HANDOFF.md §6).
+	// No-op (returns nil, "") when expert.AskStructurePermission is false —
+	// every existing expert's behavior is completely unaffected.
+	if gateResult, rewrittenQuestion := e.gateStructurePermission(ctx, question, expert, replyToMessageID); gateResult != nil {
+		return gateResult, nil
+	} else if rewrittenQuestion != "" {
+		question = rewrittenQuestion
+	}
 
 	// GATE 1: Information Sufficiency
 	if result := e.gate1(question, expert); result != nil {
@@ -153,7 +175,13 @@ func (e *Engine) Process(
 	switch enforceResult.Status {
 	case "retry":
 		if attempt < 5 {
-			return e.Process(ctx, question, expert, chunks, projectSummary, attempt+1)
+			// replyToMessageID=nil on retry: Gate 0 already resolved (if
+			// applicable) on the top-level call and rewrote `question` in
+			// place — re-passing a non-nil replyToMessageID here would
+			// re-run gateStructurePermission's DB lookup against the
+			// ALREADY-rewritten question and incorrectly re-append the
+			// preference text a second time.
+			return e.Process(ctx, question, expert, chunks, projectSummary, attempt+1, nil)
 		}
 		return &DecisionResult{
 			Mode:        ModeREFUSE,
@@ -244,9 +272,7 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 	return nil
 }
 
-// gate1WithLLM is the enhanced version using LLM for vagueness detection.
-// Called when keyword check is inconclusive.
-// Uses zero-shot structured output (Byte by Byte AI course pattern).
+// gate1 checks if we have enough information to answer.
 func (e *Engine) gate1WithLLM(ctx context.Context, question string, expert Expert) *DecisionResult {
 	prompt := fmt.Sprintf(`Is this question specific enough to answer accurately?
 
