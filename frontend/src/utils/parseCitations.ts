@@ -35,8 +35,22 @@ export type ContentSegment =
 
 const CITATION_TOKEN_RE = /\[CHUNK_([a-f0-9-]+)\]/g
 
-export function splitContentByCitations(content: string, citations: Citation[]): ContentSegment[] {
-  const citationMap = new Map(citations.map((c) => [c.chunkId, c]))
+export function splitContentByCitations(content: string, citations: Citation[] | null | undefined): ContentSegment[] {
+  // 2026-09-08 RCA: defensive null-guard. Go's zero-value for an
+  // uninitialized []Citation marshals as JSON `null`, not `[]` - a
+  // categorized expert's "code"-type template section (which by
+  // design never contains [CHUNK_xxx] tokens, see chinawall's
+  // stripUncited CODE_EXEMPT handling) could send citations=null,
+  // crashing this function's `.map()` call and taking down the whole
+  // ExpertResponse component (confirmed production crash). Backend
+  // fixed at the source (extractCitations now always returns a
+  // non-nil slice), but this guard stays as defense-in-depth: rows
+  // already persisted before that backend fix deployed still have
+  // `null` sitting in their citations/template_sections JSONB columns
+  // today, and any future backend regression of the same shape should
+  // degrade gracefully here instead of crashing the UI.
+  const safeCitations = citations ?? []
+  const citationMap = new Map(safeCitations.map((c) => [c.chunkId, c]))
   const segments: ContentSegment[] = []
 
   let lastIndex = 0
