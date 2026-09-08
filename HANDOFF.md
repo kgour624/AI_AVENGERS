@@ -1257,3 +1257,37 @@ All three fixes were verified by re-reading the committed files from `main` afte
 Both fixes were verified by re-reading the committed files from `main` after each push (SQL aggregate query reads the correct table/columns per `001_initial_schema.up.sql`, `useEffect` dependency array is correct, `key` prop wiring is present alongside the existing `currentCharter` prop). **No live `go build`, no live DB with a real multi-file append-mode ingestion, no `npm run dev`/browser click-through was performed** - same toolchain limitation as every other entry in this file. Owner (Kiran) is verifying locally.
 
 *Last updated: 2026-09-08 (bug fix batch, round 2)*
+
+---
+
+## BUG FIX BATCH - 2026-09-08 (round 3) - DSA expert response garbled/near-empty despite correct mode/confidence/citations
+
+> Reported directly by admin (Kiran) with a screenshot: SCALER - DSA expert's answers showed correct ADVISE badge, confidence %, and citations, but the actual answer body was garbled or effectively empty. This was NOT a training/retrieval quality issue - Layer 1/2 (relevance score, coverage) worked correctly, as proven by the correct confidence % and citations. Root cause was in Layer 3 generation, introduced by the Category/Template feature (CT-A/B/C/D, same day).
+
+### Root cause (verified against real code, not assumed)
+
+1. Migration 010 seeds a "Coding" category and retrofits any expert with `domain IN ('dsa','algorithms','coding')` into it automatically (`UPDATE experts SET category_id = ... WHERE category_id IS NULL AND LOWER(TRIM(domain)) IN (...)`). If SCALER - DSA's `domain` column matches, this silently moved it into the categorized/structured generation path with zero UI or config change - a path that did not exist when this expert was trained.
+
+2. Once categorized, `chinawall/enforcer.go`'s `generateStructured` asks the LLM for one JSON object containing Pattern + Idea + a full working code block + Walkthrough + 4 test-case buckets (BASE/EDGE/CORNER/STRESS) - all in a single response. `MaxTokens: 2000` was routinely too tight for this combined payload on real DSA questions (e.g. "Median of Two Sorted Arrays"), so the LLM's response got cut off mid-JSON.
+
+3. `json.Unmarshal` on a truncated JSON object always fails. The existing "fallback" for a parse failure dumped the raw, half-formed JSON string directly into `Answer` - stray `{`, `"key":`, `[CHUNK_xxx]` tokens then got handed to the frontend's markdown renderer, which rendered it as garbled or near-invisible text. Meanwhile Layer 1's confidence score and Layer 3's regex-based `extractCitations` (which just scans for `[CHUNK_uuid]` tokens, independent of whether the surrounding text is valid JSON) both still worked - producing exactly the reported symptom: correct badge/confidence/citations, garbled/empty answer body.
+
+### Fix
+
+- Extracted the original flat-text generation logic (prompts + gateway call, previously inlined in `generateWithCitations`) into a standalone `generateFlatText` function - zero behavior change for any non-categorized expert.
+- `generateStructured` now calls `generateFlatText` as a REAL fallback when `parseStructuredResponse` fails, instead of dumping raw truncated JSON into `Answer`. The whole response degrades to a genuine flat prose+code answer for that turn, not a half-broken structured one.
+- Raised structured generation's `MaxTokens` from 2000 to 3500 to reduce truncation frequency (this alone does not fully eliminate the risk on very long answers, which is why the real fallback above is the primary fix, not the token increase).
+
+**Files:** `backend-go/internal/chinawall/enforcer.go` (`generateWithCitations`, new `generateFlatText`, `generateStructured`)
+
+### Mental execution (performed before committing)
+
+- Happy path: valid, complete JSON returned -> parses successfully -> sections populate exactly as before, no regression.
+- Edge case (truncated JSON): parse fails -> falls back to `generateFlatText` -> real prose+code answer, `TemplateSections` stays nil -> `Enforce()`'s `len(generated.TemplateSections) > 0` check is false -> takes the existing flat Layer 4 path (`stripUncited`), not `enforceStructured` -> frontend receives clean flat `content`, renders correctly via the existing markdown path.
+- Edge case (flat fallback also produces zero citations): existing retry/refusal safety net in `Enforce()` still applies unchanged - no new silent-success failure mode introduced.
+
+### Verification caveat (same as every other entry in this file)
+
+Verified by re-reading the full file from `main` after each commit and manually tracing every call site of the changed functions (`generateStructured` has exactly one caller, `generateWithCitations`, already updated in the same change). **No live `go build`, no live LLM call, no real truncated-JSON reproduction was performed** - same toolchain limitation as every other entry in this file. Owner (Kiran) should re-ask the same DSA questions from the screenshot after deploying this fix to confirm.
+
+*Last updated: 2026-09-08 (bug fix batch, round 3)*
