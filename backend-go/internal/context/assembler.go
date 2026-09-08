@@ -2,6 +2,7 @@ package context
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -16,6 +17,15 @@ import (
 	"ai_avengers/backend/internal/ml"
 )
 
+// jsonUnmarshalInt unmarshals a system_settings JSONB value (stored as
+// e.g. the bare text "10") into an int. Kept as a tiny named helper
+// (not inlined) so getReplyThreadMaxDepth's error handling reads as one
+// line, matching this file's existing style of small single-purpose
+// helpers (estimateTokens, etc.) at the bottom of the file.
+func jsonUnmarshalInt(data []byte, v *int) error {
+	return json.Unmarshal(data, v)
+}
+
 // AssembledContext holds everything needed for one LLM call.
 // Built fresh for every turn. Never cached.
 type AssembledContext struct {
@@ -24,7 +34,23 @@ type AssembledContext struct {
 	RelevantHistory []HistoryEntry
 	CourseChunks    []chinawall.CourseChunk
 	ProjectContext  *memory.ProjectContext
-	TotalTokens     int
+	// ReplyThread (CT-C2): populated ONLY when the incoming message has
+	// a non-nil ReplyToMessageID (CATEGORY_TEMPLATE_HANDOFF.md §5). nil
+	// for every fresh (non-reply) question — the vast majority of
+	// messages, both before and after this feature existed. This is a
+	// new, isolated budgeted slice; it does not replace or alter
+	// RecentMessages/RelevantHistory/CourseChunks logic above (additive
+	// only, per CATEGORY_TEMPLATE_HANDOFF.md §5).
+	ReplyThread []ReplyThreadEntry
+	TotalTokens int
+}
+
+// ReplyThreadEntry is one message in a resolved reply thread, pinned
+// (single entry) or full-chain (multiple entries, root-ward order).
+type ReplyThreadEntry struct {
+	Role       string
+	Content    string
+	TurnNumber int
 }
 
 // Message is a single chat message for context.
@@ -101,6 +127,13 @@ func (a *Assembler) Assemble(
 	expertID uuid.UUID,
 	question string,
 	turnNumber int,
+	// replyToMessageID/includeFullThread (CT-C2): nil/false for every
+	// fresh (non-reply) question — every existing behavior above this
+	// point in Assemble is completely unaffected. Only orchestrator.go's
+	// processWithExpert passes non-nil values through, and only when the
+	// client actually replied to a specific prior message.
+	replyToMessageID *uuid.UUID,
+	includeFullThread bool,
 ) (*AssembledContext, error) {
 
 	assembled := &AssembledContext{}
@@ -181,6 +214,27 @@ func (a *Assembler) Assemble(
 		}
 	}
 
+	// 7. Reply thread (CT-C2). Runs regardless of remaining budget %
+	// (unlike sources 1-6 above) because a reply is an explicit client
+	// action — pinning the wrong/missing context on a reply the client
+	// specifically asked to reference would be a worse failure mode than
+	// slightly exceeding the soft budget checkpoints above. Still counted
+	// into tokensUsed/TotalTokens for accurate reporting.
+	if replyToMessageID != nil {
+		thread, err := a.getReplyThread(ctx, *replyToMessageID, includeFullThread)
+		if err != nil {
+			a.logger.Warn("reply thread resolution failed, continuing without it",
+				zap.String("reply_to", replyToMessageID.String()),
+				zap.Error(err),
+			)
+		} else {
+			assembled.ReplyThread = thread
+			for _, e := range thread {
+				tokensUsed += estimateTokens(e.Content)
+			}
+		}
+	}
+
 	assembled.TotalTokens = tokensUsed
 
 	a.logger.Debug("context assembled",
@@ -190,6 +244,102 @@ func (a *Assembler) Assemble(
 	)
 
 	return assembled, nil
+}
+
+// getReplyThread resolves reply context for a message that has a
+// non-nil ReplyToMessageID (CT-C2, CATEGORY_TEMPLATE_HANDOFF.md §5).
+//
+// includeFullThread=false (CT-L6 default): returns exactly ONE entry —
+// the pinned message itself. Cheapest, matches "sirf pin kra sirf uska".
+//
+// includeFullThread=true (explicit opt-in only): walks reply_to_message_id
+// pointers upward (root-ward), capped at system_settings.reply_thread_max_depth
+// (falls back to 10 if the setting is missing or unparseable — same
+// default the migration seeds, so a missing row behaves identically to
+// the seeded row).
+//
+// Mental execution (happy path):
+// pinned message id=X, X.reply_to_message_id=Y, Y.reply_to_message_id=NULL
+// includeFullThread=true, max_depth=10
+// -> loadOne(X) -> entries=[X], next=Y
+// -> loadOne(Y) -> entries=[X,Y], next=nil (Y has no parent)
+// -> loop ends (next==nil), return [X,Y] (2 entries, well under cap)
+//
+// Edge case (max depth exceeded): a 15-message-deep reply chain with
+// max_depth=10 -> loop stops after 10 iterations even though more
+// ancestors exist — partial thread is returned, not an error, and is
+// logged so an admin can see truncation happened.
+//
+// Edge case (pinned message deleted): messages.reply_to_message_id has
+// ON DELETE SET NULL (migration 010), so a deleted parent simply breaks
+// the chain at that point — loadOne on a since-deleted id returns
+// pgx.ErrNoRows, treated as "no more ancestors", not a hard failure.
+func (a *Assembler) getReplyThread(ctx context.Context, pinnedID uuid.UUID, includeFullThread bool) ([]ReplyThreadEntry, error) {
+	entry, nextParent, err := a.loadOneThreadMessage(ctx, pinnedID)
+	if err != nil {
+		return nil, fmt.Errorf("load pinned message: %w", err)
+	}
+	entries := []ReplyThreadEntry{entry}
+
+	if !includeFullThread {
+		return entries, nil
+	}
+
+	maxDepth := a.getReplyThreadMaxDepth(ctx)
+	for depth := 1; depth < maxDepth && nextParent != nil; depth++ {
+		next, parent, err := a.loadOneThreadMessage(ctx, *nextParent)
+		if err != nil {
+			// Deleted/missing ancestor — chain ends here, not an error
+			// for the caller (partial thread is still useful context).
+			break
+		}
+		entries = append(entries, next)
+		nextParent = parent
+	}
+	if nextParent != nil {
+		a.logger.Warn("reply thread truncated at max depth",
+			zap.Int("max_depth", maxDepth),
+			zap.String("pinned_id", pinnedID.String()),
+		)
+	}
+
+	return entries, nil
+}
+
+// loadOneThreadMessage loads role/content/turn_number for one message,
+// plus its own parent pointer (for continuing the walk upward).
+func (a *Assembler) loadOneThreadMessage(ctx context.Context, id uuid.UUID) (ReplyThreadEntry, *uuid.UUID, error) {
+	var e ReplyThreadEntry
+	var parent *uuid.UUID
+	err := a.db.QueryRow(ctx,
+		`SELECT role, content, turn_number, reply_to_message_id
+		 FROM messages WHERE id=$1`,
+		id,
+	).Scan(&e.Role, &e.Content, &e.TurnNumber, &parent)
+	if err != nil {
+		return ReplyThreadEntry{}, nil, err
+	}
+	return e, parent, nil
+}
+
+// getReplyThreadMaxDepth reads system_settings.reply_thread_max_depth.
+// Falls back to 10 (same default migration 010 seeds) if the row is
+// missing or its value is not a valid integer — never blocks reply
+// resolution on a settings-read failure.
+func (a *Assembler) getReplyThreadMaxDepth(ctx context.Context) int {
+	const fallback = 10
+	var valueJSON []byte
+	err := a.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key='reply_thread_max_depth'`,
+	).Scan(&valueJSON)
+	if err != nil {
+		return fallback
+	}
+	var depth int
+	if err := jsonUnmarshalInt(valueJSON, &depth); err != nil || depth <= 0 {
+		return fallback
+	}
+	return depth
 }
 
 // getRollingSummary fetches the latest rolling summary for a chat.
@@ -514,6 +664,18 @@ func (a *Assembler) FormatForPrompt(ctx *AssembledContext) string {
 		sb.WriteString("## Project Decisions (from all experts)\n")
 		for _, e := range ctx.ProjectContext.L2Entries {
 			sb.WriteString(fmt.Sprintf("- %s\n", e.Content))
+		}
+		sb.WriteString("\n")
+	}
+
+	// CT-C2: reply thread, if this question is a reply. Placed before
+	// RecentMessages/RelevantHistory so the specific pinned/threaded
+	// context the client explicitly asked to reference is not lost in
+	// the middle of the prompt.
+	if len(ctx.ReplyThread) > 0 {
+		sb.WriteString("## Replying To\n")
+		for _, e := range ctx.ReplyThread {
+			sb.WriteString(fmt.Sprintf("%s (turn %d): %s\n", strings.ToUpper(e.Role), e.TurnNumber, e.Content))
 		}
 		sb.WriteString("\n")
 	}
