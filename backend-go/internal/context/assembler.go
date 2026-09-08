@@ -151,40 +151,129 @@ func (a *Assembler) Assemble(
 	}
 
 	// 2. L2 project memory (20% budget)
+	// FIX (2026-09-08 RCA): this step previously had NO budget
+	// enforcement at all (unlike steps 3/4/5, which at least check
+	// tokensUsed before running). Every L2Entry's tokens were added
+	// unconditionally, so a long-running conversation with many
+	// cross-expert decisions could silently consume far more than its
+	// declared 20% share — leaving nothing for step 5 (course chunks,
+	// declared "most important") once its own 90%-of-budget guard was
+	// reached. That crowd-out is exactly what caused a trained DSA
+	// expert to see ZERO course chunks and refuse "This topic is not in
+	// my training material" on later turns of a conversation, while an
+	// earlier turn (fresh budget) worked fine. Fix: enforce the SAME
+	// 20% cap this step already claims in its own comment, by capping
+	// entries actually kept (both here AND in assembled.ProjectContext,
+	// since FormatForPrompt below reads straight from that field —
+	// capping tokensUsed alone without also trimming the real entries
+	// list would not have fixed anything).
 	projCtx, err := a.memManager.GetProjectContext(ctx, projectID, expertID, question)
 	if err == nil {
-		assembled.ProjectContext = projCtx
+		l2Budget := budget * 20 / 100
+		l2Tokens := 0
+		kept := projCtx.L2Entries[:0:0] // fresh slice, never aliases the original backing array
 		for _, entry := range projCtx.L2Entries {
-			tokensUsed += estimateTokens(entry.Content)
+			t := estimateTokens(entry.Content)
+			if l2Tokens+t > l2Budget && len(kept) > 0 {
+				break
+			}
+			kept = append(kept, entry)
+			l2Tokens += t
 		}
+		if len(kept) < len(projCtx.L2Entries) {
+			a.logger.Debug("L2 project memory truncated to stay within its 20% budget",
+				zap.Int("kept", len(kept)),
+				zap.Int("total", len(projCtx.L2Entries)),
+			)
+		}
+		projCtx.L2Entries = kept
+		assembled.ProjectContext = projCtx
+		tokensUsed += l2Tokens
 	}
 
 	// 3. Recent messages (20% budget)
+	// FIX (2026-09-08 RCA, same class of bug as step 2 above): the
+	// pre-entry check below only decided WHETHER to run this step, not
+	// how much of it to keep once running — every message's tokens were
+	// added unconditionally afterward. A long assistant answer (a full
+	// DSA solution with code) could alone consume several times this
+	// step's declared 20% share. Same fix pattern: cap greedily, keep at
+	// least the single most recent message even if it alone exceeds the
+	// cap (recency matters more than a hard budget wall here — dropping
+	// the newest message entirely would be worse than slightly
+	// exceeding this step's soft cap).
 	if tokensUsed < budget*60/100 {
 		recent, err := a.getRecentMessages(ctx, chatID, a.recentMsgs)
 		if err == nil {
-			assembled.RecentMessages = recent
-			for _, m := range recent {
-				tokensUsed += estimateTokens(m.Content)
+			recentBudget := budget * 20 / 100
+			recentTokens := 0
+			var kept []Message
+			// getRecentMessages already returns chronological (oldest->newest)
+			// order (it reverses its own DESC query) — iterate from the END
+			// (newest first) so truncation drops the OLDEST messages first,
+			// then restore chronological order for FormatForPrompt.
+			for i := len(recent) - 1; i >= 0; i-- {
+				t := estimateTokens(recent[i].Content)
+				if recentTokens+t > recentBudget && len(kept) > 0 {
+					break
+				}
+				kept = append(kept, recent[i])
+				recentTokens += t
 			}
+			for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+				kept[i], kept[j] = kept[j], kept[i]
+			}
+			if len(kept) < len(recent) {
+				a.logger.Debug("recent messages truncated to stay within 20% budget",
+					zap.Int("kept", len(kept)),
+					zap.Int("total", len(recent)),
+				)
+			}
+			assembled.RecentMessages = kept
+			tokensUsed += recentTokens
 		}
 	}
 
 	// 4. Semantic history (15% budget)
+	// Same enforcement pattern as steps 2/3 — lower risk in practice
+	// (OneLineSummary entries are short one-liners), but fixed for the
+	// same reason: a step that claims a % budget must actually enforce
+	// it, not just gate its own entry.
 	if tokensUsed < budget*75/100 {
 		history, err := a.searchChatHistory(ctx, chatID, question, a.semanticTopK)
 		if err == nil {
-			assembled.RelevantHistory = history
+			historyBudget := budget * 15 / 100
+			historyTokens := 0
+			var kept []HistoryEntry
 			for _, h := range history {
-				tokensUsed += estimateTokens(h.OneLineSummary)
+				t := estimateTokens(h.OneLineSummary)
+				if historyTokens+t > historyBudget && len(kept) > 0 {
+					break
+				}
+				kept = append(kept, h)
+				historyTokens += t
 			}
+			assembled.RelevantHistory = kept
+			tokensUsed += historyTokens
 		}
 	}
 
-	// 5. Course chunks (35% budget — most important)
-	if tokensUsed < budget*90/100 {
-		chunks, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
-		if err != nil {
+	// 5. Course chunks — "most important" (per this function's own doc
+	// comment above). FIX (2026-09-08 RCA): previously gated behind
+	// `if tokensUsed < budget*90/100`, which is exactly what let steps
+	// 2/3/4's budget overruns silently starve this step to ZERO chunks
+	// on later conversation turns — the root cause of a trained expert
+	// refusing with "This topic is not in my training material" despite
+	// having real, relevant course content. Chunk COUNT is already
+	// bounded by a.chunksTopK (config), so running this unconditionally
+	// cannot cause unbounded growth — it can, in a pathological case,
+	// modestly exceed the soft `budget` ceiling, which is an intentional
+	// trade-off: a refused answer is a much worse failure mode than a
+	// prompt slightly over its token budget (same rationale already
+	// documented on the reply-thread step below, applied here to the
+	// step whose own doc comment calls it "most important").
+	chunks, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
+	if err != nil {
 			// FIX (2026-09-08 RCA): this error was previously swallowed
 			// completely silently — zero chunks reached decision.Engine's
 			// Gate 2, which then refused with "This topic is not in my
@@ -200,24 +289,23 @@ func (a *Assembler) Assemble(
 				zap.String("expert_id", expertID.String()),
 				zap.Error(err),
 			)
-		} else {
-			assembled.CourseChunks = chunks
-			for _, c := range chunks {
-				tokensUsed += estimateTokens(c.Text)
-			}
-			if len(chunks) == 0 {
-				// No error, but genuinely zero candidates found (vector
-				// search itself returned 0 rows for this expert_id — e.g.
-				// wrong/stale expert_id, or the table really is empty).
-				// Distinct from the err!=nil branch above: this is NOT a
-				// transient failure, it is a real "no candidates" result —
-				// logging it separately so the two causes are never
-				// conflated when reading logs later.
-				a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content and matches the expert actually selected",
-					zap.String("expert_id", expertID.String()),
-					zap.String("question_preview", question[:minInt(80, len(question))]),
-				)
-			}
+	} else {
+		assembled.CourseChunks = chunks
+		for _, c := range chunks {
+			tokensUsed += estimateTokens(c.Text)
+		}
+		if len(chunks) == 0 {
+			// No error, but genuinely zero candidates found (vector
+			// search itself returned 0 rows for this expert_id — e.g.
+			// wrong/stale expert_id, or the table really is empty).
+			// Distinct from the err!=nil branch above: this is NOT a
+			// transient failure, it is a real "no candidates" result —
+			// logging it separately so the two causes are never
+			// conflated when reading logs later.
+			a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content and matches the expert actually selected",
+				zap.String("expert_id", expertID.String()),
+				zap.String("question_preview", question[:minInt(80, len(question))]),
+			)
 		}
 	}
 
