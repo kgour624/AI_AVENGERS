@@ -52,5 +52,14 @@ export function persistedMessageToExpertResponse(
     // undefined here even though the data existed all along.
     warning: message.warningText,
     questions: message.clarifyingQuestions,
+    // Fix (2026-09-08 RCA round 7, migration 011): previously always
+    // undefined here - the backend persisted nothing to map from.
+    // Now that chat/service.go's ListMessages selects and returns
+    // template_sections, this survives a page reload / message
+    // history fetch identically to the live SSE render. undefined
+    // (not []) for every flat-text message - matches
+    // ExpertResponse.tsx's existing `templateSections &&
+    // templateSections.length > 0` guard exactly.
+    templateSections: message.templateSections,
   }
 }
