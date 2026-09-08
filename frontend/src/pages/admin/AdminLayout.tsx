@@ -2,13 +2,14 @@ import { NavLink, Outlet, Link } from 'react-router-dom'
 import { cn } from '@/utils/cn'
 
 const NAV_ITEMS = [
-  { to: '/admin',              label: 'Overview',     end: true  },
-  { to: '/admin/experts',      label: 'Experts',      end: false },
-  { to: '/admin/categories',   label: 'Categories',   end: false },
-  { to: '/admin/clients',      label: 'Clients',      end: false },
-  { to: '/admin/stats',        label: 'Stats',        end: false },
-  { to: '/admin/settings',     label: 'Settings',     end: false },
-  { to: '/admin/llm-settings', label: 'LLM Settings', end: false },
+  { to: '/admin',                 label: 'Overview',        end: true  },
+  { to: '/admin/experts',         label: 'Experts',         end: false },
+  { to: '/admin/categories',      label: 'Categories',      end: false },
+  { to: '/admin/domain-profiles', label: 'Domain Profiles', end: false },
+  { to: '/admin/clients',         label: 'Clients',         end: false },
+  { to: '/admin/stats',           label: 'Stats',           end: false },
+  { to: '/admin/settings',        label: 'Settings',        end: false },
+  { to: '/admin/llm-settings',    label: 'LLM Settings',    end: false },
 ]
 
 /**
