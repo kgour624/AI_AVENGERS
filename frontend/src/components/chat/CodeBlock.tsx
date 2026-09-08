@@ -26,18 +26,38 @@ export function CodeBlock({ className, children }: { className?: string; childre
   }
 
   return (
-    <Highlight theme={themes.vsDark} code={code} language={language}>
-      {({ style, tokens, getLineProps, getTokenProps }) => (
-        <pre style={style} className="my-2 overflow-x-auto rounded-md p-3 text-sm">
-          {tokens.map((line, i) => (
-            <div key={i} {...getLineProps({ line })}>
-              {line.map((token, key) => (
-                <span key={key} {...getTokenProps({ token })} />
-              ))}
-            </div>
-          ))}
-        </pre>
-      )}
-    </Highlight>
+    <div className="group relative my-2">
+      <button
+        type="button"
+        onClick={() => {
+          navigator.clipboard
+            .writeText(code)
+            .then(() => {
+              setCopied(true)
+              setTimeout(() => setCopied(false), 1500)
+            })
+            .catch((err) => {
+              console.warn('copy to clipboard failed', err)
+            })
+        }}
+        aria-label="Copy code"
+        className="absolute right-2 top-2 rounded-md border border-surface-border bg-surface-overlay/80 px-2 py-1 text-xs text-text-secondary opacity-0 backdrop-blur-sm transition-opacity hover:text-text-primary group-hover:opacity-100"
+      >
+        {copied ? 'Copied!' : 'Copy'}
+      </button>
+      <Highlight theme={themes.vsDark} code={code} language={language}>
+        {({ style, tokens, getLineProps, getTokenProps }) => (
+          <pre style={style} className="overflow-x-auto rounded-md p-3 text-sm">
+            {tokens.map((line, i) => (
+              <div key={i} {...getLineProps({ line })}>
+                {line.map((token, key) => (
+                  <span key={key} {...getTokenProps({ token })} />
+                ))}
+              </div>
+            ))}
+          </pre>
+        )}
+      </Highlight>
+    </div>
   )
 }
