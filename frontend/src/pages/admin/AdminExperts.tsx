@@ -140,7 +140,14 @@ function AdminExperts() {
                 </span>
               )}
             </p>
-            <ExpertRow expertId={expert.id} onViewProgress={setPipelineJob} />
+            <ExpertRow
+              expertId={expert.id}
+              expertName={expert.name}
+              onViewProgress={(job, name) => {
+                setPipelineJob(job)
+                setPipelineExpertName(name)
+              }}
+            />
 
             <div className="mt-3 flex flex-wrap gap-2">
               <Button variant="secondary" size="sm" onClick={() => setUploadTargetId(expert.id)}>
