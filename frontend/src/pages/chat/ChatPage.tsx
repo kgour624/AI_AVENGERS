@@ -234,7 +234,7 @@ export default function ChatPage() {
         </div>
       </div>
 
-      <MessageInput experts={experts} onSend={handleSend} isSending={isStreamActive} />
+      <MessageInput chatId={chat.id} experts={experts} onSend={handleSend} isSending={isStreamActive} />
     </div>
   )
 }
