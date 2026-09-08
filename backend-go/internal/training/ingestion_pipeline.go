@@ -264,7 +264,11 @@ func (p *IngestionPipeline) IngestTranscript(
 
 	embeddings := make([][]float32, len(chunks))
 
-	const embedBatchSize = 100
+	// WHY 25 not 100:
+	//   100 chunks × bge-base-en-v1.5 on CPU ≈ 40s > 30s HTTP timeout.
+	//   25 chunks ≈ 10s per batch — well within 300s timeout.
+	//   Smaller batches also mean more frequent checkpoints.
+	const embedBatchSize = 25
 	resumeEmbedBatch := 0
 	if isResume && cp != nil && cp.Stage == StageEmbedding {
 		resumeEmbedBatch = cp.LastBatchIndex
