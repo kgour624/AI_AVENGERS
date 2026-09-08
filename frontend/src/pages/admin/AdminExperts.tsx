@@ -41,10 +41,12 @@ const STAGE_LABELS: Record<string, string> = {
 
 function ExpertRow({
   expertId,
+  expertName,
   onViewProgress,
 }: {
   expertId: string
-  onViewProgress: (job: IngestionJob) => void
+  expertName: string
+  onViewProgress: (job: IngestionJob, name: string) => void
 }) {
   const { data: jobs } = useIngestionStatus(expertId)
   const latestJob = jobs?.[0]
