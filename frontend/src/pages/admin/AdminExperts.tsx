@@ -45,7 +45,7 @@ function ExpertRow({
 }: {
   expertId: string
   expertName: string
-  onViewProgress: (job: IngestionJob, name: string) => void
+  onViewProgress: (expertId: string, name: string) => void
 }) {
   const { data: jobs } = useIngestionStatus(expertId)
   const latestJob = jobs?.[0]
