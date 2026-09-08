@@ -126,6 +126,36 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
             <li key={q}>{q}</li>
           ))}
         </ul>
+      ) : response.templateSections && response.templateSections.length > 0 ? (
+        <div className="flex flex-col gap-3">
+          {response.templateSections.map((section) => {
+            const sectionSegments = splitContentByCitations(section.content, section.citations)
+            return (
+              <div key={section.key}>
+                <h4 className="mb-1 text-xs font-semibold uppercase tracking-wide text-text-secondary">
+                  {section.label}
+                </h4>
+                {section.type === 'code' ? (
+                  <ReactMarkdown components={{ code: CodeBlock }}>
+                    {'```\n' + section.content + '\n```'}
+                  </ReactMarkdown>
+                ) : (
+                  <div className="prose prose-invert prose-sm max-w-none text-text-primary">
+                    {sectionSegments.map((segment, i) =>
+                      segment.type === 'text' ? (
+                        <ReactMarkdown key={i} components={{ code: CodeBlock }}>
+                          {segment.value}
+                        </ReactMarkdown>
+                      ) : (
+                        <CitationChip key={i} citation={segment.citation} index={i + 1} />
+                      )
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
       ) : (
         <div className="prose prose-invert prose-sm max-w-none text-text-primary">
           {segments.map((segment, i) =>
