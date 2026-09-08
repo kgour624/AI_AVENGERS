@@ -577,7 +577,7 @@ COURSE CONTENT:
 // extracts citations independently per section so Layer 4 can strip each
 // prose section on its own (CT-B2) without touching code/test_cases text.
 //
-// Mental execution:
+// Mental execution (fixed, post-RCA):
 // sections = [pattern(prose), idea(prose), code(code), walkthrough(prose), test_cases(test_cases)]
 // LLM returns valid JSON with all 5 keys -> parseStructuredResponse succeeds
 //   -> 5 TemplateSectionResult entries, citations extracted per prose section
@@ -585,10 +585,29 @@ COURSE CONTENT:
 //      sections are not expected to contain [CHUNK_xxx] tokens per the prompt's
 //      rule #4, so extractCitations on them normally returns empty, which is
 //      correct — not a bug).
-// Edge case: LLM returns malformed JSON (parseStructuredResponse errors) ->
-//   fall back to flat citation extraction on the raw response so Layer 3's
-//   "no citations" check still has real signal instead of silently returning
-//   an empty structured answer that would masquerade as "success" with zero content.
+//
+// Edge case (RCA 2026-09-08, real production symptom — reported as:
+// mode badge / confidence % / citations all render correctly, but the
+// actual answer body is garbled or near-empty): a DSA-style question
+// needs prose + a full working code block + 4 test-case buckets ALL
+// inside one JSON object — this routinely exceeds MaxTokens and the
+// model's response gets cut off mid-JSON. json.Unmarshal on a
+// truncated object always fails. The PREVIOUS fix for this dumped the
+// raw, half-formed JSON text straight into Answer as a "fallback" —
+// this is not a real fallback, it is broken output disguised as one:
+// stray braces/quotes/[CHUNK_xxx] tokens render as garbled or
+// near-invisible markdown, while Layer 1-2's mode/confidence and
+// Layer 3's extracted citations (independent metadata) still display
+// correctly — producing exactly the reported symptom.
+//
+// REAL fix: when parsing fails, fall back to generateFlatText — the
+// SAME reliable flat-prose+code generation path every non-categorized
+// expert already uses. This produces a genuine, complete answer
+// instead of surfacing a parser failure as content. The caller
+// (Enforce) already treats a zero-TemplateSections, non-empty-Answer
+// generatedAnswer as the flat path, so this transparently degrades
+// the WHOLE response to flat-text for this one turn — not a
+// half-structured, half-broken hybrid.
 func (e *Enforcer) generateStructured(
 	ctx context.Context,
 	question string,
@@ -598,6 +617,7 @@ func (e *Enforcer) generateStructured(
 	contextText string,
 	sections []category.TemplateSection,
 	defaultLanguage string,
+	profile *DomainProfile,
 ) (*generatedAnswer, error) {
 	if defaultLanguage == "" {
 		defaultLanguage = "java" // CT-L5: hardcoded default, admin-overridable per category
@@ -609,10 +629,14 @@ func (e *Enforcer) generateStructured(
 		Model:        gateway.ModelStrong,
 		SystemPrompt: systemPrompt,
 		UserPrompt:   question,
-		// WHY 2000 not flat path's 1500: a structured answer must fit
-		// prose + a full code block + test case buckets all inside one
-		// JSON payload, which is larger than a single flat prose+code answer.
-		MaxTokens:   2000,
+		// RCA 2026-09-08: 2000 was still routinely too tight for
+		// prose + a full code block + 4 test-case buckets in one JSON
+		// object — this was the primary cause of truncated/malformed
+		// JSON. Raised to 3500. Even with this raised limit, truncation
+		// can still happen on an unusually long answer — that's exactly
+		// why the parseErr branch below now does a REAL fallback instead
+		// of assuming a higher limit alone fully solves it.
+		MaxTokens:   3500,
 		Temperature: 0.4,
 	})
 	if err != nil {
@@ -621,11 +645,11 @@ func (e *Enforcer) generateStructured(
 
 	parsed, parseErr := parseStructuredResponse(resp.Content, sections)
 	if parseErr != nil {
-		e.logger.Warn("structured response parse failed, falling back to flat citation extraction on raw content",
+		e.logger.Warn("structured response parse failed (likely truncated JSON) — falling back to flat-text generation for this turn",
 			zap.Error(parseErr),
+			zap.Int("raw_response_length", len(resp.Content)),
 		)
-		citations := e.extractCitations(resp.Content, chunks)
-		return &generatedAnswer{Answer: resp.Content, Citations: citations}, nil
+		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, profile, contextText)
 	}
 
 	var allCitations []Citation
