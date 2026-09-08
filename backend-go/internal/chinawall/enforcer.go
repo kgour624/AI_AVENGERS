@@ -127,7 +127,7 @@ func (e *Enforcer) Enforce(
 	}
 
 	// LAYER 3: Generate with mandatory citations
-	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter)
+	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, isProblemSolving)
 	if err != nil {
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
