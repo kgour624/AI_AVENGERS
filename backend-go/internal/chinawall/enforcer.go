@@ -202,7 +202,7 @@ func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []
 		sb.WriteString(fmt.Sprintf("Chunk %d: %s\n", i+1, preview))
 	}
 
-	if isProblemSolvingQuestion(question) {
+	if isProblemSolving {
 		// Problem-solving mode: check if principles are applicable
 		sb.WriteString(`
 Think step by step:
