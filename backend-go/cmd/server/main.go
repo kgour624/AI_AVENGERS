@@ -215,7 +215,7 @@ func buildRouter(
 		cfg.Context.SemanticTopK, cfg.Context.CourseChunksTopK,
 		logger,
 	)
-	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, logger)
+	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, logger)
 
 	// Initialize domain services
 	projectSvc := project.NewService(postgres.Pool, logger)

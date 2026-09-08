@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	appcontext "ai_avengers/backend/internal/context"
+	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/memory"
@@ -49,6 +50,13 @@ type ExpertResponse struct {
 	Warning     string               `json:"warning,omitempty"`
 	Questions   []string             `json:"questions,omitempty"`
 	Error       string               `json:"error,omitempty"`
+	// TemplateSections (CT-B4): populated only when this expert has a
+	// category with a non-empty template_schema. nil for every flat-text
+	// expert response (CT-L2) — frontend (CT-D5, not yet built) must
+	// check len(TemplateSections) > 0 before rendering structured UI,
+	// falling back to plain Content otherwise, exactly like every layer
+	// below this one already does.
+	TemplateSections []chinawall.TemplateSectionResult `json:"template_sections,omitempty"`
 }
 
 // SynthesisResult holds the combined view when multiple experts respond.
@@ -74,6 +82,8 @@ type expertRecord struct {
 	Domain               string
 	ReasoningCharter     string
 	ClarificationCharter map[string][]string
+	// CategoryID (CT-B4): nullable per CT-L2. nil means flat-text expert.
+	CategoryID *uuid.UUID
 }
 
 // Orchestrator coordinates multiple domain experts for a single request.
@@ -87,6 +97,12 @@ type Orchestrator struct {
 	assembler   *appcontext.Assembler
 	decisionEng *decision.Engine
 	memManager  *memory.Manager
+	// categoryRegistry (CT-B4): looked up per expert in loadExperts to
+	// resolve category_id -> TemplateSections/DefaultLanguage. nil is a
+	// valid state (server started before CT-A wiring, or category feature
+	// disabled) — loadExperts treats nil registry exactly like "expert has
+	// no category_id", never panics on nil dereference (see loadExperts).
+	categoryRegistry *category.Registry
 	logger      *zap.Logger
 }
 
@@ -96,6 +112,7 @@ func NewOrchestrator(
 	assembler *appcontext.Assembler,
 	decisionEng *decision.Engine,
 	memManager *memory.Manager,
+	categoryRegistry *category.Registry,
 	logger *zap.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
@@ -103,6 +120,7 @@ func NewOrchestrator(
 		assembler:   assembler,
 		decisionEng: decisionEng,
 		memManager:  memManager,
+		categoryRegistry: categoryRegistry,
 		logger:      logger,
 	}
 }
@@ -217,6 +235,21 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		projectSummary = assembledCtx.RollingSummary
 	}
 
+	// CT-B4: resolve category_id -> TemplateSections/DefaultLanguage.
+	// Both stay nil/"" (flat-text path, CT-L2) unless ALL of:
+	//   1. categoryRegistry was actually wired in (not nil)
+	//   2. expert.CategoryID is non-nil
+	//   3. that category exists in the cache AND has >=1 template section
+	// Any of these being false is a normal, common state — not an error.
+	var templateSections []category.TemplateSection
+	defaultLanguage := ""
+	if o.categoryRegistry != nil && expert.CategoryID != nil {
+		if cat := o.categoryRegistry.Get(*expert.CategoryID); cat != nil && len(cat.TemplateSchema.Sections) > 0 {
+			templateSections = cat.TemplateSchema.Sections
+			defaultLanguage = cat.DefaultLanguage
+		}
+	}
+
 	// Run decision engine
 	result, err := o.decisionEng.Process(
 		ctx,
@@ -227,6 +260,8 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 			Domain:               expert.Domain,
 			ReasoningCharter:     expert.ReasoningCharter,
 			ClarificationCharter: expert.ClarificationCharter,
+			TemplateSections:     templateSections,
+			DefaultLanguage:      defaultLanguage,
 		},
 		assembledCtx.CourseChunks,
 		projectSummary,
@@ -251,6 +286,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		GateStopped: result.GateStopped,
 		Warning:     result.Warning,
 		Questions:   result.Questions,
+		TemplateSections: result.TemplateSections,
 	}
 }
 
@@ -326,11 +362,11 @@ func (o *Orchestrator) loadExperts(ctx context.Context, expertIDs []uuid.UUID) (
 		var e expertRecord
 		var clarJSON []byte
 		err := o.db.QueryRow(ctx,
-			`SELECT id, name, domain, COALESCE(reasoning_charter,''), clarification_charter
+			`SELECT id, name, domain, COALESCE(reasoning_charter,''), clarification_charter, category_id
 			 FROM experts
 			 WHERE id=$1 AND is_active=TRUE AND is_training=FALSE AND deleted_at IS NULL`,
 			id,
-		).Scan(&e.ID, &e.Name, &e.Domain, &e.ReasoningCharter, &clarJSON)
+		).Scan(&e.ID, &e.Name, &e.Domain, &e.ReasoningCharter, &clarJSON, &e.CategoryID)
 		if err != nil {
 			o.logger.Warn("expert not found or inactive", zap.String("id", id.String()))
 			continue
