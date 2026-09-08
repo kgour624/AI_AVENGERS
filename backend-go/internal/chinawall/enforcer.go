@@ -272,6 +272,7 @@ func (e *Enforcer) generateWithCitations(
 	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
+	isProblemSolving bool,
 ) (*generatedAnswer, error) {
 
 	// Build context with chunk IDs
