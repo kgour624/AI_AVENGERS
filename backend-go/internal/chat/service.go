@@ -147,13 +147,23 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 	if msg.ClarifyingQuestions == nil {
 		msg.ClarifyingQuestions = []string{}
 	}
-	// Bug 3.4 fix (docs bug list): Citations existed on this struct but
-	// was never in the INSERT column list below - every message's
-	// citations column was permanently NULL, which silently broke the
-	// rating->chunk-boost self-learning loop (rating/handler.go reads
-	// citations back via SELECT to know which chunks to boost/penalize).
 	if msg.Citations == nil {
 		msg.Citations = []interface{}{}
+	}
+
+	// decision_mode must be NULL or one of the allowed values.
+	// User messages have no decision_mode — empty string "" violates
+	// messages_mode_check (SQLSTATE 23514). Convert to nil so pgx
+	// sends NULL, which the constraint allows.
+	var decisionMode interface{}
+	if msg.DecisionMode != "" {
+		decisionMode = msg.DecisionMode
+	}
+	// Same for WarningText — empty string is fine for TEXT columns,
+	// but NULL is cleaner and consistent with the intent.
+	var warningText interface{}
+	if msg.WarningText != "" {
+		warningText = msg.WarningText
 	}
 
 	var id uuid.UUID
@@ -164,8 +174,8 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
-		msg.ExpertID, msg.DecisionMode, msg.Confidence,
-		msg.WarningText, msg.ClarifyingQuestions, msg.Citations,
+		msg.ExpertID, decisionMode, msg.Confidence,
+		warningText, msg.ClarifyingQuestions, msg.Citations,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)
