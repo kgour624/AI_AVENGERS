@@ -44,12 +44,29 @@ type TemplateSectionResult struct {
 // WHY JSON not markdown headings (CT-L3): reliability over flexibility —
 // explicit client choice over the more flexible but format-fragile
 // markdown-heading convention alternative.
+//
+// profile parameter (2026-09-08 RCA fix): previously this function had
+// NO access to the expert's DomainProfile at all, unlike generateFlatText
+// (enforcer.go), which uses profile.CitationMode and profile.SystemPromptExt
+// to shape its prompt. Root-cause of a real production symptom: a LOOSE-
+// citation domain (e.g. DSA — principles transfer to new problems, code is
+// exempt from per-line citations) was forced through a hardcoded
+// STRICT-only citation rule here ("every claim must cite"), and its
+// SystemPromptExt ("Always include time/space complexity, complete
+// runnable code") never reached the model at all. Result: the model,
+// facing a strict citation demand it could not satisfy with LOOSE-style
+// reasoning, produced thin, citation-only prose sections instead of full
+// explanations — exactly the reported "domain expert only gives sources"
+// symptom. Fixed by branching on profile.CitationMode (mirrors
+// generateFlatText's own branch) and appending profile.SystemPromptExt
+// as an additional numbered rule.
 func buildStructuredPrompt(
 	expertName string,
 	reasoningCharter string,
 	contextText string,
 	sections []category.TemplateSection,
 	defaultLanguage string,
+	profile *DomainProfile,
 ) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("You are %s, a domain expert.\n\nREASONING CHARTER:\n%s\n\n", expertName, reasoningCharter))
@@ -58,16 +75,78 @@ func buildStructuredPrompt(
 	sb.WriteString("\n\nCRITICAL RULES:\n")
 	sb.WriteString("1. Respond with STRICT JSON ONLY — no markdown, no prose outside the JSON object.\n")
 	sb.WriteString(fmt.Sprintf("2. The JSON object must have EXACTLY these keys: %s\n", sectionKeysList(sections)))
-	sb.WriteString("3. For every claim in a prose-type section's text, cite the source using [CHUNK_uuid] format.\n")
+	if profile.CitationMode == CitationModeLoose {
+		// LOOSE: mirrors generateFlatText's loose-mode system prompt.
+		// WHY: forcing a strict per-claim citation rule on a domain whose
+		// whole point is applying principles to NEW problems (the exact
+		// problem is often not verbatim in the training material) leaves
+		// the model unable to satisfy the rule honestly — it then falls
+		// back to citing without explaining, rather than explaining fully.
+		sb.WriteString("3. In prose-type sections, cite the training-material principles you are APPLYING using [CHUNK_uuid] format where relevant — but explain your full reasoning first; a citation supports the explanation, it does not replace it. NEVER answer with citations alone and no real explanation.\n")
+	} else {
+		sb.WriteString("3. Every factual claim in a prose-type section's text MUST cite a source using [CHUNK_uuid] format. If information is not in your training material, say so explicitly inside that section rather than omitting it.\n")
+	}
 	sb.WriteString(fmt.Sprintf("4. For any code-type section, the value must be a plain JSON string containing complete, working %s code (escape newlines as \\n). NO [CHUNK_xxx] tokens inside the code.\n", defaultLanguage))
 	sb.WriteString(fmt.Sprintf("5. For any test_cases-type section, the value must be a JSON object with EXACTLY these bucket keys: %s — each mapping to an array of test case strings (empty array if none apply).\n", strings.Join(TestCaseBuckets, ", ")))
 	sb.WriteString("6. If a technique is NOT in your training material, say so explicitly inside the relevant section's text — do not omit the key.\n")
-	sb.WriteString("\nSection descriptions:\n")
+	sb.WriteString("7. Every prose-type section must contain SUBSTANTIVE content — multiple full sentences of real explanation, not a citation-only stub or a one-line placeholder.\n")
+	if profile.SystemPromptExt != "" {
+		// RCA fix (2026-09-08): previously never reached this prompt at
+		// all — only generateFlatText applied SystemPromptExt. A DSA
+		// domain's "Always include time and space complexity (Big-O).
+		// Provide complete, runnable code." had zero effect on any
+		// categorized (structured-JSON) expert until now.
+		sb.WriteString(fmt.Sprintf("8. %s\n", profile.SystemPromptExt))
+	}
+	sb.WriteString("\nSection descriptions (what to actually write in each section):\n")
 	for _, s := range sections {
-		sb.WriteString(fmt.Sprintf("- %q (type=%s, label=%q)\n", s.Key, s.Type, s.Label))
+		sb.WriteString(fmt.Sprintf("- %q (type=%s, label=%q): %s\n", s.Key, s.Type, s.Label, sectionGuidance(s)))
 	}
 	sb.WriteString("\nReturn ONLY the JSON object, nothing else.")
 	return sb.String()
+}
+
+// sectionGuidance returns human-readable guidance on WHAT CONTENT belongs
+// in a section — distinct from Label (a display name, e.g. "Pattern"),
+// which by itself told the model nothing about what to actually write
+// (2026-09-08 RCA — see TemplateSection.Description's doc comment for
+// the full incident this fixes).
+//
+// Priority:
+//  1. s.Description, if the admin set one — always wins, any category.
+//  2. Built-in guidance for code/test_cases types (their format is
+//     already fully specified by rules 4/5 above; this just labels
+//     what belongs there content-wise).
+//  3. Built-in guidance keyed by common key/label patterns (pattern,
+//     idea, walkthrough, complexity) — covers the seeded "coding"
+//     category (migration 010) and any admin-created category reusing
+//     the same conventional names, with ZERO admin action required.
+//  4. Generic fallback for anything else — still explicitly instructs
+//     "not thin/citation-only", rather than saying nothing.
+func sectionGuidance(s category.TemplateSection) string {
+	if s.Description != "" {
+		return s.Description
+	}
+	if s.Type == category.SectionTypeCode {
+		return "Complete, working, runnable code implementing the solution (see rule 4 for format)."
+	}
+	if s.Type == category.SectionTypeTestCases {
+		return "Concrete test cases covering base/edge/corner/stress scenarios (see rule 5 for format)."
+	}
+	key := strings.ToLower(strings.TrimSpace(s.Key))
+	label := strings.ToLower(strings.TrimSpace(s.Label))
+	switch {
+	case key == "pattern" || strings.Contains(label, "pattern"):
+		return "Identify and NAME the core algorithmic pattern/technique this problem needs (e.g. two pointers, sliding window, sorting + greedy, binary search, dynamic programming). Briefly explain WHY that pattern applies here."
+	case key == "idea" || strings.Contains(label, "idea") || strings.Contains(label, "approach"):
+		return "Explain the core idea/approach in plain language — the key insight that makes the solution work — before any code details."
+	case key == "walkthrough" || strings.Contains(label, "walkthrough") || strings.Contains(label, "trace") || strings.Contains(label, "example"):
+		return "Trace through a concrete example input step-by-step, showing exactly how the algorithm executes and arrives at the final output."
+	case strings.Contains(label, "complex"):
+		return "State the time and space complexity (Big-O) with a brief justification."
+	default:
+		return "Write clear, complete, substantive content for this section — do not leave it thin or citation-only."
+	}
 }
 
 func sectionKeysList(sections []category.TemplateSection) string {
