@@ -122,6 +122,16 @@ func (h *Handler) Send(c *gin.Context) {
 			response.BadRequest(c, "INVALID_INPUT", "expert_ids must be JSON array")
 			return
 		}
+		// CT-D4 fix: the multipart branch never read reply_to_message_id/
+		// include_full_thread at all — frontend's useSSEStream.ts sends
+		// these as regular form fields on this SAME branch (alongside
+		// message/expert_ids above) whenever a file is attached to a
+		// reply, but they were silently dropped here while the JSON
+		// branch's c.ShouldBindJSON(&req) below correctly picked them up
+		// via SendMessageRequest's json tags. Fixed by reading them the
+		// same way message/expert_ids are read on this branch.
+		req.ReplyToMessageID = c.PostForm("reply_to_message_id")
+		req.IncludeFullThread = c.PostForm("include_full_thread") == "true"
 		// Handle file upload
 		if file, header, err := c.Request.FormFile("file"); err == nil {
 			defer file.Close()
