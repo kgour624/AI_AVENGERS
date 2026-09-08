@@ -396,6 +396,12 @@ func buildRouter(
 		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)
 		adminGroup.GET("/expert-categories/:id", adminHandler.GetExpertCategory)
 		adminGroup.PATCH("/expert-categories/:id", adminHandler.UpdateExpertCategory)
+		// Domain profiles (China Wall per-domain config) — admin-configurable,
+		// no redeploy needed. Includes MaxTokensFlat/MaxTokensStructured
+		// (2026-09-08 addition, see chinawall/domain_profile.go's field docs).
+		adminGroup.GET("/domain-profiles", adminHandler.ListDomainProfiles)
+		adminGroup.GET("/domain-profiles/:domain", adminHandler.GetDomainProfile)
+		adminGroup.PATCH("/domain-profiles/:domain", adminHandler.UpdateDomainProfile)
 	}
 
 	return router
