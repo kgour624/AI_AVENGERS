@@ -1229,3 +1229,31 @@ Bare `\uXXXX` escapes as unquoted JSX children text (does not get interpreted by
 All three fixes were verified by re-reading the committed files from `main` after each push (correct SQL cast present, `encoding/json` import still used elsewhere so no unused-import break, struct field + SELECT column match, frontend prop wiring matches the pattern used two lines above it for `expertName`). **No live `go build`, no live migration/DB run, no live HTTP request, no `npm run build`/`typecheck` was performed** - this session has no Go toolchain, Postgres, or Node environment available. These remain open verification items, consistent with every other unverified item already listed in "Critical open actions" above.
 
 *Last updated: 2026-09-06 (7-feature batch)*
+
+---
+
+## BUG FIX BATCH - 2026-09-08 (round 2, RCA supplied by admin)
+
+> Two more bugs found via manual local testing/code review by the admin (Kiran), with full RCA supplied. Fixed same-day as the first 2026-09-08 batch above.
+
+### Bug 4: Append-mode re-ingestion overwrites total_chunks/total_topics instead of aggregating
+
+**Root cause:** `IngestionPipeline.IngestTranscript`'s Step 9 (expert stats update) used `len(chunks)` and `uniqueTopics` directly - both are ONLY the current transcript file's counts. In append mode (the default per `DOMAIN_EXPERT_COLLABORATION_DESIGN.md` §5.4), `course_chunks` correctly accumulates both old and new chunks, but the `UPDATE experts SET total_chunks = $1 ...` overwrote the column with just the new file's count (e.g. 420), silently discarding the previous total (e.g. 745) instead of reflecting the true combined total (1165) actually sitting in `course_chunks`.
+
+**Fix:** Query `SELECT COUNT(*), COUNT(DISTINCT topic) FROM course_chunks WHERE expert_id = $1` to get the real aggregate before writing `experts.total_chunks`/`total_topics`, instead of trusting the in-memory count from only the current run. Falls back to the old (single-run) counts if the aggregate query itself errors, rather than leaving the columns unset.
+
+**File:** `backend-go/internal/training/ingestion_pipeline.go` (`IngestTranscript`, Step 9)
+
+### Bug 5: Edit Charter modal textarea stays blank/stale across different experts
+
+**Root cause:** `EditCharterModal.tsx` used `useState(currentCharter)`, which only seeds state on the component's initial mount. `AdminExperts.tsx` renders a single modal instance and just updates its props (including `currentCharter`) each time a *different* expert's "Edit Charter" is clicked - React does not re-run `useState`'s initializer on a prop change, so the textarea stayed stuck showing whichever expert's charter was loaded first (frequently `""`, especially before the 2026-09-08 round-1 `reasoningCharter` backend fix above even landed).
+
+**Fix:** Added a `useEffect(() => setCharter(currentCharter), [currentCharter, isOpen])` in `EditCharterModal.tsx` to resync local state whenever the prop changes or the modal reopens. Also added `key={charterTargetId}` on the modal's usage in `AdminExperts.tsx` as a belt-and-suspenders fix - forces a full unmount/remount per expert, so the bug is fixed even if either change is later reverted independently.
+
+**Files:** `frontend/src/components/admin/EditCharterModal.tsx`, `frontend/src/pages/admin/AdminExperts.tsx`
+
+### Verification caveat (same as every other entry in this file)
+
+Both fixes were verified by re-reading the committed files from `main` after each push (SQL aggregate query reads the correct table/columns per `001_initial_schema.up.sql`, `useEffect` dependency array is correct, `key` prop wiring is present alongside the existing `currentCharter` prop). **No live `go build`, no live DB with a real multi-file append-mode ingestion, no `npm run dev`/browser click-through was performed** - same toolchain limitation as every other entry in this file. Owner (Kiran) is verifying locally.
+
+*Last updated: 2026-09-08 (bug fix batch, round 2)*
