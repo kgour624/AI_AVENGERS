@@ -219,24 +219,26 @@ func (e *Enforcer) Enforce(
 	}, nil
 }
 
-// problemSolvingDomains: expert domains where principle-application
-// mode is correct. Set by admin at expert creation. Stable per expert.
-// WHY domain not question: same question to different experts = different behavior.
-var problemSolvingDomains = map[string]bool{
-	"dsa": true, "algorithms": true, "coding": true,
-	"programming": true, "computer_science": true,
-	"software_engineering": true, "data_structures": true,
-	"competitive_programming": true,
+// globalRegistry is set by the application at startup via SetGlobalRegistry.
+// Used by IsProblemSolvingDomain for backward compatibility with decision/engine.go Gate 1.
+// WHY global: Gate 1 is a package-level function, not a method on Enforcer.
+var globalRegistry *DomainRegistry
+
+// SetGlobalRegistry must be called once at startup after registry.Init().
+// This allows IsProblemSolvingDomain to use the DB-backed registry.
+func SetGlobalRegistry(r *DomainRegistry) {
+	globalRegistry = r
 }
 
 // IsProblemSolvingDomain is exported for use by decision/engine.go Gate 1.
+// Returns true if the domain's profile has Gate1Skip=true.
+// Falls back to BaseProfile (Gate1Skip=false) if registry not set or domain unknown.
 func IsProblemSolvingDomain(domain string) bool {
-	return problemSolvingDomains[strings.ToLower(domain)]
-}
-
-// internal alias for use within this package
-func isProblemSolvingDomain(domain string) bool {
-	return IsProblemSolvingDomain(domain)
+	if globalRegistry == nil {
+		// Registry not initialized yet — safe default: do not skip Gate 1.
+		return false
+	}
+	return globalRegistry.Get(domain).Gate1Skip
 }
 
 // checkCoverage asks cheap LLM if chunks can answer the question.
