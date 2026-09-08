@@ -214,7 +214,7 @@ func (e *Enforcer) Enforce(
 			e.logger.Warn("Layer 4: domain rules produced empty output, retrying with BaseProfile",
 				zap.String("domain", profile.Domain),
 			)
-			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, BaseProfile)
+			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, BaseProfile, nil, "")
 			if err != nil {
 				return nil, fmt.Errorf("base profile generation failed: %w", err)
 			}
