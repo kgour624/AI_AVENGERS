@@ -117,6 +117,56 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     <div className="border-t border-surface-border bg-surface-raised p-3">
       <ExpertPicker experts={experts} selectedIds={selectedIds} onChange={setSelectedIds} />
 
+      {replyState && (
+        <div className="mt-2 flex flex-col gap-2 rounded-md border border-brand/30 bg-brand/5 p-2">
+          <div className="flex items-center justify-between">
+            <p className="text-xs text-text-secondary">
+              Replying to{replyState.target.expertName ? ` ${replyState.target.expertName}` : ''}:{' '}
+              <span className="text-text-primary">
+                &ldquo;{replyState.target.preview}&rdquo;
+              </span>
+            </p>
+            <button
+              type="button"
+              onClick={() => clearReply(chatId)}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >
+              Cancel reply
+            </button>
+          </div>
+
+          <label className="flex items-center gap-2 text-xs text-text-secondary">
+            <input
+              type="checkbox"
+              checked={replyState.includeFullThread}
+              onChange={(e) => setIncludeFullThread(chatId, e.target.checked)}
+            />
+            Include full thread (off by default, pins only the message above)
+          </label>
+
+          {experts.filter((e) => e.expertId !== replyState.target.expertId).length > 0 && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-xs text-text-disabled">Loop in:</span>
+              {experts
+                .filter((e) => e.expertId !== replyState.target.expertId)
+                .map((expert) => (
+                  <label
+                    key={expert.expertId}
+                    className="flex items-center gap-1 text-xs text-text-secondary"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={replyState.loopedInExpertIds.has(expert.expertId)}
+                      onChange={() => toggleLoopedInExpert(chatId, expert.expertId)}
+                    />
+                    {expert.expertName}
+                  </label>
+                ))}
+            </div>
+          )}
+        </div>
+      )}
+
       <div
         {...getRootProps()}
         className={cn(
