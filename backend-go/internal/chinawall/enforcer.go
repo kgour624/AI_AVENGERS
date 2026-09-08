@@ -255,7 +255,14 @@ func IsProblemSolvingDomain(domain string) bool {
 //   solve "Longest Common Prefix" by applying string traversal principles.
 //   Asking "does the transcript mention Longest Common Prefix?" is wrong —
 //   it would refuse every new problem, defeating the purpose of DSA education.
-func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []CourseChunk, isProblemSolving bool) (string, error) {
+// checkCoverage asks cheap LLM if chunks can answer the question.
+// Uses Chain-of-Thought prompting.
+//
+// CoverageModeApplyPrinciples: checks if expert can APPLY principles to solve.
+//   Correct for DSA, coding — principles transfer to new problems.
+// CoverageModeLiteralMatch: checks if chunks CONTAIN the answer.
+//   Correct for medical, legal, finance — facts must be in transcript.
+func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []CourseChunk, mode CoverageMode) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("Question: " + question + "\n\nAvailable Knowledge:\n")
 	for i, c := range chunks {
@@ -269,8 +276,8 @@ func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []
 		sb.WriteString(fmt.Sprintf("Chunk %d: %s\n", i+1, preview))
 	}
 
-	if isProblemSolving {
-		// Problem-solving mode: check if principles are applicable
+	if mode == CoverageModeApplyPrinciples {
+		// Principle-application mode: check if principles are applicable.
 		sb.WriteString(`
 Think step by step:
 1. What algorithmic concepts or data structures does this problem require?
@@ -284,7 +291,7 @@ YES = chunks contain principles/techniques applicable to solve this problem
 PARTIAL = chunks have related concepts but missing some key technique
 NO = chunks are completely unrelated to this type of problem`)
 	} else {
-		// Factual mode: check if chunks contain the answer
+		// Literal match mode: check if chunks contain the answer.
 		sb.WriteString(`
 Think step by step:
 1. What specific information does the question ask for?
