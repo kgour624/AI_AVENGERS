@@ -73,7 +73,7 @@ function ExpertRow({
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => onViewProgress(latestJob, expertName)}
+          onClick={() => onViewProgress(expertId, expertName)}
           className="text-[10px] px-2 py-0.5"
         >
           View Progress
