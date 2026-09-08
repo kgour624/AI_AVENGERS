@@ -28,6 +28,17 @@ function slugify(name: string): string {
  * All behind a collapsible toggle — simple case stays simple.
  */
 export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertModalProps) {
+  // CT-D2: category dropdown. Fetched lazily via useQuery (cached
+  // across modal opens, same pattern every admin list page already
+  // uses) rather than a prop drilled in from the parent — this modal
+  // is self-contained per its existing prop contract (isOpen/onClose/
+  // onCreated only).
+  const { data: categories } = useQuery({
+    queryKey: ['admin', 'expert-categories'],
+    queryFn: getExpertCategories,
+  })
+  const [categoryId, setCategoryId] = useState('')
+
   // Required fields
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
@@ -53,6 +64,7 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
     setSlugEdited(false)
     setDomain('')
     setDescription('')
+    setCategoryId('')
     setShowAdvanced(false)
     setModelTier('strong')
     setLoopPattern('react')
