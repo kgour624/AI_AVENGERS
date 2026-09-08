@@ -32,6 +32,14 @@ type OrchestratorRequest struct {
 	// appcontext.Assembler.Assemble unchanged.
 	ReplyToMessageID  *uuid.UUID
 	IncludeFullThread bool
+	// UserMessageID (CT-C4): the already-saved id of the user message
+	// that triggered this request (message/handler.go's Send saves it
+	// BEFORE calling orchestrator.Process). Used only by
+	// processWithExpert's structure-permission-ASK branch, to set that
+	// ASK message's own reply_to_message_id back to this id so a LATER
+	// reply-to-the-ASK can walk one more parent level and recover the
+	// original question (decision/engine.go's gateStructurePermission).
+	UserMessageID uuid.UUID
 }
 
 // OrchestratorResponse is the full output including all expert responses.
@@ -63,6 +71,14 @@ type ExpertResponse struct {
 	// falling back to plain Content otherwise, exactly like every layer
 	// below this one already does.
 	TemplateSections []chinawall.TemplateSectionResult `json:"template_sections,omitempty"`
+	// ReplyToUserMessageID (CT-C4): set ONLY when GateStopped==-1 (this
+	// response IS a structure-permission ASK, decision/engine.go's
+	// gateStructurePermission sentinel). message/handler.go's
+	// saveAssistantMessage uses this as the ASK message's OWN
+	// reply_to_message_id when saving it, so a later reply-to-this-ASK
+	// can walk one more parent level and recover the original question.
+	// nil for every other response.
+	ReplyToUserMessageID *uuid.UUID `json:"-"`
 }
 
 // SynthesisResult holds the combined view when multiple experts respond.
@@ -306,35 +322,30 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		Warning:     result.Warning,
 		Questions:   result.Questions,
 		TemplateSections: result.TemplateSections,
-		// ReplyToUserMessageID (CT-C4 completion): lets message/handler.go's
-		// saveAssistantMessage set this ASK's own reply_to_message_id back
-		// to the user's question, so a LATER reply-to-this-ASK can walk one
-		// more level up and recover the original question. Only set when
-		// GateStopped==-1 (the structure-permission gate's own sentinel,
-		// see decision/engine.go's gateStructurePermission) — nil for every
-		// other response, including every non-categorized expert.
-		ReplyToUserMessageID: structurePermissionAskParent(result.GateStopped, req.ReplyToMessageID, req.Message),
+		// ReplyToUserMessageID (CT-C4): only set when this IS a
+		// structure-permission ASK (sentinel GateStopped==-1, see
+		// decision/engine.go's gateStructurePermission). userMsgID copy
+		// taken here, not a pointer into req, so each goroutine gets its
+		// own value — req is shared read-only across all expert goroutines
+		// (Process launches one per expert), but taking &local avoids any
+		// doubt about aliasing a shared struct's field across goroutines.
+		ReplyToUserMessageID: structurePermissionAskParent(result.GateStopped, req.UserMessageID),
 	}
 }
 
-// structurePermissionAskParent returns the uuid the structure-permission
-// ASK message itself should be saved as a reply to (its own
-// reply_to_message_id), so a later reply-to-this-ASK can recover the
-// original question by walking one more parent level
-// (decision/engine.go's gateStructurePermission does exactly that).
-//
-// WHY this can't just reuse req.ReplyToMessageID directly here: this
-// function is intentionally a placeholder that returns nil — the ASK
-// message is saved by saveAssistantMessage in message/handler.go, which
-// has access to userMsgID (the actual saved id of the question that
-// triggered this ASK), not available inside the orchestrator at all.
-// Wiring is completed in message/handler.go's saveAssistantMessage,
-// which sets ReplyToMessageID = &userMsgID whenever resp.GateStopped == -1.
-// This function documents WHY the field exists on ExpertResponse and
-// intentionally always returns nil from here — kept as a named function
-// (not inlined) so the reasoning has one place to live.
-func structurePermissionAskParent(gateStopped int, _ *uuid.UUID, _ string) *uuid.UUID {
-	return nil
+// structurePermissionAskParent returns &userMessageID when gateStopped
+// indicates this response is a structure-permission ASK (sentinel -1,
+// decision/engine.go's gateStructurePermission), or nil for every other
+// response. Named function (not inlined) so the sentinel-value meaning
+// has exactly one place to live, per Step 5's "magic values -> named
+// constants" rule (gateStopped==-1 itself is documented at its one
+// source of truth, gateStructurePermission).
+func structurePermissionAskParent(gateStopped int, userMessageID uuid.UUID) *uuid.UUID {
+	if gateStopped != -1 {
+		return nil
+	}
+	id := userMessageID
+	return &id
 }
 
 // synthesize finds agreements and contradictions between expert responses.
