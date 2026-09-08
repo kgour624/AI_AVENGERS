@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/category"
+	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
@@ -27,7 +28,14 @@ type AdminHandler struct {
 	mlClient    *ml.SidecarClient
 	ingestion   *training.IngestionPipeline
 	categoryReg *category.Registry
-	logger      *zap.Logger
+	// domainReg backs the domain-profile admin endpoints (max tokens,
+	// coverage/citation/strip modes, etc — see ListDomainProfiles /
+	// GetDomainProfile / UpdateDomainProfile below). SAME registry
+	// instance wired at startup in cmd/server/main.go and used by
+	// chinawall.Enforcer — writes here take effect for the very next
+	// question with zero redeploy, exactly like categoryReg above.
+	domainReg *chinawall.DomainRegistry
+	logger    *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -43,6 +51,7 @@ func NewAdminHandler(
 	gw *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
 	categoryReg *category.Registry,
+	domainReg *chinawall.DomainRegistry,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -51,6 +60,7 @@ func NewAdminHandler(
 		mlClient:    mlClient,
 		ingestion:   training.NewIngestionPipeline(db, mlClient, gw, logger),
 		categoryReg: categoryReg,
+		domainReg:   domainReg,
 		logger:      logger,
 	}
 }
