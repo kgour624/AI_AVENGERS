@@ -5,7 +5,7 @@
  * AI_AVENGERS_SYSTEM_ARCHITECTURE.md section 5.
  */
 
-import type { Citation, ResponseMode } from './expert'
+import type { Citation, ResponseMode, TemplateSectionResult } from './expert'
 
 export type ProjectStatus = 'active' | 'completed' | 'archived'
 export type RepoProvider = 'github' | 'gitlab'
@@ -80,6 +80,17 @@ export interface Message {
   warningText?: string
   /** Gate 1 ASK clarifying questions. See warningText comment above. */
   clarifyingQuestions?: string[]
+  /**
+   * Fix (2026-09-08 RCA round 7, migration 011): a categorized
+   * expert's structured answer (Pattern/Idea/Code/Walkthrough/Test
+   * Cases) is now persisted to messages.template_sections and
+   * returned here on reload/history fetch - previously undefined on
+   * every persisted message, which meant utils/adaptMessage.ts could
+   * only ever produce content (empty for a structured response) on
+   * reload, rendering as completely blank despite the live SSE
+   * stream having shown it correctly moments earlier.
+   */
+  templateSections?: TemplateSectionResult[]
   createdAt: string
 }
 
