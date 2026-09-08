@@ -154,17 +154,45 @@ func (e *Enforcer) Enforce(
 	}, nil
 }
 
+// isProblemSolvingQuestion detects if a question requires applying principles
+// to solve a new problem (DSA, coding, algorithms) vs factual recall.
+// WHY this matters: DSA experts must APPLY principles to new problems.
+// Literal coverage check ("is this exact problem in the transcript?") is wrong
+// for problem-solving domains — it would refuse every new LeetCode problem.
+func isProblemSolvingQuestion(question string) bool {
+	q := strings.ToLower(question)
+	problemKeywords := []string{
+		"write a function", "write a code", "implement", "solve",
+		"algorithm", "complexity", "leetcode", "code", "program",
+		"find the", "return the", "given an array", "given a string",
+		"time complexity", "space complexity", "big o",
+		"data structure", "sort", "search", "traverse",
+	}
+	for _, kw := range problemKeywords {
+		if strings.Contains(q, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 // checkCoverage asks cheap LLM if chunks can answer the question.
 // Uses Chain-of-Thought prompting (Byte by Byte AI course improvement).
 //
-// WHY CoT here (Byte by Byte AI course):
-// Course taught: chain-of-thought prompting makes model reason step-by-step
-// before answering. Without CoT, model jumps to YES/NO too quickly.
-// With CoT: model analyzes each chunk, identifies gaps, then decides.
-// Result: 30-40% fewer false refusals (PARTIAL/NO when answer exists).
+// TWO MODES:
+// 1. Problem-solving mode (DSA/coding): checks if expert can APPLY principles
+//    to solve the problem. Correct for DSA — principles must transfer to new problems.
+// 2. Factual mode (default): checks if chunks CONTAIN the answer.
+//    Correct for medical/legal/domain-fact experts.
+//
+// WHY two modes:
+//   A DSA expert trained on "two pointers, sliding window, prefix sum" SHOULD
+//   solve "Longest Common Prefix" by applying string traversal principles.
+//   Asking "does the transcript mention Longest Common Prefix?" is wrong —
+//   it would refuse every new problem, defeating the purpose of DSA education.
 func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []CourseChunk) (string, error) {
 	var sb strings.Builder
-	sb.WriteString("Question: " + question + "\n\nAvailable Content:\n")
+	sb.WriteString("Question: " + question + "\n\nAvailable Knowledge:\n")
 	for i, c := range chunks {
 		if i >= 5 {
 			break
@@ -175,7 +203,24 @@ func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []
 		}
 		sb.WriteString(fmt.Sprintf("Chunk %d: %s\n", i+1, preview))
 	}
-	sb.WriteString(`
+
+	if isProblemSolvingQuestion(question) {
+		// Problem-solving mode: check if principles are applicable
+		sb.WriteString(`
+Think step by step:
+1. What algorithmic concepts or data structures does this problem require?
+2. What relevant concepts, techniques, or principles do the chunks contain?
+3. Can the expert APPLY the knowledge in these chunks to solve this problem?
+   (The exact problem does NOT need to be in the chunks — principles transfer)
+
+After thinking, reply with ONLY one word: YES, PARTIAL, or NO
+
+YES = chunks contain principles/techniques applicable to solve this problem
+PARTIAL = chunks have related concepts but missing some key technique
+NO = chunks are completely unrelated to this type of problem`)
+	} else {
+		// Factual mode: check if chunks contain the answer
+		sb.WriteString(`
 Think step by step:
 1. What specific information does the question ask for?
 2. What does each chunk cover?
@@ -186,6 +231,7 @@ After thinking, reply with ONLY one word: YES, PARTIAL, or NO
 YES = chunks contain all information needed
 PARTIAL = chunks answer some parts but missing key details
 NO = chunks do not cover this question`)
+	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
