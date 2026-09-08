@@ -34,16 +34,30 @@ import { cn } from '@/utils/cn'
  *   the backend contract doesn't actually accept.
  */
 export interface MessageInputProps {
+  chatId: string
   experts: ProjectExpert[]
-  onSend: (message: string, expertIds: string[], file?: File) => void
+  onSend: (
+    message: string,
+    expertIds: string[],
+    file?: File,
+    replyToMessageId?: string,
+    includeFullThread?: boolean
+  ) => void
   isSending: boolean
 }
 
-export function MessageInput({ experts, onSend, isSending }: MessageInputProps) {
+export function MessageInput({ chatId, experts, onSend, isSending }: MessageInputProps) {
   const [message, setMessage] = useState('')
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [attachedFile, setAttachedFile] = useState<File | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  // CT-D4: reply state, isolated per-chat via replyStore (CT-L10 —
+  // does not touch streamStore or the message list at all).
+  const replyState = useReplyStore((s) => s.replies.get(chatId))
+  const setIncludeFullThread = useReplyStore((s) => s.setIncludeFullThread)
+  const toggleLoopedInExpert = useReplyStore((s) => s.toggleLoopedInExpert)
+  const clearReply = useReplyStore((s) => s.clearReply)
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const file = acceptedFiles[acceptedFiles.length - 1]
