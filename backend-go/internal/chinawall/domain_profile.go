@@ -107,6 +107,31 @@ type DomainProfile struct {
 	// Updated by AI based on conversation patterns.
 	// Stored in DB as JSONB, loaded at startup, cached in memory.
 	CustomRules []DomainRule
+
+	// MaxTokensFlat: LLM response token cap for this domain's flat-text
+	// generation (chinawall.Enforcer.generateFlatText). 0 means "use
+	// DefaultMaxTokensFlat" - this is what every domain has today, so
+	// admins upgrading from an older DB row (no this field yet) keep
+	// identical behavior with zero migration required.
+	//
+	// WHY admin-configurable (2026-09-08, real production incident):
+	// a hardcoded token limit caused a real DSA expert's structured
+	// answers to get truncated mid-JSON, producing garbled output (see
+	// HANDOFF.md's 2026-09-08 round-3 RCA). A fixed code-level constant
+	// meant fixing this for one domain risked being wrong for the next
+	// domain with different answer-length needs - now every domain
+	// admin can tune this independently from the admin panel, without a
+	// backend redeploy, exactly like every other field on this struct.
+	MaxTokensFlat int
+
+	// MaxTokensStructured: same as MaxTokensFlat, but for this domain's
+	// STRUCTURED (categorized-expert) generation path
+	// (chinawall.Enforcer.generateStructured). 0 means "use
+	// DefaultMaxTokensStructured". Separate from MaxTokensFlat because a
+	// structured answer must fit prose + a full code block + test-case
+	// buckets all inside ONE JSON object - routinely needs a much higher
+	// cap than a flat answer for the SAME domain.
+	MaxTokensStructured int
 }
 
 // DomainRule is a single domain-specific rule.
