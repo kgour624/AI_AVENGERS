@@ -92,8 +92,10 @@ function AdminExperts() {
   const [isCreateOpen, setIsCreateOpen] = useState(false)
   const [charterTargetId, setCharterTargetId] = useState<string | null>(null)
   const [configTargetId, setConfigTargetId] = useState<string | null>(null)
-  // Pipeline progress modal
+  // Pipeline progress modal — store job + expertName together so we
+  // never need to call a hook inside a callback or conditional.
   const [pipelineJob, setPipelineJob] = useState<IngestionJob | null>(null)
+  const [pipelineExpertName, setPipelineExpertName] = useState<string>('')
 
   return (
     <div className="p-6">
