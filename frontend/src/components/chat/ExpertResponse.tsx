@@ -127,8 +127,8 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming }: Ex
       {response.citations.length > 0 && (
         <div className="mt-3 flex flex-wrap items-center gap-1.5">
           <span className="text-xs text-text-secondary">Citations:</span>
-          {response.citations.map((c) => (
-            <CitationChip key={c.chunkId} citation={c} />
+          {response.citations.map((c, i) => (
+            <CitationChip key={c.chunkId} citation={c} index={i + 1} />
           ))}
         </div>
       )}
