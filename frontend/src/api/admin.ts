@@ -2,6 +2,7 @@ import { baseAPI } from './base'
 import type { ApiResponse } from '@/types/api'
 import type { Expert } from '@/types/expert'
 import type { ExpertCategory, CategoryTemplateSchema } from '@/types/category'
+import type { DomainProfile } from '@/types/domainProfile'
 
 /**
  * Admin-only endpoints. Route guard (AuthGuard) + backend 403 both
@@ -324,5 +325,47 @@ export interface UpdateExpertCategoryRequest {
 export const updateExpertCategory = (categoryId: string, req: UpdateExpertCategoryRequest) =>
   baseAPI
     .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/expert-categories/${categoryId}`, req)
+    .then((res) => res.data.data!)
+
+// ============================================================
+// DOMAIN PROFILES (China Wall per-domain config, admin-configurable)
+// ============================================================
+// Matches admin_handler.go's ListDomainProfiles/GetDomainProfile/
+// UpdateDomainProfile exactly — read directly from source before
+// writing these (same discipline as every other function in this
+// file). Includes maxTokensFlat/maxTokensStructured (2026-09-08
+// addition) alongside every other DomainProfile field (Option B scope).
+
+export const getDomainProfiles = () =>
+  baseAPI
+    .get<ApiResponse<DomainProfile[]>>('/api/v1/admin/domain-profiles')
+    .then((res) => res.data.data!)
+
+export const getDomainProfile = (domain: string) =>
+  baseAPI
+    .get<ApiResponse<DomainProfile>>(`/api/v1/admin/domain-profiles/${domain}`)
+    .then((res) => res.data.data!)
+
+// All fields optional — only provided fields are changed on the
+// backend (UpdateDomainProfile's *T pointer fields). customRules is
+// deliberately NOT included here: admin_handler.go's UpdateDomainProfile
+// request struct has no custom_rules field — those are AI-updated based
+// on conversation patterns (domain_profile.go's CustomRules doc
+// comment), not admin-panel-edited, so there is no PATCH surface for
+// them to wire up here.
+export interface UpdateDomainProfileRequest {
+  gate1Skip?: boolean
+  coverageMode?: DomainProfile['coverageMode']
+  citationMode?: DomainProfile['citationMode']
+  stripMode?: DomainProfile['stripMode']
+  systemPromptExt?: string
+  domainKeywords?: string[]
+  maxTokensFlat?: number
+  maxTokensStructured?: number
+}
+
+export const updateDomainProfile = (domain: string, req: UpdateDomainProfileRequest) =>
+  baseAPI
+    .patch<ApiResponse<DomainProfile>>(`/api/v1/admin/domain-profiles/${domain}`, req)
     .then((res) => res.data.data!)
 
