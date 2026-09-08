@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/gateway"
 )
@@ -33,6 +34,13 @@ type Expert struct {
 	Domain               string
 	ReasoningCharter     string
 	ClarificationCharter map[string][]string
+	// TemplateSections/DefaultLanguage (CT-B4): populated by the caller
+	// (orchestrator.go) ONLY when this expert has a category_id whose
+	// category has a non-empty template_schema. nil/"" for every other
+	// expert (CT-L2) — Process()/chinaWall.Enforce() take the existing
+	// flat-text path unchanged in that case.
+	TemplateSections []category.TemplateSection
+	DefaultLanguage  string
 }
 
 // DecisionResult is the output of the 5-gate system.
@@ -45,6 +53,9 @@ type DecisionResult struct {
 	Warning     string   // Set when Gate 3 triggers WARN but continues
 	Questions   []string // Set when Gate 1 triggers ASK
 	Reason      string   // Set when Gate 5 refuses (China Wall reason)
+	// TemplateSections (CT-B4): mirrors chinawall.EnforceResult.TemplateSections.
+	// nil for every flat-text expert response (CT-L2).
+	TemplateSections []chinawall.TemplateSectionResult
 }
 
 // Engine implements the 5-gate decision system.
@@ -128,8 +139,12 @@ func (e *Engine) Process(
 	// GATE 5: Generate Answer (China Wall)
 	// Pass expert.Domain so China Wall uses domain-based mode,
 	// not question-based keyword detection.
+	// Pass expert.TemplateSections/DefaultLanguage (CT-B4) — nil/"" for
+	// any expert with no category or an empty template_schema, in which
+	// case Enforce() takes its existing flat-text path unchanged (CT-L2).
 	enforceResult, err := e.chinaWall.Enforce(
 		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, attempt,
+		expert.TemplateSections, expert.DefaultLanguage,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gate 5 failed: %w", err)
@@ -156,11 +171,12 @@ func (e *Engine) Process(
 
 	case "success":
 		return &DecisionResult{
-			Mode:       ModeADVISE,
-			Content:    enforceResult.Answer,
-			Citations:  enforceResult.Citations,
-			Confidence: enforceResult.Confidence,
-			Warning:    warning,
+			Mode:             ModeADVISE,
+			Content:          enforceResult.Answer,
+			Citations:        enforceResult.Citations,
+			Confidence:       enforceResult.Confidence,
+			Warning:          warning,
+			TemplateSections: enforceResult.TemplateSections,
 		}, nil
 	}
 
