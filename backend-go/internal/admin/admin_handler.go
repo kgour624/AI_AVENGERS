@@ -559,10 +559,15 @@ func (h *AdminHandler) GetExpertCategory(c *gin.Context) {
 // with no clear error at the point the mistake was actually made.
 type templateSchemaInput struct {
 	Sections []struct {
-		Key      string `json:"key"`
-		Label    string `json:"label"`
-		Type     string `json:"type"`
-		Required bool   `json:"required"`
+		Key         string `json:"key"`
+		Label       string `json:"label"`
+		Type        string `json:"type"`
+		Required    bool   `json:"required"`
+		// Description (2026-09-08 RCA fix): optional. See
+		// category.TemplateSection.Description's doc comment for the
+		// full root-cause explanation - this is the admin-facing input
+		// wire shape for that same field.
+		Description string `json:"description"`
 	} `json:"sections"`
 }
 
