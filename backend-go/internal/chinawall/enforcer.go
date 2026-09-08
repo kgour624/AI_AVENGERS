@@ -629,14 +629,11 @@ func (e *Enforcer) generateStructured(
 		Model:        gateway.ModelStrong,
 		SystemPrompt: systemPrompt,
 		UserPrompt:   question,
-		// RCA 2026-09-08: 2000 was still routinely too tight for
-		// prose + a full code block + 4 test-case buckets in one JSON
-		// object — this was the primary cause of truncated/malformed
-		// JSON. Raised to 3500. Even with this raised limit, truncation
-		// can still happen on an unusually long answer — that's exactly
-		// why the parseErr branch below now does a REAL fallback instead
-		// of assuming a higher limit alone fully solves it.
-		MaxTokens:   3500,
+		// Admin-configurable per domain (profile.MaxTokensStructured),
+		// falls back to DefaultMaxTokensStructured (3500) when unset (0).
+		// See DomainProfile's field comment for the 2026-09-08 RCA this
+		// setting exists to prevent from recurring on a different domain.
+		MaxTokens:   resolveMaxTokens(profile.MaxTokensStructured, DefaultMaxTokensStructured),
 		Temperature: 0.4,
 	})
 	if err != nil {
