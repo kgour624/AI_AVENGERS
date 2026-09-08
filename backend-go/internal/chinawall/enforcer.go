@@ -623,7 +623,7 @@ func (e *Enforcer) generateStructured(
 		defaultLanguage = "java" // CT-L5: hardcoded default, admin-overridable per category
 	}
 
-	systemPrompt := buildStructuredPrompt(expertName, reasoningCharter, contextText, sections, defaultLanguage)
+	systemPrompt := buildStructuredPrompt(expertName, reasoningCharter, contextText, sections, defaultLanguage, profile)
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelStrong,
