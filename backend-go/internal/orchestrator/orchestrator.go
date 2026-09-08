@@ -253,29 +253,38 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// Any of these being false is a normal, common state — not an error.
 	var templateSections []category.TemplateSection
 	defaultLanguage := ""
+	askStructurePermission := false
 	if o.categoryRegistry != nil && expert.CategoryID != nil {
-		if cat := o.categoryRegistry.Get(*expert.CategoryID); cat != nil && len(cat.TemplateSchema.Sections) > 0 {
-			templateSections = cat.TemplateSchema.Sections
-			defaultLanguage = cat.DefaultLanguage
+		if cat := o.categoryRegistry.Get(*expert.CategoryID); cat != nil {
+			askStructurePermission = cat.AskStructurePermission
+			if len(cat.TemplateSchema.Sections) > 0 {
+				templateSections = cat.TemplateSchema.Sections
+				defaultLanguage = cat.DefaultLanguage
+			}
 		}
 	}
 
-	// Run decision engine
+	// Run decision engine. req.ReplyToMessageID (CT-C4) is nil for every
+	// fresh question — gateStructurePermission (decision/engine.go) is a
+	// no-op in that case regardless, since it also checks
+	// expert.AskStructurePermission first.
 	result, err := o.decisionEng.Process(
 		ctx,
 		req.Message,
 		decision.Expert{
-			ID:                   expert.ID,
-			Name:                 expert.Name,
-			Domain:               expert.Domain,
-			ReasoningCharter:     expert.ReasoningCharter,
-			ClarificationCharter: expert.ClarificationCharter,
-			TemplateSections:     templateSections,
-			DefaultLanguage:      defaultLanguage,
+			ID:                     expert.ID,
+			Name:                   expert.Name,
+			Domain:                 expert.Domain,
+			ReasoningCharter:       expert.ReasoningCharter,
+			ClarificationCharter:   expert.ClarificationCharter,
+			TemplateSections:       templateSections,
+			DefaultLanguage:        defaultLanguage,
+			AskStructurePermission: askStructurePermission,
 		},
 		assembledCtx.CourseChunks,
 		projectSummary,
 		1,
+		req.ReplyToMessageID,
 	)
 	if err != nil {
 		o.logger.Error("decision engine failed", zap.String("expert", expert.Name), zap.Error(err))
@@ -297,7 +306,35 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		Warning:     result.Warning,
 		Questions:   result.Questions,
 		TemplateSections: result.TemplateSections,
+		// ReplyToUserMessageID (CT-C4 completion): lets message/handler.go's
+		// saveAssistantMessage set this ASK's own reply_to_message_id back
+		// to the user's question, so a LATER reply-to-this-ASK can walk one
+		// more level up and recover the original question. Only set when
+		// GateStopped==-1 (the structure-permission gate's own sentinel,
+		// see decision/engine.go's gateStructurePermission) — nil for every
+		// other response, including every non-categorized expert.
+		ReplyToUserMessageID: structurePermissionAskParent(result.GateStopped, req.ReplyToMessageID, req.Message),
 	}
+}
+
+// structurePermissionAskParent returns the uuid the structure-permission
+// ASK message itself should be saved as a reply to (its own
+// reply_to_message_id), so a later reply-to-this-ASK can recover the
+// original question by walking one more parent level
+// (decision/engine.go's gateStructurePermission does exactly that).
+//
+// WHY this can't just reuse req.ReplyToMessageID directly here: this
+// function is intentionally a placeholder that returns nil — the ASK
+// message is saved by saveAssistantMessage in message/handler.go, which
+// has access to userMsgID (the actual saved id of the question that
+// triggered this ASK), not available inside the orchestrator at all.
+// Wiring is completed in message/handler.go's saveAssistantMessage,
+// which sets ReplyToMessageID = &userMsgID whenever resp.GateStopped == -1.
+// This function documents WHY the field exists on ExpertResponse and
+// intentionally always returns nil from here — kept as a named function
+// (not inlined) so the reasoning has one place to live.
+func structurePermissionAskParent(gateStopped int, _ *uuid.UUID, _ string) *uuid.UUID {
+	return nil
 }
 
 // synthesize finds agreements and contradictions between expert responses.
