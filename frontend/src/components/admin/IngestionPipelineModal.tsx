@@ -1,7 +1,8 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Modal } from '@/components/ui/Modal'
 import { cn } from '@/utils/cn'
 import { useIngestionStream } from '@/hooks/useIngestionStream'
+import { resumeIngestionJob } from '@/api/admin'
 
 // ============================================================
 // Stage definitions
