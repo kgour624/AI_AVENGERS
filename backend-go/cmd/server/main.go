@@ -193,17 +193,7 @@ func buildRouter(
 
 	// Initialize core services
 	memManager := memory.NewManager(postgres.Pool, redisClient.Client, mlClient, logger)
-
-	// DomainRegistry: seed defaults, load all profiles into memory.
-	// Must complete before NewEnforcer — Enforce() calls registry.Get() per question.
-	domainRegistry := chinawall.NewDomainRegistry(postgres.Pool, logger)
-	if err := domainRegistry.Init(ctx); err != nil {
-		logger.Fatal("failed to initialize domain registry", zap.Error(err))
-	}
-	// SetGlobalRegistry enables IsProblemSolvingDomain() used by Gate 1.
-	// Set once at startup, read-only after that.
-	chinawall.SetGlobalRegistry(domainRegistry)
-
+	// domainRegistry is already initialized in main() and passed here.
 	chinawallEnforcer := chinawall.NewEnforcer(cfg.ChinaWall, modelGateway, mlClient, logger, domainRegistry)
 	decisionEngine := decision.NewEngine(postgres.Pool, modelGateway, chinawallEnforcer, logger)
 	contextAssembler := appcontext.NewAssembler(
