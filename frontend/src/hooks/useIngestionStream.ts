@@ -68,15 +68,14 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
       setState((prev) => ({ ...prev, isConnected: false, lastEvent: { type: 'connecting' } }))
       addLog('connecting', 'Opening SSE connection...')
 
-      // EventSource does not support custom headers (no Authorization).
-      // WHY this works: the SSE endpoint is under /admin which requires
-      // AdminMiddleware. We pass the access token as a query param.
-      // The backend reads it from ?token= if Authorization header is missing.
-      const token = localStorage.getItem('_sse_token') ??
-        (window as unknown as Record<string, string>)['__sse_token'] ?? ''
+      // EventSource cannot send Authorization headers.
+      // Pass access token as ?token= query param.
+      // Backend AuthMiddleware reads this as fallback for SSE endpoints.
+      // Token read at connect() time so reconnects always use latest token.
+      const accessToken = useAuthStore.getState().accessToken ?? ''
+      const sseUrl = accessToken ? `${url}?token=${encodeURIComponent(accessToken)}` : url
 
-      // Simpler: use withCredentials — cookie-based auth works for SSE
-      const es = new EventSource(url, { withCredentials: true })
+      const es = new EventSource(sseUrl, { withCredentials: true })
       esRef.current = es
 
       es.onopen = () => {
