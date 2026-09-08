@@ -16,23 +16,29 @@ import (
 // Centralizing prevents forgetting auth on a route.
 func AuthMiddleware(jwtService *auth.JWTService, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Extract token from Authorization header
-		// Format: "Bearer <token>"
+		// Extract token — two sources, in priority order:
+		// 1. Authorization: Bearer <token>  (standard for all requests)
+		// 2. ?token=<token> query param      (SSE only — EventSource cannot set headers)
+		var tokenString string
+
 		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			response.Unauthorized(c, "Authorization header required")
+		if authHeader != "" {
+			parts := strings.SplitN(authHeader, " ", 2)
+			if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+				response.Unauthorized(c, "Invalid authorization format. Use: Bearer <token>")
+				c.Abort()
+				return
+			}
+			tokenString = parts[1]
+		} else if qToken := c.Query("token"); qToken != "" {
+			// SSE fallback: EventSource cannot send Authorization header.
+			// Frontend passes access token as ?token= for SSE endpoints only.
+			tokenString = qToken
+		} else {
+			response.Unauthorized(c, "Authorization required")
 			c.Abort()
 			return
 		}
-
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			response.Unauthorized(c, "Invalid authorization format. Use: Bearer <token>")
-			c.Abort()
-			return
-		}
-
-		tokenString := parts[1]
 
 		// Validate token
 		claims, err := jwtService.ValidateAccessToken(tokenString)
