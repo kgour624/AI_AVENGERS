@@ -483,9 +483,28 @@ func (e *Enforcer) generateWithCitations(
 	}
 
 	if len(templateSections) > 0 {
-		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, contextSB.String(), templateSections, defaultLanguage)
+		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, contextSB.String(), templateSections, defaultLanguage, profile)
 	}
 
+	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, profile, contextSB.String())
+}
+
+// generateFlatText is the ORIGINAL flat-text generation path, extracted
+// unchanged from generateWithCitations so generateStructured can reuse
+// it as a fallback (RCA 2026-09-08, see below) instead of duplicating
+// its prompts. Behavior is byte-for-byte identical to before this
+// extraction — same variables, same prompts, same gateway call, same
+// 1500 MaxTokens (CT-L2: this path is what every non-categorized
+// expert has always used and must keep using unchanged).
+func (e *Enforcer) generateFlatText(
+	ctx context.Context,
+	question string,
+	chunks []CourseChunk,
+	expertName string,
+	reasoningCharter string,
+	profile *DomainProfile,
+	contextText string,
+) (*generatedAnswer, error) {
 	var systemPrompt string
 	if profile.CitationMode == CitationModeLoose {
 		// Loose citation mode: cite principles in explanation, code blocks exempt.
@@ -509,7 +528,7 @@ CRITICAL RULES:
 5. If a technique is NOT in your training material, say so explicitly
 6. The code must be correct and runnable — this is the primary deliverable
 %s`,
-			expertName, reasoningCharter, contextSB.String(), profile.SystemPromptExt)
+			expertName, reasoningCharter, contextText, profile.SystemPromptExt)
 	} else {
 		// Strict citation mode: every factual claim must have inline citation.
 		// WHY: medical/legal/finance — no uncited claims allowed.
@@ -527,7 +546,7 @@ CRITICAL RULES:
 
 COURSE CONTENT:
 %s`,
-			expertName, reasoningCharter, profile.SystemPromptExt, contextSB.String())
+			expertName, reasoningCharter, profile.SystemPromptExt, contextText)
 	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
