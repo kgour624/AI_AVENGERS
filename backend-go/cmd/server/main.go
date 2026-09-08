@@ -355,6 +355,7 @@ func buildRouter(
 		adminGroup.PATCH("/experts/:id", adminHandler.UpdateExpert)
 		adminGroup.POST("/experts/:id/ingest", adminHandler.IngestTranscript)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
+		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
 		adminGroup.GET("/stats", adminHandler.GetStats)
