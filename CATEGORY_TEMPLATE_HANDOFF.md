@@ -254,7 +254,103 @@ Owner: Kiran (has DB + running-server access). Runbook commands available on req
 | CT-B1 | Structured JSON prompt + parse path in Layer 3 | `backend-go/internal/chinawall/enforcer.go`, `backend-go/internal/chinawall/template.go` | DONE (2026-09-08) | \u23f3 NOT STARTED |
 | CT-B2 | Per-section Layer 4 strip logic | `backend-go/internal/chinawall/enforcer.go` (`enforceStructured`) | DONE (2026-09-08) | \u23f3 NOT STARTED |
 | CT-B3 | Hardcoded test-case bucket constants | `backend-go/internal/chinawall/template.go` (new) | DONE (2026-09-08) | \u23f3 NOT STARTED |
-| CT-B4 | `DecisionResult`/`ExpertResponse` carry structured sections through decision engine + orchestrator | `backend-go/internal/decision/engine.go`, `backend-go/internal/orchestrator/orchestrator.go` | \u23f3 NOT STARTED |
+| CT-B4 | `DecisionResult`/`ExpertResponse` carry structured sections through decision engine + orchestrator | `backend-go/internal/decision/engine.go`, `backend-go/internal/orchestrator/orchestrator.go`, `backend-go/internal/message/handler.go`, `backend-go/cmd/server/main.go` | DONE (2026-09-08) |
+
+**Evidence (commits on main, 2026-09-08, verified by re-reading each file
+from main after push):**
+
+1. feat(chinawall): add template.go -- new file, 169 lines. TestCaseBuckets
+   hardcoded [BASE, EDGE, CORNER, STRESS] order (CT-L4, never model or
+   admin controlled). buildStructuredPrompt builds the JSON-only Layer 3
+   prompt; parseStructuredResponse/renderTestCaseBuckets parse the
+   model's JSON into per-section text, re-ordering test_cases buckets to
+   the fixed order regardless of what order the model returned them in.
+2. feat(chinawall): CT-B1/B2 -- enforcer.go. Enforce() gained two new
+   trailing params (templateSections []category.TemplateSection,
+   defaultLanguage string), both nil/empty for every non-categorized
+   expert (CT-L2) -- verified the entire pre-existing flat-text branch
+   (Layer 4 strip + BaseProfile safety net) is untouched other than
+   passing the two new params through unchanged. Added enforceStructured
+   (per-section Layer 4 + its own BaseProfile retry, mirroring the flat
+   path's conflict-resolution logic) and generateStructured (Layer 3
+   structured branch, called from generateWithCitations only when
+   len(templateSections) > 0).
+3. **3 compile-breaking bugs found and fixed in the SAME session, before
+   moving to CT-B4** (caught by re-reading the full file end-to-end and
+   tracing every call site, per Step 4 "mentally execute before writing"):
+   - generateStructured's defined parameter order did not match its call
+     site inside generateWithCitations -- fixed by reordering the
+     function signature to match the call site.
+   - The flat path's own BaseProfile safety-net retry (inside Enforce(),
+     unrelated to the new structured code) still called the OLD 6-arg
+     generateWithCitations after the signature grew to 8 args -- fixed
+     by adding nil, "" to that call site.
+   - decision/engine.go's call to chinaWall.Enforce() still used the
+     OLD 7-arg signature after Enforce() grew to 9 args -- fixed together
+     with CT-B4's Expert.TemplateSections/DefaultLanguage addition in
+     the same commit that changed the call site, per the anti-pattern
+     checklist rule "changing a method signature -> update every call
+     site in the same commit."
+4. feat(decision): CT-B4 part 1 -- engine.go. Added
+   Expert.TemplateSections/DefaultLanguage (nil/empty for every
+   non-categorized expert) and DecisionResult.TemplateSections, wired
+   through Process()'s Gate 5 call into the new Enforce() signature
+   and the "success" case's return value.
+5. feat(orchestrator): CT-B4 part 2 -- orchestrator.go. loadExperts'
+   SQL now selects category_id (verified against migration 010's actual
+   column name before writing the query, not assumed) into a new
+   nullable expertRecord.CategoryID. processWithExpert resolves it via
+   a new categoryRegistry *category.Registry field on Orchestrator --
+   nil-safe at every step (nil registry, nil CategoryID, unknown id, or
+   empty template_schema.Sections all fall through to the flat-text
+   path identically). NewOrchestrator gained a categoryRegistry param;
+   its only call site (main.go) was updated in the SAME commit.
+6. feat(message): CT-B4 completion -- message/handler.go. SSE
+   SSEComplete payload now includes template_sections. **Known,
+   explicitly documented gap** (not silently worked around): structured
+   sections are NOT YET persisted to the messages table --
+   saveAssistantMessage still only saves resp.Content, which is empty
+   for a structured response. A page reload will show a categorized
+   expert's past answer as blank even though the live SSE stream
+   renders it correctly. Fixing this needs either a new
+   messages.template_sections JSONB column (its own migration) or a
+   text-serialization fallback -- deliberately left for a later phase
+   since it is outside CT-B's stated checkpoint ("the raw API response
+   contains a template_sections array" -- satisfied for the live SSE
+   response, not for reload-from-DB).
+
+**Checkpoint CT-B -- honest status:** a categorized expert's live SSE
+response (SSEComplete event) now contains a template_sections array
+matching the category's schema keys, each independently citation-processed
+(Layer 4 applied per prose section, code/test_cases sections structurally
+exempt). **This has NOT been verified against a live running server, a
+real LLM call, or a real HTTP/SSE connection** -- there is no Go
+toolchain, Postgres, ML sidecar, or LLM provider available in this
+session. Every claim above was verified by re-reading each committed
+file from main and manually tracing every call site, parameter order,
+and struct field name -- including catching and fixing 3 real
+signature-mismatch bugs this way before they could reach a build step
+-- but this is not a substitute for go build ./... or an actual
+generation request. Same honesty bar as Phase CT-A and every entry in
+HANDOFF.md.
+
+**Owed before this phase can be called done:**
+- [ ] cd backend-go && go build ./... -- confirm the package compiles.
+      This is the single most important open item; 3 mismatches were
+      already caught by manual tracing but manual tracing cannot
+      guarantee it catches everything a real compiler would.
+- [ ] Create a category with a real template_schema (CT-A, already
+      committed) + an expert with that category_id + real trained
+      content, send it a question, confirm the SSE complete event's
+      template_sections array has the right keys with real generated
+      text and non-empty citations on prose sections.
+- [ ] Confirm a malformed-JSON LLM response degrades to the documented
+      fallback (flat citation extraction on raw content) instead of
+      crashing or silently returning empty sections.
+- [ ] Confirm reload-from-DB gap (documented above) matches expectation
+      -- decide whether to fix now or defer to a dedicated follow-up.
+
+Owner: Kiran (has DB + running-server access). Runbook commands available on request. \u23f3 NOT STARTED |
 
 **Checkpoint CT-B:** a categorized expert with a template answers a coding
 question and the raw API response contains a `template_sections` array
