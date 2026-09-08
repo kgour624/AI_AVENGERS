@@ -186,6 +186,15 @@ function AdminExperts() {
 
       {charterTargetId && (
         <EditCharterModal
+          // BUG FIX (2026-09-08): key={charterTargetId} forces React to
+          // unmount+remount a fresh EditCharterModal instance whenever a
+          // DIFFERENT expert's "Edit Charter" is clicked, instead of
+          // reusing the same instance with just-updated props. This is
+          // a belt-and-suspenders safety net alongside the modal's own
+          // useEffect fix — either one alone fixes the blank-textarea
+          // bug, but together they make the component robust even if
+          // one of the two fixes is ever reverted independently.
+          key={charterTargetId}
           isOpen={charterTargetId !== null}
           onClose={() => setCharterTargetId(null)}
           expertId={charterTargetId}

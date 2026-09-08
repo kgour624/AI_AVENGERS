@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useState, useEffect, type FormEvent } from 'react'
 import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { updateExpertCharter } from '@/api/admin'
@@ -30,6 +30,22 @@ export function EditCharterModal({
   const [charter, setCharter] = useState(currentCharter)
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
+
+  // BUG FIX (2026-09-08): useState(currentCharter) only seeds state on
+  // this component's initial mount. AdminExperts.tsx renders one
+  // EditCharterModal instance and just changes its props (isOpen,
+  // currentCharter, etc.) each time "Edit Charter" is clicked for a
+  // DIFFERENT expert — React does not re-run useState's initializer on
+  // a prop change, so `charter` stayed stuck at whatever the FIRST
+  // opened expert's currentCharter was (often "" the very first time,
+  // before the reasoningCharter backend fix even landed). This effect
+  // re-syncs local state whenever the prop actually changes OR the
+  // modal is (re)opened, so switching between experts — or reopening
+  // the same expert after an edit — always starts from the real saved
+  // value, not stale local state.
+  useEffect(() => {
+    setCharter(currentCharter)
+  }, [currentCharter, isOpen])
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
