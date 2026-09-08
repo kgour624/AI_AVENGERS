@@ -1381,3 +1381,45 @@ Removing `category_id` routes the expert through `generateFlatText` (profile-awa
 Re-read `template.go` and `enforcer.go` in full from `main` after each commit; confirmed `buildStructuredPrompt` has exactly one caller (`generateStructured`, in the same file) and that caller's `profile` parameter was already in scope before this fix (added in round 4's token-config work) - no additional parameter-threading through other layers was needed. **No live `go build`, no live LLM call reproducing the exact JSON prompt, was performed.** Admin should re-enable `category_id` on the DSA expert and re-ask the same 3Sum Closest / 4Sum / Next Permutation questions to confirm full-detail structured answers instead of citations-only.
 
 *Last updated: 2026-09-08 (bug fix batch, round 6)*
+
+---
+
+## BUG FIX - 2026-09-08 (round 7) - Categorized expert's structured answer renders correctly the FIRST time (live SSE), then blank on reload/history - closes the CT-B4 KNOWN GAP
+
+> Admin (Kiran) rebuilt (`docker-compose up --build`) with round 6's fix live, then reported: for the same categorized DSA expert, the answer "kabhi dikhta hai, kabhi kuch bhi nahi" (sometimes shows something, sometimes nothing at all) across different questions in the same session. This is a DIFFERENT bug from round 6 - round 6 fixed WHAT the model generates (was citations-only); round 7 fixes WHETHER a correctly-generated structured answer survives being displayed a second time.
+
+### Root cause (was already self-documented as a KNOWN GAP, never actually fixed)
+
+`message/handler.go`'s `saveAssistantMessage` had this exact comment since the Category/Template feature (CT-B4) shipped:
+
+> "KNOWN GAP (CT-B4)... the messages table has no column for resp.TemplateSections. A categorized expert's structured sections are streamed correctly over SSE... but are NOT persisted here - only resp.Content (empty for a structured response...) is saved."
+
+This was never fixed. Concretely:
+
+1. For a categorized (structured) expert, `chinawall.Enforce()` populates `EnforceResult.TemplateSections` and leaves `Answer`/`Content` **empty** - the structured path never writes prose into `Content`.
+2. The live SSE payload (`sendSSE(w, SSEComplete, {... "template_sections": ...})`) correctly includes the full structured sections - so the FIRST render (immediately after asking) always looked correct.
+3. `saveAssistantMessage` only ever saved `resp.Content` (empty) to the `messages` table - `resp.TemplateSections` was silently dropped, with no DB column to hold it even if someone tried.
+4. Any subsequent render sourced from persisted data - a page reload, or `GET /chats/:id/messages` populating chat history - read back a row with `content=''` and no `template_sections` at all. The frontend adapter (`persistedMessageToExpertResponse`) had no `templateSections` field to map, and `content` was empty, so `ExpertResponse.tsx` rendered **nothing** for that message.
+
+This exactly explains the "sometimes shows something (freshly asked, still on screen from the live stream), sometimes nothing at all (same message re-rendered from persisted/history data, e.g. after a reload or scrolling a long chat)" symptom the admin reported.
+
+### Fix
+
+- **Migration 011** (`011_message_template_sections.up.sql`/`.down.sql`): adds nullable `messages.template_sections JSONB`. Additive only, same design principle as migration 010 - NULL for every flat-text message and every pre-migration row.
+- **`chat/service.go`**: `Message` struct gets `TemplateSections interface{}` (same convention as the existing `Citations interface{}` field - raw JSON, no `chinawall` package dependency in this file). `SaveMessage`'s INSERT and `ListMessages`' SELECT both updated to write/read the new column - `ListMessages` unmarshals it the same way it already unmarshals `citations`.
+- **`message/handler.go`**: `saveAssistantMessage` now passes `resp.TemplateSections` through to `chat.Message.TemplateSections`. The old KNOWN GAP comment is replaced with a FIXED note referencing this round.
+- **Frontend**: `types/project.ts`'s `Message` gets `templateSections?: TemplateSectionResult[]`. `utils/adaptMessage.ts`'s `persistedMessageToExpertResponse` maps `message.templateSections` straight through to the returned `ExpertResponse.templateSections` - `ExpertResponse.tsx`'s existing `templateSections && templateSections.length > 0` render branch needed ZERO changes, since it was already written to handle this field whenever it appears.
+
+**Files:** `backend-go/migrations/011_message_template_sections.up.sql` (new), `backend-go/migrations/011_message_template_sections.down.sql` (new), `backend-go/internal/chat/service.go` (`Message`, `SaveMessage`, `ListMessages`), `backend-go/internal/message/handler.go` (`saveAssistantMessage`), `frontend/src/types/project.ts` (`Message`), `frontend/src/utils/adaptMessage.ts` (`persistedMessageToExpertResponse`)
+
+### Mental execution (performed before committing)
+
+- Scenario 1 (categorized expert, structured answer): `Enforce()` -> `TemplateSections` populated, `Content` empty -> live SSE render correct (unchanged) -> `saveAssistantMessage` now ALSO saves `TemplateSections` -> reload -> `ListMessages` unmarshals a non-empty `template_sections` column -> frontend adapter maps it -> `ExpertResponse.tsx` renders the structured branch, identical to the live render.
+- Scenario 2 (flat-text expert, no category): `resp.TemplateSections` is nil -> pgx encodes a nil interface{} as SQL NULL -> reload -> `len(templateSectionsJSON) > 0` is false -> `m.TemplateSections` stays nil -> frontend gets `undefined` -> zero behavior change, exactly as before this fix.
+- Edge case (message saved before migration 011 ran): `template_sections` column did not exist for that row at save time, but the column is added retroactively as NULL for all existing rows by the `ADD COLUMN IF NOT EXISTS` - reading it back is safe (NULL, not an error), same as scenario 2.
+
+### Verification caveat
+
+Re-read every changed file in full from `main` after each commit (struct field name/JSON tag, INSERT column list matches parameter count and order, SELECT column list matches `Scan()` argument order and count exactly, frontend field name matches what `camelizeKeys()` produces from the backend's `template_sections` JSON key - same conversion already verified working for other nested JSON fields like `categoryRow.templateSchema`). **No live `go build`, no live migration run against a real Postgres instance, no live HTTP round trip, no `npm run build`/`typecheck` was performed.** Admin should re-run `docker-compose up --build` (migration 011 auto-applies via the `migrate` service, matching every other migration's deploy path) and confirm the SAME categorized-expert answer looks identical immediately after asking AND after a page reload.
+
+*Last updated: 2026-09-08 (bug fix batch, round 7)*
