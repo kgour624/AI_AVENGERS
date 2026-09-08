@@ -1291,3 +1291,93 @@ Both fixes were verified by re-reading the committed files from `main` after eac
 Verified by re-reading the full file from `main` after each commit and manually tracing every call site of the changed functions (`generateStructured` has exactly one caller, `generateWithCitations`, already updated in the same change). **No live `go build`, no live LLM call, no real truncated-JSON reproduction was performed** - same toolchain limitation as every other entry in this file. Owner (Kiran) should re-ask the same DSA questions from the screenshot after deploying this fix to confirm.
 
 *Last updated: 2026-09-08 (bug fix batch, round 3)*
+
+---
+
+## FEATURE - 2026-09-08 (round 4) - Admin-configurable China Wall max tokens + full DomainProfile editor
+
+> Requested by admin (Kiran) directly following round 3 above: since a hardcoded `MaxTokens` value caused a real production incident for one domain, every domain should be able to have this (and every other DomainProfile field) tuned from the admin panel without a backend redeploy.
+
+### What changed
+
+- **`chinawall/domain_profile.go`**: added `DefaultMaxTokensFlat = 1500` / `DefaultMaxTokensStructured = 3500` named constants, and `MaxTokensFlat int` / `MaxTokensStructured int` fields on `DomainProfile`. `0` means "use the default constant" - backward compatible with every existing DB row (profiles are stored as JSONB, Go's zero-value for a missing JSON field is `0`), zero migration required.
+- **`chinawall/enforcer.go`**: new `resolveMaxTokens(override, fallback int) int` helper (returns `override` if `> 0`, else `fallback`). `generateFlatText`'s hardcoded `1500` and `generateStructured`'s hardcoded `3500` (from round 3) both now call this against `profile.MaxTokensFlat`/`profile.MaxTokensStructured`.
+- **`chinawall/domain_registry.go`**: added `List()` (snapshot of every cached profile) and `GetExact(domain)` (exact cached profile, no `BaseProfile` fallback - distinguishes "has its own stored profile" from "falls back to base") - needed by the new admin endpoints below.
+- **`admin/admin_handler.go`**: `AdminHandler` gets a new `domainReg *chinawall.DomainRegistry` field; `NewAdminHandler`'s signature changed to accept it (call site in `main.go` updated in the same commit). New handlers: `ListDomainProfiles` (GET), `GetDomainProfile` (GET), `UpdateDomainProfile` (PATCH) - scope decision confirmed with admin before implementing: **Option B, the whole `DomainProfile` struct is editable**, not just the two token fields, since the admin API itself exposes the full struct via `DomainRegistry.Upsert` (already existed for AI/admin overrides, just had no HTTP surface). `customRules` is intentionally NOT included in the PATCH body - it is AI-updated from conversation patterns per `domain_profile.go`'s own doc comment, not an admin-panel field.
+- **`cmd/server/main.go`**: 3 new routes - `GET /admin/domain-profiles`, `GET /admin/domain-profiles/:domain`, `PATCH /admin/domain-profiles/:domain`.
+- **Frontend**: `types/domainProfile.ts` (new `DomainProfile` type + mode enums), `api/admin.ts` (`getDomainProfiles`/`getDomainProfile`/`updateDomainProfile`), `pages/admin/AdminDomainProfiles.tsx` (new list+edit page, full-field form), `AdminLayout.tsx` nav entry + `App.tsx` route at `/admin/domain-profiles`.
+
+### Verification caveat
+
+Every changed/new file was re-read from `main` after each commit (struct field names, constructor signature + call site, route registration, prop/type compatibility with the existing `Input`/`Card`/`Button` components). **No live `go build`, no `npm run build`, no live PATCH request was performed.**
+
+*Last updated: 2026-09-08 (feature, round 4)*
+
+---
+
+## BUG FIX - 2026-09-08 (round 5) - Trained DSA expert refusing "not in my training material" on later turns of a conversation (0% REFUSE), despite passing earlier in the same conversation
+
+> Reported by admin (Kiran): SCALER - DSA answered "Two Sum" correctly (ADVISE 63%, citations), but the SAME expert then refused "3Sum Closest" and "4Sum" with 0% REFUSE and "This topic is not in my training material" - despite 420 chunks of real training data. Two competing hypotheses (category-system breakage, then conversation-budget starvation) were both proposed and INVESTIGATED HONESTLY IN THIS SAME SESSION - the budget-starvation fix below is real and correct as a general robustness fix, but was later proven NOT to be the actual root cause of this specific symptom once the admin reported the same failure in a brand-new project + brand-new chat (see round 6 below, which found and fixed the REAL root cause). Both fixes are kept and documented separately because both are real, independently-justified bugs - the round 5 fix is not reverted.
+
+### Root cause investigated in this round (context-budget enforcement gap - real bug, general fix)
+
+`context/assembler.go`'s `Assemble()` allocates a percentage token budget per context source (10% rolling summary, 20% L2 memory, 20% recent messages, 15% semantic history, 35% course chunks - "most important" per the function's own doc comment). Steps 2 (L2 project memory), 3 (recent messages), and 4 (semantic history) added every byte of their fetched content to `tokensUsed` **unconditionally** - they never actually enforced their own declared percentage cap, unlike step 5 (course chunks), which was gated behind `if tokensUsed < budget*90/100`. In a long-running conversation, steps 2-4 could silently consume far more than their declared share, pushing `tokensUsed` past 90% and causing step 5 to be **skipped entirely** - zero course chunks reached `decision.Engine`'s Gate 2, which then refused with the generic "not in my training material" message (indistinguishable from a genuine coverage gap).
+
+### Fix
+
+- Steps 2/3/4 now each enforce their own declared budget cap via greedy truncation (keep entries/messages until the next one would exceed the cap), instead of adding everything unconditionally.
+- Step 3 (recent messages) truncates oldest-first, preserving the most recent message even if it alone exceeds the cap (recency > hard budget wall).
+- Step 5 (course chunks) no longer has a `tokensUsed < 90%` gate at all - it always runs. Chunk count is already bounded by the `chunksTopK` config value, so this cannot cause unbounded growth; it can, in a pathological case, modestly exceed the soft token budget, which is an accepted trade-off (a refused answer is a far worse failure mode than a slightly over-budget prompt).
+- Also fixed in the same round: `getCourseChunks`/`getRepoChunks` errors were previously swallowed completely silently (no log at all) - now logged via `a.logger.Warn(...)`, including a distinct log line for "zero chunks, no error" (genuinely empty result) vs "error calling embed/vector-search" (transient failure), so a future incident like this is diagnosable from logs alone.
+
+**Files:** `backend-go/internal/context/assembler.go` (`Assemble`, steps 2-5)
+
+### Why this was NOT the actual root cause of the reported symptom (found out in round 6)
+
+Admin reported the SAME failure (3Sum Closest / 4Sum refused) in a **brand-new project with a brand-new chat**. A fresh chat has empty L2 memory, empty recent messages, empty semantic history by definition - `tokensUsed` cannot be anywhere near 90% of budget on message #1 of a new chat, so step 5 could not have been skipped in that reproduction. This directly falsified the budget-starvation theory as the explanation for the admin's exact reported case. The fix above is kept regardless because it is a real, independently-valid robustness bug (a sufficiently long single conversation absolutely could still hit this), but the admin's specific repeated-refusal symptom needed a different explanation - see round 6.
+
+### Verification caveat
+
+Re-read the full file from `main` after commit; traced order-preservation logic for each truncation loop by hand (oldest-first for recent messages, insertion-order for L2/history). **No live `go build`, no live long-conversation reproduction was performed.**
+
+*Last updated: 2026-09-08 (bug fix batch, round 5)*
+
+---
+
+## BUG FIX - 2026-09-08 (round 6) - REAL root cause of categorized-expert answers being citations-only / near-empty prose, with admin-supplied proof
+
+> Admin (Kiran) supplied the decisive proof: after temporarily removing `category_id` from the DSA expert in the DB directly, the SAME expert answered the SAME kind of questions correctly and in full detail (flat markdown mode - full explanation, complete code, complexity analysis, citations). Re-adding the category caused it to degrade back to citations-only / thin prose. This proves the bug is in the STRUCTURED (categorized) generation prompt path specifically, not in retrieval, not in the context assembler (round 5), and not a training-coverage gap - the exact same expert, same training data, same question, behaves correctly in flat mode and badly in structured mode.
+
+### Root cause (confirmed by direct code comparison, not assumed)
+
+`chinawall/enforcer.go`'s `generateFlatText` (the flat/non-categorized path) builds its prompt using `profile.CitationMode` (branches LOOSE vs STRICT) and appends `profile.SystemPromptExt` (e.g. DSA's "Always include time and space complexity. Provide complete, runnable code."). `chinawall/template.go`'s `buildStructuredPrompt` (the categorized/structured path) had **no access to `*DomainProfile` at all** - it took no `profile` parameter. Concretely, for a `CitationMode: LOOSE` domain like DSA (principles transfer to new problems, code is citation-exempt):
+
+1. The structured prompt hardcoded a STRICT-only rule ("every claim in a prose-type section MUST cite a source") regardless of the domain's actual `CitationMode`. A LOOSE domain answering a problem that is not verbatim in its training material cannot honestly satisfy a strict per-claim citation demand - the model's safest way to comply was to lean on citations instead of writing real explanatory prose, producing exactly the reported "only gives source" symptom.
+2. `profile.SystemPromptExt` never reached this prompt at all - DSA's "always include complexity, complete runnable code" instruction had zero effect on any categorized expert.
+3. Each section's only description sent to the model was its `key`/`type`/`label` (e.g. `"pattern" (type=prose, label="Pattern")`) - a display name, not content guidance. The model had no way to know what "Pattern" vs "Idea" vs "Walkthrough" were actually supposed to contain, unlike the flat path's explicit "Approach -> Code -> Complexity" structure instruction.
+
+### Fix
+
+- **`category/registry.go`**: added optional `TemplateSection.Description string` field (`json:"description,omitempty"`) - lets an admin specify exactly what content belongs in a section. Empty is valid (no regression for existing categories).
+- **`admin/admin_handler.go`**: `templateSchemaInput`'s section struct accepts the same `description` field, so it round-trips through category create/update.
+- **`chinawall/template.go`**: `buildStructuredPrompt` now takes a `profile *DomainProfile` parameter. Citation rule (numbered rule 3) branches exactly like `generateFlatText`: LOOSE domains get "cite principles you are applying, but explain your full reasoning first; a citation supports the explanation, it does not replace it - NEVER answer with citations alone"; STRICT domains keep the original per-claim-citation rule unchanged. `profile.SystemPromptExt` is appended as an additional numbered rule when non-empty. Added rule 7: every prose section must contain substantive content, not a citation-only stub. New `sectionGuidance(section) string` helper provides per-section content guidance with priority: (1) admin's `Description` if set, (2) built-in guidance for `code`/`test_cases` types, (3) built-in guidance keyed by common key/label patterns (`pattern`, `idea`/`approach`, `walkthrough`/`trace`/`example`, `complex`) - covers the migration-010-seeded "Coding" category's exact section names with zero admin action required, (4) generic "write substantive content, not thin/citation-only" fallback.
+- **`chinawall/enforcer.go`**: `generateStructured`'s call site updated to pass `profile` (it already received `profile *DomainProfile` as a parameter from the round-3 fix's flat-text-fallback wiring, so this is just forwarding an already-available value - no new parameter threaded through additional layers).
+
+**Files:** `backend-go/internal/category/registry.go`, `backend-go/internal/admin/admin_handler.go`, `backend-go/internal/chinawall/template.go`, `backend-go/internal/chinawall/enforcer.go`
+
+### Mental execution (performed before committing)
+
+- Scenario 1 (DSA, LOOSE, seeded "Coding" category, no admin `Description` set on any section): `profile.CitationMode == LOOSE` -> rule 3 becomes the explain-first/citation-supports-explanation wording. `profile.SystemPromptExt` non-empty -> rule 8 added. Section `pattern` -> `sectionGuidance` matches `key=="pattern"` -> pattern-naming guidance. Section `idea` -> matches -> idea/approach guidance. Section `walkthrough` -> matches -> step-by-step trace guidance. Model now receives the same level of structural instruction the flat path always had, plus an explicit anti-citation-only rule.
+- Scenario 2 (a hypothetical STRICT-mode categorized domain, e.g. medical): `profile.CitationMode != LOOSE` -> original strict rule unchanged, byte-for-byte - zero regression for any non-LOOSE domain.
+- Edge case (`profile` nil): traced every call path into `generateStructured` - it is only invoked from `generateWithCitations`, which is only invoked from `Enforce()`, where `profile` is always either `e.registry.Get(expertDomain)` (never nil - falls back to `BaseProfile` internally) or `BaseProfile` itself directly. `profile` cannot be nil at this call site.
+- Edge case (admin sets `Description` on a section): `sectionGuidance` checks it first, unconditionally overriding every built-in fallback - confirmed by reading the function's own priority-ordered `if`/`switch` structure top to bottom.
+
+### Why this fully explains the admin's proof
+
+Removing `category_id` routes the expert through `generateFlatText` (profile-aware citation mode + SystemPromptExt + explicit "Approach -> Code -> Complexity" structure from day one) - which is exactly why it "worked fine" the moment the category was removed. The bug was never in retrieval, training coverage, or the context assembler; it was that the structured path was built without ever wiring in the same domain-awareness the flat path already had.
+
+### Verification caveat
+
+Re-read `template.go` and `enforcer.go` in full from `main` after each commit; confirmed `buildStructuredPrompt` has exactly one caller (`generateStructured`, in the same file) and that caller's `profile` parameter was already in scope before this fix (added in round 4's token-config work) - no additional parameter-threading through other layers was needed. **No live `go build`, no live LLM call reproducing the exact JSON prompt, was performed.** Admin should re-enable `category_id` on the DSA expert and re-ask the same 3Sum Closest / 4Sum / Next Permutation questions to confirm full-detail structured answers instead of citations-only.
+
+*Last updated: 2026-09-08 (bug fix batch, round 6)*
