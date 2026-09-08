@@ -23,6 +23,16 @@ import (
 type SendMessageRequest struct {
 	Message   string      `json:"message" binding:"required"`
 	ExpertIDs []string    `json:"expert_ids" binding:"required,min=1"`
+	// ReplyToMessageID (CT-C1): optional. When set, this message is a
+	// reply to a specific prior message (CT-L6: pins exactly that one
+	// message by default). nil/absent = fresh question, the existing
+	// behavior for every message sent before this feature (CT-L2-style
+	// fallback, applied here to messages instead of experts).
+	ReplyToMessageID string `json:"reply_to_message_id,omitempty"`
+	// IncludeFullThread (CT-L6): explicit opt-in only. false/absent means
+	// only the single pinned message is used as reply context — never
+	// automatic full-chain inclusion. Ignored if ReplyToMessageID is empty.
+	IncludeFullThread bool `json:"include_full_thread,omitempty"`
 }
 
 // SSEEvent types for streaming
@@ -145,6 +155,19 @@ func (h *Handler) Send(c *gin.Context) {
 		expertIDs = append(expertIDs, id)
 	}
 
+	// Parse reply_to_message_id (CT-C1). Empty string is valid (fresh
+	// question) — only parse+validate when non-empty, matching the
+	// existing expertIDs loop's error-on-malformed-input pattern above.
+	var replyToMessageID *uuid.UUID
+	if req.ReplyToMessageID != "" {
+		parsed, err := uuid.Parse(req.ReplyToMessageID)
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid reply_to_message_id")
+			return
+		}
+		replyToMessageID = &parsed
+	}
+
 	// Verify chat ownership
 	ch, err := h.chatSvc.GetByID(c.Request.Context(), chatID, clientID)
 	if err != nil {
@@ -167,10 +190,11 @@ func (h *Handler) Send(c *gin.Context) {
 
 	// Save user message
 	userMsgID, err := h.chatSvc.SaveMessage(c.Request.Context(), chat.Message{
-		ChatID:     chatID,
-		Role:       "user",
-		Content:    fullMessage,
-		TurnNumber: turnNumber,
+		ChatID:           chatID,
+		Role:             "user",
+		Content:          fullMessage,
+		TurnNumber:       turnNumber,
+		ReplyToMessageID: replyToMessageID,
 	})
 	if err != nil {
 		h.logger.Error("save user message failed", zap.Error(err))
@@ -198,12 +222,14 @@ func (h *Handler) Send(c *gin.Context) {
 
 		// Run orchestrator
 		orchestratorReq := orchestrator.OrchestratorRequest{
-			ProjectID:  ch.ProjectID,
-			ClientID:   clientID,
-			ChatID:     chatID,
-			Message:    fullMessage,
-			ExpertIDs:  expertIDs,
-			TurnNumber: turnNumber,
+			ProjectID:         ch.ProjectID,
+			ClientID:          clientID,
+			ChatID:            chatID,
+			Message:           fullMessage,
+			ExpertIDs:         expertIDs,
+			TurnNumber:        turnNumber,
+			ReplyToMessageID:  replyToMessageID,
+			IncludeFullThread: req.IncludeFullThread,
 		}
 
 		orchestratorResp, err := h.orchestrator.Process(c.Request.Context(), orchestratorReq)
