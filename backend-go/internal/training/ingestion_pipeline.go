@@ -776,13 +776,47 @@ func (p *IngestionPipeline) runSmokeTest(
 		return false, 0, fmt.Errorf("smoke test: topic scan error: %w", err)
 	}
 
-	// If no capabilities yet (edge case: capability build failed), fall back
-	// to a single generic probe about the expert's domain.
+	// If expert_capabilities is empty (capability build failed), load
+	// distinct topics directly from course_chunks.
+	// WHY: Topic extraction (Step 2) runs before capability build (Step 8).
+	// Chunk topics are stored even when capability build fails.
+	// This gives real topic probes instead of a weak "general" fallback.
 	if len(topics) == 0 {
-		p.logger.Warn("smoke test: no capabilities found, using generic probe",
+		p.logger.Warn("smoke test: no capabilities found, loading topics from course_chunks",
 			zap.String("expert_id", expertID.String()),
 		)
-		topics = []string{"general"}
+		chunkTopicRows, chunkTopicErr := p.db.Query(ctx,
+			`SELECT DISTINCT topic
+			 FROM course_chunks
+			 WHERE expert_id = $1
+			   AND topic IS NOT NULL
+			   AND topic != ''
+			   AND topic != 'general'
+			 ORDER BY topic
+			 LIMIT $2`,
+			expertID, smokeTestProbeCount,
+		)
+		if chunkTopicErr == nil {
+			defer chunkTopicRows.Close()
+			for chunkTopicRows.Next() {
+				var t string
+				if scanErr := chunkTopicRows.Scan(&t); scanErr == nil {
+					topics = append(topics, t)
+				}
+			}
+		}
+		if len(topics) > 0 {
+			p.logger.Info("smoke test: loaded topics from course_chunks",
+				zap.Int("count", len(topics)),
+				zap.Strings("topics", topics),
+			)
+		} else {
+			// Last resort: generic probe
+			p.logger.Warn("smoke test: no topics in chunks either, using generic probe",
+				zap.String("expert_id", expertID.String()),
+			)
+			topics = []string{"general"}
+		}
 	}
 
 	// Step 2–6: Probe each topic.
