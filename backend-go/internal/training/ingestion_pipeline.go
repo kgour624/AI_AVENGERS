@@ -371,9 +371,37 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.storeCapabilities(ctx, expertID, capabilities)
 	}
 
-	// Step 9: Update expert stats
+	// Step 9: Update expert stats.
+	// BUG FIX (2026-09-08): previously used len(chunks)/uniqueTopics
+	// directly, which are ONLY the current transcript file's counts.
+	// In append mode (the DEFAULT per DOMAIN_EXPERT_COLLABORATION_DESIGN.md
+	// §5.4), course_chunks keeps BOTH the old and new chunks, but this
+	// UPDATE overwrote experts.total_chunks with just the new file's
+	// count (e.g. 420), silently discarding the previous total (e.g.
+	// 745) instead of reflecting the true 1165 rows now in course_chunks.
+	// Fix: query the actual aggregate from course_chunks/expert_capabilities
+	// (the real source of truth this column is supposed to mirror) instead
+	// of trusting the in-memory count from only this run. Falls back to
+	// the old (wrong but non-fatal) values on query error rather than
+	// leaving total_chunks unset entirely.
 	uniqueTopics := countUniqueTopics(topicResults)
 	avgDepth := calculateAvgDepth(capabilities)
+
+	actualTotalChunks := len(chunks)
+	actualTotalTopics := uniqueTopics
+	if err := p.db.QueryRow(ctx,
+		`SELECT COUNT(*), COUNT(DISTINCT topic)
+		 FROM course_chunks
+		 WHERE expert_id = $1`,
+		expertID,
+	).Scan(&actualTotalChunks, &actualTotalTopics); err != nil {
+		p.logger.Warn("failed to compute actual total_chunks/total_topics from DB, falling back to this run's counts",
+			zap.String("expert_id", expertID.String()),
+			zap.Error(err),
+		)
+		actualTotalChunks = len(chunks)
+		actualTotalTopics = uniqueTopics
+	}
 
 	_, err = p.db.Exec(ctx,
 		`UPDATE experts SET
@@ -383,7 +411,7 @@ func (p *IngestionPipeline) IngestTranscript(
 			is_training = FALSE,
 			updated_at = NOW()
 		 WHERE id = $4`,
-		len(chunks), uniqueTopics, avgDepth, expertID,
+		actualTotalChunks, actualTotalTopics, avgDepth, expertID,
 	)
 	if err != nil {
 		p.logger.Warn("failed to update expert stats", zap.Error(err))
