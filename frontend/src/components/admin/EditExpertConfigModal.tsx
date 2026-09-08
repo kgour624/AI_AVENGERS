@@ -104,6 +104,12 @@ export function EditExpertConfigModal({
         maxLoopIterations: maxIter,
         allowedTools,
         trainingStatus,
+        // Only send categoryId when it is actually set. UpdateExpert's
+        // documented convention is set-if-present, no explicit-clear
+        // support (see admin_handler.go's UpdateExpert comment on
+        // CategoryID). Omitting the field when categoryId is empty
+        // leaves the expert's existing category untouched.
+        ...(categoryId ? { categoryId } : {}),
       })
       onSaved()
       handleClose()
