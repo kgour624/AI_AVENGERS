@@ -274,21 +274,21 @@ func (a *Assembler) Assemble(
 	// step whose own doc comment calls it "most important").
 	chunks, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
 	if err != nil {
-			// FIX (2026-09-08 RCA): this error was previously swallowed
-			// completely silently — zero chunks reached decision.Engine's
-			// Gate 2, which then refused with "This topic is not in my
-			// training material", indistinguishable from a genuine
-			// coverage gap. An admin debugging that refusal had no way to
-			// tell "ML sidecar down / embedding failed" apart from "this
-			// expert genuinely never trained on this topic" without this
-			// log line. Warn (not Error): a single question failing
-			// retrieval is degraded service, not a crash — matches this
-			// file's existing severity convention (getReplyThread already
-			// Warns on its own non-fatal failures).
-			a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
-				zap.String("expert_id", expertID.String()),
-				zap.Error(err),
-			)
+		// FIX (2026-09-08 RCA): this error was previously swallowed
+		// completely silently — zero chunks reached decision.Engine's
+		// Gate 2, which then refused with "This topic is not in my
+		// training material", indistinguishable from a genuine
+		// coverage gap. An admin debugging that refusal had no way to
+		// tell "ML sidecar down / embedding failed" apart from "this
+		// expert genuinely never trained on this topic" without this
+		// log line. Warn (not Error): a single question failing
+		// retrieval is degraded service, not a crash — matches this
+		// file's existing severity convention (getReplyThread already
+		// Warns on its own non-fatal failures).
+		a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
+			zap.String("expert_id", expertID.String()),
+			zap.Error(err),
+		)
 	} else {
 		assembled.CourseChunks = chunks
 		for _, c := range chunks {
