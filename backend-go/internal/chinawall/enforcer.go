@@ -649,7 +649,10 @@ func (e *Enforcer) generateStructured(
 		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, profile, contextText)
 	}
 
-	var allCitations []Citation
+	// 2026-09-08 RCA: initialized non-nil - a structured answer with
+	// zero prose citations (e.g. only code/test_cases sections) must
+	// not marshal this as JSON null (crashes frontend citations.map()).
+	allCitations := []Citation{}
 	seen := make(map[string]bool)
 	resultSections := make([]TemplateSectionResult, 0, len(sections))
 	for _, s := range sections {
