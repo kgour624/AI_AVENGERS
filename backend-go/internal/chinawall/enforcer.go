@@ -47,15 +47,28 @@ type Citation struct {
 // Layer 3: Generate with mandatory citations — strong LLM
 // Layer 4: Strip uncited claims — regex
 //
+// DOMAIN BEHAVIOR:
+//   Each layer's behavior is controlled by DomainProfile, not hardcoded booleans.
+//   registry.Get(expertDomain) → *DomainProfile → controls all 4 layers.
+//   Unknown domain → BaseProfile (strict defaults, safe fallback).
+//
+// CONFLICT RESOLUTION (base wall safety net):
+//   Domain rules apply first.
+//   IF Layer 4 output is empty AND profile.StripMode == FULL_STRIP:
+//     → retry with BaseProfile (domain rules over-relaxed the wall)
+//   IF profile.StripMode == CODE_EXEMPT AND output has code block:
+//     → valid output, domain rules win
+//
 // WHY 4 layers:
 // Single layer is not enough. LLMs are trained to be helpful
 // and will hallucinate even when told not to.
 // Each layer catches what the previous missed.
 type Enforcer struct {
-	cfg     config.ChinaWallConfig
-	gateway *gateway.ModelGateway
-	ml      *ml.SidecarClient
-	logger  *zap.Logger
+	cfg      config.ChinaWallConfig
+	gateway  *gateway.ModelGateway
+	ml       *ml.SidecarClient
+	logger   *zap.Logger
+	registry *DomainRegistry
 }
 
 // NewEnforcer creates a new China Wall enforcer.
