@@ -156,26 +156,18 @@ func (e *Enforcer) Enforce(
 	}, nil
 }
 
-// isProblemSolvingQuestion detects if a question requires applying principles
-// to solve a new problem (DSA, coding, algorithms) vs factual recall.
-// WHY this matters: DSA experts must APPLY principles to new problems.
-// Literal coverage check ("is this exact problem in the transcript?") is wrong
-// for problem-solving domains — it would refuse every new LeetCode problem.
-func isProblemSolvingQuestion(question string) bool {
-	q := strings.ToLower(question)
-	problemKeywords := []string{
-		"write a function", "write a code", "implement", "solve",
-		"algorithm", "complexity", "leetcode", "code", "program",
-		"find the", "return the", "given an array", "given a string",
-		"time complexity", "space complexity", "big o",
-		"data structure", "sort", "search", "traverse",
-	}
-	for _, kw := range problemKeywords {
-		if strings.Contains(q, kw) {
-			return true
-		}
-	}
-	return false
+// problemSolvingDomains: expert domains where principle-application
+// mode is correct. Set by admin at expert creation. Stable per expert.
+// WHY domain not question: same question to different experts = different behavior.
+var problemSolvingDomains = map[string]bool{
+	"dsa": true, "algorithms": true, "coding": true,
+	"programming": true, "computer_science": true,
+	"software_engineering": true, "data_structures": true,
+	"competitive_programming": true,
+}
+
+func isProblemSolvingDomain(domain string) bool {
+	return problemSolvingDomains[strings.ToLower(domain)]
 }
 
 // checkCoverage asks cheap LLM if chunks can answer the question.
