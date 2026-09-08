@@ -26,6 +26,12 @@ type OrchestratorRequest struct {
 	Message     string
 	ExpertIDs   []uuid.UUID
 	TurnNumber  int
+	// ReplyToMessageID/IncludeFullThread (CT-C1/C2): nil/false for every
+	// fresh (non-reply) question — the existing behavior for every
+	// request sent before this feature. Passed through to
+	// appcontext.Assembler.Assemble unchanged.
+	ReplyToMessageID  *uuid.UUID
+	IncludeFullThread bool
 }
 
 // OrchestratorResponse is the full output including all expert responses.
@@ -217,9 +223,13 @@ collected:
 
 // processWithExpert runs one expert through the full pipeline.
 func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRequest, expert expertRecord) ExpertResponse {
-	// Assemble context
+	// Assemble context. ReplyToMessageID/IncludeFullThread (CT-C1/C2) are
+	// nil/false for every fresh question — Assemble's reply-thread branch
+	// (source 7) is a pure no-op in that case, identical to before this
+	// feature existed.
 	assembledCtx, err := o.assembler.Assemble(
 		ctx, req.ChatID, req.ProjectID, expert.ID, req.Message, req.TurnNumber,
+		req.ReplyToMessageID, req.IncludeFullThread,
 	)
 	if err != nil {
 		o.logger.Warn("context assembly failed", zap.String("expert", expert.Name), zap.Error(err))
