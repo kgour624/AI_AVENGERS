@@ -473,13 +473,101 @@ Owner: Kiran (has DB + running-server access). Runbook commands available on req
 
 | # | Component | File | Status |
 |---|---|---|---|
-| CT-D1 | Admin Categories page + template builder | `frontend/src/pages/admin/AdminCategories.tsx` (new) | \u23f3 NOT STARTED |
-| CT-D2 | `CreateExpertModal.tsx` category dropdown | `frontend/src/components/admin/CreateExpertModal.tsx` | \u23f3 NOT STARTED |
-| CT-D3 | Reply state slice (isolated, new) | `frontend/src/stores/replyStore.ts` (new) | \u23f3 NOT STARTED |
-| CT-D4 | Reply UI (chip, full-thread toggle, expert multi-select) | `frontend/src/components/chat/MessageInput.tsx` | \u23f3 NOT STARTED |
-| CT-D5 | Structured section renderer | `frontend/src/components/chat/ExpertResponse.tsx` (or new sibling) | \u23f3 NOT STARTED |
-| CT-D6 | Copy button in `CodeBlock.tsx` | `frontend/src/components/chat/CodeBlock.tsx` | \u23f3 NOT STARTED |
-| CT-D7 | Whole-response copy button | `frontend/src/components/chat/ExpertResponse.tsx` | \u23f3 NOT STARTED |
+| CT-D1 | Admin Categories page + template builder | `frontend/src/pages/admin/AdminCategories.tsx` (new) | DONE (2026-09-08) |
+| CT-D2 | `CreateExpertModal.tsx` category dropdown | `frontend/src/components/admin/CreateExpertModal.tsx` | DONE (2026-09-08) |
+| CT-D3 | Reply state slice (isolated, new) | `frontend/src/stores/replyStore.ts` (new) | DONE (2026-09-08) |
+| CT-D4 | Reply UI (chip, full-thread toggle, expert multi-select) | `frontend/src/components/chat/MessageInput.tsx` | DONE (2026-09-08) |
+| CT-D5 | Structured section renderer | `frontend/src/components/chat/ExpertResponse.tsx` | DONE (2026-09-08) |
+| CT-D6 | Copy button in `CodeBlock.tsx` | `frontend/src/components/chat/CodeBlock.tsx` | DONE (2026-09-08) |
+| CT-D7 | Whole-response copy button | `frontend/src/components/chat/ExpertResponse.tsx` | DONE (2026-09-08) |
+
+**Evidence (commits on main, 2026-09-08, verified by re-reading each file
+from main after push):**
+
+1. CT-D0 (prerequisite): types/expert.ts's GateStopped extended with -1
+   sentinel (CT-C4) and ExpertResponse gained templateSections?
+   (CT-B4). Without this the TS compiler would reject the real SSE
+   payload shape.
+2. CT-D1: types/category.ts (ExpertCategory/CategoryTemplateSchema/
+   Section types matching admin_handler.go's categoryRow exactly),
+   api/admin.ts (getExpertCategories/createExpertCategory/
+   updateExpertCategory), AdminCategories.tsx (list + template builder
+   with add/remove/reorder sections, key/label/type/required per
+   section, default_language, ask_structure_permission toggle),
+   App.tsx route + AdminLayout.tsx nav item.
+3. CT-D2: CreateExpertModal.tsx gained an optional category dropdown
+   (useQuery-fetched). Found and fixed a real gap during this work:
+   CreateExpertRequest (api/admin.ts) was missing categoryId entirely
+   -- would have failed TypeScript compilation the moment the dropdown
+   tried to pass it.
+4. CT-D3: stores/replyStore.ts -- new, fully isolated Zustand slice
+   (zero imports to/from streamStore.ts, per CT-L10). Per-chat Map
+   keying, mirrors streamStore's own new-object-per-mutation pattern
+   for correct React re-renders.
+5. CT-D4: useSSEStream.ts's SendMessageOptions/sendMessage thread
+   replyToMessageId/includeFullThread through both the JSON and
+   multipart request branches. Found and fixed a real backend gap
+   during this work: message/handler.go's Send() multipart branch
+   never read reply_to_message_id/include_full_thread from PostForm at
+   all -- a reply sent together with a file attachment would have
+   silently lost its reply target; the JSON branch already worked
+   correctly via ShouldBindJSON. MessageInput.tsx gained chatId prop,
+   reply chip with cancel, full-thread toggle, and expert loop-in
+   multi-select (CT-L6/CT-L7), all reading from replyStore. Wired
+   end-to-end through ChatPage.tsx's handleSend and its MessageInput
+   call site (chatId prop was missing -- would not have compiled).
+6. CT-D5: ExpertResponse.tsx gained a chatId prop, a Reply button
+   (gated on chatId + persistedMessageId both being set, same reason
+   RatingWidget already gates on persistedMessageId alone), and a
+   structured-section renderer that only activates when
+   response.templateSections is non-empty -- every flat-text expert
+   response falls through to the pre-existing markdown branch,
+   byte-for-byte unchanged. Code-type sections render as a fenced
+   block directly (no citation splitting, matching the backend's own
+   citation-exempt treatment); prose sections reuse
+   splitContentByCitations exactly like the flat-text path already
+   does. Wired via ChatPage.tsx's persisted-message call site (chatId
+   prop was missing there too -- would not have compiled).
+7. CT-D6: CodeBlock.tsx gained a hover-visible Copy button using
+   navigator.clipboard.writeText, with a 1.5s "Copied!" confirmation
+   state and a caught+logged (not silently swallowed) clipboard error.
+8. CT-D7: ExpertResponse.tsx gained a whole-response Copy button in
+   the header row. Handles the structured case explicitly --
+   concatenates each section's label+content into readable plain text
+   rather than copying nothing just because the flat-text `content`
+   field is empty for a structured response.
+
+**Checkpoint CT-D -- honest status:** every listed UI piece (template
+builder, category dropdown, reply chip/toggle/loop-in, structured
+section rendering, both copy buttons) is committed and wired end-to-end
+by manual tracing of every call site and prop change. **This has NOT
+been verified with a real npm run build/typecheck, a real browser
+click-through, or a real backend response** -- no Node/browser
+environment is available in this session, same limitation stated for
+every other phase in this file. 3 real gaps were found and fixed
+during this work purely by re-reading files after each commit
+(CreateExpertRequest missing categoryId, the multipart reply-field
+backend gap, and two ChatPage.tsx call sites missing the now-required
+chatId prop) -- consistent with the pattern already seen in CT-B (3
+bugs) and CT-C (2 bugs): manual tracing catches real problems, but it
+is not a substitute for an actual compiler/build run.
+
+**Owed before this phase (and the whole feature) can be called done:**
+- [ ] `cd backend-go && go build ./...`
+- [ ] `cd frontend && npm install && npm run typecheck && npm run build`
+      -- this is the single most important open item for the entire
+      CATEGORY_TEMPLATE feature; nothing in Phases CT-A through CT-D
+      has been compiled even once.
+- [ ] Manual click-through: create a category with a template, assign
+      an expert to it, ask it a question, confirm structured sections
+      render distinctly in the UI.
+- [ ] Manual click-through: reply to a message, toggle full-thread,
+      loop in a second expert, send -- confirm all three reach the
+      backend correctly.
+- [ ] Manual click-through: click Copy on a code block and on a whole
+      response, confirm clipboard contents are correct in both cases.
+
+Owner: Kiran (has DB + running-server + browser access). Runbook commands available on request.
 
 **Checkpoint CT-D:** admin builds a template visually, an expert in that
 category renders Pattern/Idea/Code/Walkthrough/TestCases as distinct UI
