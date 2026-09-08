@@ -164,6 +164,30 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
           onChange={(e) => setDomain(e.target.value)}
           placeholder="system_design"
         />
+
+        {/* CT-D2: optional category dropdown. Not required (CT-L2 —
+            category_id is nullable, flat-text is the safe default). */}
+        <div className="flex flex-col gap-1.5">
+          <label htmlFor="expert-category" className="text-sm text-text-secondary">
+            Category (optional)
+            <span className="ml-1 text-xs text-text-disabled">
+              (structured answer template, e.g. Pattern/Idea/Code/Walkthrough/Test Cases)
+            </span>
+          </label>
+          <select
+            id="expert-category"
+            value={categoryId}
+            onChange={(e) => setCategoryId(e.target.value)}
+            className="rounded-md border border-surface-border bg-surface-overlay px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+          >
+            <option value="">None — flat-text answers</option>
+            {categories?.map((cat) => (
+              <option key={cat.id} value={cat.id}>
+                {cat.name}
+              </option>
+            ))}
+          </select>
+        </div>
         <div className="flex flex-col gap-1.5">
           <label htmlFor="expert-description" className="text-sm text-text-secondary">
             Description (optional)
