@@ -201,7 +201,6 @@ func (h *Handler) Send(c *gin.Context) {
 		response.InternalError(c)
 		return
 	}
-	_ = userMsgID
 
 	// Increment message count
 	_ = h.chatSvc.IncrementMessageCount(c.Request.Context(), chatID)
@@ -230,6 +229,9 @@ func (h *Handler) Send(c *gin.Context) {
 			TurnNumber:        turnNumber,
 			ReplyToMessageID:  replyToMessageID,
 			IncludeFullThread: req.IncludeFullThread,
+			// UserMessageID (CT-C4): userMsgID was saved above, BEFORE this
+			// point, so it is always a real id by the time orchestrator runs.
+			UserMessageID: userMsgID,
 		}
 
 		orchestratorResp, err := h.orchestrator.Process(c.Request.Context(), orchestratorReq)
@@ -332,6 +334,14 @@ func (h *Handler) saveAssistantMessage(
 		// loop (rating/handler.go's updateChunkBoosts reads citations
 		// back from a saved message to know which chunks to boost).
 		Citations:           resp.Citations,
+		// CT-C4: when this response IS a structure-permission ASK
+		// (orchestrator.go's structurePermissionAskParent sentinel),
+		// this sets the ASK message's OWN reply_to_message_id back to
+		// the user's question — so a later reply-to-this-ASK can walk
+		// one more parent level and recover the original question
+		// (decision/engine.go's gateStructurePermission). nil for every
+		// other response — identical to before this feature existed.
+		ReplyToMessageID:    resp.ReplyToUserMessageID,
 	})
 	if err != nil {
 		h.logger.Warn("save assistant message failed",
