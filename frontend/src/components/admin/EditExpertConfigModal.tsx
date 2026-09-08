@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
-import { updateExpert } from '@/api/admin'
+import { updateExpert, getExpertCategories } from '@/api/admin'
 import { handleAPIError } from '@/utils/errors'
 import type { Expert } from '@/types/expert'
 
