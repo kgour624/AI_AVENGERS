@@ -1455,3 +1455,37 @@ Go's zero-value for an uninitialized `[]Citation` slice is `nil`, and `encoding/
 Re-read every changed file in full from `main` after each commit (confirmed `extractCitations` has multiple call sites, all unaffected by the initialization change since `append` behaves identically on a nil vs empty slice; confirmed `splitContentByCitations`'s only two call sites in `ExpertResponse.tsx` both pass through the new nullable parameter type correctly). **No live `go build`, no live browser reproduction of the original crash, no `npm run build`/`typecheck` was performed.** Admin should rebuild and confirm scrolling to a categorized expert's answer (especially one with a code-type section) no longer crashes the chat page.
 
 *Last updated: 2026-09-08 (bug fix batch, round 8)*
+
+---
+
+## FOUR-QUESTION AUDIT - 2026-09-08 (round 9)
+
+> Admin (Kiran) asked 4 direct questions with two chat screenshots after round 8. Each investigated by reading actual code first, not assumption.
+
+### Q1: Is the template system fully working now?
+
+**Confirmed yes**, per admin's own screenshot (PATTERN/IDEA/CODE/WALKTHROUGH/TEST CASES rendering correctly with citations). Matches rounds 6-8's fixes exactly. No further action.
+
+### Q2: Why does the response pop in all at once instead of streaming, sometimes only after typing the next message?
+
+**This is the current architecture, not a bug.** `gateway/model_gateway.go`'s `ModelGateway.Call()` -> `provider.Call(ctx, provReq)` is a single BLOCKING HTTP call - zero token-by-token streaming from any LLM provider. `message/handler.go`'s SSE `complete` event for an expert only fires AFTER the entire blocking LLM call inside `chinawall.Enforce()` has returned. SSE here is used for multi-expert coordination (each expert's finished answer arrives as its own event), not within-one-answer token streaming. The symptom is simply a slow LLM call (a full structured JSON answer takes longer) finishing after the user already moved on - not buffering, not throttling.
+
+**Not fixed this round** - real token-level streaming needs every provider (`gateway/providers/*.go`) switched to its streaming API plus a new SSE partial-chunk event schema - a feature, not a bug fix, out of scope without explicit go-ahead.
+
+### Q3: Why does replying to a message lose context ("kiske baare mein baat kar rahe ho?")?
+
+**REAL BUG, found and fixed.** `context/assembler.go`'s `loadOneThreadMessage` (used by `getReplyThread`, CT-C2) selected ONLY the `content` column. For a categorized expert's structured answer, `content` is empty (structured path only populates `TemplateSections`, never `Content` - same underlying fact round 7 fixed for message persistence, but this is a DIFFERENT code path round 7 never touched: reply-context resolution). Replying to a structured answer sent the next expert turn a prompt with "## Replying To\nASSISTANT (turn N): " and literally nothing after the colon - a genuinely empty pin, not a wrong one. The expert asking "what are we talking about?" was correct behavior given that broken input.
+
+**Fix:** `loadOneThreadMessage` now also selects `template_sections`. When `content` is empty but sections exist, a new `flattenTemplateSections` helper converts the JSONB array into a readable `"Label:\ncontent"` text block, used as the entry's `Content`. Flat-text messages (the vast majority, and everything pre-migration-011) are unaffected - `template_sections` is NULL, the flatten branch never triggers.
+
+**Files:** `backend-go/internal/context/assembler.go` (`loadOneThreadMessage`, new `flattenTemplateSections`)
+
+### Q4: Does a new category with different section keys work without code changes?
+
+**Confirmed fully dynamic already**, verified by reading every consumer of `category.TemplateSection`. `buildStructuredPrompt` builds its JSON instructions purely from the admin-defined `sections` slice - zero hardcoded category/domain names. `sectionGuidance` (round 6) checks the admin's `Description` field FIRST, before any built-in key/label pattern fallback, and even that fallback ends in a fully generic catch-all for unrecognized keys. `parseStructuredResponse` parses back using the same admin-defined `Key`/`Type` fields. **A brand-new category via the admin panel with entirely new section keys works with zero code changes** - recommendation: always fill in each section's `Description` (round 6), since the built-in pattern fallback only recognizes the seeded "Coding" category's specific names (pattern/idea/walkthrough/complexity); a very different category (e.g. "System Design" with `tradeoffs`/`bottlenecks`) would fall through to the generic fallback without an explicit `Description`.
+
+### Verification caveat
+
+Q1/Q2/Q4 answered by reading source directly - no code changed for those three. Q3's fix re-read in full from `main` after commit; confirmed `strings`/`encoding/json` were already imported (no new import needed), traced the null-check against both a flat-text message (unaffected) and a structured message (now flattens correctly). **No live `go build`, no live reply-to-structured-answer reproduction was performed.** Admin should reply to a categorized expert's structured answer and confirm the next expert turn now receives real context.
+
+*Last updated: 2026-09-08 (four-question audit, round 9)*
