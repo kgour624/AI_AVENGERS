@@ -9,6 +9,7 @@ import { fadeUp, staggerContainer, ARC_MOTION } from '@/design-system/motion'
 
 export function Sidebar() {
   const sidebarOpen = useUIStore((s) => s.sidebarOpen)
+  const setSidebarOpen = useUIStore((s) => s.setSidebarOpen)
   const { projectId: activeProjectId } = useParams<{ projectId: string }>()
   const reduceMotion = useReducedMotion()
 
@@ -19,14 +20,34 @@ export function Sidebar() {
   })
 
   return (
-    <aside className={cn(
-      'flex-shrink-0 overflow-y-auto',
-      'border-r border-glass-border',
-      'bg-surface-base/70 backdrop-blur-xl',
-      'transition-all duration-200 ease-arc',
-      sidebarOpen ? 'w-64' : 'w-0'
-    )}>
+    <>
+      {/* Mobile-only backdrop (2026-09-09 responsive fix): below sm,
+          the sidebar switches from push-layout to a fixed overlay (see
+          <aside> classes below) - this backdrop lets a tap outside the
+          drawer close it, and dims the page content behind it so it's
+          clear the drawer is a temporary overlay, not part of the flow.
+          Absent entirely on sm+ (push-layout there, no overlay concept). */}
       {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/50 sm:hidden"
+          aria-hidden="true"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+      <aside className={cn(
+        'overflow-y-auto',
+        'border-r border-glass-border',
+        'bg-surface-base/70 backdrop-blur-xl',
+        'transition-all duration-200 ease-arc',
+        // Mobile (< sm): fixed overlay drawer, full height, slides via
+        // width/translate - NOT a push layout, so it never squeezes the
+        // page content underneath on a narrow viewport.
+        // Desktop (sm+): original push-layout behavior, unchanged.
+        'fixed inset-y-0 left-0 z-40 sm:static sm:z-auto',
+        sidebarOpen ? 'w-64 translate-x-0' : 'w-0 -translate-x-full sm:translate-x-0',
+        'flex-shrink-0'
+      )}>
+        {sidebarOpen && (
         <nav className="p-4">
           <div className="mb-3 flex items-center justify-between">
             <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-text-disabled">Projects</p>
