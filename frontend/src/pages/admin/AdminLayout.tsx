@@ -35,8 +35,43 @@ const NAV_ITEMS = [
  * NavLink/Outlet/cn() logic line is untouched, only classNames changed.
  */
 export function AdminLayout() {
+  const navigate = useNavigate()
+  const user = useAuthStore((s) => s.user)
+  const clearAuth = useAuthStore((s) => s.clearAuth)
+
+  // 2026-09-09 fix (round 12): /admin/* routes render OUTSIDE AppShell
+  // (see App.tsx's route tree - AdminLayout is its own top-level lazy
+  // subtree, never nested under AppShell's <Header>/<Sidebar>), so
+  // Header.tsx's Logout/user-name were NEVER reachable from any admin
+  // page - not a CSS/overflow bug (rounds 10-11), a genuine missing
+  // feature on this specific layout. Same handleLogout logic as
+  // Header.tsx, duplicated rather than shared via a hook/component
+  // since the two headers render structurally different markup
+  // (Header.tsx also has a sidebar-toggle button and an Experts link
+  // that make no sense in the admin shell).
+  const handleLogout = async () => {
+    try { await logoutApi() } catch { /* best-effort */ }
+    clearAuth()
+    queryClient.clear()
+    navigate('/login', { replace: true })
+  }
+
   return (
-    <div className="arc-atmosphere flex h-screen text-text-primary">
+    <div className="arc-atmosphere flex h-screen flex-col text-text-primary">
+      <header className="flex h-12 flex-shrink-0 items-center justify-end gap-3 border-b border-glass-border bg-surface-base/80 px-4 backdrop-blur-xl">
+        {user && (
+          <span className="hidden text-xs text-text-secondary sm:inline" title={user.email}>
+            {user.fullName}
+          </span>
+        )}
+        <button
+          onClick={handleLogout}
+          className="text-xs font-medium uppercase tracking-wider text-text-disabled transition-colors duration-150 ease-arc hover:text-mode-refuse"
+        >
+          Logout
+        </button>
+      </header>
+      <div className="flex flex-1 overflow-hidden">
       <aside className="w-56 flex-shrink-0 border-r border-glass-border bg-surface-raised/70 p-4 backdrop-blur-xl">
         <p className="mb-4 font-semibold tracking-wide [text-shadow:0_0_12px_var(--glow-purple)]">
           {'\u26A1'} AI Avengers Admin
