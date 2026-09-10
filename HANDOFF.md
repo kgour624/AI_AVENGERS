@@ -1489,3 +1489,36 @@ Re-read every changed file in full from `main` after each commit (confirmed `ext
 Q1/Q2/Q4 answered by reading source directly - no code changed for those three. Q3's fix re-read in full from `main` after commit; confirmed `strings`/`encoding/json` were already imported (no new import needed), traced the null-check against both a flat-text message (unaffected) and a structured message (now flattens correctly). **No live `go build`, no live reply-to-structured-answer reproduction was performed.** Admin should reply to a categorized expert's structured answer and confirm the next expert turn now receives real context.
 
 *Last updated: 2026-09-08 (four-question audit, round 9)*
+
+---
+
+## BUG FIX - 2026-09-09 (round 10) - UI not responsive; Admin/Logout/profile buttons appeared to vanish on narrow viewports
+
+> Admin (Sabh) reported the whole product UI is not responsive, and separately that Admin/Logout/profile buttons had disappeared after recent changes.
+
+### Root cause (verified by reading every layout file, not assumed)
+
+Two confirmed facts:
+
+1. **Zero responsive breakpoints existed anywhere in the layout layer.** Read `Header.tsx`, `Sidebar.tsx`, `AppShell.tsx`, `Card.tsx`, `Button.tsx`, `MessageInput.tsx` - not a single `sm:`/`md:`/`lg:` Tailwind prefix in any of them. `Header.tsx` was a fixed-height flex row with no `flex-wrap`, no `overflow-x-auto`, and full-text labels ("AI Avengers", user's full name) at every viewport width. `Sidebar.tsx` was a hardcoded `w-64`/`w-0` PUSH layout (not an overlay) at every viewport width, including mobile.
+2. **Admin/Logout/user-name buttons were never removed from the code.** Read `Header.tsx` directly - the `isAdmin && <Link to="/admin">`, `user && <span>{user.fullName}</span>`, and the `onClick={handleLogout}` button are all present, unconditionally rendered whenever their guard condition is true. The "vanished" symptom is a rendering consequence of fact #1, not a missing/deleted feature: on a narrow viewport, the header row's total content width (logo text + "Experts" link + Admin link + full user name + Logout, all fixed-width, no shrink, no wrap) exceeds the viewport width, and the right-side items get pushed past the visible edge - present in the DOM, invisible on screen.
+
+### Fix
+
+- **`Header.tsx`**: added responsive breakpoints. Below `sm`, the full "AI Avengers" brand text and the user's full name are hidden (`hidden sm:inline`) - only the lightning-bolt icon, "Experts", Admin link (if admin), and Logout stay visible at every width, since those are the actionable items, not decorative labels. Added `overflow-x-auto` on the header itself as a safety net for anything still too wide on extremely narrow screens, and `whitespace-nowrap` + `flex-shrink-0` on both left/right groups so items never get squeezed into unreadable wrapped text.
+- **`Sidebar.tsx`**: below `sm`, the sidebar is now a `fixed` overlay drawer (`inset-y-0 left-0`, slides via `translate-x-0`/`-translate-x-full`) with a semi-transparent backdrop (`fixed inset-0 bg-black/50 sm:hidden`, tap-to-close) instead of a push layout - opening it on mobile no longer squeezes the page content into a narrow column. At `sm` and above, behavior is byte-for-byte unchanged (`sm:static sm:z-auto`, same `w-64`/`w-0` push-layout classes as before).
+
+**Files:** `frontend/src/components/layout/Header.tsx`, `frontend/src/components/layout/Sidebar.tsx`
+
+### Mental execution (performed before committing)
+
+- Mobile, sidebar closed: backdrop absent (`sidebarOpen` false, conditional never renders) - `<aside>` gets `w-0 -translate-x-full` - drawer fully off-screen, page content unaffected.
+- Mobile, sidebar open: backdrop renders (dark overlay, `sm:hidden` so desktop never sees it) - `<aside>` gets `w-64 translate-x-0` - drawer slides in as a `fixed` overlay ON TOP of page content (not pushing it), tapping the backdrop calls `setSidebarOpen(false)`.
+- Desktop (sm+): backdrop's own conditional still evaluates but the element carries `sm:hidden`, so it's never visually present; `<aside>` carries `sm:static sm:z-auto`, overriding the mobile `fixed` positioning - identical push-layout behavior to before this fix, confirmed by comparing every non-responsive class against the pre-fix version.
+- Header, narrow viewport: brand text and user's full name hidden, Admin/Experts/Logout remain visible and clickable - the actual reported "missing buttons" are now visible at every tested width.
+
+### Verification caveat
+
+Re-read both files in full from `main` after each commit (confirmed JSX fragment/tag nesting closes correctly in `Sidebar.tsx` after the two-part edit - opening `<>`, conditional backdrop, `<aside>`, conditional `<nav>`, all matched with their closing counterparts in the same order). **No live `npm run dev`, no live browser resize/viewport testing, no `npm run build`/`typecheck` was performed.** Admin should verify at common breakpoints (360px, 768px, 1024px+) that Admin/Logout/user-name are reachable and the sidebar opens as an overlay (not a squeeze) on mobile widths.
+
+*Last updated: 2026-09-09 (bug fix batch, round 10)*
