@@ -1522,3 +1522,32 @@ Two confirmed facts:
 Re-read both files in full from `main` after each commit (confirmed JSX fragment/tag nesting closes correctly in `Sidebar.tsx` after the two-part edit - opening `<>`, conditional backdrop, `<aside>`, conditional `<nav>`, all matched with their closing counterparts in the same order). **No live `npm run dev`, no live browser resize/viewport testing, no `npm run build`/`typecheck` was performed.** Admin should verify at common breakpoints (360px, 768px, 1024px+) that Admin/Logout/user-name are reachable and the sidebar opens as an overlay (not a squeeze) on mobile widths.
 
 *Last updated: 2026-09-09 (bug fix batch, round 10)*
+
+---
+
+## BUG FIX - 2026-09-09 (round 11) - round 10 was incomplete; real root cause was page-level horizontal overflow, not Header's own overflow
+
+> Admin (Sabh) gave the precise correct diagnosis: Logout disappears due to horizontal overflow pushing the header's right side off-viewport (caused by wide content further down the page, not by Header itself); Admin disappears because `isAdmin` correctly returns false for a non-admin account (expected, not a bug); user name is hidden by round 10's `hidden sm:inline` class plus the same overflow issue. Round 10's `overflow-x-auto` scoped to `<header>` alone was insufficient.
+
+### Root cause round 10 missed
+
+`overflow-x-auto` on `<header>` only lets the header's OWN box scroll internally - it does nothing if the PAGE itself is wider than the viewport. In `AppShell.tsx`, `Header` and the `Sidebar`+`main` wrapper are SIBLING flex items in the same outer `flex flex-col`. `<main>` had `flex-1` but no `min-w-0` - a flex item's default min-width is `auto`, so it will not shrink below its content's intrinsic width. Any wide descendant rendered inside `<Outlet/>` forces `<main>` wider than the viewport, and because `<main>` and `Header` share the same ancestor flex-column, the WHOLE PAGE gets a horizontal scrollbar. Scrolling that shifts `Header` itself sideways, carrying Admin/user-name/Logout off the visible edge - exactly the reported symptom, and exactly why fixing only `<header>`'s own overflow could never solve it.
+
+### Fix
+
+- `frontend/src/index.css`: added `html, body { overflow-x: hidden; }` as a guaranteed backstop.
+- `AppShell.tsx`: `<main>` now has `min-w-0` alongside `flex-1` - the real source-level fix, containing wide content inside main's own scroll area instead of expanding the page.
+- `AdminLayout.tsx`: same `min-w-0 flex-1` fix applied to the admin panel's `<main>` - same gap existed there.
+- `Header.tsx`: removed round 10's now-unnecessary `overflow-x-auto`.
+
+**Files:** `frontend/src/index.css`, `frontend/src/components/layout/AppShell.tsx`, `frontend/src/pages/admin/AdminLayout.tsx`, `frontend/src/components/layout/Header.tsx`
+
+### Correction to round 10
+
+Both round 10's breakpoint work AND round 11's page-overflow fix are needed together: breakpoints reduce how much header content there is; `min-w-0`/`overflow-x:hidden` stops unrelated page content from pushing the header off-screen regardless of how minimal the header itself is.
+
+### Verification caveat
+
+Re-read all four changed files in full from `main` after each commit. **No live `npm run dev`, no live browser testing, no `npm run build`/`typecheck` was performed.** Admin should verify no page-level horizontal scrollbar appears anywhere and Admin/user-name/Logout stay visible at every viewport width.
+
+*Last updated: 2026-09-09 (bug fix batch, round 11)*
