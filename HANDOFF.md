@@ -1551,3 +1551,42 @@ Both round 10's breakpoint work AND round 11's page-overflow fix are needed toge
 Re-read all four changed files in full from `main` after each commit. **No live `npm run dev`, no live browser testing, no `npm run build`/`typecheck` was performed.** Admin should verify no page-level horizontal scrollbar appears anywhere and Admin/user-name/Logout stay visible at every viewport width.
 
 *Last updated: 2026-09-09 (bug fix batch, round 11)*
+
+---
+
+## BUG FIX - 2026-09-10 (round 13) - round 11's diagnosis was WRONG; fixing it broke Admin/name/Logout completely (not just on narrow viewports)
+
+> Admin (Kiran) reported Admin/Logout/user-name had *stopped* showing entirely after round 11-12's work, when round 10 had at least made them reachable (via scroll) on narrow viewports. Correctly pushed back and asked for a re-diagnosis instead of another guess-fix.
+
+### Root cause: round 11's "page-level horizontal overflow" theory was never actually true
+
+Re-read `AppShell.tsx` from scratch before touching anything. Its outermost `<div>` already carries `overflow-hidden` (both axes) - `className="arc-atmosphere flex h-screen flex-col overflow-hidden text-text-primary"`. This means a page-level horizontal scrollbar was **never possible** in this layout - the browser cannot scroll past a container that clips overflow at the root. Round 11's entire premise ("the whole page gets a horizontal scrollbar, scrolling it shifts Header off-screen") does not hold up against the actual code.
+
+What round 11 got right: `<main>` lacking `min-w-0` is a real (harmless-in-isolation) gap - a wide descendant inside `<Outlet/>` could force `<main>` wider than available space. But because the ancestor `overflow-hidden` clips it, that excess width was **already being contained**, not leaking to the page. `min-w-0` on `<main>` was an unnecessary-but-harmless fix.
+
+What round 11 got wrong, and what actually broke things: it **removed `overflow-x-auto` from `<header>` itself** (Header.tsx), reasoning that the "real" fix lived elsewhere. But `Header` is a **sibling** of the `Sidebar`+`main` wrapper in `AppShell`'s outer flex-column - not a descendant of `main`. `main`'s `min-w-0` has zero effect on `Header`'s own box. `Header`'s row uses `justify-between` with two `flex-shrink-0` groups (left: toggle+brand+Experts; right: Admin+name+Logout) - on any viewport narrow enough that these two groups' combined width exceeds the header's width, the row overflows **inside `Header`'s own box**. Before round 11, `overflow-x-auto` on `<header>` caught this locally (scrollable, buttons reachable). After round 11 removed it, that same overflow has nowhere to go but get clipped by the *ancestor* `overflow-hidden` on `AppShell`'s outer div - silently, with no scrollbar, no visible fallback. Round 12 then compounded the confusion by additionally adding a *global* `overflow-x: hidden` on `html, body` in `index.css`, a second layer of the same wrong theory, which only made any real overflow anywhere in the app more likely to clip invisibly instead of scroll.
+
+### Fix (revert to round-10 known-good state, on top of round 11/12's harmless parts)
+
+- `frontend/src/index.css`: removed the speculative `html, body { overflow-x: hidden; }` rule added in round 11. It was solving a page-level overflow that the outer `overflow-hidden` on `AppShell` already made impossible, and it risked clipping legitimate overflow anywhere else in the app.
+- `frontend/src/components/layout/Header.tsx`: restored `overflow-x-auto` on `<header>` (round 10's original fix, wrongly removed in round 11). This is the only container that actually needs to absorb Header's own row overflow, since it is not a descendant of `main` and cannot benefit from `main`'s `min-w-0`.
+- Left `AppShell.tsx`'s `min-w-0` on `<main>` and `AdminLayout.tsx`'s `min-w-0` on its `<main>` in place - genuinely harmless (contains wide `Outlet` content inside its own scroll area, does not affect Header at all).
+
+**Files:** `frontend/src/index.css`, `frontend/src/components/layout/Header.tsx`
+
+### Mental execution (performed before committing)
+
+- Narrow viewport, Header content fits within available width: `overflow-x-auto` produces no visible scrollbar (nothing overflows), identical to no scroll behavior at all - zero regression for the common case.
+- Narrow viewport, Header content does NOT fit (e.g. long email/name via `title` attr doesn't matter, but the two `flex-shrink-0` groups together are still too wide even with round 10's `hidden sm:inline` trimming): Header's own box scrolls horizontally, Admin/name/Logout are reachable by scrolling within the header strip - matches round 10's original, admin-confirmed-working behavior before round 11 touched it.
+- Any other page in the app with a genuinely wide descendant inside `<Outlet/>` (e.g. a long code block, a wide table): contained by `main`'s own `min-w-0` + `overflow-hidden`/`overflow-y-auto`, never escapes to affect `Header`, with or without the now-removed global `overflow-x:hidden` backstop.
+- `AdminLayout.tsx`'s own header (added round 12, `justify-end` with only 2 items: name + Logout, no `justify-between` two-group squeeze) has much lower overflow risk than `Header.tsx`'s 2-group layout - left untouched this round, flagged for the admin to confirm is also fine.
+
+### Verification caveat
+
+Re-read both changed files in full from `main` after each commit. **No live `npm run dev`, no live browser testing, no `npm run build`/`typecheck` was performed.** Admin (Kiran) confirmed after this fix that Admin/Logout/user-name are visible again on the main app shell. `/admin`'s own header (`AdminLayout.tsx`, round 12) was not separately confirmed by the admin in this round and should be checked too.
+
+### Lesson (stated plainly, not hidden)
+
+Round 11 introduced a fix for a mechanism (page-level scroll) that a five-second read of `AppShell.tsx`'s own existing `overflow-hidden` would have shown was impossible - that read was skipped in round 11, in violation of the read-before-write rule. The fix still "worked" in the sense that no error occurred, but it deleted the one working safety net (`Header`'s own `overflow-x-auto`) and replaced it with nothing, then round 12 added a second layer of the same wrong theory on top. Going forward: before writing a fix for an "X causes Y" theory, verify X is actually reachable given the code as it exists today, not as assumed.
+
+*Last updated: 2026-09-10 (bug fix, round 13)*
