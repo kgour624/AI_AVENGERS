@@ -63,7 +63,7 @@ export function AdminLayout() {
           {'\u2190'} Back to App
         </Link>
       </aside>
-      <main className="flex-1 overflow-y-auto">
+      <main className="min-w-0 flex-1 overflow-y-auto">
         <Outlet />
       </main>
     </div>
