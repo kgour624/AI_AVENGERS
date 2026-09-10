@@ -105,6 +105,7 @@ export function Sidebar() {
           </motion.ul>
         </nav>
       )}
-    </aside>
+      </aside>
+    </>
   )
 }
