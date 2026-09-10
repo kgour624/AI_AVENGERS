@@ -1,5 +1,8 @@
-import { NavLink, Outlet, Link } from 'react-router-dom'
+import { NavLink, Outlet, Link, useNavigate } from 'react-router-dom'
 import { cn } from '@/utils/cn'
+import { useAuthStore } from '@/stores/authStore'
+import { logout as logoutApi } from '@/api/auth'
+import { queryClient } from '@/api/queryKeys'
 
 const NAV_ITEMS = [
   { to: '/admin',                 label: 'Overview',        end: true  },
