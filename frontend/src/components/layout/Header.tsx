@@ -19,7 +19,7 @@ export function Header() {
   }
 
   return (
-    <header className="relative flex h-14 flex-shrink-0 items-center justify-between gap-2 overflow-x-auto px-2 sm:gap-4 sm:px-4 border-b border-glass-border bg-surface-base/80 backdrop-blur-xl shadow-[0_1px_0_oklch(68%_0.28_295_/_0.15)]">
+    <header className="relative flex h-14 flex-shrink-0 items-center justify-between gap-2 px-2 sm:gap-4 sm:px-4 border-b border-glass-border bg-surface-base/80 backdrop-blur-xl shadow-[0_1px_0_oklch(68%_0.28_295_/_0.15)]">
       <div className="flex flex-shrink-0 items-center gap-2 sm:gap-5">
         <button onClick={toggleSidebar} aria-label="Toggle sidebar"
           className="text-text-disabled transition-colors duration-150 ease-arc hover:text-glow-cyan text-lg">
