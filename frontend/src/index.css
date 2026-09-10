@@ -5,24 +5,3 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
-
-/* ============================================================
-   2026-09-09 responsive root-cause fix (round 11): global safety
-   net against page-level horizontal overflow. Root cause: a flex
-   item without `min-width: 0` (e.g. AppShell's <main>) will not
-   shrink below its content's intrinsic min-content width, so any
-   sufficiently wide descendant (a long unwrapped string, a table,
-   etc.) forces that flex item - and everything sharing its ancestor
-   flex-column, INCLUDING Header, which is a sibling flex item in the
-   SAME column, not a descendant of main - wider than the viewport.
-   The browser then gives the whole page a horizontal scrollbar, and
-   scrolling it shifts Header along with everything else, pushing its
-   right-side buttons (Admin/user name/Logout) off the visible edge.
-   This is NOT fixed by scoping overflow-x-auto to Header alone (tried
-   first, insufficient) - it must be fixed at the page-overflow level.
-   overflow-x: hidden here is the guaranteed backstop: no matter what
-   breaks inside the app, the page itself can never scroll
-   horizontally, so Header can never be shifted off-screen by it. */
-html, body {
-  overflow-x: hidden;
-}
