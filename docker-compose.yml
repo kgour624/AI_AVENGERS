@@ -94,6 +94,13 @@ services:
       #- /app/node_modules
     environment:
       - VITE_API_URL=http://192.168.1.7:8080
+      # 2026-09-09 fix (round 12): tells vite.config.ts's server.hmr.clientPort
+      # what port the BROWSER actually uses (host-side 3001), not the
+      # container-internal port (3000) Vite would otherwise assume for its
+      # injected HMR WebSocket client - this is what "[vite] failed to
+      # connect to websocket" was caused by. Must match the host-side port
+      # in this same file's "ports: - 3001:3000" mapping below.
+      - VITE_HMR_CLIENT_PORT=3001
     depends_on:
       - api
     restart: unless-stopped
