@@ -82,7 +82,7 @@ func (s *L2Store) Append(ctx context.Context, entry L2Entry) error {
 // "What decisions were made about scaling?" — semantic is better.
 // Hybrid covers both cases.
 func (s *L2Store) SearchByQuery(ctx context.Context, projectID uuid.UUID, query string, limit int) ([]L2Entry, error) {
-	embedding, err := s.ml.EmbedSingle(ctx, query)
+	embedding, err := s.embedder.EmbedSingle(ctx, query)
 	if err != nil {
 		// Embedding failed — fall back to keyword search
 		return s.searchByKeyword(ctx, projectID, query, limit)

@@ -26,7 +26,8 @@ import (
 // 4. Store: All data ready, single transaction
 type IngestionPipeline struct {
 	db       *pgxpool.Pool
-	embedder ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	embedder ml.Embedder        // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	sidecar  *ml.SidecarClient  // kept separately for Rerank() — Rerank is sidecar-only, not in Embedder interface
 	gateway  *gateway.ModelGateway
 	chunker  *TextChunker
 	topics   *TopicExtractor
@@ -36,17 +37,24 @@ type IngestionPipeline struct {
 }
 
 // NewIngestionPipeline creates a new ingestion pipeline.
+//
 // embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
 // *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+//
+// sidecar is kept as a separate *ml.SidecarClient because the smoke test
+// step calls Rerank(), which is sidecar-only and NOT part of the Embedder
+// interface (locked decision: reranking always stays on the Python sidecar).
 func NewIngestionPipeline(
 	db *pgxpool.Pool,
 	embedder ml.Embedder,
+	sidecar *ml.SidecarClient,
 	gw *gateway.ModelGateway,
 	logger *zap.Logger,
 ) *IngestionPipeline {
 	return &IngestionPipeline{
 		db:         db,
 		embedder:   embedder,
+		sidecar:    sidecar,
 		gateway:    gw,
 		chunker:    NewTextChunker(DefaultChunkerConfig()),
 		topics:     NewTopicExtractor(gw, embedder, logger),
@@ -957,7 +965,7 @@ func (p *IngestionPipeline) runSmokeTest(
 		)
 
 		// Step 3: Embed the probe question.
-		embeddings, embedErr := p.ml.Embed(ctx, []string{probeQuestion})
+		embeddings, embedErr := p.embedder.Embed(ctx, []string{probeQuestion})
 		if embedErr != nil {
 			p.logger.Warn("smoke test: embed failed for probe",
 				zap.Int("probe_index", i),
@@ -1005,7 +1013,10 @@ func (p *IngestionPipeline) runSmokeTest(
 		}
 
 		// Step 5: Rerank candidates against the probe question.
-		rankResults, rerankErr := p.ml.Rerank(ctx, probeQuestion, candidates, len(candidates))
+		// WHY p.sidecar.Rerank (not p.embedder.Rerank):
+		// Rerank() is sidecar-only — it is NOT in the Embedder interface.
+		// CodeCraftAPI has no /v1/rerank endpoint. Locked decision.
+		rankResults, rerankErr := p.sidecar.Rerank(ctx, probeQuestion, candidates, len(candidates))
 		if rerankErr != nil {
 			p.logger.Warn("smoke test: rerank failed",
 				zap.Int("probe_index", i),

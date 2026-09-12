@@ -64,7 +64,7 @@ func NewAdminHandler(
 		db:          db,
 		gateway:     gw,
 		embedder:    embedder,
-		ingestion:   training.NewIngestionPipeline(db, embedder, gw, logger),
+		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
 		logger:      logger,
