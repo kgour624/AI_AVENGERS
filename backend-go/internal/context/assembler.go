@@ -81,7 +81,8 @@ type HistoryEntry struct {
 // WHY this order: Most important context last = less lost-in-middle.
 type Assembler struct {
 	db          *pgxpool.Pool
-	embedder    ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	embedder    ml.Embedder       // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	sidecar     *ml.SidecarClient // kept separately for Rerank() — Rerank is sidecar-only, not in Embedder interface
 	memManager  *memory.Manager
 	maxTokens   int
 	recentMsgs  int
@@ -94,9 +95,15 @@ type Assembler struct {
 // NewAssembler creates a new context assembler.
 // embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
 // *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+//
+// sidecar is kept as a separate *ml.SidecarClient because getCourseChunks
+// and getRepoChunks call Rerank(), which is sidecar-only and NOT part of
+// the Embedder interface (locked decision: reranking always stays on the
+// Python sidecar).
 func NewAssembler(
 	db *pgxpool.Pool,
 	embedder ml.Embedder,
+	sidecar *ml.SidecarClient,
 	memManager *memory.Manager,
 	maxTokens, recentMsgs, semanticTopK, chunksTopK int,
 	logger *zap.Logger,
@@ -104,6 +111,7 @@ func NewAssembler(
 	return &Assembler{
 		db:           db,
 		embedder:     embedder,
+		sidecar:      sidecar,
 		memManager:   memManager,
 		maxTokens:    maxTokens,
 		recentMsgs:   recentMsgs,
@@ -691,7 +699,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		texts[i] = c.Text
 	}
 
-	reranked, err := a.ml.Rerank(ctx, question, texts, limit)
+	reranked, err := a.sidecar.Rerank(ctx, question, texts, limit)
 	if err != nil {
 		// Fallback: return top K without reranking
 		var chunks []chinawall.CourseChunk
@@ -729,7 +737,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 // consumes - see the call site in Assemble() above for why that
 // matters.
 func (a *Assembler) getRepoChunks(ctx context.Context, projectID uuid.UUID, question string, limit int) ([]chinawall.CourseChunk, error) {
-	embedding, err := a.ml.EmbedSingle(ctx, question)
+	embedding, err := a.embedder.EmbedSingle(ctx, question)
 	if err != nil {
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}
@@ -801,7 +809,7 @@ func (a *Assembler) getRepoChunks(ctx context.Context, projectID uuid.UUID, ques
 		texts[i] = c.Text
 	}
 
-	reranked, err := a.ml.Rerank(ctx, question, texts, limit)
+	reranked, err := a.sidecar.Rerank(ctx, question, texts, limit)
 	if err != nil {
 		var chunks []chinawall.CourseChunk
 		for i, c := range candidates {

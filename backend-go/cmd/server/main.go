@@ -229,7 +229,7 @@ func buildRouter(
 	chinawallEnforcer := chinawall.NewEnforcer(cfg.ChinaWall, modelGateway, mlClient, logger, domainRegistry)
 	decisionEngine := decision.NewEngine(postgres.Pool, modelGateway, chinawallEnforcer, logger)
 	contextAssembler := appcontext.NewAssembler(
-		postgres.Pool, embedder, memManager,
+		postgres.Pool, embedder, mlClient, memManager,
 		cfg.Context.MaxTokens, cfg.Context.RecentMessages,
 		cfg.Context.SemanticTopK, cfg.Context.CourseChunksTopK,
 		logger,
