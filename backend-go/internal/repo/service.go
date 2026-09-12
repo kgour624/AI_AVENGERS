@@ -87,7 +87,7 @@ type RepoFile struct {
 // 8. Chunk + embed + store in repo_chunks
 type Service struct {
 	db            *pgxpool.Pool
-	mlClient      *ml.SidecarClient
+	embedder      ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
 	chunker       *training.TextChunker
 	encryptionKey []byte
 	githubOAuth   OAuthConfig
@@ -104,9 +104,11 @@ type Service struct {
 }
 
 // NewService creates a new repo integration service.
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
 func NewService(
 	db *pgxpool.Pool,
-	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	redisClient *redis.Client,
 	encryptionKey string,
 	githubClientID, githubClientSecret string,
@@ -117,7 +119,7 @@ func NewService(
 ) *Service {
 	return &Service{
 		db:       db,
-		mlClient: mlClient,
+		embedder: embedder,
 		chunker:  training.NewTextChunker(training.DefaultChunkerConfig()),
 		encryptionKey: []byte(encryptionKey),
 		redis:    redisClient,
