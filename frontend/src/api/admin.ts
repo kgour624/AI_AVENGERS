@@ -281,6 +281,15 @@ export const getLLMSettings = () =>
 export const updateLLMSettings = (req: {
   provider: string
   apiKeys: Record<string, string>
+  // CodeCraftAPI per-tier model IDs — camelCase here, snakeifyKeys
+  // interceptor in base.ts converts to snake_case before sending:
+  //   codecraftapiModelCheap  → codecraftapi_model_cheap
+  //   codecraftapiModelStrong → codecraftapi_model_strong
+  //   codecraftapiModelFast   → codecraftapi_model_fast
+  // Backend json tags match exactly: json:"codecraftapi_model_cheap" etc.
+  codecraftapiModelCheap?: string
+  codecraftapiModelStrong?: string
+  codecraftapiModelFast?: string
 }) =>
   baseAPI
     .post<ApiResponse<{ status: string; provider: string; note: string }>>(
