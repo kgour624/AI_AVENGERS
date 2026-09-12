@@ -1663,11 +1663,19 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 
 // UpdateLLMSettings POST /admin/llm-settings
 // Body: {provider: "deepseek", api_keys: {"deepseek": "sk-xxx"}}
-// Saves provider + keys to system_settings. Takes effect immediately.
+// UpdateLLMSettings POST /admin/llm-settings
+// Body: {provider: "deepseek", api_keys: {"deepseek": "sk-xxx"},
+//        codecraftapi_model_cheap: "...", codecraftapi_model_strong: "...", codecraftapi_model_fast: "..."}
+// Saves provider + keys + CodeCraftAPI per-tier model names to system_settings.
+// Takes effect immediately (no restart needed).
 func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 	var req struct {
 		Provider string            `json:"provider"`
 		APIKeys  map[string]string `json:"api_keys"`
+		// CodeCraftAPI per-tier model names (optional — only used when provider=codecraftapi)
+		CodeCraftAPIModelCheap  string `json:"codecraftapi_model_cheap"`
+		CodeCraftAPIModelStrong string `json:"codecraftapi_model_strong"`
+		CodeCraftAPIModelFast   string `json:"codecraftapi_model_fast"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -1735,6 +1743,34 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 		)
 		if err != nil {
 			h.logger.Error("save llm api keys failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+	}
+
+	// Save CodeCraftAPI per-tier model names (only when provided)
+	modelSettings := map[string]string{
+		"codecraftapi_model_cheap":  req.CodeCraftAPIModelCheap,
+		"codecraftapi_model_strong": req.CodeCraftAPIModelStrong,
+		"codecraftapi_model_fast":   req.CodeCraftAPIModelFast,
+	}
+	for key, value := range modelSettings {
+		if value == "" {
+			continue // Don't overwrite existing value with empty
+		}
+		valueJSON, _ := json.Marshal(value)
+		_, err := h.db.Exec(ctx,
+			`INSERT INTO system_settings (key, value, updated_by)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (key) DO UPDATE SET
+				value = EXCLUDED.value,
+				updated_by = EXCLUDED.updated_by,
+				updated_at = NOW()`,
+			key, string(valueJSON), adminID,
+		)
+		if err != nil {
+			h.logger.Error("save codecraftapi model name failed",
+				zap.String("key", key), zap.Error(err))
 			response.InternalError(c)
 			return
 		}
