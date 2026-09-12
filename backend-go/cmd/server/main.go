@@ -184,6 +184,7 @@ func buildRouter(
 	authService *auth.AuthService,
 	modelGateway *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	domainRegistry *chinawall.DomainRegistry,
 	categoryRegistry *category.Registry,
 ) *gin.Engine {
@@ -205,12 +206,12 @@ func buildRouter(
 	router.Use(middleware.RateLimitMiddleware(redisClient.Client, cfg.RateLimit.PerIP, logger))
 
 	// Initialize core services
-	memManager := memory.NewManager(postgres.Pool, redisClient.Client, mlClient, logger)
+	memManager := memory.NewManager(postgres.Pool, redisClient.Client, embedder, logger)
 	// domainRegistry is already initialized in main() and passed here.
 	chinawallEnforcer := chinawall.NewEnforcer(cfg.ChinaWall, modelGateway, mlClient, logger, domainRegistry)
 	decisionEngine := decision.NewEngine(postgres.Pool, modelGateway, chinawallEnforcer, logger)
 	contextAssembler := appcontext.NewAssembler(
-		postgres.Pool, mlClient, memManager,
+		postgres.Pool, embedder, memManager,
 		cfg.Context.MaxTokens, cfg.Context.RecentMessages,
 		cfg.Context.SemanticTopK, cfg.Context.CourseChunksTopK,
 		logger,
@@ -222,7 +223,7 @@ func buildRouter(
 	chatSvc := chat.NewService(postgres.Pool, logger)
 	ratingSvc := rating.NewService(postgres.Pool, memManager, logger)
 	repoSvc := repo.NewService(
-		postgres.Pool, mlClient, redisClient.Client,
+		postgres.Pool, embedder, redisClient.Client,
 		cfg.Security.EncryptionKey,
 		cfg.OAuth.GitHubClientID, cfg.OAuth.GitHubClientSecret,
 		cfg.OAuth.GitLabClientID, cfg.OAuth.GitLabClientSecret,
@@ -233,11 +234,11 @@ func buildRouter(
 	// Initialize HTTP handlers
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
-	messageHandler := message.NewHandler(chatSvc, orch, modelGateway, mlClient, memManager, logger)
+	messageHandler := message.NewHandler(chatSvc, orch, modelGateway, embedder, memManager, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, categoryRegistry, domainRegistry, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -391,6 +392,11 @@ func buildRouter(
 		// LLM provider + API key management (no env file needed)
 		adminGroup.GET("/llm-settings", adminHandler.GetLLMSettings)
 		adminGroup.POST("/llm-settings", adminHandler.UpdateLLMSettings)
+		// CodeCraftAPI model catalog proxy + embedding settings
+		// WHY proxy: API key must never leave the server.
+		adminGroup.GET("/codecraftapi/models",  adminHandler.GetCodeCraftModels)
+		adminGroup.GET("/embedding-settings",   adminHandler.GetEmbeddingSettings)
+		adminGroup.POST("/embedding-settings",  adminHandler.UpdateEmbeddingSettings)
 		// Expert categories (migration 010, CT-A3) — admin-owned template layer.
 		adminGroup.GET("/expert-categories", adminHandler.ListExpertCategories)
 		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)
