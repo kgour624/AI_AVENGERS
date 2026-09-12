@@ -380,7 +380,7 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 			for j, ch := range chunks {
 				texts[j] = ch.Text
 			}
-			embeddings, err := s.mlClient.Embed(ctx, texts)
+			embeddings, err := s.embedder.Embed(ctx, texts)
 			if err != nil {
 				s.logger.Warn("embed failed for file", zap.String("file", rf.Path))
 				continue
