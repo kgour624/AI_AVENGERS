@@ -245,13 +245,33 @@ func (p *IngestionPipeline) IngestTranscript(
 
 	if !charterAlreadyDone {
 		p.updateStage(ctx, jobID, StageCharterExtraction, "Extracting expert charter...")
-		charter, err = p.charters.Extract(ctx, transcript, expertName)
-		if err != nil {
-			p.logger.Warn("charter extraction failed, using default", zap.Error(err))
-			charter = &Charter{
-				ReasoningCharter:     defaultReasoningCharter(expertName),
-				ClarificationCharter: defaultClarificationCharter(),
+		extractedCharter, extractErr := p.charters.Extract(ctx, transcript, expertName)
+		if extractErr != nil {
+			p.logger.Warn("charter extraction failed (LLM error) — keeping existing charter if present, using default only if no charter exists yet",
+				zap.Error(extractErr),
+			)
+			// PERMANENT FIX: Do NOT overwrite an existing good charter with a
+			// default when LLM fails. Load whatever is already in DB.
+			// Only use default if the expert has NO charter at all yet.
+			// WHY: LLM errors are transient (API down, rate limit, wrong model
+			// name). Silently replacing a carefully-extracted charter with a
+			// generic template destroys weeks of training value.
+			existingCharter, loadErr := p.loadCharterFromDB(ctx, expertID)
+			if loadErr == nil && existingCharter != nil && existingCharter.ReasoningCharter != "" {
+				// Expert already has a real charter — keep it, don't overwrite
+				p.logger.Info("charter extraction failed but existing charter preserved",
+					zap.String("expert_id", expertID.String()),
+				)
+				charter = existingCharter
+			} else {
+				// No existing charter — use default as last resort
+				charter = &Charter{
+					ReasoningCharter:     defaultReasoningCharter(expertName),
+					ClarificationCharter: defaultClarificationCharter(),
+				}
 			}
+		} else {
+			charter = extractedCharter
 		}
 		// Checkpoint: charter done
 		cpWriter.Write(ctx, JobCheckpoint{
@@ -353,6 +373,12 @@ func (p *IngestionPipeline) IngestTranscript(
 	p.logger.Info("chunks stored", zap.Int("count", len(chunkIDs)))
 
 	// Step 7: Update expert charters
+	// PERMANENT FIX: Only overwrite charter when:
+	//   a) replaceExisting=true (admin explicitly wants full retrain), OR
+	//   b) charter came from LLM (not default fallback) — handled above by
+	//      preserving existing charter on LLM failure
+	// This prevents a transient LLM error from silently destroying a
+	// carefully-extracted charter that took real training to produce.
 	clarificationJSON, _ := json.Marshal(charter.ClarificationCharter)
 	_, err = p.db.Exec(ctx,
 		`UPDATE experts SET
