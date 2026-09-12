@@ -91,6 +91,18 @@ func (g *ModelGateway) buildProvider(ctx context.Context) LLMProvider {
 		return providers.NewAnthropicProvider(apiKey, g.httpClient)
 	case config.ProviderGemini:
 		return providers.NewGeminiProvider(apiKey, g.httpClient)
+	case config.ProviderCodeCraftAPI:
+		// Model names are admin-configured per tier, stored in system_settings.
+		// Empty string is valid at construction time — Call() will get a 400
+		// from CodeCraftAPI which surfaces as an actionable error to the admin.
+		modelCheap := g.getModelName(ctx, "codecraftapi_model_cheap", "")
+		modelStrong := g.getModelName(ctx, "codecraftapi_model_strong", "")
+		modelFast := g.getModelName(ctx, "codecraftapi_model_fast", "")
+		return providers.NewCodeCraftAPIProvider(
+			apiKey, g.cfg.CodeCraftAPIBaseURL,
+			modelCheap, modelStrong, modelFast,
+			g.httpClient,
+		)
 	default: // openrouter
 		return providers.NewOpenRouterProvider(apiKey, g.cfg.OpenRouterBaseURL, g.httpClient)
 	}
@@ -263,9 +275,38 @@ func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvide
 		return g.cfg.AnthropicAPIKey
 	case config.ProviderGemini:
 		return g.cfg.GeminiAPIKey
+	case config.ProviderCodeCraftAPI:
+		return g.cfg.CodeCraftAPIKey
 	default:
 		return g.cfg.OpenRouterAPIKey
 	}
+}
+
+// getModelName reads a per-tier model name from system_settings.
+// Falls back to the provided default if the key is missing or empty.
+//
+// WHY this method exists:
+//   CodeCraftAPI exposes a live model catalog. Admin selects which model
+//   to use per tier from the admin panel. Model names are stored in
+//   system_settings (e.g. key="codecraftapi_model_strong").
+//   Same pattern as getActiveProvider() and getAPIKey().
+func (g *ModelGateway) getModelName(ctx context.Context, settingKey, fallback string) string {
+	if g.db == nil {
+		return fallback
+	}
+	var valueJSON []byte
+	err := g.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = $1`,
+		settingKey,
+	).Scan(&valueJSON)
+	if err != nil || len(valueJSON) == 0 {
+		return fallback
+	}
+	var name string
+	if json.Unmarshal(valueJSON, &name) != nil || name == "" {
+		return fallback
+	}
+	return name
 }
 
 // cacheKey generates a stable cache key for a request.

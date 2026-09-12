@@ -60,10 +60,11 @@ type JWTConfig struct {
 type LLMProvider string
 
 const (
-	ProviderOpenRouter LLMProvider = "openrouter"
-	ProviderDeepSeek   LLMProvider = "deepseek"
-	ProviderAnthropic  LLMProvider = "anthropic"
-	ProviderGemini     LLMProvider = "gemini"
+	ProviderOpenRouter   LLMProvider = "openrouter"
+	ProviderDeepSeek     LLMProvider = "deepseek"
+	ProviderAnthropic    LLMProvider = "anthropic"
+	ProviderGemini       LLMProvider = "gemini"
+	ProviderCodeCraftAPI LLMProvider = "codecraftapi" // multi-model aggregator with embeddings support
 )
 
 type LLMConfig struct {
@@ -75,6 +76,12 @@ type LLMConfig struct {
 	DeepSeekAPIKey  string
 	AnthropicAPIKey string
 	GeminiAPIKey    string
+
+	// CodeCraftAPI (multi-model aggregator with embeddings support)
+	// Key prefix: cc_
+	// Base URL default: https://codecraftapi.com/v1
+	CodeCraftAPIKey     string // env: CODECRAFTAPI_KEY
+	CodeCraftAPIBaseURL string // env: CODECRAFTAPI_BASE_URL
 
 	// Active provider — can be overridden from admin panel via system_settings
 	// Default: openrouter
@@ -178,12 +185,14 @@ func Load() (*Config, error) {
 		//   .env.example shows the value but doesn't set it.
 		//   This ensures dev works out-of-box without editing .env.
 		LLM: LLMConfig{
-			OpenRouterAPIKey:  v.GetString("OPENROUTER_API_KEY"),
-			OpenRouterBaseURL: v.GetString("OPENROUTER_BASE_URL"),
-			DeepSeekAPIKey:    v.GetString("DEEPSEEK_API_KEY"),
-			AnthropicAPIKey:   v.GetString("ANTHROPIC_API_KEY"),
-			GeminiAPIKey:      v.GetString("GEMINI_API_KEY"),
-			Provider:          LLMProvider(v.GetString("LLM_PROVIDER")),
+			OpenRouterAPIKey:    v.GetString("OPENROUTER_API_KEY"),
+			OpenRouterBaseURL:   v.GetString("OPENROUTER_BASE_URL"),
+			DeepSeekAPIKey:      v.GetString("DEEPSEEK_API_KEY"),
+			AnthropicAPIKey:     v.GetString("ANTHROPIC_API_KEY"),
+			GeminiAPIKey:        v.GetString("GEMINI_API_KEY"),
+			CodeCraftAPIKey:     v.GetString("CODECRAFTAPI_KEY"),
+			CodeCraftAPIBaseURL: v.GetString("CODECRAFTAPI_BASE_URL"),
+			Provider:            LLMProvider(v.GetString("LLM_PROVIDER")),
 			ModelCheap:        v.GetString("LLM_MODEL_CHEAP"),
 			ModelStrong:       v.GetString("LLM_MODEL_STRONG"),
 			ModelFast:         v.GetString("LLM_MODEL_FAST"),
@@ -313,6 +322,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.LLM.OpenRouterBaseURL == "" {
 		c.LLM.OpenRouterBaseURL = "https://openrouter.ai/api/v1"
+	}
+	if c.LLM.CodeCraftAPIBaseURL == "" {
+		// WHY this default: CodeCraftAPI's documented base URL.
+		// Configurable via CODECRAFTAPI_BASE_URL env var if it ever changes.
+		c.LLM.CodeCraftAPIBaseURL = "https://codecraftapi.com/v1"
 	}
 	if c.LLM.ModelCheap == "" {
 		c.LLM.ModelCheap = "deepseek/deepseek-chat"
