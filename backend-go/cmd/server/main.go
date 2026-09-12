@@ -120,8 +120,26 @@ func main() {
 		logger.Fatal("failed to initialize category registry", zap.Error(err))
 	}
 
+	// Build CodeCraftAPI embedder.
+	// Constructor takes db (reads embedding_model from system_settings at call time)
+	// and a dedicated http.Client with 300s timeout (batch embedding can be slow).
+	// Does NOT take model name — reads it from system_settings on every Embed() call.
+	ccEmbedder := ml.NewCodeCraftAPIEmbedder(
+		cfg.LLM.CodeCraftAPIKey,
+		cfg.LLM.CodeCraftAPIBaseURL,
+		postgres.Pool,
+		&http.Client{Timeout: 300 * time.Second},
+		logger,
+	)
+
+	// DynamicEmbedder: reads embedding_provider from system_settings at call time.
+	// Falls back to mlClient (sidecar) when provider = "sidecar" or DB read fails.
+	// WHY dynamic: admin switches embedding provider from UI — takes effect
+	// on next Embed() call with no server restart needed.
+	embedder := ml.NewDynamicEmbedder(postgres.Pool, mlClient, ccEmbedder, logger)
+
 	// Build router — single call, single definition
-	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, domainRegistry, categoryRegistry)
+	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, embedder, domainRegistry, categoryRegistry)
 
 	// Build HTTP server
 	server := &http.Server{
