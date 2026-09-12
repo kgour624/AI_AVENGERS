@@ -1872,12 +1872,37 @@ func (h *AdminHandler) GetCodeCraftModels(c *gin.Context) {
 		return
 	}
 
-	// Parse and forward the model list
-	var models interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+	// Parse CodeCraftAPI response.
+	// CodeCraftAPI returns OpenAI-compatible format:
+	//   { "object": "list", "data": [{"id": "model-1"}, ...] }
+	// We extract the "data" array and return it directly so the frontend
+	// receives a clean []CodeCraftModel, not a nested object.
+	// WHY extract here (not in frontend):
+	//   Backend is the single source of truth for the wire contract.
+	//   Frontend should never need to know CodeCraftAPI's internal envelope.
+	var rawResponse map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&rawResponse); err != nil {
 		h.logger.Error("codecraftapi models: decode response failed", zap.Error(err))
 		response.InternalError(c)
 		return
+	}
+
+	// Extract the models array from the response.
+	// Handle two cases:
+	//   Case 1: { "object": "list", "data": [...] }  ← standard OpenAI format
+	//   Case 2: [...] (bare array, some providers do this)
+	var models []interface{}
+	if dataField, ok := rawResponse["data"]; ok {
+		if arr, ok := dataField.([]interface{}); ok {
+			models = arr
+		}
+	}
+	if models == nil {
+		// Fallback: response was not the expected shape — return empty list
+		// rather than crashing. Admin will see "no models" and can check
+		// their CodeCraftAPI key/account.
+		h.logger.Warn("codecraftapi models: unexpected response shape, returning empty list")
+		models = []interface{}{}
 	}
 
 	response.OK(c, models)

@@ -389,8 +389,19 @@ import type { CodeCraftModel } from '@/types/codecraftapi'
 
 export const getCodeCraftModels = () =>
   baseAPI
-    .get<ApiResponse<CodeCraftModel[]>>('/api/v1/admin/codecraftapi/models')
-    .then((res) => res.data.data!)
+    .get<ApiResponse<unknown>>('/api/v1/admin/codecraftapi/models')
+    .then((res) => {
+      const d = res.data.data
+      // Backend already extracts the data array from CodeCraftAPI's
+      // { object: "list", data: [...] } envelope, so d should be a
+      // plain array. This defensive check handles any edge case where
+      // the shape is unexpected.
+      if (Array.isArray(d)) return d as CodeCraftModel[]
+      if (d && typeof d === 'object' && Array.isArray((d as Record<string, unknown>).data)) {
+        return (d as Record<string, unknown>).data as CodeCraftModel[]
+      }
+      return [] as CodeCraftModel[]
+    })
 
 // ============================================================
 // EMBEDDING SETTINGS
