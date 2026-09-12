@@ -170,7 +170,7 @@ export function IngestionPipelineModal({
             </div>
             <div className="mt-1 flex items-center justify-between">
               <div className="flex gap-3">
-                {job.estimatedSecondsRemaining && !isDone && !isFailed && (
+                {job.estimatedSecondsRemaining != null && job.estimatedSecondsRemaining > 0 && !isDone && !isFailed && (
                   <span className="text-[10px] text-text-disabled">
                     {formatETA(job.estimatedSecondsRemaining)} remaining
                   </span>
