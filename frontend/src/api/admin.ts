@@ -378,3 +378,45 @@ export const updateDomainProfile = (domain: string, req: UpdateDomainProfileRequ
     .patch<ApiResponse<DomainProfile>>(`/api/v1/admin/domain-profiles/${domain}`, req)
     .then((res) => res.data.data!)
 
+// ============================================================
+// CODECRAFTAPI MODEL CATALOG (proxy via backend)
+// ============================================================
+// WHY proxy: API key must never leave the server.
+// Frontend never calls CodeCraftAPI directly.
+// Backend GET /admin/codecraftapi/models proxies to CodeCraftAPI /v1/models.
+
+import type { CodeCraftModel } from '@/types/codecraftapi'
+
+export const getCodeCraftModels = () =>
+  baseAPI
+    .get<ApiResponse<CodeCraftModel[]>>('/api/v1/admin/codecraftapi/models')
+    .then((res) => res.data.data!)
+
+// ============================================================
+// EMBEDDING SETTINGS
+// ============================================================
+
+export interface EmbeddingSettings {
+  embeddingProvider: 'sidecar' | 'codecraftapi'
+  embeddingModel: string
+  availableProviders: string[]
+  note: string
+}
+
+export const getEmbeddingSettings = () =>
+  baseAPI
+    .get<ApiResponse<EmbeddingSettings>>('/api/v1/admin/embedding-settings')
+    .then((res) => res.data.data!)
+
+export interface UpdateEmbeddingSettingsRequest {
+  embeddingProvider: 'sidecar' | 'codecraftapi'
+  /** Required when embeddingProvider is 'codecraftapi'. */
+  embeddingModel?: string
+}
+
+export const updateEmbeddingSettings = (req: UpdateEmbeddingSettingsRequest) =>
+  baseAPI
+    .post<ApiResponse<{ status: string }>>('/api/v1/admin/embedding-settings', req)
+    .then((res) => res.data.data!)
+
+
