@@ -814,7 +814,10 @@ func (p *IngestionPipeline) updateJobStatus(
 			processed_chunks = $3,
 			total_chunks = $4,
 			completed_at = $5,
-			started_at = CASE WHEN $1::varchar = 'running' THEN NOW() ELSE started_at END
+			started_at = CASE WHEN $1::varchar = 'running' THEN NOW() ELSE started_at END,
+			current_stage = CASE WHEN $1::varchar = 'complete' THEN 'complete'
+			                     WHEN $1::varchar = 'failed'   THEN current_stage
+			                     ELSE current_stage END
 		 WHERE id = $6`,
 		status, errorMsg, processed, total, completedAt, jobID,
 	)

@@ -282,7 +282,7 @@ export function IngestionPipelineModal({
         {/* Complete box */}
         {isDone && (
           <div className="rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-3 text-center">
-            <p className="text-sm font-medium text-mode-advise">\u2705 Ingestion Complete</p>
+            <p className="text-sm font-medium text-mode-advise">{'\u2705'} Ingestion Complete</p>
           </div>
         )}
 
