@@ -13,15 +13,15 @@
 
 | Phase | Status | Evidence |
 |---|---|---|
-| CC-1: Backend LLM provider | ⏳ NOT STARTED | — |
-| CC-2: Embedder interface | ⏳ NOT STARTED | — |
-| CC-3: CodeCraftAPI embedder | ⏳ NOT STARTED | — |
-| CC-4: Config + gateway wiring | ⏳ NOT STARTED | — |
-| CC-5: Admin handler changes | ⏳ NOT STARTED | — |
-| CC-6: main.go wiring | ⏳ NOT STARTED | — |
-| CC-7: Caller signature updates | ⏳ NOT STARTED | — |
-| CC-8: Frontend types + API | ⏳ NOT STARTED | — |
-| CC-9: Admin UI changes | ⏳ NOT STARTED | — |
+| CC-1: Backend LLM provider | ✅ COMPLETE | `backend-go/internal/gateway/providers/codecraftapi.go` on main |
+| CC-2: Embedder interface | ✅ COMPLETE | `backend-go/internal/ml/embedder.go` on main |
+| CC-3: CodeCraftAPI embedder | ✅ COMPLETE | `backend-go/internal/ml/codecraftapi_embeddings.go` on main |
+| CC-4: Config + gateway wiring | ✅ COMPLETE | `config/config.go` + `gateway/model_gateway.go` updated |
+| CC-5: Admin handler changes | ✅ COMPLETE | `admin/admin_handler.go` updated: embedder, 3 handlers, model name persistence |
+| CC-6: main.go wiring | ✅ COMPLETE | `cmd/server/main.go` updated: DynamicEmbedder, all constructors, 3 new routes |
+| CC-7: Caller signature updates | ✅ COMPLETE | 8 files updated (embedding_clusterer, topic_extractor, ingestion_pipeline, assembler, l2_store, manager, message/handler, repo/service) |
+| CC-8: Frontend types + API | ✅ COMPLETE | `types/codecraftapi.ts` created, `api/admin.ts` extended |
+| CC-9: Admin UI changes | ✅ COMPLETE | `AdminLLMSettings.tsx` rewritten with CodeCraftAPI + model picker + embedding settings |
 
 ---
 
