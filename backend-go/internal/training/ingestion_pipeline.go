@@ -514,6 +514,7 @@ func (p *IngestionPipeline) IngestTranscript(
 // ... repeat for all chunks
 func (p *IngestionPipeline) storeChunks(
 	ctx context.Context,
+	jobID uuid.UUID,
 	expertID uuid.UUID,
 	chunks []TextChunk,
 	topics []TopicResult,
@@ -595,7 +596,7 @@ func (p *IngestionPipeline) storeChunks(
 
 		// Update job progress every 50 chunks
 		if i%50 == 0 {
-			p.updateJobProgress(ctx, chunkIDs[0], i+1, len(chunks))
+			p.updateJobProgress(ctx, jobID, i+1, len(chunks))
 		}
 	}
 
