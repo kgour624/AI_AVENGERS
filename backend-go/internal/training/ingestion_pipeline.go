@@ -373,23 +373,48 @@ func (p *IngestionPipeline) IngestTranscript(
 	p.logger.Info("chunks stored", zap.Int("count", len(chunkIDs)))
 
 	// Step 7: Update expert charters
-	// PERMANENT FIX: Only overwrite charter when:
-	//   a) replaceExisting=true (admin explicitly wants full retrain), OR
-	//   b) charter came from LLM (not default fallback) — handled above by
-	//      preserving existing charter on LLM failure
-	// This prevents a transient LLM error from silently destroying a
-	// carefully-extracted charter that took real training to produce.
+	//
+	// CHARTER OVERWRITE POLICY:
+	//   replaceExisting=true  → full retrain, overwrite charter completely
+	//   replaceExisting=false → append mode, APPEND new charter to existing
+	//                           WHY: admin uploads multiple transcripts for
+	//                           the same expert. Each transcript adds new
+	//                           principles. Overwriting destroys previous
+	//                           training. Appending builds a richer charter.
+	//
+	// If existing charter is empty (first ingestion), just write the new one.
 	clarificationJSON, _ := json.Marshal(charter.ClarificationCharter)
-	_, err = p.db.Exec(ctx,
-		`UPDATE experts SET
-			reasoning_charter = $1,
-			clarification_charter = $2,
-			updated_at = NOW()
-		 WHERE id = $3`,
-		charter.ReasoningCharter,
-		string(clarificationJSON),
-		expertID,
-	)
+
+	if replaceExisting {
+		// Full retrain: replace charter completely
+		_, err = p.db.Exec(ctx,
+			`UPDATE experts SET
+				reasoning_charter = $1,
+				clarification_charter = $2,
+				updated_at = NOW()
+			 WHERE id = $3`,
+			charter.ReasoningCharter,
+			string(clarificationJSON),
+			expertID,
+		)
+	} else {
+		// Append mode: append new charter to existing, preserve old principles
+		// CASE WHEN existing is empty: just write new charter directly
+		// CASE WHEN existing has content: append with separator
+		_, err = p.db.Exec(ctx,
+			`UPDATE experts SET
+				reasoning_charter = CASE
+					WHEN COALESCE(reasoning_charter, '') = '' THEN $1
+					ELSE reasoning_charter || E'\n\n--- Additional Principles (from new transcript) ---\n\n' || $1
+				END,
+				clarification_charter = $2,
+				updated_at = NOW()
+			 WHERE id = $3`,
+			charter.ReasoningCharter,
+			string(clarificationJSON),
+			expertID,
+		)
+	}
 	if err != nil {
 		p.logger.Warn("failed to update charters", zap.Error(err))
 	}
