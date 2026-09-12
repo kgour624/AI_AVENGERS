@@ -344,7 +344,8 @@ func (p *IngestionPipeline) IngestTranscript(
 
 	// Step 6: Store chunks. In append mode, ON CONFLICT dedups against
 	// existing (expert_id, chunk_hash) pairs so repeat ingestion is idempotent.
-	chunkIDs, err := p.storeChunks(ctx, expertID, chunks, topicResults, embeddings, sourceFile)
+	p.updateStage(ctx, jobID, StageStoring, fmt.Sprintf("Saving %d chunks to database...", len(chunks)))
+	chunkIDs, err := p.storeChunks(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile)
 	if err != nil {
 		p.updateJobStatus(ctx, jobID, "failed", "storage failed: "+err.Error(), 0, 0)
 		return nil, fmt.Errorf("chunk storage failed: %w", err)
