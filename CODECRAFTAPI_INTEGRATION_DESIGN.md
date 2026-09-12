@@ -461,7 +461,7 @@ DynamicEmbedder reads embedding_provider = "sidecar"
 
 **Responsibility:** Call CodeCraftAPI `/v1/embeddings` to generate embeddings.
 
-**Inputs:** API key (string), base URL (string), model name (string), `*http.Client`
+**Inputs:** API key (string), base URL (string), `*pgxpool.Pool` (to read `embedding_model` from DB at call time), `*http.Client`
 
 **Outputs:** `[][]float32` (dimension depends on model)
 
@@ -472,19 +472,25 @@ DynamicEmbedder reads embedding_provider = "sidecar"
 **Locked decisions:**
 - Timeout: 300s (same as sidecar — batch embedding can be slow)
 - Sort response by `index` field before returning (defensive, OpenAI spec guarantees order but sort is correct)
-- Model name comes from constructor (admin-configured), NOT hardcoded
+- Model name is read from `system_settings` key `embedding_model` at CALL TIME (not stored in constructor)
+  WHY: Same pattern as `ModelGateway.getActiveProvider()` and `DynamicEmbedder.Embed()`. Admin changes model
+  name in UI → takes effect on next embed call, no restart needed.
+- Constructor takes `db *pgxpool.Pool` NOT `modelName string`
+- `*http.Client` is required in constructor (makes HTTP calls to CodeCraftAPI)
 
 **Mental execution — `Embed()` happy path:**
 ```
 Input: ["How to shard?", "Use consistent hashing"]
-1. Marshal: {"model": "cc-embed-model-X", "input": ["How to shard?", "Use consistent hashing"]}
-2. POST https://codecraftapi.com/v1/embeddings
+1. SELECT value FROM system_settings WHERE key='embedding_model' → "cc-embed-model-X"
+2. If model empty → return nil, fmt.Errorf("codecraftapi: embedding_model not configured")
+3. Marshal: {"model": "cc-embed-model-X", "input": ["How to shard?", "Use consistent hashing"]}
+4. POST https://codecraftapi.com/v1/embeddings
    Header: Authorization: Bearer cc_xxx
-3. Parse response:
+5. Parse response:
    data[0] = {embedding: [0.1, 0.2, ...768 floats], index: 0}
    data[1] = {embedding: [0.3, 0.4, ...768 floats], index: 1}
-4. Sort by index (defensive)
-5. Return [[0.1, 0.2, ...], [0.3, 0.4, ...]]
+6. Sort by index (defensive)
+7. Return [[0.1, 0.2, ...], [0.3, 0.4, ...]]
 ```
 
 **Mental execution — `Embed()` failure path:**
@@ -651,24 +657,27 @@ Same pattern as `getActiveProvider()` and `getAPIKey()`.
 
 **New wiring for embedder:**
 ```go
-// Build CodeCraftAPI embedder (used when embedding_provider = "codecraftapi")
+// Build CodeCraftAPI embedder.
+// Constructor takes db (to read embedding_model at call time) + httpClient + logger.
+// Does NOT take model name — reads it from system_settings on every Embed() call.
+// WHY: same pattern as ModelGateway.getActiveProvider() — no restart needed on model change.
 ccEmbedder := ml.NewCodeCraftAPIEmbedder(
     cfg.LLM.CodeCraftAPIKey,
     cfg.LLM.CodeCraftAPIBaseURL,
-    "", // model name read from DB at call time by DynamicEmbedder
+    postgres.Pool,   // reads embedding_model from system_settings at call time
+    &http.Client{Timeout: 300 * time.Second}, // 300s — batch embedding can be slow
     logger,
 )
 
-// DynamicEmbedder: reads embedding_provider from DB at call time
-// Falls back to mlClient (sidecar) when provider = "sidecar" or DB read fails
+// DynamicEmbedder: reads embedding_provider from DB at call time.
+// Falls back to mlClient (sidecar) when provider = "sidecar" or DB read fails.
 embedder := ml.NewDynamicEmbedder(postgres.Pool, mlClient, ccEmbedder, logger)
 
-// Pass embedder (not mlClient) to all embedding callers
-contextAssembler := appcontext.NewAssembler(
-    postgres.Pool, embedder, memManager, ...
-)
-// ingestion pipeline is created inside AdminHandler — AdminHandler must also receive embedder
-// OR: AdminHandler creates its own IngestionPipeline with embedder
+// Pass embedder (not mlClient) to all embedding callers:
+contextAssembler := appcontext.NewAssembler(postgres.Pool, embedder, memManager, ...)
+messageHandler := message.NewHandler(chatSvc, orch, modelGateway, embedder, memManager, logger)
+adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, logger)
+// memory.NewManager also changes — see CC-7
 ```
 
 **New admin routes:**
@@ -809,6 +818,8 @@ export const updateLLMSettings = (req: {
 | `backend-go/internal/decision/engine.go` | No ML calls |
 | `backend-go/internal/orchestrator/orchestrator.go` | No ML calls |
 | `backend-go/internal/ml/sidecar_client.go` | Struct unchanged. Already satisfies `Embedder` interface via Go structural typing. |
+| `backend-go/internal/memory/helpers.go` | Only JSON marshaling helper (`marshalJSON`). Zero ML calls. Verified by reading source. |
+| `backend-go/internal/memory/l1_store.go` | Uses Redis only. `rebuildL1FromL2()` queries l2_store directly — no `Embed()` call. |
 | `backend-go/internal/auth/` | No ML calls |
 | `backend-go/internal/chat/` | No ML calls |
 | `backend-go/internal/project/` | No ML calls |

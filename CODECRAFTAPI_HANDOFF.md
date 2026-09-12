@@ -78,6 +78,8 @@
 | `backend-go/internal/decision/engine.go` | No ML calls |
 | `backend-go/internal/orchestrator/orchestrator.go` | No ML calls |
 | `backend-go/internal/ml/sidecar_client.go` | Struct unchanged. Already satisfies `Embedder` via Go structural typing. |
+| `backend-go/internal/memory/helpers.go` | Only `marshalJSON()` helper. Zero ML calls. **Verified by reading source.** |
+| `backend-go/internal/memory/l1_store.go` | Uses Redis only. `rebuildL1FromL2()` queries l2_store directly — no `Embed()` call. |
 | `backend-go/internal/auth/` | No ML calls |
 | `backend-go/internal/chat/` | No ML calls |
 | `backend-go/internal/project/` | No ML calls |
@@ -235,26 +237,50 @@ Edge case — DB read fails:
 
 **Checkpoint:** `go build ./...` passes. Embedder compiles.
 
+**Constructor signature (FIXED — Gap 1 + Gap 2 from mental execution):**
+```go
+// CORRECT constructor — takes db (reads embedding_model at call time) + httpClient
+func NewCodeCraftAPIEmbedder(
+    apiKey     string,
+    baseURL    string,
+    db         *pgxpool.Pool,          // reads embedding_model from system_settings at call time
+    httpClient *http.Client,           // required — makes HTTP calls to CodeCraftAPI
+    logger     *zap.Logger,
+) *CodeCraftAPIEmbedder
+
+// WRONG (do not do this):
+// NewCodeCraftAPIEmbedder(apiKey, baseURL, modelName, logger)  ← no httpClient, static model name
+```
+
 **Anti-patterns to watch:**
-- DO NOT hardcode model name — comes from `DynamicEmbedder` reading `embedding_model` from DB
+- DO NOT store model name in constructor — read from `system_settings` key `embedding_model` at call time
+- DO NOT omit `*http.Client` from constructor — required for HTTP calls
 - Sort response by `index` field before returning (defensive)
-- Timeout: 300s (same as sidecar — batch embedding can be slow)
+- Timeout: 300s on the `*http.Client` passed in (same as sidecar)
 - DO NOT use string interpolation for vectors — always `pgvector.NewVector()` as `$N` param
+- If `embedding_model` is empty in DB → return error immediately (do not call CodeCraftAPI with empty model)
 
 **Mental execution — Embed():**
 ```
 Happy path:
   Input: ["How to shard?", "Use consistent hashing"]
-  1. Marshal: {"model": "cc-embed-X", "input": ["How to shard?", "Use consistent hashing"]}
-  2. POST https://codecraftapi.com/v1/embeddings
+  1. SELECT value FROM system_settings WHERE key='embedding_model' → "cc-embed-X"
+  2. If model empty → return nil, fmt.Errorf("codecraftapi: embedding_model not configured")
+  3. Marshal: {"model": "cc-embed-X", "input": ["How to shard?", "Use consistent hashing"]}
+  4. POST https://codecraftapi.com/v1/embeddings
      Authorization: Bearer cc_xxx
-  3. Parse: data[0]={embedding:[...], index:0}, data[1]={embedding:[...], index:1}
-  4. Sort by index (defensive)
-  5. Return [[...768 floats...], [...768 floats...]]
+  5. Parse: data[0]={embedding:[...], index:0}, data[1]={embedding:[...], index:1}
+  6. Sort by index (defensive)
+  7. Return [[...768 floats...], [...768 floats...]]
 
 Edge case — empty input:
   Input: []
   1. Return [][]float32{}, nil (no API call needed)
+
+Edge case — embedding_model not configured:
+  SELECT → empty string
+  Return nil, fmt.Errorf("codecraftapi: embedding_model not configured in system_settings")
+  Admin sees error in ingestion modal → goes to LLM Settings → sets embedding model
 
 Edge case — wrong model name:
   POST → 400 Bad Request
@@ -411,9 +437,12 @@ Happy path (switch back to sidecar):
 **Changes:**
 ```go
 // After mlClient initialization:
+// CORRECT: constructor takes db (reads embedding_model at call time) + httpClient
 ccEmbedder := ml.NewCodeCraftAPIEmbedder(
     cfg.LLM.CodeCraftAPIKey,
     cfg.LLM.CodeCraftAPIBaseURL,
+    postgres.Pool,                              // reads embedding_model from DB at call time
+    &http.Client{Timeout: 300 * time.Second},  // 300s — batch embedding can be slow
     logger,
 )
 embedder := ml.NewDynamicEmbedder(postgres.Pool, mlClient, ccEmbedder, logger)
@@ -698,3 +727,4 @@ export const updateLLMSettings = (req: {
 | Date | Change | Author |
 |---|---|---|
 | 2026-09-12 | Initial design doc + handoff file created | System Design Architect |
+| 2026-09-12 | Fixed 3 gaps found during mental execution verification: (1) `CodeCraftAPIEmbedder` reads `embedding_model` from DB at call time — constructor takes `db *pgxpool.Pool` not `modelName string`; (2) `*http.Client` added to `CodeCraftAPIEmbedder` constructor; (3) `memory/helpers.go` and `memory/l1_store.go` verified safe and added to NOT-touched list | System Design Architect |
