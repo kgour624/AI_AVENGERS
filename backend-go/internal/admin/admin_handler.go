@@ -25,7 +25,7 @@ import (
 type AdminHandler struct {
 	db          *pgxpool.Pool
 	gateway     *gateway.ModelGateway
-	mlClient    *ml.SidecarClient
+	embedder    ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
 	ingestion   *training.IngestionPipeline
 	categoryReg *category.Registry
 	// domainReg backs the domain-profile admin endpoints (max tokens,
@@ -40,6 +40,11 @@ type AdminHandler struct {
 
 // NewAdminHandler creates a new admin handler.
 //
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+// Passed to IngestionPipeline so transcript ingestion uses the same
+// embedding source as the rest of the system.
+//
 // categoryReg is used by the expert-category CRUD handlers (CT-A3) and
 // by CreateExpert/UpdateExpert's category_id validation (CT-A4). It is
 // the SAME registry instance wired at startup in cmd/server/main.go —
@@ -50,6 +55,7 @@ func NewAdminHandler(
 	db *pgxpool.Pool,
 	gw *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	categoryReg *category.Registry,
 	domainReg *chinawall.DomainRegistry,
 	logger *zap.Logger,
@@ -57,8 +63,8 @@ func NewAdminHandler(
 	return &AdminHandler{
 		db:          db,
 		gateway:     gw,
-		mlClient:    mlClient,
-		ingestion:   training.NewIngestionPipeline(db, mlClient, gw, logger),
+		embedder:    embedder,
+		ingestion:   training.NewIngestionPipeline(db, embedder, gw, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
 		logger:      logger,
@@ -1648,8 +1654,8 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 	}
 
 	response.OK(c, map[string]interface{}{
-		"active_provider": provider,
-		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini"},
+		"active_provider":     provider,
+		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini", "codecraftapi"},
 		"api_keys_configured": maskedKeys,
 		"note": "API keys are masked. To update, POST to this endpoint with new values.",
 	})
@@ -1671,10 +1677,11 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 	validProviders := map[string]bool{
 		"openrouter": true, "deepseek": true,
 		"anthropic": true, "gemini": true,
+		"codecraftapi": true,
 	}
 	if req.Provider != "" && !validProviders[req.Provider] {
 		response.BadRequest(c, "INVALID_PROVIDER",
-			"provider must be: openrouter, deepseek, anthropic, gemini")
+			"provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi")
 		return
 	}
 
@@ -1747,4 +1754,223 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 // isUniqueViolation checks if error is a PostgreSQL unique constraint violation.
 func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "unique")
+}
+
+// ============================================================
+// CODECRAFTAPI MODELS (proxy to /v1/models)
+// ============================================================
+
+// GetCodeCraftModels GET /admin/codecraftapi/models
+// Proxies to CodeCraftAPI's GET /v1/models endpoint.
+// Admin UI calls this to populate model picker dropdowns.
+//
+// WHY proxy instead of direct frontend call:
+//   API key must never leave the server. Frontend never calls CodeCraftAPI directly.
+//
+// Mental execution:
+//   1. Read codecraftapi key from system_settings (llm_api_keys["codecraftapi"])
+//   2. If empty → 400 KEY_NOT_CONFIGURED
+//   3. GET https://codecraftapi.com/v1/models
+//   4. Return model list to admin UI
+func (h *AdminHandler) GetCodeCraftModels(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	// Read CodeCraftAPI key from system_settings
+	apiKey := ""
+	var keysJSON []byte
+	if err := h.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'llm_api_keys'`,
+	).Scan(&keysJSON); err == nil {
+		var keys map[string]string
+		if json.Unmarshal(keysJSON, &keys) == nil {
+			apiKey = keys["codecraftapi"]
+		}
+	}
+
+	if apiKey == "" {
+		response.BadRequest(c, "KEY_NOT_CONFIGURED",
+			"CodeCraftAPI key not configured. Add key in LLM Settings first.")
+		return
+	}
+
+	// Read base URL from config (via gateway, which already has it)
+	// We use the default if not overridden
+	baseURL := "https://codecraftapi.com/v1"
+
+	// Proxy GET /v1/models to CodeCraftAPI
+	httpClient := &http.Client{Timeout: 15 * time.Second}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/models", nil)
+	if err != nil {
+		h.logger.Error("codecraftapi models: build request failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+
+	resp, err := httpClient.Do(httpReq)
+	if err != nil {
+		h.logger.Error("codecraftapi models: http call failed", zap.Error(err))
+		c.JSON(502, map[string]interface{}{
+			"success": false,
+			"error": map[string]string{
+				"code":    "UPSTREAM_ERROR",
+				"message": "Could not fetch models from CodeCraftAPI: " + err.Error(),
+			},
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		h.logger.Warn("codecraftapi models: upstream returned non-200",
+			zap.Int("status", resp.StatusCode),
+		)
+		c.JSON(502, map[string]interface{}{
+			"success": false,
+			"error": map[string]string{
+				"code":    "UPSTREAM_ERROR",
+				"message": fmt.Sprintf("CodeCraftAPI returned status %d", resp.StatusCode),
+			},
+		})
+		return
+	}
+
+	// Parse and forward the model list
+	var models interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&models); err != nil {
+		h.logger.Error("codecraftapi models: decode response failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	response.OK(c, models)
+}
+
+// ============================================================
+// EMBEDDING SETTINGS
+// ============================================================
+
+// GetEmbeddingSettings GET /admin/embedding-settings
+// Returns current embedding provider config.
+func (h *AdminHandler) GetEmbeddingSettings(c *gin.Context) {
+	ctx := c.Request.Context()
+
+	embeddingProvider := "sidecar" // default
+	var provJSON []byte
+	if err := h.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'embedding_provider'`,
+	).Scan(&provJSON); err == nil {
+		var p string
+		if json.Unmarshal(provJSON, &p) == nil && p != "" {
+			embeddingProvider = p
+		}
+	}
+
+	embeddingModel := ""
+	var modelJSON []byte
+	if err := h.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'embedding_model'`,
+	).Scan(&modelJSON); err == nil {
+		var m string
+		if json.Unmarshal(modelJSON, &m) == nil {
+			embeddingModel = m
+		}
+	}
+
+	response.OK(c, map[string]interface{}{
+		"embedding_provider":   embeddingProvider,
+		"embedding_model":      embeddingModel,
+		"available_providers": []string{"sidecar", "codecraftapi"},
+		"note": "Changing embedding provider requires re-ingesting ALL transcripts. Existing vectors will be incompatible.",
+	})
+}
+
+// UpdateEmbeddingSettings POST /admin/embedding-settings
+// Body: {embedding_provider: "codecraftapi", embedding_model: "cc-embed-X"}
+// Saves embedding config to system_settings. Takes effect on next Embed() call.
+//
+// Mental execution:
+//   Switch to codecraftapi:
+//     Input: {embedding_provider: "codecraftapi", embedding_model: "cc-embed-X"}
+//     1. Validate provider is "sidecar" or "codecraftapi"
+//     2. If codecraftapi and model empty → 400
+//     3. UPSERT embedding_provider + embedding_model
+//     4. Return {status: "updated"}
+//
+//   Switch back to sidecar:
+//     Input: {embedding_provider: "sidecar"}
+//     1. Validate
+//     2. UPSERT embedding_provider = "sidecar"
+//     3. Return {status: "updated"}
+func (h *AdminHandler) UpdateEmbeddingSettings(c *gin.Context) {
+	var req struct {
+		EmbeddingProvider string `json:"embedding_provider"`
+		EmbeddingModel    string `json:"embedding_model"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+
+	validEmbeddingProviders := map[string]bool{
+		"sidecar": true, "codecraftapi": true,
+	}
+	if !validEmbeddingProviders[req.EmbeddingProvider] {
+		response.BadRequest(c, "INVALID_PROVIDER",
+			"embedding_provider must be: sidecar, codecraftapi")
+		return
+	}
+
+	if req.EmbeddingProvider == "codecraftapi" && req.EmbeddingModel == "" {
+		response.BadRequest(c, "MODEL_REQUIRED",
+			"embedding_model is required when embedding_provider is codecraftapi")
+		return
+	}
+
+	ctx := c.Request.Context()
+	adminID := c.MustGet("user_id").(uuid.UUID)
+
+	// Save embedding_provider
+	providerJSON, _ := json.Marshal(req.EmbeddingProvider)
+	_, err := h.db.Exec(ctx,
+		`INSERT INTO system_settings (key, value, updated_by)
+		 VALUES ('embedding_provider', $1, $2)
+		 ON CONFLICT (key) DO UPDATE SET
+			value = EXCLUDED.value,
+			updated_by = EXCLUDED.updated_by,
+			updated_at = NOW()`,
+		string(providerJSON), adminID,
+	)
+	if err != nil {
+		h.logger.Error("save embedding_provider failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	// Save embedding_model (only when codecraftapi; clear when switching back to sidecar)
+	modelValue := req.EmbeddingModel
+	modelJSON, _ := json.Marshal(modelValue)
+	_, err = h.db.Exec(ctx,
+		`INSERT INTO system_settings (key, value, updated_by)
+		 VALUES ('embedding_model', $1, $2)
+		 ON CONFLICT (key) DO UPDATE SET
+			value = EXCLUDED.value,
+			updated_by = EXCLUDED.updated_by,
+			updated_at = NOW()`,
+		string(modelJSON), adminID,
+	)
+	if err != nil {
+		h.logger.Error("save embedding_model failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	h.logger.Info("embedding settings updated",
+		zap.String("provider", req.EmbeddingProvider),
+		zap.String("model", req.EmbeddingModel),
+	)
+	response.OK(c, map[string]string{
+		"status": "updated",
+		"note":   "Changes take effect on next Embed() call. No restart needed.",
+	})
 }
