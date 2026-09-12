@@ -22,7 +22,7 @@ import (
 // Without clustering: 1000 chunks / 10 per batch = 100 LLM calls
 // With clustering:    1000 chunks -> 50 clusters -> 50 LLM calls (50% reduction)
 type EmbeddingClusterer struct {
-	ml              *ml.SidecarClient
+	embedder        ml.Embedder
 	similarityThreshold float32
 	logger          *zap.Logger
 }
@@ -37,9 +37,12 @@ type ChunkCluster struct {
 
 // NewEmbeddingClusterer creates a new clusterer.
 // threshold: cosine similarity above which chunks are in same cluster (0.75 recommended).
-func NewEmbeddingClusterer(mlClient *ml.SidecarClient, threshold float32, logger *zap.Logger) *EmbeddingClusterer {
+// NewEmbeddingClusterer creates a new clusterer.
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+func NewEmbeddingClusterer(embedder ml.Embedder, threshold float32, logger *zap.Logger) *EmbeddingClusterer {
 	return &EmbeddingClusterer{
-		ml:                  mlClient,
+		embedder:            embedder,
 		similarityThreshold: threshold,
 		logger:              logger,
 	}
@@ -74,7 +77,7 @@ func (c *EmbeddingClusterer) Cluster(ctx context.Context, chunks []TextChunk) ([
 		texts[i] = ch.Text
 	}
 
-	embeddings, err := c.ml.Embed(ctx, texts)
+	embeddings, err := c.embedder.Embed(ctx, texts)
 	if err != nil {
 		return nil, nil, err
 	}

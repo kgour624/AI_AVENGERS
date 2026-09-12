@@ -36,10 +36,12 @@ type TopicExtractor struct {
 }
 
 // NewTopicExtractor creates a new topic extractor.
-func NewTopicExtractor(gw *gateway.ModelGateway, mlClient *ml.SidecarClient, logger *zap.Logger) *TopicExtractor {
+// NewTopicExtractor creates a new topic extractor.
+// embedder satisfies ml.Embedder — passed through to EmbeddingClusterer.
+func NewTopicExtractor(gw *gateway.ModelGateway, embedder ml.Embedder, logger *zap.Logger) *TopicExtractor {
 	return &TopicExtractor{
 		gateway:   gw,
-		clusterer: NewEmbeddingClusterer(mlClient, 0.75, logger),
+		clusterer: NewEmbeddingClusterer(embedder, 0.75, logger),
 		logger:    logger,
 	}
 }

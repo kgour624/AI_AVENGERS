@@ -32,21 +32,23 @@ type L2Entry struct {
 // "What did Expert A decide at turn 15?" = structured query.
 // "What decisions are related to sharding?" = vector search.
 type L2Store struct {
-	db     *pgxpool.Pool
-	ml     *ml.SidecarClient
-	logger *zap.Logger
+	db       *pgxpool.Pool
+	embedder ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	logger   *zap.Logger
 }
 
 // NewL2Store creates a new L2 store.
-func NewL2Store(db *pgxpool.Pool, mlClient *ml.SidecarClient, logger *zap.Logger) *L2Store {
-	return &L2Store{db: db, ml: mlClient, logger: logger}
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+func NewL2Store(db *pgxpool.Pool, embedder ml.Embedder, logger *zap.Logger) *L2Store {
+	return &L2Store{db: db, embedder: embedder, logger: logger}
 }
 
 // Append adds a new memory entry to L2.
 // Generates embedding for semantic search.
 func (s *L2Store) Append(ctx context.Context, entry L2Entry) error {
 	// Generate embedding for semantic search
-	embedding, err := s.ml.EmbedSingle(ctx, entry.Content)
+	embedding, err := s.embedder.EmbedSingle(ctx, entry.Content)
 	if err != nil {
 		s.logger.Warn("embedding failed for L2 entry, storing without vector", zap.Error(err))
 		// Store without embedding — won't be searchable but won't fail

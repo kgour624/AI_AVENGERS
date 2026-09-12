@@ -55,17 +55,19 @@ type Handler struct {
 	chatSvc      *chat.Service
 	orchestrator *orchestrator.Orchestrator
 	gateway      *gateway.ModelGateway
-	mlClient     *ml.SidecarClient
+	embedder     ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
 	memManager   *memory.Manager
 	logger       *zap.Logger
 }
 
 // NewHandler creates a new message handler.
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
 func NewHandler(
 	chatSvc *chat.Service,
 	orch *orchestrator.Orchestrator,
 	gw *gateway.ModelGateway,
-	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	memManager *memory.Manager,
 	logger *zap.Logger,
 ) *Handler {
@@ -73,7 +75,7 @@ func NewHandler(
 		chatSvc:      chatSvc,
 		orchestrator: orch,
 		gateway:      gw,
-		mlClient:     mlClient,
+		embedder:     embedder,
 		memManager:   memManager,
 		logger:       logger,
 	}
@@ -433,7 +435,7 @@ Return JSON: {"summary": "...", "topic": "...", "importance": 1-5}`, turnText)
 
 	// Generate embedding for semantic search
 	var embedding []float32
-	if emb, err := h.mlClient.EmbedSingle(ctx, summary); err == nil {
+	if emb, err := h.embedder.EmbedSingle(ctx, summary); err == nil {
 		embedding = emb
 	}
 

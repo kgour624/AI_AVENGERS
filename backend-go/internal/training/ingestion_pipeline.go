@@ -25,29 +25,31 @@ import (
 // 3. Embed: Needed for vector search
 // 4. Store: All data ready, single transaction
 type IngestionPipeline struct {
-	db         *pgxpool.Pool
-	ml         *ml.SidecarClient
-	gateway    *gateway.ModelGateway
-	chunker    *TextChunker
-	topics     *TopicExtractor
-	charters   *CharterExtractor
+	db       *pgxpool.Pool
+	embedder ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	gateway  *gateway.ModelGateway
+	chunker  *TextChunker
+	topics   *TopicExtractor
+	charters *CharterExtractor
 	capability *CapabilityBuilder
-	logger     *zap.Logger
+	logger   *zap.Logger
 }
 
 // NewIngestionPipeline creates a new ingestion pipeline.
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
 func NewIngestionPipeline(
 	db *pgxpool.Pool,
-	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	gw *gateway.ModelGateway,
 	logger *zap.Logger,
 ) *IngestionPipeline {
 	return &IngestionPipeline{
 		db:         db,
-		ml:         mlClient,
+		embedder:   embedder,
 		gateway:    gw,
 		chunker:    NewTextChunker(DefaultChunkerConfig()),
-		topics:     NewTopicExtractor(gw, mlClient, logger),
+		topics:     NewTopicExtractor(gw, embedder, logger),
 		charters:   NewCharterExtractor(gw, logger),
 		capability: NewCapabilityBuilder(gw, logger),
 		logger:     logger,
@@ -291,7 +293,7 @@ func (p *IngestionPipeline) IngestTranscript(
 			texts[i] = c.Text
 		}
 
-		batchEmbeds, embedErr := p.ml.Embed(ctx, texts)
+		batchEmbeds, embedErr := p.embedder.Embed(ctx, texts)
 		if embedErr != nil {
 			p.updateJobStatus(ctx, jobID, "failed",
 				"ML sidecar unavailable: "+embedErr.Error(), batchStart, len(chunks))

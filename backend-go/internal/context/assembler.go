@@ -81,7 +81,7 @@ type HistoryEntry struct {
 // WHY this order: Most important context last = less lost-in-middle.
 type Assembler struct {
 	db          *pgxpool.Pool
-	ml          *ml.SidecarClient
+	embedder    ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
 	memManager  *memory.Manager
 	maxTokens   int
 	recentMsgs  int
@@ -91,16 +91,19 @@ type Assembler struct {
 }
 
 // NewAssembler creates a new context assembler.
+// NewAssembler creates a new context assembler.
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
 func NewAssembler(
 	db *pgxpool.Pool,
-	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	memManager *memory.Manager,
 	maxTokens, recentMsgs, semanticTopK, chunksTopK int,
 	logger *zap.Logger,
 ) *Assembler {
 	return &Assembler{
 		db:           db,
-		ml:           mlClient,
+		embedder:     embedder,
 		memManager:   memManager,
 		maxTokens:    maxTokens,
 		recentMsgs:   recentMsgs,
@@ -569,7 +572,7 @@ func (a *Assembler) getRecentMessages(ctx context.Context, chatID uuid.UUID, lim
 
 // searchChatHistory finds semantically relevant past turns.
 func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, query string, limit int) ([]HistoryEntry, error) {
-	embedding, err := a.ml.EmbedSingle(ctx, query)
+	embedding, err := a.embedder.EmbedSingle(ctx, query)
 	if err != nil {
 		return nil, err
 	}
@@ -614,7 +617,7 @@ func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, que
 // Step 4: Rerank merged set -> top K
 func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int) ([]chinawall.CourseChunk, error) {
 	// Step 1: Vector search
-	embedding, err := a.ml.EmbedSingle(ctx, question)
+	embedding, err := a.embedder.EmbedSingle(ctx, question)
 	if err != nil {
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}

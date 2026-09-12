@@ -31,15 +31,18 @@ type Manager struct {
 }
 
 // NewManager creates a new memory manager.
+// embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
+// *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+// Passed through to L2Store which uses it for semantic search embeddings.
 func NewManager(
 	db *pgxpool.Pool,
 	redisClient *redis.Client,
-	mlClient *ml.SidecarClient,
+	embedder ml.Embedder,
 	logger *zap.Logger,
 ) *Manager {
 	return &Manager{
 		l1:     NewL1Store(redisClient, logger),
-		l2:     NewL2Store(db, mlClient, logger),
+		l2:     NewL2Store(db, embedder, logger),
 		l3:     NewL3Store(db, logger),
 		logger: logger,
 	}
