@@ -16,6 +16,7 @@ import (
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/memory"
+	"ai_avengers/backend/internal/selflearning"
 )
 
 // OrchestratorRequest is the input to the orchestrator.
@@ -125,6 +126,13 @@ type Orchestrator struct {
 	// disabled) — loadExperts treats nil registry exactly like "expert has
 	// no category_id", never panics on nil dereference (see loadExperts).
 	categoryRegistry *category.Registry
+	// selfLearning (Self-Learning Mode): nil = disabled (zero regression).
+	// When non-nil, processWithExpert runs Understand → Extract → Verify
+	// on the raw question before passing it to the decision engine.
+	// This converts story-noisy or domain-agnostic questions into
+	// domain-specific signal, improving RAG retrieval accuracy.
+	// WHY nil-safe: allows disabling self-learning without code change.
+	selfLearning *selflearning.QuestionProcessor
 	logger      *zap.Logger
 }
 
@@ -135,15 +143,17 @@ func NewOrchestrator(
 	decisionEng *decision.Engine,
 	memManager *memory.Manager,
 	categoryRegistry *category.Registry,
+	selfLearning *selflearning.QuestionProcessor,
 	logger *zap.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
-		db:          db,
-		assembler:   assembler,
-		decisionEng: decisionEng,
-		memManager:  memManager,
+		db:               db,
+		assembler:        assembler,
+		decisionEng:      decisionEng,
+		memManager:       memManager,
 		categoryRegistry: categoryRegistry,
-		logger:      logger,
+		selfLearning:     selfLearning,
+		logger:           logger,
 	}
 }
 
@@ -292,9 +302,39 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// from chinawall (would create a circular dependency).
 	replyContext := formatReplyContext(assembledCtx.ReplyThread)
 
+	// SELF-LEARNING MODE: Understand → Extract → Verify.
+	// Converts raw question into domain-specific signal before RAG.
+	// WHY here: must run after context assembly (chunks available for
+	// domain context) but before decision engine (Gate 1 uses question).
+	// WHY nil check: selfLearning=nil means disabled — zero regression,
+	// original question used unchanged, no log spam.
+	questionForRAG := req.Message
+	if o.selfLearning != nil {
+		processed := o.selfLearning.Process(
+			ctx,
+			req.Message,
+			expert.Name,
+			expert.Domain,
+			expert.ReasoningCharter,
+			assembledCtx.CourseChunks,
+		)
+		if processed.VerificationPassed {
+			questionForRAG = processed.Extracted
+			o.logger.Info("self-learning: using extracted question",
+				zap.String("expert", expert.Name),
+				zap.String("domain", expert.Domain),
+			)
+		} else if processed.SkippedReason != "" {
+			o.logger.Debug("self-learning: using original question",
+				zap.String("expert", expert.Name),
+				zap.String("reason", processed.SkippedReason),
+			)
+		}
+	}
+
 	result, err := o.decisionEng.Process(
 		ctx,
-		req.Message,
+		questionForRAG,
 		decision.Expert{
 			ID:                     expert.ID,
 			Name:                   expert.Name,
