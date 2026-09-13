@@ -3,6 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -1023,6 +1024,17 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 			false, // replaceExisting=false → append mode
 		)
 		if err != nil {
+			if errors.Is(err, training.ErrJobPaused) {
+				// Not a crash — pipeline paused intentionally at charter
+				// extraction. Job status is already 'paused' in DB.
+				// SSE stream will emit llm_failure_decision_required event.
+				// Admin must click Retry Now or leave paused (auto-fails 24h).
+				h.logger.Info("ingestion paused: charter LLM failure — awaiting admin action",
+					zap.String("job_id", jobID.String()),
+					zap.String("expert_id", expertID.String()),
+				)
+				return
+			}
 			h.logger.Error("ingestion failed",
 				zap.String("job_id", jobID.String()),
 				zap.Error(err),
@@ -1135,12 +1147,16 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 				eventType = "complete"
 			} else if job.Status == "failed" {
 				eventType = "failed"
+			} else if job.Status == "paused" {
+				// Charter LLM failed — pipeline stopped, waiting for admin.
+				// Frontend shows Retry Now button on this event type.
+				eventType = "llm_failure_decision_required"
 			}
 
 			sendEvent(eventType, job)
 
 			// Close stream when job is terminal
-			if job.Status == "complete" || job.Status == "failed" {
+			if job.Status == "complete" || job.Status == "failed" || job.Status == "paused" {
 				return
 			}
 		}
@@ -1149,6 +1165,7 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 
 // ResumeIngestionJob POST /admin/experts/:id/jobs/:jobID/resume
 // Resumes a failed ingestion job from its last checkpoint.
+// Only for status='failed' jobs. For status='paused' use RetryIngestionJob.
 // Admin does NOT need to re-upload the transcript.
 func (h *AdminHandler) ResumeIngestionJob(c *gin.Context) {
 	expertID, err := uuid.Parse(c.Param("id"))
@@ -1265,6 +1282,130 @@ func (h *AdminHandler) ResumeIngestionJob(c *gin.Context) {
 		"status":           "resuming",
 		"checkpoint_stage": job.CheckpointStage,
 		"message":          fmt.Sprintf("Resuming from stage: %s", job.CheckpointStage),
+	})
+}
+
+// RetryIngestionJob POST /admin/experts/:id/jobs/:jobID/retry
+// Retries a paused ingestion job from its last checkpoint (charter stage).
+// Only allowed when job status='paused' — use ResumeIngestionJob for 'failed' jobs.
+//
+// WHY separate from ResumeIngestionJob:
+//   Resume is for crashed/failed jobs (any stage).
+//   Retry is specifically for paused jobs (charter LLM failure).
+//   Keeping them separate makes the admin UI intent explicit.
+func (h *AdminHandler) RetryIngestionJob(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	jobID, err := uuid.Parse(c.Param("jobID"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_JOB_ID", "invalid job ID")
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load job — verify it belongs to this expert and is paused.
+	var job struct {
+		ExpertID          uuid.UUID
+		ExpertName        string
+		Status            string
+		CheckpointStage   string
+		TranscriptContent string
+		SourcePath        string
+	}
+	err = h.db.QueryRow(ctx, `
+		SELECT ij.expert_id, e.name, ij.status,
+		       COALESCE(ij.checkpoint_data->>'stage', 'pending'),
+		       COALESCE(ij.transcript_content, ''),
+		       COALESCE(ij.source_path, '')
+		FROM ingestion_jobs ij
+		JOIN experts e ON e.id = ij.expert_id
+		WHERE ij.id = $1 AND ij.expert_id = $2`,
+		jobID, expertID,
+	).Scan(
+		&job.ExpertID, &job.ExpertName, &job.Status,
+		&job.CheckpointStage, &job.TranscriptContent, &job.SourcePath,
+	)
+	if err != nil {
+		response.NotFound(c, "ingestion job")
+		return
+	}
+
+	if job.Status != "paused" {
+		response.BadRequest(c, "JOB_NOT_PAUSED",
+			fmt.Sprintf("job status is '%s', not 'paused' — use /resume for failed jobs", job.Status))
+		return
+	}
+
+	// Charter extraction needs the transcript text.
+	// Chunks are already in DB — IngestTranscript loads them from DB.
+	// But charter extraction itself needs the transcript for context.
+	if job.TranscriptContent == "" {
+		response.BadRequest(c, "TRANSCRIPT_REQUIRED",
+			"Transcript content not stored. Please re-upload the transcript file to retry.")
+		return
+	}
+
+	// Reset job to resumable state.
+	// LoadCheckpoint() will find the StagePaused checkpoint and
+	// resume from charter_extraction (CharterExtracted=false).
+	_, err = h.db.Exec(ctx,
+		`UPDATE ingestion_jobs SET
+			status        = 'pending',
+			error_message = NULL,
+			paused_at     = NULL,
+			completed_at  = NULL,
+			updated_at    = NOW()
+		 WHERE id = $1`,
+		jobID,
+	)
+	if err != nil {
+		h.logger.Error("reset paused job for retry failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	// Mark expert as training again
+	_, _ = h.db.Exec(ctx, `UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
+
+	// Retry in background with SAME jobID — LoadCheckpoint() finds the
+	// StagePaused checkpoint and skips chunking + topic extraction.
+	go func() {
+		_, err := h.ingestion.IngestTranscript(
+			context.Background(),
+			jobID, expertID, job.ExpertName,
+			job.TranscriptContent,
+			job.SourcePath,
+			false,
+		)
+		if err != nil {
+			if errors.Is(err, training.ErrJobPaused) {
+				// LLM failed again — job is paused again.
+				// Admin will see another llm_failure_decision_required SSE event.
+				h.logger.Warn("retry ingestion: charter LLM failed again — job re-paused",
+					zap.String("job_id", jobID.String()),
+				)
+				return
+			}
+			h.logger.Error("retry ingestion failed",
+				zap.String("job_id", jobID.String()),
+				zap.Error(err),
+			)
+		}
+	}()
+
+	h.logger.Info("ingestion job retry started",
+		zap.String("job_id", jobID.String()),
+		zap.String("expert_id", expertID.String()),
+	)
+
+	response.OK(c, map[string]interface{}{
+		"job_id":  jobID,
+		"status":  "retrying",
+		"message": "Retrying charter extraction from checkpoint",
 	})
 }
 
