@@ -105,6 +105,7 @@ func (e *Engine) Process(
 	expert Expert,
 	chunks []chinawall.CourseChunk,
 	projectSummary string,
+	replyContext string,
 	attempt int,
 	replyToMessageID *uuid.UUID,
 ) (*DecisionResult, error) {
@@ -165,7 +166,7 @@ func (e *Engine) Process(
 	// any expert with no category or an empty template_schema, in which
 	// case Enforce() takes its existing flat-text path unchanged (CT-L2).
 	enforceResult, err := e.chinaWall.Enforce(
-		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, attempt,
+		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, replyContext, attempt,
 		expert.TemplateSections, expert.DefaultLanguage,
 	)
 	if err != nil {
@@ -181,7 +182,7 @@ func (e *Engine) Process(
 			// re-run gateStructurePermission's DB lookup against the
 			// ALREADY-rewritten question and incorrectly re-append the
 			// preference text a second time.
-			return e.Process(ctx, question, expert, chunks, projectSummary, attempt+1, nil)
+		return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil)
 		}
 		return &DecisionResult{
 			Mode:        ModeREFUSE,
