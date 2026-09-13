@@ -139,6 +139,40 @@ func (p *IngestionPipeline) IngestTranscript(
 	p.updateJobStatus(ctx, jobID, "running", "", 0, 0)
 
 	// ============================================================
+	// STEP 0: TRANSCRIPT CLEANING (always runs, before chunking)
+	// ============================================================
+	// WHY clean before chunking:
+	//   Raw transcripts contain 45-55% noise (greetings, timestamps,
+	//   quiz mechanics, filler words). This noise gets embedded into
+	//   chunks and lowers reranker scores below the China Wall threshold
+	//   (0.35), causing Gate 2 to refuse all questions even when the
+	//   expert has relevant knowledge.
+	//
+	//   Cleaning BEFORE chunking ensures every chunk contains only
+	//   DSA/technical content. Noise patterns documented in:
+	//   TRANSCRIPT_NOISE_TABLE.md
+	if transcript != "" {
+		cleaner := NewTranscriptCleaner()
+		originalLen := len(transcript)
+		transcript = cleaner.Clean(transcript)
+		cleanedLen := len(transcript)
+		reductionPct := 0
+		if originalLen > 0 {
+			reductionPct = (originalLen - cleanedLen) * 100 / originalLen
+		}
+		p.logger.Info("transcript cleaned",
+			zap.Int("original_chars", originalLen),
+			zap.Int("cleaned_chars", cleanedLen),
+			zap.Int("reduction_pct", reductionPct),
+		)
+		if cleanedLen == 0 {
+			err := fmt.Errorf("transcript is empty after cleaning")
+			p.updateJobStatus(ctx, jobID, "failed", err.Error(), 0, 0)
+			return nil, err
+		}
+	}
+
+	// ============================================================
 	// STEP 1: CHUNKING
 	// ============================================================
 	// If resuming from topic_extraction or later, load chunks from DB
