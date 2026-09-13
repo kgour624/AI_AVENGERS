@@ -93,6 +93,12 @@ func (e *Enforcer) Enforce(
 	expertName string,
 	expertDomain string,
 	reasoningCharter string,
+	// replyContext is a pre-formatted string produced by
+	// orchestrator.formatReplyContext(). Empty string for every fresh
+	// (non-reply) question — all downstream functions check for "" and
+	// skip injection, so the flat-text and structured paths are
+	// completely unaffected for the vast majority of calls (CT-L2).
+	replyContext string,
 	attempt int,
 	// templateSections/defaultLanguage (CT-B) are nil/"" for every expert
 	// with no category or an empty template_schema — the entire flat-text
@@ -160,7 +166,7 @@ func (e *Enforcer) Enforce(
 
 	// LAYER 3: Generate with mandatory citations
 	// Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
-	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, profile, templateSections, defaultLanguage)
+	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, templateSections, defaultLanguage)
 	if err != nil {
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
@@ -214,7 +220,7 @@ func (e *Enforcer) Enforce(
 			e.logger.Warn("Layer 4: domain rules produced empty output, retrying with BaseProfile",
 				zap.String("domain", profile.Domain),
 			)
-			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, BaseProfile, nil, "")
+			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, BaseProfile, nil, "")
 			if err != nil {
 				return nil, fmt.Errorf("base profile generation failed: %w", err)
 			}
@@ -471,6 +477,7 @@ func (e *Enforcer) generateWithCitations(
 	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
+	replyContext string,
 	profile *DomainProfile,
 	templateSections []category.TemplateSection,
 	defaultLanguage string,
@@ -483,10 +490,10 @@ func (e *Enforcer) generateWithCitations(
 	}
 
 	if len(templateSections) > 0 {
-		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, contextSB.String(), templateSections, defaultLanguage, profile)
+		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, contextSB.String(), templateSections, defaultLanguage, profile)
 	}
 
-	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, profile, contextSB.String())
+	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextSB.String())
 }
 
 // generateFlatText is the ORIGINAL flat-text generation path, extracted
@@ -502,6 +509,7 @@ func (e *Enforcer) generateFlatText(
 	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
+	replyContext string,
 	profile *DomainProfile,
 	contextText string,
 ) (*generatedAnswer, error) {
@@ -547,6 +555,12 @@ CRITICAL RULES:
 COURSE CONTENT:
 %s`,
 			expertName, reasoningCharter, profile.SystemPromptExt, contextText)
+	}
+
+	// Inject reply context into system prompt when the user is replying
+	// to a prior message. Empty string for fresh questions — no-op (CT-L2).
+	if replyContext != "" {
+		systemPrompt += "\n\n" + replyContext
 	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
@@ -614,6 +628,7 @@ func (e *Enforcer) generateStructured(
 	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
+	replyContext string,
 	contextText string,
 	sections []category.TemplateSection,
 	defaultLanguage string,
@@ -624,6 +639,12 @@ func (e *Enforcer) generateStructured(
 	}
 
 	systemPrompt := buildStructuredPrompt(expertName, reasoningCharter, contextText, sections, defaultLanguage, profile)
+
+	// Inject reply context when the user is replying to a prior message.
+	// Empty string for fresh questions — no-op (CT-L2).
+	if replyContext != "" {
+		systemPrompt += "\n\n" + replyContext
+	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelStrong,
@@ -646,7 +667,7 @@ func (e *Enforcer) generateStructured(
 			zap.Error(parseErr),
 			zap.Int("raw_response_length", len(resp.Content)),
 		)
-		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, profile, contextText)
+		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextText)
 	}
 
 	// 2026-09-08 RCA: initialized non-nil - a structured answer with
