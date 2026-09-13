@@ -78,6 +78,53 @@ func (g *ModelGateway) SetDB(db *pgxpool.Pool) {
 	g.db = db
 }
 
+// buildProviderByName creates an LLMProvider for the given provider name.
+// Used by getFallbackProvider() to build the fallback without touching
+// the cached primary provider (g.provider / g.providerName).
+func (g *ModelGateway) buildProviderByName(ctx context.Context, providerName string) LLMProvider {
+	apiKey := g.getAPIKey(ctx, config.LLMProvider(providerName))
+	switch config.LLMProvider(providerName) {
+	case config.ProviderDeepSeek:
+		return providers.NewDeepSeekProvider(apiKey, g.httpClient)
+	case config.ProviderAnthropic:
+		return providers.NewAnthropicProvider(apiKey, g.httpClient)
+	case config.ProviderGemini:
+		return providers.NewGeminiProvider(apiKey, g.httpClient)
+	case config.ProviderCodeCraftAPI:
+		modelCheap := g.getModelName(ctx, "codecraftapi_model_cheap", "")
+		modelStrong := g.getModelName(ctx, "codecraftapi_model_strong", "")
+		modelFast := g.getModelName(ctx, "codecraftapi_model_fast", "")
+		return providers.NewCodeCraftAPIProvider(
+			apiKey, g.cfg.CodeCraftAPIBaseURL,
+			modelCheap, modelStrong, modelFast,
+			g.httpClient,
+		)
+	default: // openrouter
+		return providers.NewOpenRouterProvider(apiKey, g.cfg.OpenRouterBaseURL, g.httpClient)
+	}
+}
+
+// getFallbackProvider reads 'llm_fallback_provider' from system_settings
+// and returns a ready-to-use LLMProvider, or nil if no fallback is configured.
+// Returns nil when DB is not wired or key is missing/empty.
+func (g *ModelGateway) getFallbackProvider(ctx context.Context) LLMProvider {
+	if g.db == nil {
+		return nil
+	}
+	var valueJSON []byte
+	err := g.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'llm_fallback_provider'`,
+	).Scan(&valueJSON)
+	if err != nil || len(valueJSON) == 0 {
+		return nil
+	}
+	var name string
+	if json.Unmarshal(valueJSON, &name) != nil || name == "" {
+		return nil
+	}
+	return g.buildProviderByName(ctx, name)
+}
+
 // buildProvider creates the correct LLMProvider implementation for the
 // currently active provider. Called lazily on first use and on change.
 func (g *ModelGateway) buildProvider(ctx context.Context) LLMProvider {
@@ -133,6 +180,13 @@ func (g *ModelGateway) getProvider(ctx context.Context) LLMProvider {
 // Call makes an LLM call via the active provider.
 // Provider is resolved at call time — switching provider in admin panel
 // takes effect on the next Call() with no restart needed.
+//
+// Fallback behavior:
+//   If all 3 attempts on the primary provider fail (any error), and
+//   'llm_fallback_provider' is configured in system_settings AND is
+//   different from the primary, Call() retries 3 more times on the
+//   fallback provider. This is per-Call() — global provider is never
+//   mutated. If fallback also fails, the original error is returned.
 func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, error) {
 	if req.UseCache {
 		if cached, ok := g.cache.Load(g.cacheKey(req)); ok {
@@ -142,84 +196,130 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 		}
 	}
 
-	provider := g.getProvider(ctx)
+	primary := g.getProvider(ctx)
 
-	maxTokens := req.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 2000
-	}
-	if provMax := provider.MaxTokens(req.Model); maxTokens > provMax {
-		maxTokens = provMax
-	}
+	// tryProvider runs up to 3 attempts on the given provider.
+	// Returns (response, nil) on first success.
+	// Returns (nil, lastErr) if all attempts fail.
+	tryProvider := func(p LLMProvider) (*LLMResponse, error) {
+		maxTokens := req.MaxTokens
+		if maxTokens <= 0 {
+			maxTokens = 2000
+		}
+		if provMax := p.MaxTokens(req.Model); maxTokens > provMax {
+			maxTokens = provMax
+		}
 
-	var messages []ProviderMessage
-	if req.SystemPrompt != "" {
-		messages = append(messages, ProviderMessage{Role: "system", Content: req.SystemPrompt})
-	}
-	messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
+		var messages []ProviderMessage
+		if req.SystemPrompt != "" {
+			messages = append(messages, ProviderMessage{Role: "system", Content: req.SystemPrompt})
+		}
+		messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
 
-	provReq := ProviderRequest{
-		ModelTier:   req.Model,
-		Messages:    messages,
-		MaxTokens:   maxTokens,
-		Temperature: req.Temperature,
-		EnableCache: req.UseCache,
-	}
+		provReq := ProviderRequest{
+			ModelTier:   req.Model,
+			Messages:    messages,
+			MaxTokens:   maxTokens,
+			Temperature: req.Temperature,
+			EnableCache: req.UseCache,
+		}
 
-	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil, ctx.Err()
+		var lastErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(math.Pow(2, float64(attempt-1))) * time.Second
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
 			}
-		}
 
-		start := time.Now()
-		provResp, err := provider.Call(ctx, provReq)
-		if err != nil {
-			lastErr = err
-			g.logger.Warn("LLM call attempt failed",
-				zap.Int("attempt", attempt+1),
-				zap.String("provider", provider.Name()),
-				zap.Error(err),
+			start := time.Now()
+			provResp, err := p.Call(ctx, provReq)
+			if err != nil {
+				lastErr = err
+				g.logger.Warn("LLM call attempt failed",
+					zap.Int("attempt", attempt+1),
+					zap.String("provider", p.Name()),
+					zap.Error(err),
+				)
+				continue
+			}
+
+			duration := time.Since(start)
+			inCost, outCost := p.CostPer1K(req.Model)
+			cost := float64(provResp.InputTokens)/1000*inCost +
+				float64(provResp.OutputTokens)/1000*outCost
+
+			currentCost := g.totalCost.Load().(float64)
+			g.totalCost.Store(currentCost + cost)
+			g.callCount.Add(1)
+
+			result := &LLMResponse{
+				Content:      provResp.Content,
+				InputTokens:  provResp.InputTokens,
+				OutputTokens: provResp.OutputTokens,
+				CostUSD:      cost,
+				ModelUsed:    provResp.ModelUsed,
+				DurationMs:   float64(duration.Milliseconds()),
+			}
+
+			g.logger.Info("LLM call complete",
+				zap.String("provider", p.Name()),
+				zap.String("tier", string(req.Model)),
+				zap.Float64("cost_usd", cost),
+				zap.Float64("duration_ms", result.DurationMs),
 			)
-			continue
+
+			if req.UseCache {
+				g.cache.Store(g.cacheKey(req), result)
+			}
+			return result, nil
 		}
+		return nil, lastErr
+	}
 
-		duration := time.Since(start)
-		inCost, outCost := provider.CostPer1K(req.Model)
-		cost := float64(provResp.InputTokens)/1000*inCost +
-			float64(provResp.OutputTokens)/1000*outCost
-
-		currentCost := g.totalCost.Load().(float64)
-		g.totalCost.Store(currentCost + cost)
-		g.callCount.Add(1)
-
-		result := &LLMResponse{
-			Content:      provResp.Content,
-			InputTokens:  provResp.InputTokens,
-			OutputTokens: provResp.OutputTokens,
-			CostUSD:      cost,
-			ModelUsed:    provResp.ModelUsed,
-			DurationMs:   float64(duration.Milliseconds()),
-		}
-
-		g.logger.Info("LLM call complete",
-			zap.String("provider", provider.Name()),
-			zap.String("tier", string(req.Model)),
-			zap.Float64("cost_usd", cost),
-			zap.Float64("duration_ms", result.DurationMs),
-		)
-
-		if req.UseCache {
-			g.cache.Store(g.cacheKey(req), result)
-		}
+	// Try primary provider first.
+	result, err := tryProvider(primary)
+	if err == nil {
 		return result, nil
 	}
-	return nil, fmt.Errorf("all LLM attempts failed: %w", lastErr)
+
+	// Primary failed all 3 attempts. Try fallback if configured.
+	// getFallbackProvider() returns nil when no fallback is set —
+	// in that case we return the primary's error unchanged (backward compatible).
+	fallback := g.getFallbackProvider(ctx)
+	if fallback == nil {
+		return nil, fmt.Errorf("all LLM attempts failed: %w", err)
+	}
+	if fallback.Name() == primary.Name() {
+		// Fallback is the same provider as primary — retrying is pointless.
+		g.logger.Warn("LLM fallback provider is same as primary — skipping fallback",
+			zap.String("provider", primary.Name()),
+		)
+		return nil, fmt.Errorf("all LLM attempts failed: %w", err)
+	}
+
+	g.logger.Warn("primary LLM provider failed — trying fallback",
+		zap.String("primary", primary.Name()),
+		zap.String("fallback", fallback.Name()),
+		zap.Error(err),
+	)
+
+	result, fallbackErr := tryProvider(fallback)
+	if fallbackErr == nil {
+		return result, nil
+	}
+
+	g.logger.Error("both primary and fallback LLM providers failed",
+		zap.String("primary", primary.Name()),
+		zap.String("fallback", fallback.Name()),
+		zap.NamedError("primary_err", err),
+		zap.NamedError("fallback_err", fallbackErr),
+	)
+	return nil, fmt.Errorf("all LLM attempts failed (primary: %s, fallback: %s): %w",
+		primary.Name(), fallback.Name(), fallbackErr)
 }
 
 // GetStats returns usage statistics.
