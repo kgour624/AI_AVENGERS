@@ -35,6 +35,7 @@ import (
 	"ai_avengers/backend/internal/rating"
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/selflearning"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -267,7 +268,14 @@ func buildRouter(
 		cfg.Context.SemanticTopK, cfg.Context.CourseChunksTopK,
 		logger,
 	)
-	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, logger)
+
+	// Self-Learning Mode: Understand → Extract → Verify.
+	// Converts raw questions into domain-specific signal before RAG.
+	// WHY always enabled: accuracy improvement justifies 3×ModelCheap cost.
+	// To disable: pass nil instead of questionProcessor to NewOrchestrator.
+	questionProcessor := selflearning.NewQuestionProcessor(modelGateway, logger)
+
+	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, questionProcessor, logger)
 
 	// Initialize domain services
 	projectSvc := project.NewService(postgres.Pool, logger)
