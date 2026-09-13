@@ -141,6 +141,39 @@ func main() {
 	// Build router — single call, single definition
 	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, embedder, domainRegistry, categoryRegistry)
 
+	// 24-hour auto-fail checker for paused ingestion jobs.
+	// WHY here not in admin_handler: server-lifecycle concern, not per-request.
+	// Starts once at boot, runs every 5 minutes for the lifetime of the process.
+	// WHY 5-minute interval: precise enough for a 24h window, single admin user.
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				res, err := postgres.Exec(context.Background(),
+					`UPDATE ingestion_jobs
+					 SET status        = 'failed',
+					     error_message = 'Auto-failed: paused for >24h without admin action',
+					     completed_at  = NOW()
+					 WHERE status = 'paused'
+					   AND paused_at < NOW() - INTERVAL '24 hours'`,
+				)
+				if err != nil {
+					logger.Warn("paused job auto-fail checker: DB error", zap.Error(err))
+					continue
+				}
+				if res.RowsAffected() > 0 {
+					logger.Info("paused job auto-fail checker: expired jobs failed",
+						zap.Int64("count", res.RowsAffected()),
+					)
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Build HTTP server
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
@@ -400,6 +433,7 @@ func buildRouter(
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
+		adminGroup.POST("/experts/:id/jobs/:jobID/retry", adminHandler.RetryIngestionJob)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
 		adminGroup.GET("/stats", adminHandler.GetStats)
