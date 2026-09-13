@@ -281,32 +281,33 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.updateStage(ctx, jobID, StageCharterExtraction, "Extracting expert charter...")
 		extractedCharter, extractErr := p.charters.Extract(ctx, transcript, expertName)
 		if extractErr != nil {
-			p.logger.Warn("charter extraction failed (LLM error) — keeping existing charter if present, using default only if no charter exists yet",
+			// Charter LLM failed (API error, rate limit, timeout, or bad output).
+			// Do NOT silently fall back to a default charter — charter quality
+			// is non-negotiable. A default charter produces generic, uncited
+			// answers that defeat the purpose of domain-expert training.
+			//
+			// Instead: pause the job and wait for admin action.
+			// Admin options (via admin panel):
+			//   • Retry Now — re-run charter LLM from this stage
+			//   • Pause & Wait — leave paused, resume manually later
+			// Auto-fail: if paused for >24h without action (main.go checker).
+			//
+			// WHY pause not fail:
+			//   LLM errors are transient. Chunks + topics are already in DB.
+			//   Failing would require re-uploading the transcript and re-running
+			//   all 6 stages from scratch. Pausing preserves all prior work.
+			p.logger.Warn("charter extraction failed — pausing job for admin action",
+				zap.String("expert_id", expertID.String()),
+				zap.String("job_id", jobID.String()),
 				zap.Error(extractErr),
 			)
-			// PERMANENT FIX: Do NOT overwrite an existing good charter with a
-			// default when LLM fails. Load whatever is already in DB.
-			// Only use default if the expert has NO charter at all yet.
-			// WHY: LLM errors are transient (API down, rate limit, wrong model
-			// name). Silently replacing a carefully-extracted charter with a
-			// generic template destroys weeks of training value.
-			existingCharter, loadErr := p.loadCharterFromDB(ctx, expertID)
-			if loadErr == nil && existingCharter != nil && existingCharter.ReasoningCharter != "" {
-				// Expert already has a real charter — keep it, don't overwrite
-				p.logger.Info("charter extraction failed but existing charter preserved",
-					zap.String("expert_id", expertID.String()),
-				)
-				charter = existingCharter
-			} else {
-				// No existing charter — use default as last resort
-				charter = &Charter{
-					ReasoningCharter:     defaultReasoningCharter(expertName),
-					ClarificationCharter: defaultClarificationCharter(),
-				}
-			}
-		} else {
-			charter = extractedCharter
+			return nil, p.pauseOnLLMFailure(
+				ctx, jobID, cpWriter,
+				len(chunks), tracker.TotalCost(), start,
+				fmt.Sprintf("Charter LLM failed: %s", extractErr.Error()),
+			)
 		}
+		charter = extractedCharter
 		// Checkpoint: charter done
 		cpWriter.Write(ctx, JobCheckpoint{
 			Stage:            StageCharterExtraction,
@@ -815,6 +816,75 @@ func (p *IngestionPipeline) updateStage(ctx context.Context, jobID uuid.UUID, st
 	if err != nil {
 		p.logger.Warn("updateStage failed", zap.String("stage", stage), zap.Error(err))
 	}
+}
+
+// pauseOnLLMFailure transitions the job to status='paused' when the
+// charter LLM call fails. Writes a checkpoint so resume/retry can
+// restart from charter_extraction without re-chunking or re-embedding.
+//
+// Returns ErrJobPaused always — caller must return this to the goroutine
+// so IngestTranscript stops cleanly.
+//
+// Mental execution:
+//   Input: jobID, reason="charter LLM: context deadline exceeded"
+//   1. Write checkpoint at StagePaused (chunks + topics already done)
+//   2. UPDATE status='paused', paused_at=NOW(), error_message=reason
+//   3. Return ErrJobPaused
+//   Caller (IngestTranscript): return nil, ErrJobPaused
+//   Goroutine (admin_handler): errors.Is(err, ErrJobPaused) → log info, no retry
+func (p *IngestionPipeline) pauseOnLLMFailure(
+	ctx context.Context,
+	jobID uuid.UUID,
+	cpWriter *CheckpointWriter,
+	chunksTotal int,
+	costSoFar float64,
+	start time.Time,
+	reason string,
+) error {
+	// Write checkpoint at paused stage so resume/retry starts from
+	// charter_extraction, not from the beginning.
+	// CharterExtracted=false: charter was NOT successfully extracted —
+	// that is exactly why we are pausing. Resume must re-run it.
+	cpWriter.Write(ctx, JobCheckpoint{
+		Stage:            StagePaused,
+		ChunksDone:       chunksTotal,
+		ChunksTotal:      chunksTotal,
+		CharterExtracted: false,
+		LastBatchIndex:   0,
+		CostUSDSoFar:     costSoFar,
+		StartedAt:        start,
+	})
+
+	// Transition job to paused state.
+	// paused_at is used by the 24h auto-fail checker in main.go.
+	_, err := p.db.Exec(ctx,
+		`UPDATE ingestion_jobs SET
+			status        = 'paused',
+			current_stage = 'paused',
+			stage_detail  = $1,
+			paused_at     = NOW(),
+			error_message = $2
+		 WHERE id = $3`,
+		StageLabels[StagePaused],
+		reason,
+		jobID,
+	)
+	if err != nil {
+		// DB write failed — log but still return ErrJobPaused.
+		// Pipeline must stop regardless; worst case the job stays
+		// 'running' in DB until the 24h checker or admin intervenes.
+		p.logger.Error("pauseOnLLMFailure: DB update failed",
+			zap.String("job_id", jobID.String()),
+			zap.Error(err),
+		)
+	}
+
+	p.logger.Warn("ingestion paused: charter LLM failure — awaiting admin action",
+		zap.String("job_id", jobID.String()),
+		zap.String("reason", reason),
+	)
+
+	return ErrJobPaused
 }
 
 // loadChunksFromDB loads existing TextChunks for an expert from the DB.
