@@ -1795,8 +1795,21 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 		}
 	}
 
+	// Read fallback provider from system_settings
+	fallbackProvider := "" // empty = not configured
+	var fallbackJSON []byte
+	if err := h.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'llm_fallback_provider'`,
+	).Scan(&fallbackJSON); err == nil {
+		var fp string
+		if json.Unmarshal(fallbackJSON, &fp) == nil {
+			fallbackProvider = fp
+		}
+	}
+
 	response.OK(c, map[string]interface{}{
 		"active_provider":     provider,
+		"fallback_provider":   fallbackProvider,
 		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini", "codecraftapi"},
 		"api_keys_configured": maskedKeys,
 		"note": "API keys are masked. To update, POST to this endpoint with new values.",
@@ -1804,20 +1817,26 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 }
 
 // UpdateLLMSettings POST /admin/llm-settings
-// Body: {provider: "deepseek", api_keys: {"deepseek": "sk-xxx"}}
-// UpdateLLMSettings POST /admin/llm-settings
-// Body: {provider: "deepseek", api_keys: {"deepseek": "sk-xxx"},
+// Body: {provider: "deepseek", fallback_provider: "openrouter", api_keys: {"deepseek": "sk-xxx"},
 //        codecraftapi_model_cheap: "...", codecraftapi_model_strong: "...", codecraftapi_model_fast: "..."}
-// Saves provider + keys + CodeCraftAPI per-tier model names to system_settings.
+// Saves provider + fallback + keys + CodeCraftAPI per-tier model names to system_settings.
 // Takes effect immediately (no restart needed).
 func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 	var req struct {
-		Provider string            `json:"provider"`
-		APIKeys  map[string]string `json:"api_keys"`
+		Provider         string            `json:"provider"`
+		// FallbackProvider: optional. When set, Call() tries this provider
+		// if the primary fails all 3 attempts. Empty string = no fallback.
+		// Set to "" explicitly to clear an existing fallback.
+		FallbackProvider string            `json:"fallback_provider"`
+		APIKeys          map[string]string `json:"api_keys"`
 		// CodeCraftAPI per-tier model names (optional — only used when provider=codecraftapi)
 		CodeCraftAPIModelCheap  string `json:"codecraftapi_model_cheap"`
 		CodeCraftAPIModelStrong string `json:"codecraftapi_model_strong"`
 		CodeCraftAPIModelFast   string `json:"codecraftapi_model_fast"`
+		// ClearFallback: set to true to explicitly remove the fallback provider.
+		// WHY a separate flag: empty string in FallbackProvider is ambiguous
+		// ("not provided" vs "clear it"). ClearFallback=true is unambiguous.
+		ClearFallback bool `json:"clear_fallback"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -1832,6 +1851,11 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 	if req.Provider != "" && !validProviders[req.Provider] {
 		response.BadRequest(c, "INVALID_PROVIDER",
 			"provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi")
+		return
+	}
+	if req.FallbackProvider != "" && !validProviders[req.FallbackProvider] {
+		response.BadRequest(c, "INVALID_FALLBACK_PROVIDER",
+			"fallback_provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi")
 		return
 	}
 
@@ -1852,6 +1876,35 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 		)
 		if err != nil {
 			h.logger.Error("save llm provider failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+	}
+
+	// Save fallback provider
+	if req.ClearFallback {
+		// Explicitly clear fallback — delete the key so getFallbackProvider() returns nil.
+		_, err := h.db.Exec(ctx,
+			`DELETE FROM system_settings WHERE key = 'llm_fallback_provider'`,
+		)
+		if err != nil {
+			h.logger.Error("clear llm fallback provider failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+	} else if req.FallbackProvider != "" {
+		fallbackJSON, _ := json.Marshal(req.FallbackProvider)
+		_, err := h.db.Exec(ctx,
+			`INSERT INTO system_settings (key, value, updated_by)
+			 VALUES ('llm_fallback_provider', $1, $2)
+			 ON CONFLICT (key) DO UPDATE SET
+				value = EXCLUDED.value,
+				updated_by = EXCLUDED.updated_by,
+				updated_at = NOW()`,
+			string(fallbackJSON), adminID,
+		)
+		if err != nil {
+			h.logger.Error("save llm fallback provider failed", zap.Error(err))
 			response.InternalError(c)
 			return
 		}
@@ -1920,12 +1973,14 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 
 	h.logger.Info("LLM settings updated",
 		zap.String("provider", req.Provider),
+		zap.String("fallback_provider", req.FallbackProvider),
 		zap.Int("keys_updated", len(req.APIKeys)),
 	)
 	response.OK(c, map[string]string{
-		"status":   "updated",
-		"provider": req.Provider,
-		"note":     "Changes take effect on next LLM call. No restart needed.",
+		"status":            "updated",
+		"provider":          req.Provider,
+		"fallback_provider": req.FallbackProvider,
+		"note":              "Changes take effect on next LLM call. No restart needed.",
 	})
 }
 
