@@ -3,6 +3,7 @@ package training
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,17 +12,35 @@ import (
 	"go.uber.org/zap"
 )
 
-// Stage constants — must match migration 007 CHECK constraint.
+// ErrJobPaused is returned by IngestTranscript when the pipeline
+// intentionally stops due to a charter LLM failure and sets
+// status='paused'. The caller (admin_handler goroutine) must treat
+// this as a non-error stop — the job is not broken, it is waiting
+// for admin action (Retry Now or Pause & Wait).
+//
+// WHY sentinel error not bool return:
+//   IngestTranscript already returns (*IngestionResult, error).
+//   Adding a third return value would require updating every caller.
+//   A sentinel error is idiomatic Go for "stop, but not a crash".
+var ErrJobPaused = errors.New("ingestion job paused: charter LLM failure — awaiting admin action")
+
+// Stage constants — must match migration 007 CHECK constraint on
+// current_stage AND migration 011 CHECK constraint on status.
 const (
-	StagePending          = "pending"
-	StageChunking         = "chunking"
-	StageTopicExtraction  = "topic_extraction"
+	StagePending           = "pending"
+	StageChunking          = "chunking"
+	StageTopicExtraction   = "topic_extraction"
 	StageCharterExtraction = "charter_extraction"
-	StageEmbedding        = "embedding"
-	StageStoring          = "storing"
-	StageSmokeTest        = "smoke_test"
-	StageComplete         = "complete"
-	StageFailed           = "failed"
+	StageEmbedding         = "embedding"
+	StageStoring           = "storing"
+	StageSmokeTest         = "smoke_test"
+	StageComplete          = "complete"
+	StageFailed            = "failed"
+	// StagePaused: pipeline stopped at charter_extraction due to LLM
+	// failure. Job is NOT failed — it is waiting for admin action.
+	// Admin can: Retry Now (re-run charter LLM) or leave paused
+	// (auto-fails after 24h via background checker in main.go).
+	StagePaused = "paused"
 )
 
 // StageLabels maps stage constants to human-readable UI labels.
@@ -35,6 +54,7 @@ var StageLabels = map[string]string{
 	StageSmokeTest:         "Step 6/6: Running smoke test",
 	StageComplete:          "Complete ✅",
 	StageFailed:            "Failed ❌",
+	StagePaused:            "Paused ⏸ — Charter LLM failed. Use Retry Now or wait.",
 }
 
 // StageOrder maps stage → index for progress % calculation.
@@ -47,6 +67,7 @@ var StageOrder = map[string]int{
 	StageStoring:           5,
 	StageSmokeTest:         6,
 	StageComplete:          7,
+	StagePaused:            3, // paused at charter stage — same order as charter_extraction
 }
 
 // JobCheckpoint is the durable state written to ingestion_jobs.checkpoint_data.
