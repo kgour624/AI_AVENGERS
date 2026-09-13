@@ -284,6 +284,14 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// fresh question — gateStructurePermission (decision/engine.go) is a
 	// no-op in that case regardless, since it also checks
 	// expert.AskStructurePermission first.
+	//
+	// replyContext: pre-formatted string from assembledCtx.ReplyThread.
+	// Empty string for fresh questions (no reply target) — enforcer
+	// injects it into the LLM system prompt only when non-empty.
+	// WHY format here not in enforcer: avoids importing appcontext
+	// from chinawall (would create a circular dependency).
+	replyContext := formatReplyContext(assembledCtx.ReplyThread)
+
 	result, err := o.decisionEng.Process(
 		ctx,
 		req.Message,
@@ -299,6 +307,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		},
 		assembledCtx.CourseChunks,
 		projectSummary,
+		replyContext,
 		1,
 		req.ReplyToMessageID,
 	)
@@ -438,7 +447,30 @@ func (o *Orchestrator) loadExperts(ctx context.Context, expertIDs []uuid.UUID) (
 	return experts, nil
 }
 
-// parseJSON unmarshals JSON bytes into v.
-func parseJSON(data []byte, v interface{}) error {
-	return json.Unmarshal(data, v)
+// formatReplyContext converts a reply thread into a pre-formatted string
+// for injection into the LLM system prompt.
+//
+// WHY format here (not in enforcer/chinawall):
+//   appcontext.ReplyThreadEntry lives in the context package.
+//   chinawall imports context would create a circular dependency
+//   (context already imports chinawall for CourseChunk).
+//   Formatting here keeps the dependency direction clean.
+//
+// Returns empty string for fresh questions (no reply thread) —
+// enforcer skips injection when empty.
+func formatReplyContext(thread []appcontext.ReplyThreadEntry) string {
+	if len(thread) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("## REPLY CONTEXT (the user is replying to this prior message):\n")
+	for _, entry := range thread {
+		role := "ASSISTANT"
+		if entry.Role == "user" {
+			role = "USER"
+		}
+		sb.WriteString(fmt.Sprintf("%s (turn %d):\n%s\n\n", role, entry.TurnNumber, entry.Content))
+	}
+	sb.WriteString("Answer the user's follow-up question with full awareness of the above context.\n")
+	return sb.String()
 }
