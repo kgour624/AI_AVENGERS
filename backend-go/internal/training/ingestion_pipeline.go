@@ -1293,6 +1293,9 @@ func isFatalLLMError(err error) bool {
 		strings.Contains(msg, "status 401") ||
 		strings.Contains(msg, "status 403")
 }
+
+// updateJobProgress updates processed chunk count.
+func (p *IngestionPipeline) updateJobProgress(ctx context.Context, jobID uuid.UUID, processed, total int) {
 	_, _ = p.db.Exec(ctx,
 		`UPDATE ingestion_jobs SET processed_chunks = $1, total_chunks = $2 WHERE id = $3`,
 		processed, total, jobID,
