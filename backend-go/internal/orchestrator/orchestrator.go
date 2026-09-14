@@ -208,8 +208,8 @@ func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*O
 	}()
 
 	// Collect results with timeout
-	// WHY 30s timeout: LLM calls can be slow. Don't wait forever.
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// WHY 120s timeout: LLM calls + self-learning steps can take 30-60s for complex problems.
+	timeoutCtx, cancel := context.WithTimeout(ctx, 120*time.Second)
 	defer cancel()
 
 	var expertResponses []ExpertResponse

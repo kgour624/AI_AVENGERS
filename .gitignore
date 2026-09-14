@@ -27,3 +27,7 @@ frontend/dist/
 ml-sidecar/__pycache__/
 ml-sidecar/*.pyc
 ml-sidecar/.venv/
+
+# Generated charter & debug text files
+*.txt
+
