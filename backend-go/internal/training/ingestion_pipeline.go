@@ -238,7 +238,31 @@ func (p *IngestionPipeline) IngestTranscript(
 
 		batchResults, batchErr := p.topics.ExtractBatch(ctx, batch)
 		if batchErr != nil {
-			p.logger.Warn("topic batch failed, using fallback",
+			// Distinguish fatal errors (payment/auth) from transient errors.
+			// Fatal: 402 (credits exhausted), 401 (invalid key), 403 (forbidden).
+			//   → Pause the job. Continuing would store all remaining chunks
+			//     with topic="general", destroying topic diversity and making
+			//     Gate 2 fail for every future question. This is worse than
+			//     not training at all.
+			// Transient: 429 (rate limit), 5xx (server error), network timeout.
+			//   → Use fallback topic="general" for this batch and continue.
+			//     A few "general" chunks are acceptable; all chunks being
+			//     "general" is not.
+			if isFatalLLMError(batchErr) {
+				p.logger.Error("topic extraction: fatal LLM error — pausing job to prevent all-general-topic disaster",
+					zap.Int("batch", batchIdx),
+					zap.Int("chunks_done", batchStart),
+					zap.Int("chunks_total", len(chunks)),
+					zap.Error(batchErr),
+				)
+				return nil, p.pauseOnLLMFailure(
+					ctx, jobID, cpWriter,
+					len(chunks), tracker.TotalCost(), start,
+					fmt.Sprintf("Topic extraction fatal LLM error at batch %d: %s", batchIdx, batchErr.Error()),
+				)
+			}
+			// Transient error — use fallback for this batch, continue.
+			p.logger.Warn("topic batch failed (transient), using fallback topic",
 				zap.Int("batch", batchIdx), zap.Error(batchErr))
 		} else {
 			copy(topicResults[batchStart:batchEnd], batchResults)
@@ -1238,8 +1262,37 @@ func (p *IngestionPipeline) runSmokeTest(
 	return passed, passCount, nil
 }
 
-// updateJobProgress updates processed chunk count.
-func (p *IngestionPipeline) updateJobProgress(ctx context.Context, jobID uuid.UUID, processed, total int) {
+// isFatalLLMError returns true when the error indicates a permanent
+// provider-level failure that will not resolve by retrying.
+//
+// Fatal errors (pause job):
+//   - 402 Payment Required: API credits exhausted
+//   - 401 Unauthorized:     API key invalid or revoked
+//   - 403 Forbidden:        Account suspended or access denied
+//
+// Non-fatal errors (use fallback, continue):
+//   - 429 Too Many Requests: rate limit, transient
+//   - 5xx Server Error:      provider outage, transient
+//   - network timeout:       transient
+//
+// WHY this distinction matters for topic extraction:
+//   A fatal error on batch 3 of 50 means batches 4-50 will also fail.
+//   Continuing stores all remaining chunks with topic="general",
+//   destroying topic diversity. Gate 2 then fails for every question
+//   because no relevant topic-specific chunk exists.
+//   Pausing preserves the work done so far and lets admin fix the
+//   API key/credits before resuming from the last checkpoint.
+func isFatalLLMError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// Match the exact format from providers/common.go:
+	// fmt.Errorf("provider returned status %d", resp.StatusCode)
+	return strings.Contains(msg, "status 402") ||
+		strings.Contains(msg, "status 401") ||
+		strings.Contains(msg, "status 403")
+}
 	_, _ = p.db.Exec(ctx,
 		`UPDATE ingestion_jobs SET processed_chunks = $1, total_chunks = $2 WHERE id = $3`,
 		processed, total, jobID,
