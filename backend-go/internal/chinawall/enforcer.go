@@ -186,7 +186,7 @@ func (e *Enforcer) Enforce(
 	// logic (including its BaseProfile safety net) stays byte-for-byte
 	// unchanged for every non-categorized expert (CT-L2).
 	if len(generated.TemplateSections) > 0 {
-		return e.enforceStructured(ctx, question, chunks, expertName, reasoningCharter, profile, generated, coverage, bestScore, templateSections, defaultLanguage)
+		return e.enforceStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, generated, coverage, bestScore, templateSections, defaultLanguage)
 	}
 
 	// LAYER 4: Strip uncited claims
@@ -269,6 +269,7 @@ func (e *Enforcer) enforceStructured(
 	chunks []CourseChunk,
 	expertName string,
 	reasoningCharter string,
+	replyContext string,
 	profile *DomainProfile,
 	generated *generatedAnswer,
 	coverage string,
