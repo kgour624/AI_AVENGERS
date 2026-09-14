@@ -38,16 +38,32 @@ type ChunkerConfig struct {
 }
 
 // DefaultChunkerConfig returns production-tuned defaults.
-// WHY these values (Byte by Byte AI + Apna Kiro):
-// 500-800 tokens: Large enough for context, small enough for precise retrieval.
-// 100 token overlap: Prevents losing context at chunk boundaries.
-// Course taught: overlap ensures boundary concepts are not cut off.
+// WHY these values (updated 2026-09-14 for V4 retraining):
+//
+// Previous values: Target=600, Min=500, Max=800, Overlap=100
+// New values:      Target=450, Min=375, Max=600, Overlap=75
+//
+// WHY 25% reduction:
+//   V3 (Claude Opus, 2654 chunks, 98 topics) refused problems that
+//   V2 (DeepSeek, 2022 chunks, 156 topics) solved correctly.
+//   Root cause: larger chunks consolidate related concepts into fewer
+//   chunks, reducing topic diversity. Gate 2 (coverage check) needs
+//   a relevant chunk to exist — fewer, larger chunks = lower hit rate.
+//   Smaller chunks = more chunks = more topics = higher Gate 2 pass rate.
+//
+// WHY 25% not more:
+//   Below ~350 tokens chunks lose enough context that the reranker
+//   (0.35 threshold) starts failing — chunk too short to carry
+//   meaningful semantic signal for the embedding model.
+//
+// Overlap reduced proportionally (100 -> 75) to maintain the same
+// overlap-to-chunk ratio (~17%) as before.
 func DefaultChunkerConfig() ChunkerConfig {
 	return ChunkerConfig{
-		TargetSize: 600,
-		MinSize:    500,
-		MaxSize:    800,
-		Overlap:    100,
+		TargetSize: 450,
+		MinSize:    375,
+		MaxSize:    600,
+		Overlap:    75,
 	}
 }
 
