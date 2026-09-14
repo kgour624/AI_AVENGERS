@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -513,4 +514,11 @@ func formatReplyContext(thread []appcontext.ReplyThreadEntry) string {
 	}
 	sb.WriteString("Answer the user's follow-up question with full awareness of the above context.\n")
 	return sb.String()
+}
+
+// parseJSON unmarshals raw JSON bytes into dst.
+// Used by loadExperts to decode clarification_charter JSONB column.
+// Non-fatal: if unmarshal fails, dst is left at its zero value.
+func parseJSON(data []byte, dst interface{}) error {
+	return json.Unmarshal(data, dst)
 }
