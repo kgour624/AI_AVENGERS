@@ -312,7 +312,7 @@ func (e *Enforcer) enforceStructured(
 	e.logger.Warn("Layer 4 (structured): all sections empty, retrying with BaseProfile",
 		zap.String("domain", profile.Domain),
 	)
-	baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, BaseProfile, templateSections, defaultLanguage)
+	baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, BaseProfile, templateSections, defaultLanguage)
 	if err != nil {
 		return nil, fmt.Errorf("base profile structured generation failed: %w", err)
 	}
