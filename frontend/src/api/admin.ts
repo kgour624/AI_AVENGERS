@@ -56,6 +56,18 @@ export const updateExpertCharter = (expertId: string, reasoningCharter: string) 
     })
     .then((res) => res.data.data!)
 
+// RegenerateCharter: calls POST /admin/experts/:id/regenerate-charter
+// Used when an expert has blank reasoning_charter (e.g. LLM credits
+// ran out during ingestion). Regenerates charter from stored transcript
+// without re-processing any chunks. Returns immediately — generation
+// happens in background (~30s). Poll getAdminExperts to see result.
+export const regenerateCharter = (expertId: string) =>
+  baseAPI
+    .post<ApiResponse<{ status: string; message: string }>>(
+      `/api/v1/admin/experts/${expertId}/regenerate-charter`,
+    )
+    .then((res) => res.data.data!)
+
 // Bug 1.5 fix (docs bug list): the real backend route
 // (POST /admin/experts -> AdminHandler.CreateExpert) was already
 // registered, but no frontend function ever called it and no UI
