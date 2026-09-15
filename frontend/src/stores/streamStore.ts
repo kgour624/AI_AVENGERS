@@ -32,10 +32,16 @@ export interface StreamState {
   expertResponses: Partial<ExpertResponse>[]
   synthesis: SynthesisResult | null
   error: string | null
+  // streamingContent: accumulates chunk tokens as they arrive.
+  // Shown in the UI while status='thinking' so the user sees
+  // the answer being typed out in real time instead of waiting
+  // for the complete event. Cleared when complete event arrives
+  // (ExpertResponse takes over rendering at that point).
+  streamingContent: string
 }
 
 function emptyStreamState(): StreamState {
-  return { status: 'thinking', expertResponses: [], synthesis: null, error: null }
+  return { status: 'thinking', expertResponses: [], synthesis: null, error: null, streamingContent: '' }
 }
 
 interface StreamStore {
