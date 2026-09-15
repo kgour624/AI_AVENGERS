@@ -108,5 +108,5 @@ func (p *OpenRouterProvider) StreamCall(ctx context.Context, req gtypes.Provider
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	httpReq.Header.Set("HTTP-Referer", "https://ai-avengers.app")
 	httpReq.Header.Set("X-Title", "AI Avengers")
-	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
