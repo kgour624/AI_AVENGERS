@@ -74,5 +74,3 @@ func (p *DeepSeekProvider) StreamCall(ctx context.Context, req gtypes.ProviderRe
 // ensure DeepSeekProvider satisfies the interface at compile time.
 var _ gtypes.LLMProvider = (*DeepSeekProvider)(nil)
 
-// keep strings import used (for potential future use; remove if linter complains)
-var _ = strings.TrimSpace
