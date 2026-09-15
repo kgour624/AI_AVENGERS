@@ -51,5 +51,5 @@ func (p *DeepSeekProvider) StreamCall(ctx context.Context, req gtypes.ProviderRe
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }

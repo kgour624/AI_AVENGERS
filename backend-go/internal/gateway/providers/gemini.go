@@ -54,5 +54,5 @@ func (p *GeminiProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequ
 		return nil, nil, fmt.Errorf("gemini stream: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }

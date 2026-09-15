@@ -83,6 +83,14 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 		model := p.ModelName(req.ModelTier)
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
+			// Check context cancellation on every line — same pattern as
+			// doOpenAICompatibleStream. Prevents goroutine leak when caller
+			// context is cancelled while provider stalls mid-stream.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
 				continue
@@ -106,7 +114,12 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 			case "content_block_delta":
 				if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
 					sb.WriteString(ev.Delta.Text)
-					tokens <- ev.Delta.Text
+					// Send token or exit if context cancelled.
+					select {
+					case tokens <- ev.Delta.Text:
+					case <-ctx.Done():
+						return
+					}
 				}
 			case "message_delta":
 				out = ev.Usage.OutputTokens

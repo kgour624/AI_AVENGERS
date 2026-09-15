@@ -2,6 +2,7 @@ package providers
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -77,8 +78,18 @@ func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName st
 // doOpenAICompatibleStream executes a streaming HTTP request.
 // The HTTP request body must already include stream:true.
 // Returns tokenCh (individual tokens) and respCh (final metadata).
-// Both channels are closed when the stream ends.
+// Both channels are closed when the stream ends OR ctx is cancelled.
+//
+// WHY ctx param:
+//   Without ctx, the internal goroutine had no way to exit if the provider
+//   sent HTTP 200 headers but then stalled the body (no [DONE], no tokens,
+//   no RST/FIN). scanner.Scan() blocked forever, tokens channel never
+//   closed, callers hung indefinitely.
+//   With ctx: select on ctx.Done() in the token-send path ensures the
+//   goroutine exits cleanly when the caller's context is cancelled
+//   (request disconnect, streaming timeout, orchestrator timeout).
 func doOpenAICompatibleStream(
+	ctx context.Context,
 	client *http.Client,
 	req *http.Request,
 	modelName string,
@@ -106,6 +117,17 @@ func doOpenAICompatibleStream(
 
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
+			// Check context cancellation on every line.
+			// WHY here not just on send: scanner.Scan() itself can block
+			// if the provider stalls mid-stream. Checking ctx.Err() after
+			// each successful Scan() ensures we exit promptly when the
+			// caller's context is cancelled even between token arrivals.
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			line := scanner.Text()
 			if !strings.HasPrefix(line, "data: ") {
 				continue
@@ -129,7 +151,15 @@ func doOpenAICompatibleStream(
 				token := chunk.Choices[0].Delta.Content
 				if token != "" {
 					fullContent.WriteString(token)
-					tokens <- token
+					// Send token or exit if context cancelled.
+					// WHY select: without this, tokens <- token blocks
+					// if the caller's tokenCh is full AND ctx is done —
+					// goroutine would leak instead of exiting.
+					select {
+					case tokens <- token:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 		}
