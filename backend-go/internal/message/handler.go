@@ -231,6 +231,30 @@ func (h *Handler) Send(c *gin.Context) {
 			"experts": len(expertIDs),
 		})
 
+		// Streaming: create a token channel when exactly one expert is selected.
+		// WHY single expert only: multiple experts run in parallel goroutines.
+		// Mixing tokens from N experts into one SSE stream would interleave
+		// tokens from different experts, making the response unreadable.
+		// Single expert = 95% of real usage (DSA, System Design one at a time).
+		// Multi-expert = blocking path (same as before, no regression).
+		var tokenCh chan string
+		var tokenDone chan struct{}
+		if len(expertIDs) == 1 {
+			tokenCh = make(chan string, 128)
+			tokenDone = make(chan struct{})
+			// Goroutine: forward tokens from channel to SSE as they arrive.
+			// Runs concurrently with orchestrator.Process().
+			go func() {
+				defer close(tokenDone)
+				for token := range tokenCh {
+					sendSSE(w, SSEChunk, map[string]interface{}{
+						"content": token,
+						"expert_id": expertIDs[0].String(),
+					})
+				}
+			}()
+		}
+
 		// Run orchestrator
 		orchestratorReq := orchestrator.OrchestratorRequest{
 			ProjectID:         ch.ProjectID,
@@ -241,12 +265,20 @@ func (h *Handler) Send(c *gin.Context) {
 			TurnNumber:        turnNumber,
 			ReplyToMessageID:  replyToMessageID,
 			IncludeFullThread: req.IncludeFullThread,
-			// UserMessageID (CT-C4): userMsgID was saved above, BEFORE this
-			// point, so it is always a real id by the time orchestrator runs.
-			UserMessageID: userMsgID,
+			UserMessageID:     userMsgID,
+		}
+		if tokenCh != nil {
+			orchestratorReq.TokenCh = tokenCh
 		}
 
 		orchestratorResp, err := h.orchestrator.Process(c.Request.Context(), orchestratorReq)
+
+		// Wait for token forwarding goroutine to finish before sending SSEComplete.
+		// This ensures all streamed tokens arrive before the complete event.
+		if tokenDone != nil {
+			<-tokenDone
+		}
+
 		if err != nil {
 			h.logger.Error("orchestrator failed", zap.Error(err))
 			sendSSE(w, SSEError, map[string]string{"message": "Processing failed"})
