@@ -12,10 +12,23 @@ import (
 )
 
 // OpenRouterProvider implements gtypes.LLMProvider for OpenRouter.
+//
+// Content format: OpenRouter normalizes responses to standard OpenAI
+// format. StandardExtractContent handles this correctly.
 type OpenRouterProvider struct {
 	apiKey     string
 	baseURL    string
 	httpClient *http.Client
+}
+
+// ExtractContent: standard string + reasoning_content fallback.
+func (p *OpenRouterProvider) ExtractContent(raw json.RawMessage, reasoningContent string) string {
+	return gtypes.StandardExtractContent(raw, reasoningContent)
+}
+
+// ExtractStreamToken: standard delta.content + reasoning_content fallback.
+func (p *OpenRouterProvider) ExtractStreamToken(content, reasoningContent string) string {
+	return gtypes.StandardExtractStreamToken(content, reasoningContent)
 }
 
 func NewOpenRouterProvider(apiKey, baseURL string, client *http.Client) *OpenRouterProvider {
@@ -82,7 +95,7 @@ func (p *OpenRouterProvider) Call(ctx context.Context, req gtypes.ProviderReques
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	httpReq.Header.Set("HTTP-Referer", "https://ai-avengers.app")
 	httpReq.Header.Set("X-Title", "AI Avengers")
-	return doOpenAICompatibleCall(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleCall(p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
 
 // StreamCall implements streaming for OpenRouter using SSE.
@@ -108,5 +121,7 @@ func (p *OpenRouterProvider) StreamCall(ctx context.Context, req gtypes.Provider
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	httpReq.Header.Set("HTTP-Referer", "https://ai-avengers.app")
 	httpReq.Header.Set("X-Title", "AI Avengers")
-	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
+
+var _ gtypes.LLMProvider = (*OpenRouterProvider)(nil)
