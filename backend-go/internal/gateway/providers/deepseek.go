@@ -6,10 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	gtypes "ai_avengers/backend/internal/gateway/types"
 )
 
+// DeepSeekProvider handles DeepSeek models.
+//
+// Content format: standard string OR reasoning_content fallback.
+// DeepSeek-R1 and V4-Flash return content="" with the answer in
+// reasoning_content. StandardExtractContent handles both cases.
 type DeepSeekProvider struct {
 	apiKey     string
 	httpClient *http.Client
@@ -24,6 +30,17 @@ func (p *DeepSeekProvider) ModelName(_ gtypes.ModelType) string             { re
 func (p *DeepSeekProvider) CostPer1K(_ gtypes.ModelType) (float64, float64) { return 0.00014, 0.00028 }
 func (p *DeepSeekProvider) MaxTokens(_ gtypes.ModelType) int                { return 8192 }
 
+// ExtractContent: standard string + reasoning_content fallback.
+// Covers DeepSeek-chat (standard) and DeepSeek-R1 (reasoning_content).
+func (p *DeepSeekProvider) ExtractContent(raw json.RawMessage, reasoningContent string) string {
+	return gtypes.StandardExtractContent(raw, reasoningContent)
+}
+
+// ExtractStreamToken: standard delta.content + reasoning_content fallback.
+func (p *DeepSeekProvider) ExtractStreamToken(content, reasoningContent string) string {
+	return gtypes.StandardExtractStreamToken(content, reasoningContent)
+}
+
 func (p *DeepSeekProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
 	var msgs []map[string]string
 	for _, m := range req.Messages {
@@ -36,7 +53,7 @@ func (p *DeepSeekProvider) Call(ctx context.Context, req gtypes.ProviderRequest)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	return doOpenAICompatibleCall(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleCall(p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
 
 func (p *DeepSeekProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
@@ -51,5 +68,11 @@ func (p *DeepSeekProvider) StreamCall(ctx context.Context, req gtypes.ProviderRe
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
+
+// ensure DeepSeekProvider satisfies the interface at compile time.
+var _ gtypes.LLMProvider = (*DeepSeekProvider)(nil)
+
+// keep strings import used (for potential future use; remove if linter complains)
+var _ = strings.TrimSpace

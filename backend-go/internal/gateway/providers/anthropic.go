@@ -12,6 +12,12 @@ import (
 	gtypes "ai_avengers/backend/internal/gateway/types"
 )
 
+// AnthropicProvider handles Anthropic Claude models via direct API.
+//
+// Content format: Claude thinking/extended models return content as a
+// typed array: [{"type":"thinking","thinking":"..."},{"type":"text","text":"..."}]
+// Standard Claude models return a plain string.
+// ExtractContent handles both.
 type AnthropicProvider struct {
 	apiKey     string
 	httpClient *http.Client
@@ -33,6 +39,46 @@ func (p *AnthropicProvider) CostPer1K(tier gtypes.ModelType) (float64, float64) 
 func (p *AnthropicProvider) MaxTokens(tier gtypes.ModelType) int {
 	if tier == gtypes.ModelStrong { return 8192 }
 	return 4096
+}
+
+// claudeContentBlock is one element of Claude's typed content array.
+type claudeContentBlock struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking"`
+}
+
+// ExtractContent handles Claude's two content formats:
+//   - Plain string (standard Claude models)
+//   - Typed array (Claude thinking/extended models)
+// Joins all "text" blocks; ignores "thinking" blocks.
+func (p *AnthropicProvider) ExtractContent(raw json.RawMessage, _ string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	if raw[0] == '[' {
+		var blocks []claudeContentBlock
+		if err := json.Unmarshal(raw, &blocks); err == nil {
+			var sb strings.Builder
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					sb.WriteString(b.Text)
+				}
+			}
+			return strings.TrimSpace(sb.String())
+		}
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return ""
+}
+
+// ExtractStreamToken: standard delta.content only.
+// Claude's native streaming API uses delta.content (not reasoning_content).
+func (p *AnthropicProvider) ExtractStreamToken(content, _ string) string {
+	return content
 }
 
 func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
@@ -83,9 +129,6 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 		model := p.ModelName(req.ModelTier)
 		scanner := bufio.NewScanner(resp.Body)
 		for scanner.Scan() {
-			// Check context cancellation on every line — same pattern as
-			// doOpenAICompatibleStream. Prevents goroutine leak when caller
-			// context is cancelled while provider stalls mid-stream.
 			select {
 			case <-ctx.Done():
 				return
@@ -114,7 +157,6 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 			case "content_block_delta":
 				if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
 					sb.WriteString(ev.Delta.Text)
-					// Send token or exit if context cancelled.
 					select {
 					case tokens <- ev.Delta.Text:
 					case <-ctx.Done():
@@ -179,3 +221,5 @@ func (p *AnthropicProvider) Call(ctx context.Context, req gtypes.ProviderRequest
 	}
 	return &gtypes.ProviderResponse{Content: r.Content[0].Text, InputTokens: r.Usage.InputTokens, OutputTokens: r.Usage.OutputTokens, ModelUsed: r.Model}, nil
 }
+
+var _ gtypes.LLMProvider = (*AnthropicProvider)(nil)

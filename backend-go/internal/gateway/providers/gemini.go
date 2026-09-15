@@ -10,6 +10,10 @@ import (
 	gtypes "ai_avengers/backend/internal/gateway/types"
 )
 
+// GeminiProvider handles Google Gemini models via OpenAI-compatible endpoint.
+//
+// Content format: standard plain string. Gemini does not use
+// reasoning_content or array content blocks.
 type GeminiProvider struct {
 	apiKey     string
 	httpClient *http.Client
@@ -27,6 +31,16 @@ func (p *GeminiProvider) ModelName(tier gtypes.ModelType) string {
 func (p *GeminiProvider) CostPer1K(_ gtypes.ModelType) (float64, float64) { return 0.00035, 0.00105 }
 func (p *GeminiProvider) MaxTokens(_ gtypes.ModelType) int                 { return 8192 }
 
+// ExtractContent: standard plain string only.
+func (p *GeminiProvider) ExtractContent(raw json.RawMessage, reasoningContent string) string {
+	return gtypes.StandardExtractContent(raw, reasoningContent)
+}
+
+// ExtractStreamToken: standard delta.content only.
+func (p *GeminiProvider) ExtractStreamToken(content, reasoningContent string) string {
+	return gtypes.StandardExtractStreamToken(content, reasoningContent)
+}
+
 func (p *GeminiProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
 	var msgs []map[string]string
 	for _, m := range req.Messages {
@@ -39,7 +53,7 @@ func (p *GeminiProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (
 		return nil, fmt.Errorf("gemini: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	return doOpenAICompatibleCall(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleCall(p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
 
 func (p *GeminiProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
@@ -54,5 +68,7 @@ func (p *GeminiProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequ
 		return nil, nil, fmt.Errorf("gemini stream: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
+
+var _ gtypes.LLMProvider = (*GeminiProvider)(nil)
