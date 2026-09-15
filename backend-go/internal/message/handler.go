@@ -244,11 +244,17 @@ func (h *Handler) Send(c *gin.Context) {
 			tokenDone = make(chan struct{})
 			// Goroutine: forward tokens from channel to SSE as they arrive.
 			// Runs concurrently with orchestrator.Process().
+			// Empty string tokens are heartbeats (sent by blocking-fallback
+			// path in enforcer.go to keep SSE connection alive) — skip them
+			// so no fake content reaches the frontend.
 			go func() {
 				defer close(tokenDone)
 				for token := range tokenCh {
+					if token == "" {
+						continue // heartbeat — keep connection alive, no content
+					}
 					sendSSE(w, SSEChunk, map[string]interface{}{
-						"content": token,
+						"content":   token,
 						"expert_id": expertIDs[0].String(),
 					})
 				}
