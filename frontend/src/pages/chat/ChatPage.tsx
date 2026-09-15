@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState, useEffect } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
+import ReactMarkdown from 'react-markdown'
 import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData, useRevalidator, useParams, Link } from 'react-router-dom'
 import { getChat, getMessages } from '@/api/chats'
@@ -12,6 +13,7 @@ import { MessageInput } from '@/components/chat/MessageInput'
 import { ExpertResponse } from '@/components/chat/ExpertResponse'
 import { SynthesisPanel } from '@/components/chat/SynthesisPanel'
 import { StreamingIndicator } from '@/components/chat/StreamingIndicator'
+import { CodeBlock } from '@/components/chat/CodeBlock'
 import { persistedMessageToExpertResponse } from '@/utils/adaptMessage'
 
 /**
@@ -211,9 +213,24 @@ export default function ChatPage() {
 
           {stream && isStreamActive && (
             <>
-              {stream.status === 'thinking' && (
+              {/* Show thinking indicator only when no content has arrived yet */}
+              {stream.status === 'thinking' && !stream.streamingContent && (
                 <StreamingIndicator stream={stream} expertCount={experts.length} />
               )}
+
+              {/* Live streaming content — shown as tokens arrive via chunk events.
+                  Replaced by ExpertResponse once complete event fires. */}
+              {stream.streamingContent && (
+                <div className="rounded-lg border-l-4 border-l-mode-advise border-y border-r border-glass-border bg-surface-raised/80 p-4 backdrop-blur-xl">
+                  <div className="prose prose-invert prose-sm max-w-none text-text-primary">
+                    <ReactMarkdown components={{ code: CodeBlock }}>
+                      {stream.streamingContent}
+                    </ReactMarkdown>
+                  </div>
+                  <p className="mt-2 text-xs text-text-disabled animate-pulse">Streaming...</p>
+                </div>
+              )}
+
               {stream.expertResponses.map((partial, i) =>
                 partial.expertId ? (
                   <ExpertResponse key={partial.expertId} response={partial as ExpertResponseType} isStreaming />
