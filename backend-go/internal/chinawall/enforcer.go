@@ -610,10 +610,44 @@ COURSE CONTENT:
 		} else {
 			streamCancel()
 		}
-		// StreamCall failed, timed out, or returned empty — fall through to blocking call
+		// StreamCall failed, timed out, or returned empty — fall through to blocking call.
+		// WHY heartbeat goroutine:
+		//   Blocking Call() can take 30+ seconds. During this time, no SSE
+		//   events are sent to the frontend. Browser SSE connection drops
+		//   after ~30s of silence (OS/browser TCP keepalive timeout).
+		//   When the blocking call finally returns, the frontend connection
+		//   is already dead — UI stays stuck on "Thinking..." forever.
+		//   Fix: send a "thinking" SSE heartbeat every 5s while blocking
+		//   call runs. This keeps the SSE connection alive without sending
+		//   fake content. heartbeatDone stops the goroutine immediately
+		//   when the blocking call returns (no goroutine leak).
 		e.logger.Warn("streaming failed or empty, falling back to blocking call",
 			zap.NamedError("stream_err", streamErr),
 		)
+		if tokenCh != nil {
+			heartbeatDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-heartbeatDone:
+						return
+					case <-ctx.Done():
+						return
+					case <-ticker.C:
+						// Send empty string as heartbeat — handler.go forwards
+						// non-empty tokens only, so this keeps SSE alive
+						// without injecting fake content into the answer.
+						select {
+						case tokenCh <- "":
+						default: // channel full — skip this heartbeat
+						}
+					}
+				}
+			}()
+			defer close(heartbeatDone)
+		}
 	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
