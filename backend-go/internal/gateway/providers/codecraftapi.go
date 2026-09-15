@@ -96,7 +96,53 @@ func (p *CodeCraftAPIProvider) CostPer1K(_ gtypes.ModelType) (float64, float64) 
 // ModelGateway.Call() caps this against the request's MaxTokens anyway.
 func (p *CodeCraftAPIProvider) MaxTokens(_ gtypes.ModelType) int { return 8192 }
 
-// Call makes the LLM call to CodeCraftAPI's chat completions endpoint.
+// ExtractContent: CodeCraftAPI passes through native model formats.
+// Claude thinking models return a typed array; DeepSeek uses reasoning_content.
+// This provider handles both via the same logic as AnthropicProvider
+// (array check first) plus reasoning_content fallback for DeepSeek-style models.
+//
+// WHY not StandardExtractContent:
+//   CodeCraftAPI is a semi-raw proxy — it does NOT normalize inner payload.
+//   Claude Opus 5 via CodeCraftAPI returns content as [{type:text,text:...}].
+//   DeepSeek-V4-Flash via CodeCraftAPI returns content="", reasoning_content="...".
+//   Both cases must be handled here so any model in the catalog works.
+func (p *CodeCraftAPIProvider) ExtractContent(raw json.RawMessage, reasoningContent string) string {
+	if len(raw) == 0 {
+		return reasoningContent
+	}
+	// Claude-style typed array
+	if raw[0] == '[' {
+		var blocks []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		}
+		if err := json.Unmarshal(raw, &blocks); err == nil {
+			var sb strings.Builder
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					sb.WriteString(b.Text)
+				}
+			}
+			if result := strings.TrimSpace(sb.String()); result != "" {
+				return result
+			}
+		}
+		return reasoningContent
+	}
+	// Standard plain string
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && strings.TrimSpace(s) != "" {
+		return s
+	}
+	// DeepSeek-style: content empty, answer in reasoning_content
+	return reasoningContent
+}
+
+// ExtractStreamToken: standard delta.content + reasoning_content fallback.
+// Covers both standard streaming models and DeepSeek reasoning streaming.
+func (p *CodeCraftAPIProvider) ExtractStreamToken(content, reasoningContent string) string {
+	return gtypes.StandardExtractStreamToken(content, reasoningContent)
+}
 //
 // Uses doOpenAICompatibleCall() from common.go — CodeCraftAPI uses the
 // same OpenAI-compatible response format as OpenRouter/DeepSeek/Gemini.
@@ -127,7 +173,7 @@ func (p *CodeCraftAPIProvider) Call(ctx context.Context, req gtypes.ProviderRequ
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	return doOpenAICompatibleCall(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleCall(p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
 
 // StreamCall implements streaming for CodeCraftAPI.
@@ -153,5 +199,7 @@ func (p *CodeCraftAPIProvider) StreamCall(ctx context.Context, req gtypes.Provid
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-	return doOpenAICompatibleStream(ctx, p.httpClient, httpReq, p.ModelName(req.ModelTier))
+	return doOpenAICompatibleStream(ctx, p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
+
+var _ gtypes.LLMProvider = (*CodeCraftAPIProvider)(nil)
