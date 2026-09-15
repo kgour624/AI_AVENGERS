@@ -153,7 +153,15 @@ Write in first person. Only what THIS instructor taught. Include numbers where m
 		return "", fmt.Errorf("LLM call failed: %w", err)
 	}
 
-	return strings.TrimSpace(resp.Content), nil
+	content := strings.TrimSpace(resp.Content)
+	if content == "" {
+		// LLM returned 200 OK but empty body — treat as failure.
+		// Saving an empty charter silently is worse than failing:
+		// training_status becomes 'trained' but expert answers nothing.
+		return "", fmt.Errorf("LLM returned empty reasoning charter (200 OK but empty body)")
+	}
+
+	return content, nil
 }
 
 // extractClarificationCharter extracts topic-specific questions the instructor asks.
