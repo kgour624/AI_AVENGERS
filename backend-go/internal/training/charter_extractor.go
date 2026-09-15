@@ -59,10 +59,16 @@ func (e *CharterExtractor) Extract(ctx context.Context, transcript string, exper
 	// Extract reasoning charter
 	reasoningCharter, err := e.extractReasoningCharter(ctx, sample, expertName)
 	if err != nil {
-		e.logger.Warn("reasoning charter extraction failed, using default",
+		// Do NOT silently fall back to a generic charter.
+		// A generic charter produces generic answers that defeat the purpose
+		// of domain-expert training. The caller (ingestion_pipeline.go) must
+		// decide what to do — it will call pauseOnLLMFailure() so the job
+		// pauses and admin can retry after fixing credits/API key.
+		e.logger.Warn("reasoning charter extraction failed — propagating error to caller",
+			zap.String("expert", expertName),
 			zap.Error(err),
 		)
-		reasoningCharter = defaultReasoningCharter(expertName)
+		return nil, fmt.Errorf("reasoning charter extraction failed: %w", err)
 	}
 
 	// Validate WHY principle
