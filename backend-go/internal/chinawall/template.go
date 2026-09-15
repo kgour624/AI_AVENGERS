@@ -188,14 +188,33 @@ var thinkBlockRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
 // dropping the section (no empty catch / silent error, per Step 5 checklist).
 func parseStructuredResponse(raw string, sections []category.TemplateSection) (map[string]string, error) {
 	clean := strings.TrimSpace(raw)
+
+	// Strip <think>...</think> reasoning blocks FIRST.
+	// WHY: DeepSeek and other reasoning models emit a thinking block
+	// before the actual JSON. These blocks often contain code examples
+	// with {} braces. strings.LastIndex("}") below would find the last
+	// brace INSIDE the thinking block, not the JSON's closing brace,
+	// causing json.Unmarshal to fail on every structured response.
+	clean = thinkBlockRe.ReplaceAllString(clean, "")
+	clean = strings.TrimSpace(clean)
+
 	clean = strings.TrimPrefix(clean, "```json")
 	clean = strings.TrimPrefix(clean, "```")
 	clean = strings.TrimSuffix(clean, "```")
 	clean = strings.TrimSpace(clean)
 
+	// Find the JSON object using balanced brace matching instead of
+	// naive strings.LastIndex("}").
+	// WHY: LastIndex finds the LAST } in the string. If the model
+	// included any trailing text or a partial second object after the
+	// real JSON, LastIndex would include that garbage. Balanced matching
+	// finds the FIRST complete, balanced JSON object — exactly what we want.
 	start := strings.Index(clean, "{")
-	end := strings.LastIndex(clean, "}")
-	if start == -1 || end == -1 || start >= end {
+	if start == -1 {
+		return nil, fmt.Errorf("no JSON object found in structured response")
+	}
+	end := findMatchingBrace(clean, start)
+	if end == -1 {
 		return nil, fmt.Errorf("no JSON object found in structured response")
 	}
 	clean = clean[start : end+1]
