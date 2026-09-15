@@ -50,6 +50,7 @@ export interface SendMessageOptions {
 
 type SSEEvent =
   | { type: 'thinking'; data: { message: string; experts: number } }
+  | { type: 'chunk'; data: { content: string; expertId: string } }
   | { type: 'complete'; data: ExpertResponse }
   | { type: 'synthesis'; data: SynthesisResult }
   | { type: 'done'; data: { turnNumber: number; durationMs: number } }
@@ -62,11 +63,26 @@ function applyEvent(chatId: string, event: SSEEvent) {
     case 'thinking':
       appendChunk(chatId, { status: 'thinking' })
       break
+    case 'chunk': {
+      // Accumulate streaming tokens into streamingContent.
+      // This is what the user sees while the answer is being typed out.
+      // content:"" heartbeat tokens are filtered in message/handler.go
+      // before reaching SSE, but guard here too for safety.
+      if (!event.data.content) break
+      const current = useStreamStore.getState().activeStreams.get(chatId)
+      const prev = current?.streamingContent ?? ''
+      appendChunk(chatId, {
+        status: 'streaming',
+        streamingContent: prev + event.data.content,
+      })
+      break
+    }
     case 'complete': {
       const current = useStreamStore.getState().activeStreams.get(chatId)
       const responses = current ? [...current.expertResponses] : []
       responses.push(event.data)
-      appendChunk(chatId, { status: 'streaming', expertResponses: responses })
+      // Clear streamingContent — ExpertResponse component takes over rendering.
+      appendChunk(chatId, { status: 'streaming', expertResponses: responses, streamingContent: '' })
       break
     }
     case 'synthesis':
