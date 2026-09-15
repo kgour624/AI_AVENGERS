@@ -107,12 +107,10 @@ func (p *CodeCraftAPIProvider) MaxTokens(_ gtypes.ModelType) int { return 8192 }
 //   doesn't support it could break the call. Omitting it is safe —
 //   worst case is no caching, not a broken call.
 func (p *CodeCraftAPIProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
-	// Build messages slice — same structure as all other OpenAI-compatible providers
 	var msgs []map[string]string
 	for _, m := range req.Messages {
 		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
 	}
-
 	body, err := json.Marshal(map[string]interface{}{
 		"model":       p.ModelName(req.ModelTier),
 		"messages":    msgs,
@@ -122,20 +120,38 @@ func (p *CodeCraftAPIProvider) Call(ctx context.Context, req gtypes.ProviderRequ
 	if err != nil {
 		return nil, fmt.Errorf("codecraftapi: marshal request: %w", err)
 	}
-
-	httpReq, err := http.NewRequestWithContext(
-		ctx,
-		http.MethodPost,
-		p.baseURL+"/chat/completions",
-		bytes.NewReader(body),
-	)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		p.baseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("codecraftapi: build request: %w", err)
 	}
-
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
-
-	// Reuse shared OpenAI-compatible response parser from common.go
 	return doOpenAICompatibleCall(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+}
+
+// StreamCall implements streaming for CodeCraftAPI.
+func (p *CodeCraftAPIProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
+	var msgs []map[string]string
+	for _, m := range req.Messages {
+		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"model":       p.ModelName(req.ModelTier),
+		"messages":    msgs,
+		"max_tokens":  req.MaxTokens,
+		"temperature": req.Temperature,
+		"stream":      true,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("codecraftapi stream: marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		p.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("codecraftapi stream: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }

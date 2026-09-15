@@ -84,3 +84,29 @@ func (p *OpenRouterProvider) Call(ctx context.Context, req gtypes.ProviderReques
 	httpReq.Header.Set("X-Title", "AI Avengers")
 	return doOpenAICompatibleCall(p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
+
+// StreamCall implements streaming for OpenRouter using SSE.
+func (p *OpenRouterProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
+	var msgs []map[string]interface{}
+	for _, m := range req.Messages {
+		msgs = append(msgs, map[string]interface{}{"role": m.Role, "content": m.Content})
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"model":       p.ModelName(req.ModelTier),
+		"messages":    msgs,
+		"max_tokens":  req.MaxTokens,
+		"temperature": req.Temperature,
+		"stream":      true,
+		"stream_options": map[string]bool{"include_usage": true},
+	})
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		p.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("openrouter stream: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	httpReq.Header.Set("HTTP-Referer", "https://ai-avengers.app")
+	httpReq.Header.Set("X-Title", "AI Avengers")
+	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
+}
