@@ -107,6 +107,9 @@ func (e *Enforcer) Enforce(
 	// through from expert.TemplateSections/expert.DefaultLanguage.
 	templateSections []category.TemplateSection,
 	defaultLanguage string,
+	// tokenCh: non-nil enables streaming for Gate 5 generation.
+	// nil = blocking Call() (backward compatible, used by smoke test etc.).
+	tokenCh chan<- string,
 ) (*EnforceResult, error) {
 	// Load domain profile from registry.
 	// O(1) lookup. Falls back to BaseProfile for unknown domains.
@@ -166,7 +169,7 @@ func (e *Enforcer) Enforce(
 
 	// LAYER 3: Generate with mandatory citations
 	// Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
-	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, templateSections, defaultLanguage)
+	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, templateSections, defaultLanguage, tokenCh)
 	if err != nil {
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
@@ -220,7 +223,7 @@ func (e *Enforcer) Enforce(
 			e.logger.Warn("Layer 4: domain rules produced empty output, retrying with BaseProfile",
 				zap.String("domain", profile.Domain),
 			)
-			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, BaseProfile, nil, "")
+			baseGenerated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, BaseProfile, nil, "", tokenCh)
 			if err != nil {
 				return nil, fmt.Errorf("base profile generation failed: %w", err)
 			}
@@ -482,6 +485,7 @@ func (e *Enforcer) generateWithCitations(
 	profile *DomainProfile,
 	templateSections []category.TemplateSection,
 	defaultLanguage string,
+	tokenCh chan<- string,
 ) (*generatedAnswer, error) {
 
 	// Build context with chunk IDs
@@ -494,7 +498,7 @@ func (e *Enforcer) generateWithCitations(
 		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, contextSB.String(), templateSections, defaultLanguage, profile)
 	}
 
-	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextSB.String())
+	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextSB.String(), tokenCh)
 }
 
 // generateFlatText is the ORIGINAL flat-text generation path, extracted
@@ -513,6 +517,7 @@ func (e *Enforcer) generateFlatText(
 	replyContext string,
 	profile *DomainProfile,
 	contextText string,
+	tokenCh chan<- string,
 ) (*generatedAnswer, error) {
 	var systemPrompt string
 	if profile.CitationMode == CitationModeLoose {
@@ -564,6 +569,35 @@ COURSE CONTENT:
 		systemPrompt += "\n\n" + replyContext
 	}
 
+	// Gate 5 generation: streaming when tokenCh non-nil, blocking otherwise.
+	if tokenCh != nil {
+		rawTokenCh, rawRespCh, streamErr := e.gateway.StreamCall(ctx, gateway.LLMRequest{
+			Model:        gateway.ModelStrong,
+			SystemPrompt: systemPrompt,
+			UserPrompt:   question,
+			MaxTokens:    resolveMaxTokens(profile.MaxTokensFlat, DefaultMaxTokensFlat),
+			Temperature:  0.4,
+		})
+		if streamErr == nil {
+			var sb strings.Builder
+			for token := range rawTokenCh {
+				sb.WriteString(token)
+				select {
+				case tokenCh <- token:
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
+			<-rawRespCh // drain metadata channel
+			content := sb.String()
+			if content != "" {
+				return &generatedAnswer{Answer: content, Citations: e.extractCitations(content, chunks)}, nil
+			}
+		}
+		// StreamCall failed or returned empty — fall through to blocking call
+		e.logger.Warn("streaming failed or empty, falling back to blocking call")
+	}
+
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelStrong,
 		SystemPrompt: systemPrompt,
@@ -574,14 +608,8 @@ COURSE CONTENT:
 	if err != nil {
 		return nil, err
 	}
-
-	// Extract citations from response
 	citations := e.extractCitations(resp.Content, chunks)
-
-	return &generatedAnswer{
-		Answer:    resp.Content,
-		Citations: citations,
-	}, nil
+	return &generatedAnswer{Answer: resp.Content, Citations: citations}, nil
 }
 
 // generateStructured is the CT-B1 structured JSON generation branch.
