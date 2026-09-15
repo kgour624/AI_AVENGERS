@@ -43,6 +43,18 @@ type LLMProvider interface {
 
 	// Call makes the actual HTTP call to the provider's API.
 	Call(ctx context.Context, req ProviderRequest) (*ProviderResponse, error)
+
+	// StreamCall makes a streaming HTTP call to the provider's API.
+	// Tokens arrive on tokenCh as they stream from the LLM.
+	// The channel is closed when the stream ends (success or error).
+	// Final ProviderResponse (token counts) arrives on respCh after tokenCh closes.
+	// On error, both channels are closed immediately.
+	//
+	// WHY two channels not one:
+	//   tokenCh carries high-frequency string tokens (one per LLM token).
+	//   respCh carries one final metadata struct. Mixing them in one channel
+	//   would require a discriminated union type. Two typed channels is cleaner.
+	StreamCall(ctx context.Context, req ProviderRequest) (tokenCh <-chan string, respCh <-chan *ProviderResponse, err error)
 }
 
 // ProviderRequest is the normalized input to any provider.
