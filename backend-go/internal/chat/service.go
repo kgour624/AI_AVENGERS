@@ -444,7 +444,7 @@ func (h *Handler) Update(c *gin.Context) {
 	response.OK(c, map[string]string{"status": "updated"})
 }
 
-// Archive DELETE /chats/:id
+// Archive DELETE /chats/:id — soft disable (is_archived=true)
 func (h *Handler) Archive(c *gin.Context) {
 	clientID := c.MustGet("user_id").(uuid.UUID)
 	chatID, err := uuid.Parse(c.Param("id"))
@@ -461,6 +461,44 @@ func (h *Handler) Archive(c *gin.Context) {
 		return
 	}
 	response.OK(c, map[string]string{"status": "archived"})
+}
+
+// Unarchive POST /chats/:id/unarchive — restore archived chat to active
+func (h *Handler) Unarchive(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	chatID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid chat ID")
+		return
+	}
+	if err := h.svc.Unarchive(c.Request.Context(), chatID, clientID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			response.NotFound(c, "chat")
+			return
+		}
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]string{"status": "active"})
+}
+
+// PermanentDelete DELETE /chats/:id/permanent — hard delete with cascade
+func (h *Handler) PermanentDelete(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	chatID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid chat ID")
+		return
+	}
+	if err := h.svc.PermanentDelete(c.Request.Context(), chatID, clientID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			response.NotFound(c, "chat")
+			return
+		}
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]string{"status": "deleted"})
 }
 
 // ListMessages GET /chats/:id/messages
