@@ -330,6 +330,79 @@ func (g *ModelGateway) GetStats() map[string]interface{} {
 	}
 }
 
+// StreamCall makes a streaming LLM call via the active provider.
+// Returns tokenCh (individual tokens as they arrive) and respCh (final metadata).
+// Used by chinawall/enforcer.go generateFlatText for Gate 5 generation.
+//
+// WHY streaming only for Gate 5:
+//   Gates 1-4 are fast (keyword check, vector search, charter check, necessity).
+//   Only Gate 5 (LLM generation) takes 30-67s. Streaming Gate 5 means
+//   the user sees the first token in 2-3s instead of waiting 67s.
+//
+// Fallback: if StreamCall fails, caller should fall back to Call().
+func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan string, <-chan *LLMResponse, error) {
+	provider := g.getProvider(ctx)
+
+	maxTokens := req.MaxTokens
+	if maxTokens <= 0 {
+		maxTokens = 2000
+	}
+	if provMax := provider.MaxTokens(req.Model); maxTokens > provMax {
+		maxTokens = provMax
+	}
+
+	var messages []ProviderMessage
+	if req.SystemPrompt != "" {
+		messages = append(messages, ProviderMessage{Role: "system", Content: req.SystemPrompt})
+	}
+	messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
+
+	provReq := ProviderRequest{
+		ModelTier:   req.Model,
+		Messages:    messages,
+		MaxTokens:   maxTokens,
+		Temperature: req.Temperature,
+		EnableCache: req.UseCache,
+	}
+
+	rawTokenCh, rawRespCh, err := provider.StreamCall(ctx, provReq)
+	if err != nil {
+		return nil, nil, fmt.Errorf("stream call failed: %w", err)
+	}
+
+	// Wrap rawRespCh to accumulate cost + update stats, same as Call().
+	tokenCh := rawTokenCh // pass through directly — no wrapping needed
+	respCh := make(chan *LLMResponse, 1)
+
+	go func() {
+		defer close(respCh)
+		provResp, ok := <-rawRespCh
+		if !ok || provResp == nil {
+			return
+		}
+		inCost, outCost := provider.CostPer1K(req.Model)
+		cost := float64(provResp.InputTokens)/1000*inCost +
+			float64(provResp.OutputTokens)/1000*outCost
+		currentCost := g.totalCost.Load().(float64)
+		g.totalCost.Store(currentCost + cost)
+		g.callCount.Add(1)
+		g.logger.Info("LLM stream complete",
+			zap.String("provider", provider.Name()),
+			zap.String("tier", string(req.Model)),
+			zap.Float64("cost_usd", cost),
+		)
+		respCh <- &LLMResponse{
+			Content:      provResp.Content,
+			InputTokens:  provResp.InputTokens,
+			OutputTokens: provResp.OutputTokens,
+			CostUSD:      cost,
+			ModelUsed:    provResp.ModelUsed,
+		}
+	}()
+
+	return tokenCh, respCh, nil
+}
+
 // getActiveProvider reads the active LLM provider from DB system_settings.
 // Falls back to cfg.Provider (env var). Falls back to openrouter.
 func (g *ModelGateway) getActiveProvider(ctx context.Context) config.LLMProvider {
