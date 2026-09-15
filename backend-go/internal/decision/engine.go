@@ -108,6 +108,9 @@ func (e *Engine) Process(
 	replyContext string,
 	attempt int,
 	replyToMessageID *uuid.UUID,
+	// tokenCh: non-nil enables streaming for Gate 5 generation.
+	// nil = blocking (backward compatible).
+	tokenCh chan<- string,
 ) (*DecisionResult, error) {
 
 	e.logger.Debug("decision engine processing",
@@ -167,7 +170,7 @@ func (e *Engine) Process(
 	// case Enforce() takes its existing flat-text path unchanged (CT-L2).
 	enforceResult, err := e.chinaWall.Enforce(
 		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, replyContext, attempt,
-		expert.TemplateSections, expert.DefaultLanguage,
+		expert.TemplateSections, expert.DefaultLanguage, tokenCh,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gate 5 failed: %w", err)
@@ -182,7 +185,7 @@ func (e *Engine) Process(
 			// re-run gateStructurePermission's DB lookup against the
 			// ALREADY-rewritten question and incorrectly re-append the
 			// preference text a second time.
-		return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil)
+		return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil, nil)
 		}
 		return &DecisionResult{
 			Mode:        ModeREFUSE,
