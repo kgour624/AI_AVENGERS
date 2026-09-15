@@ -1163,6 +1163,138 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 	}
 }
 
+// RegenerateCharter POST /admin/experts/:id/regenerate-charter
+// Regenerates ONLY the reasoning charter for an expert whose charter
+// is blank (e.g. because the LLM API ran out of credits during ingestion).
+//
+// WHY this endpoint exists:
+//   When charter extraction fails mid-ingestion (402/401/403), the
+//   pipeline now pauses. But for experts trained BEFORE that fix
+//   (like SCALER-DSA-V5), the job completed with blank reasoning_charter.
+//   Re-ingesting wastes 1M+ tokens re-embedding chunks that are already
+//   correct. This endpoint regenerates ONLY the charter from the stored
+//   transcript, leaving all existing chunks untouched.
+//
+// Requires: transcript_content stored in the most recent ingestion job.
+// If transcript_content is empty, returns 400 — admin must re-upload.
+func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Load expert name
+	var expertName string
+	err = h.db.QueryRow(ctx,
+		`SELECT name FROM experts WHERE id=$1 AND deleted_at IS NULL`,
+		expertID,
+	).Scan(&expertName)
+	if err != nil {
+		response.NotFound(c, "expert")
+		return
+	}
+
+	// Load transcript from most recent ingestion job.
+	// WHY most recent: admin may have uploaded multiple transcripts.
+	// We use the last one as representative sample for charter extraction.
+	// Charter extractor uses only first 8000 chars anyway (see charter_extractor.go).
+	var transcriptContent string
+	err = h.db.QueryRow(ctx,
+		`SELECT COALESCE(transcript_content, '')
+		 FROM ingestion_jobs
+		 WHERE expert_id = $1
+		 ORDER BY created_at DESC
+		 LIMIT 1`,
+		expertID,
+	).Scan(&transcriptContent)
+	if err != nil || transcriptContent == "" {
+		response.BadRequest(c, "TRANSCRIPT_NOT_STORED",
+			"Transcript content not found in ingestion jobs. "+
+				"Please re-upload the transcript file and ingest again.")
+		return
+	}
+
+	// Mark expert as training so it disappears from public listings
+	_, _ = h.db.Exec(ctx,
+		`UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`,
+		expertID,
+	)
+
+	// Regenerate charter in background — same goroutine pattern as IngestTranscript
+	go func() {
+		bgCtx := context.Background()
+		charters := training.NewCharterExtractor(h.gateway, h.logger)
+
+		charter, extractErr := charters.Extract(bgCtx, transcriptContent, expertName)
+		if extractErr != nil {
+			h.logger.Error("charter regeneration failed",
+				zap.String("expert_id", expertID.String()),
+				zap.Error(extractErr),
+			)
+			// Reset is_training so expert is not stuck in training state
+			_, _ = h.db.Exec(bgCtx,
+				`UPDATE experts SET is_training=FALSE, updated_at=NOW() WHERE id=$1`,
+				expertID,
+			)
+			return
+		}
+
+		clarificationJSON, _ := json.Marshal(charter.ClarificationCharter)
+
+		// Update charter.
+		// reasoning_charter: always overwrite (it was blank, that's why we're here).
+		// clarification_charter: preserve existing if new one is empty/null.
+		// training_status: set to 'trained' — chunks are already verified by smoke test.
+		_, dbErr := h.db.Exec(bgCtx,
+			`UPDATE experts SET
+				reasoning_charter     = $1,
+				clarification_charter = CASE
+					WHEN $2::text NOT IN ('{}', 'null', '') THEN $2::text
+					ELSE clarification_charter
+				END,
+				training_status = 'trained',
+				is_training     = FALSE,
+				updated_at      = NOW()
+			 WHERE id = $3`,
+			charter.ReasoningCharter,
+			string(clarificationJSON),
+			expertID,
+		)
+		if dbErr != nil {
+			h.logger.Error("charter regeneration DB update failed",
+				zap.String("expert_id", expertID.String()),
+				zap.Error(dbErr),
+			)
+			_, _ = h.db.Exec(bgCtx,
+				`UPDATE experts SET is_training=FALSE, updated_at=NOW() WHERE id=$1`,
+				expertID,
+			)
+			return
+		}
+
+		h.logger.Info("charter regeneration complete",
+			zap.String("expert_id", expertID.String()),
+			zap.String("expert_name", expertName),
+			zap.Int("charter_length", len(charter.ReasoningCharter)),
+		)
+	}()
+
+	h.logger.Info("charter regeneration started",
+		zap.String("expert_id", expertID.String()),
+		zap.String("expert_name", expertName),
+	)
+
+	response.OK(c, map[string]interface{}{
+		"status":      "regenerating",
+		"expert_id":   expertID,
+		"expert_name": expertName,
+		"message":     "Charter regeneration started. Check expert reasoning_charter in ~30 seconds.",
+	})
+}
+
 // ResumeIngestionJob POST /admin/experts/:id/jobs/:jobID/resume
 // Resumes a failed ingestion job from its last checkpoint.
 // Only for status='failed' jobs. For status='paused' use RetryIngestionJob.
