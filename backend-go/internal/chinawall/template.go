@@ -3,6 +3,7 @@ package chinawall
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"ai_avengers/backend/internal/category"
@@ -156,6 +157,13 @@ func sectionKeysList(sections []category.TemplateSection) string {
 	}
 	return strings.Join(keys, ", ")
 }
+
+// thinkBlockRe strips <think>...</think> reasoning blocks that DeepSeek
+// and other reasoning models emit before their actual JSON response.
+// These blocks often contain code examples with {} braces, which break
+// the naive strings.LastIndex("}") JSON extraction below.
+// (?s) flag makes . match newlines (multi-line think blocks).
+var thinkBlockRe = regexp.MustCompile(`(?s)<think>.*?</think>`)
 
 // parseStructuredResponse parses the LLM's JSON response into one raw
 // string per section key, keyed by section.Key. Prose/code sections are
