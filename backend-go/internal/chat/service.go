@@ -109,7 +109,7 @@ func (s *Service) UpdateTitle(ctx context.Context, chatID, clientID uuid.UUID, t
 	return nil
 }
 
-// Archive marks a chat as archived.
+// Archive marks a chat as archived (soft disable).
 func (s *Service) Archive(ctx context.Context, chatID, clientID uuid.UUID) error {
 	result, err := s.db.Exec(ctx,
 		`UPDATE chats SET is_archived=TRUE, updated_at=NOW() WHERE id=$1 AND client_id=$2`,
@@ -120,6 +120,44 @@ func (s *Service) Archive(ctx context.Context, chatID, clientID uuid.UUID) error
 	}
 	if result.RowsAffected() == 0 {
 		return ErrNotFound
+	}
+	return nil
+}
+
+// Unarchive restores an archived chat to active.
+func (s *Service) Unarchive(ctx context.Context, chatID, clientID uuid.UUID) error {
+	result, err := s.db.Exec(ctx,
+		`UPDATE chats SET is_archived=FALSE, updated_at=NOW() WHERE id=$1 AND client_id=$2`,
+		chatID, clientID,
+	)
+	if err != nil {
+		return fmt.Errorf("unarchive chat failed: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// PermanentDelete hard-deletes a chat and all its messages.
+// WHY hard delete: user explicitly confirmed deletion.
+// Messages are cascade-deleted by FK constraint.
+func (s *Service) PermanentDelete(ctx context.Context, chatID, clientID uuid.UUID) error {
+	// Verify ownership before deleting
+	var exists bool
+	s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM chats WHERE id=$1 AND client_id=$2)`,
+		chatID, clientID,
+	).Scan(&exists)
+	if !exists {
+		return ErrNotFound
+	}
+	_, err := s.db.Exec(ctx,
+		`DELETE FROM chats WHERE id=$1 AND client_id=$2`,
+		chatID, clientID,
+	)
+	if err != nil {
+		return fmt.Errorf("permanent delete chat failed: %w", err)
 	}
 	return nil
 }

@@ -52,6 +52,10 @@ type UpdateProjectRequest struct {
 	Name             *string `json:"name"`
 	Description      *string `json:"description"`
 	ArchitectureType *string `json:"architecture_type"`
+	// Status: 'active' to enable, 'archived' to disable.
+	// 'archived' moves project to passive section in UI.
+	// 'active' restores it to active section.
+	Status           *string `json:"status"`
 }
 
 // Service handles project business logic.
@@ -226,6 +230,14 @@ func (s *Service) Update(ctx context.Context, projectID, clientID uuid.UUID, req
 		_, _ = s.db.Exec(ctx,
 			`UPDATE projects SET architecture_type=$1, updated_at=NOW() WHERE id=$2`,
 			*req.ArchitectureType, projectID)
+	}
+	if req.Status != nil {
+		// Only allow valid status transitions: active <-> archived
+		if *req.Status == "active" || *req.Status == "archived" {
+			_, _ = s.db.Exec(ctx,
+				`UPDATE projects SET status=$1, updated_at=NOW() WHERE id=$2`,
+				*req.Status, projectID)
+		}
 	}
 	return nil
 }
