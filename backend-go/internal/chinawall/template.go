@@ -150,6 +150,43 @@ func sectionGuidance(s category.TemplateSection) string {
 	}
 }
 
+// findMatchingBrace finds the index of the closing } that matches the
+// opening { at position start in s. Returns -1 if not found.
+// Handles nested braces correctly. Ignores braces inside JSON strings
+// (quoted with ") to avoid false matches on string values containing {}.
+func findMatchingBrace(s string, start int) int {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if ch == '\\' && inString {
+			escaped = true
+			continue
+		}
+		if ch == '"' {
+			inString = !inString
+			continue
+		}
+		if inString {
+			continue
+		}
+		if ch == '{' {
+			depth++
+		} else if ch == '}' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
 func sectionKeysList(sections []category.TemplateSection) string {
 	keys := make([]string, len(sections))
 	for i, s := range sections {
