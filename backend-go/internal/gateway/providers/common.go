@@ -139,9 +139,9 @@ func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName st
 		return nil, fmt.Errorf("empty choices in response")
 	}
 
-	// Use resolveContent: handles both standard models (content field)
-	// and reasoning models (reasoning_content field when content is empty).
-	content := resolveContent(
+	// extractMessageContent handles all 3 content formats:
+	// plain string, reasoning_content fallback, Claude array.
+	content := extractMessageContent(
 		result.Choices[0].Message.Content,
 		result.Choices[0].Message.ReasoningContent,
 	)
@@ -241,11 +241,9 @@ func doOpenAICompatibleStream(
 				outputTokens = chunk.Usage.CompletionTokens
 			}
 			if len(chunk.Choices) > 0 {
-				// resolveContent per delta: forward whichever field has
-				// the token. Standard models use delta.content; reasoning
-				// models use delta.reasoning_content. Both are forwarded
-				// so the user sees output immediately in either case.
-				token := resolveContent(
+				// resolveStreamToken: standard models use delta.content;
+				// reasoning models use delta.reasoning_content.
+				token := resolveStreamToken(
 					chunk.Choices[0].Delta.Content,
 					chunk.Choices[0].Delta.ReasoningContent,
 				)
