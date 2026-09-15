@@ -12,8 +12,8 @@ package chinawall
 // HANDOFF.md documenting a real truncation bug this exact setting
 // caused for a DSA expert).
 const (
-	DefaultMaxTokensFlat       = 3000
-	DefaultMaxTokensStructured = 7000
+	DefaultMaxTokensFlat       = 5000
+	DefaultMaxTokensStructured = 12000
 )
 
 // CoverageMode controls how Layer 2 checks if chunks can answer the question.
