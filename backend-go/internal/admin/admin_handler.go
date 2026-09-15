@@ -1247,12 +1247,18 @@ func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
 		// Update charter.
 		// reasoning_charter: always overwrite (it was blank, that's why we're here).
 		// clarification_charter: preserve existing if new one is empty/null.
+		//   WHY ::text cast on both CASE branches:
+		//   clarification_charter is JSONB. $2 is text. PostgreSQL CASE requires
+		//   both branches to be the same type. Casting ELSE branch to ::text
+		//   makes both branches text; PostgreSQL then implicitly casts the
+		//   assignment back to JSONB for the column. Without this, PostgreSQL
+		//   raises SQLSTATE 42804 "CASE types jsonb and text cannot be matched".
 		// training_status: set to 'trained' — chunks are already verified by smoke test.
 		_, dbErr := h.db.Exec(bgCtx,
 			`UPDATE experts SET
 				reasoning_charter     = $1,
 				clarification_charter = CASE
-					WHEN $2::text NOT IN ('{}', 'null', '') THEN $2::text
+					WHEN $2::text NOT IN ('{}', 'null', '') THEN $2::jsonb
 					ELSE clarification_charter
 				END,
 				training_status = 'trained',
