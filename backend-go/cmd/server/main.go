@@ -405,6 +405,8 @@ func buildRouter(
 			chats.GET("/:id", chatHandler.GetByID)
 			chats.PATCH("/:id", chatHandler.Update)
 			chats.DELETE("/:id", chatHandler.Archive)
+			chats.POST("/:id/unarchive", chatHandler.Unarchive)
+			chats.DELETE("/:id/permanent", chatHandler.PermanentDelete)
 			chats.POST("/:id/messages", messageHandler.Send)
 			chats.GET("/:id/messages", chatHandler.ListMessages)
 		}
