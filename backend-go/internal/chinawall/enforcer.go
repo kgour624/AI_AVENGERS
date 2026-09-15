@@ -570,8 +570,19 @@ COURSE CONTENT:
 	}
 
 	// Gate 5 generation: streaming when tokenCh non-nil, blocking otherwise.
+	//
+	// WHY streaming timeout (45s):
+	//   Without a timeout, if the provider sends HTTP 200 headers but then
+	//   stalls the body (no tokens, no [DONE], no RST/FIN), rawTokenCh
+	//   never closes, the for-range loop below hangs forever, tokenDone
+	//   never signals, and message/handler.go's <-tokenDone blocks
+	//   indefinitely — the user never gets a response.
+	//   45s is chosen as: generous enough for slow providers on long answers,
+	//   tight enough to fail fast and fall back to blocking Call() which
+	//   has its own 120s transport timeout.
 	if tokenCh != nil {
-		rawTokenCh, rawRespCh, streamErr := e.gateway.StreamCall(ctx, gateway.LLMRequest{
+		streamCtx, streamCancel := context.WithTimeout(ctx, 45*time.Second)
+		rawTokenCh, rawRespCh, streamErr := e.gateway.StreamCall(streamCtx, gateway.LLMRequest{
 			Model:        gateway.ModelStrong,
 			SystemPrompt: systemPrompt,
 			UserPrompt:   question,
@@ -585,17 +596,23 @@ COURSE CONTENT:
 				select {
 				case tokenCh <- token:
 				case <-ctx.Done():
+					streamCancel()
 					return nil, ctx.Err()
 				}
 			}
 			<-rawRespCh // drain metadata channel
+			streamCancel()
 			content := sb.String()
 			if content != "" {
 				return &generatedAnswer{Answer: content, Citations: e.extractCitations(content, chunks)}, nil
 			}
+		} else {
+			streamCancel()
 		}
-		// StreamCall failed or returned empty — fall through to blocking call
-		e.logger.Warn("streaming failed or empty, falling back to blocking call")
+		// StreamCall failed, timed out, or returned empty — fall through to blocking call
+		e.logger.Warn("streaming failed or empty, falling back to blocking call",
+			zap.NamedError("stream_err", streamErr),
+		)
 	}
 
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
