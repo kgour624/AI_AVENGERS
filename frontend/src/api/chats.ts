@@ -30,6 +30,18 @@ export const archiveChat = (chatId: string) =>
     .delete<ApiResponse<{ status: string }>>(`/api/v1/chats/${chatId}`)
     .then((res) => res.data.data!)
 
+// unarchiveChat: restores a disabled chat to active
+export const unarchiveChat = (chatId: string) =>
+  baseAPI
+    .post<ApiResponse<{ status: string }>>(`/api/v1/chats/${chatId}/unarchive`)
+    .then((res) => res.data.data!)
+
+// permanentDeleteChat: hard deletes chat + all messages. IRREVERSIBLE.
+export const permanentDeleteChat = (chatId: string) =>
+  baseAPI
+    .delete<ApiResponse<{ status: string }>>(`/api/v1/chats/${chatId}/permanent`)
+    .then((res) => res.data.data!)
+
 export const getMessages = (chatId: string, options?: { signal?: AbortSignal }) =>
   baseAPI
     .get<ApiResponse<Message[]>>(`/api/v1/chats/${chatId}/messages`, { signal: options?.signal })

@@ -30,12 +30,21 @@ export const createProject = (req: CreateProjectRequest) =>
 export interface UpdateProjectRequest {
   name?: string
   description?: string
+  status?: 'active' | 'archived'
 }
 
 export const updateProject = (projectId: string, req: UpdateProjectRequest) =>
   baseAPI
     .patch<ApiResponse<{ status: string }>>(`/api/v1/projects/${projectId}`, req)
     .then((res) => res.data.data!)
+
+// disableProject: sets status='archived' — moves to passive section in sidebar
+export const disableProject = (projectId: string) =>
+  updateProject(projectId, { status: 'archived' })
+
+// enableProject: sets status='active' — restores to active section
+export const enableProject = (projectId: string) =>
+  updateProject(projectId, { status: 'active' })
 
 export const deleteProject = (projectId: string) =>
   baseAPI
