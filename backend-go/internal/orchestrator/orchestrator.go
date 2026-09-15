@@ -42,6 +42,10 @@ type OrchestratorRequest struct {
 	// reply-to-the-ASK can walk one more parent level and recover the
 	// original question (decision/engine.go's gateStructurePermission).
 	UserMessageID uuid.UUID
+	// TokenCh: when non-nil, Gate 5 generation streams tokens here.
+	// message/handler.go creates this channel and forwards tokens to SSE.
+	// nil = blocking (used by tests, smoke test, non-streaming callers).
+	TokenCh chan<- string
 }
 
 // OrchestratorResponse is the full output including all expert responses.
@@ -351,6 +355,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		replyContext,
 		1,
 		req.ReplyToMessageID,
+		req.TokenCh,
 	)
 	if err != nil {
 		o.logger.Error("decision engine failed", zap.String("expert", expert.Name), zap.Error(err))
