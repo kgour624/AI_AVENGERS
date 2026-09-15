@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getAdminExperts } from '@/api/admin'
+import { getAdminExperts, regenerateCharter } from '@/api/admin'
 import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
@@ -96,6 +96,41 @@ function AdminExperts() {
   // Pipeline progress modal — expertId drives SSE connection inside modal
   const [pipelineExpertId, setPipelineExpertId] = useState<string | null>(null)
   const [pipelineExpertName, setPipelineExpertName] = useState<string>('')
+  // Regenerate charter loading state: expertId -> true while in-flight
+  const [regeneratingIds, setRegeneratingIds] = useState<Set<string>>(new Set())
+  // Regenerate charter success/error feedback: expertId -> message
+  const [regenFeedback, setRegenFeedback] = useState<Record<string, { ok: boolean; msg: string }>>({})
+
+  const handleRegenerateCharter = async (expertId: string) => {
+    setRegeneratingIds((prev) => new Set(prev).add(expertId))
+    setRegenFeedback((prev) => ({ ...prev, [expertId]: { ok: true, msg: '' } }))
+    try {
+      const result = await regenerateCharter(expertId)
+      setRegenFeedback((prev) => ({
+        ...prev,
+        [expertId]: { ok: true, msg: result.message ?? 'Charter regeneration started.' },
+      }))
+      // Poll experts list after 35s so the UI reflects the new charter
+      setTimeout(() => {
+        queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
+        setRegenFeedback((prev) => {
+          const next = { ...prev }
+          delete next[expertId]
+          return next
+        })
+      }, 35_000)
+    } catch (err: unknown) {
+      const msg =
+        err instanceof Error ? err.message : 'Charter regeneration failed. Check API credits.'
+      setRegenFeedback((prev) => ({ ...prev, [expertId]: { ok: false, msg } }))
+    } finally {
+      setRegeneratingIds((prev) => {
+        const next = new Set(prev)
+        next.delete(expertId)
+        return next
+      })
+    }
+  }
 
   return (
     <div className="p-6">
@@ -159,6 +194,32 @@ function AdminExperts() {
               <Button variant="ghost" size="sm" onClick={() => setConfigTargetId(expert.id)}>
                 Edit Config
               </Button>
+              {/* Regenerate Charter: shown when charter is blank or training failed.
+                  One-click fix for experts whose LLM credits ran out during ingestion.
+                  Calls POST /admin/experts/:id/regenerate-charter — background job,
+                  no chunk re-processing. Auto-refreshes expert list after 35s. */}
+              {(!expert.reasoningCharter || expert.reasoningCharter.trim() === '') && (
+                <div className="flex flex-col gap-1">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    disabled={regeneratingIds.has(expert.id)}
+                    onClick={() => handleRegenerateCharter(expert.id)}
+                    className="border-amber-500/50 text-amber-400 hover:bg-amber-500/10"
+                  >
+                    {regeneratingIds.has(expert.id) ? '\u23f3 Generating...' : '\u26a1 Regenerate Charter'}
+                  </Button>
+                  {regenFeedback[expert.id] && (
+                    <p
+                      className={`text-[10px] ${
+                        regenFeedback[expert.id].ok ? 'text-green-400' : 'text-red-400'
+                      }`}
+                    >
+                      {regenFeedback[expert.id].msg}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           </Card>
         ))}
