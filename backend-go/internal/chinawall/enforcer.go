@@ -696,7 +696,7 @@ func (e *Enforcer) generateStructured(
 			zap.Error(parseErr),
 			zap.Int("raw_response_length", len(resp.Content)),
 		)
-		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextText)
+		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextText, nil)
 	}
 
 	// 2026-09-08 RCA: initialized non-nil - a structured answer with
