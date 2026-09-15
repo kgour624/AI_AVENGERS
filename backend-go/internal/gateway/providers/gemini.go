@@ -67,8 +67,6 @@ func (p *GeminiProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequ
 	httpReq.Header.Set("Content-Type", "application/json")
 	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
-
-func (p *GeminiProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
 	var msgs []map[string]string
 	for _, m := range req.Messages {
 		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})

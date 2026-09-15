@@ -62,8 +62,6 @@ func (p *DeepSeekProvider) StreamCall(ctx context.Context, req gtypes.ProviderRe
 	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	return doOpenAICompatibleStream(p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
-
-func (p *DeepSeekProvider) Name() string                                    { return "deepseek" }
 func (p *DeepSeekProvider) ModelName(_ gtypes.ModelType) string             { return "deepseek-chat" }
 func (p *DeepSeekProvider) CostPer1K(_ gtypes.ModelType) (float64, float64) { return 0.00014, 0.00028 }
 func (p *DeepSeekProvider) MaxTokens(_ gtypes.ModelType) int                { return 8192 }
