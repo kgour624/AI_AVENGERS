@@ -11,22 +11,31 @@ import (
 	gtypes "ai_avengers/backend/internal/gateway/types"
 )
 
+// claudeContentBlock is one element of Claude's content array format.
+// Claude thinking/extended models return content as an array of typed
+// blocks instead of a plain string:
+//   [{"type":"thinking","thinking":"..."}, {"type":"text","text":"..."}]
+// We extract only "text" blocks for the final answer.
+type claudeContentBlock struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking"`
+}
+
 // openAICompatibleResponse is the shared response format used by
 // OpenRouter, DeepSeek, Gemini, CodeCraftAPI (all OpenAI-compatible).
 //
-// reasoning_content: populated by reasoning/thinking models
-// (DeepSeek-R1, Qwen-QwQ, Claude thinking mode, etc.) when they
-// return their chain-of-thought separately from the final answer.
-// Some models (e.g. DeepSeek-V4-Flash, Qwen3.x) leave content=""
-// and put the actual answer in reasoning_content instead.
-// WHY handle both: CodeCraftAPI proxies many model families. A model
-// that puts its answer in reasoning_content would otherwise return
-// empty content → ChinaWall rejects → unnecessary fallback call.
+// content is json.RawMessage because different model families use
+// different formats:
+//   - Standard models:  "content": "answer text"
+//   - Reasoning models: "content": "", "reasoning_content": "answer"
+//   - Claude thinking:  "content": [{"type":"text","text":"answer"},...]
+// extractMessageContent() handles all three cases.
 type openAICompatibleResponse struct {
 	Choices []struct {
 		Message struct {
-			Content          string `json:"content"`
-			ReasoningContent string `json:"reasoning_content"`
+			Content          json.RawMessage `json:"content"`
+			ReasoningContent string          `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
@@ -38,10 +47,8 @@ type openAICompatibleResponse struct {
 
 // openAIStreamChunk is one SSE data line from an OpenAI-compatible stream.
 //
-// reasoning_content in delta: same as above — reasoning models stream
-// their thinking tokens here. We forward them to the caller the same
-// way as regular content tokens so the user sees output immediately
-// instead of waiting for the full reasoning phase to complete silently.
+// reasoning_content in delta: reasoning models stream thinking tokens here.
+// We forward them so the user sees output immediately during thinking phase.
 type openAIStreamChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -57,14 +64,55 @@ type openAIStreamChunk struct {
 	Model string `json:"model"`
 }
 
-// resolveContent returns the best available content from a message.
-// Priority: content (standard) → reasoning_content (thinking models).
-// WHY: reasoning models like DeepSeek-V4-Flash, Qwen3.x, Claude thinking
-// mode leave content="" and put the actual answer in reasoning_content.
-// Without this fallback, every reasoning model call returns empty content
-// → ChinaWall rejects → unnecessary 2nd LLM call → 34+ second latency.
-func resolveContent(content, reasoningContent string) string {
-	if strings.TrimSpace(content) != "" {
+// extractMessageContent parses the content field from a message.
+// Handles 3 formats:
+//   1. Plain string:   "content": "answer"              → standard models
+//   2. Empty string:   "content": "", reasoning_content  → DeepSeek-R1, Qwen
+//   3. Content array:  "content": [{"type":"text",...}]  → Claude thinking/Opus
+//
+// Priority: text blocks from array → plain string → reasoning_content.
+// WHY: Claude Opus 5 via CodeCraftAPI returns content as a typed array.
+// Without this, content parses as empty string → ChinaWall rejects →
+// unnecessary retry → 34+ second latency.
+func extractMessageContent(raw json.RawMessage, reasoningContent string) string {
+	if len(raw) == 0 {
+		return reasoningContent
+	}
+
+	// Try array format first (Claude thinking models)
+	if raw[0] == '[' {
+		var blocks []claudeContentBlock
+		if err := json.Unmarshal(raw, &blocks); err == nil {
+			var sb strings.Builder
+			for _, b := range blocks {
+				if b.Type == "text" && b.Text != "" {
+					sb.WriteString(b.Text)
+				}
+			}
+			if result := strings.TrimSpace(sb.String()); result != "" {
+				return result
+			}
+		}
+		// Array parsed but no text blocks — fall through to reasoning_content
+		return reasoningContent
+	}
+
+	// Try plain string format (standard + reasoning models)
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		if strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+
+	// content empty → use reasoning_content (DeepSeek-R1, Qwen3.x)
+	return reasoningContent
+}
+
+// resolveStreamToken returns the best token from a streaming delta.
+// Standard models use delta.content; reasoning models use delta.reasoning_content.
+func resolveStreamToken(content, reasoningContent string) string {
+	if content != "" {
 		return content
 	}
 	return reasoningContent
