@@ -179,8 +179,13 @@ func (p *IngestionPipeline) IngestTranscript(
 	// instead of re-chunking (chunking is deterministic but expensive for large transcripts).
 	var chunks []TextChunk
 	if isResume && StageOrder[cp.Stage] >= StageOrder[StageTopicExtraction] {
-		// Load existing chunks from DB
-		chunks, err = p.loadChunksFromDB(ctx, expertID)
+		// Load existing chunks from DB — scoped to THIS job's source file.
+		// WHY sourceFile filter: without it, loadChunksFromDB returns ALL
+		// chunks for the expert across every uploaded transcript file.
+		// On resume, this inflates chunk count (e.g. 873 → 1741) and
+		// causes topic extraction + embedding to re-process chunks from
+		// OTHER files that were already correctly stored.
+		chunks, err = p.loadChunksFromDB(ctx, expertID, sourceFile)
 		if err != nil || len(chunks) == 0 {
 			p.logger.Warn("could not load chunks from DB, re-chunking", zap.Error(err))
 			chunks = p.chunker.Chunk(transcript)
@@ -911,13 +916,20 @@ func (p *IngestionPipeline) pauseOnLLMFailure(
 	return ErrJobPaused
 }
 
-// loadChunksFromDB loads existing TextChunks for an expert from the DB.
-// Used on resume to skip re-chunking.
-func (p *IngestionPipeline) loadChunksFromDB(ctx context.Context, expertID uuid.UUID) ([]TextChunk, error) {
+// loadChunksFromDB loads existing TextChunks for a specific source file.
+// Scoped to (expert_id, source_file) to prevent cross-file chunk leakage
+// when an expert has multiple uploaded transcripts.
+//
+// WHY source_file filter:
+//   Without it, resume loads ALL chunks for the expert across every
+//   transcript file ever uploaded. For an expert with 2 files
+//   (868 + 873 chunks), resume would load 1741 chunks instead of 873,
+//   causing topic extraction and embedding to re-process the wrong set.
+func (p *IngestionPipeline) loadChunksFromDB(ctx context.Context, expertID uuid.UUID, sourceFile string) ([]TextChunk, error) {
 	rows, err := p.db.Query(ctx,
 		`SELECT chunk_text, chunk_index, COALESCE(chunk_hash,'') FROM course_chunks
-		 WHERE expert_id=$1 ORDER BY chunk_index ASC`,
-		expertID,
+		 WHERE expert_id=$1 AND source_file=$2 ORDER BY chunk_index ASC`,
+		expertID, sourceFile,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("loadChunksFromDB: %w", err)
