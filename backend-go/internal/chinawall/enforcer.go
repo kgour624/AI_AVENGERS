@@ -496,7 +496,7 @@ func (e *Enforcer) generateWithCitations(
 	}
 
 	if len(templateSections) > 0 {
-		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, contextSB.String(), templateSections, defaultLanguage, profile)
+		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, contextSB.String(), templateSections, defaultLanguage, profile, tokenCh)
 	}
 
 	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextSB.String(), tokenCh)
