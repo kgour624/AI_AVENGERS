@@ -680,6 +680,7 @@ func (e *Enforcer) generateStructured(
 	sections []category.TemplateSection,
 	defaultLanguage string,
 	profile *DomainProfile,
+	tokenCh chan<- string,
 ) (*generatedAnswer, error) {
 	if defaultLanguage == "" {
 		defaultLanguage = "java" // CT-L5: hardcoded default, admin-overridable per category
@@ -714,7 +715,7 @@ func (e *Enforcer) generateStructured(
 			zap.Error(parseErr),
 			zap.Int("raw_response_length", len(resp.Content)),
 		)
-		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextText, nil)
+		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextText, tokenCh)
 	}
 
 	// 2026-09-08 RCA: initialized non-nil - a structured answer with
