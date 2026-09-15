@@ -64,9 +64,23 @@ type ModelGateway struct {
 // NewModelGateway creates a new model gateway.
 func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 	g := &ModelGateway{
-		cfg:        cfg,
-		httpClient: &http.Client{Timeout: 120 * time.Second},
-		logger:     logger,
+		cfg: cfg,
+		// Transport-level timeouts prevent TCP hangs when the LLM provider
+		// drops the connection silently (no RST, no FIN).
+		// TLSHandshakeTimeout: fail fast on TLS negotiation hang.
+		// ResponseHeaderTimeout: fail if server never sends the first byte.
+		// The outer http.Client.Timeout (120s) is the wall-clock cap for
+		// the entire round-trip including body read — kept for streaming
+		// compatibility (streaming body reads can legitimately take >60s).
+		httpClient: &http.Client{
+			Timeout: 120 * time.Second,
+			Transport: &http.Transport{
+				TLSHandshakeTimeout:   10 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+			},
+		},
+		logger: logger,
 	}
 	g.totalCost.Store(float64(0))
 	return g
