@@ -12,11 +12,21 @@ import (
 )
 
 // openAICompatibleResponse is the shared response format used by
-// OpenRouter, DeepSeek, Gemini, and CodeCraftAPI (all OpenAI-compatible).
+// OpenRouter, DeepSeek, Gemini, CodeCraftAPI (all OpenAI-compatible).
+//
+// reasoning_content: populated by reasoning/thinking models
+// (DeepSeek-R1, Qwen-QwQ, Claude thinking mode, etc.) when they
+// return their chain-of-thought separately from the final answer.
+// Some models (e.g. DeepSeek-V4-Flash, Qwen3.x) leave content=""
+// and put the actual answer in reasoning_content instead.
+// WHY handle both: CodeCraftAPI proxies many model families. A model
+// that puts its answer in reasoning_content would otherwise return
+// empty content → ChinaWall rejects → unnecessary fallback call.
 type openAICompatibleResponse struct {
 	Choices []struct {
 		Message struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"message"`
 	} `json:"choices"`
 	Usage struct {
@@ -27,10 +37,16 @@ type openAICompatibleResponse struct {
 }
 
 // openAIStreamChunk is one SSE data line from an OpenAI-compatible stream.
+//
+// reasoning_content in delta: same as above — reasoning models stream
+// their thinking tokens here. We forward them to the caller the same
+// way as regular content tokens so the user sees output immediately
+// instead of waiting for the full reasoning phase to complete silently.
 type openAIStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
 		} `json:"delta"`
 		FinishReason *string `json:"finish_reason"`
 	} `json:"choices"`
@@ -39,6 +55,19 @@ type openAIStreamChunk struct {
 		CompletionTokens int `json:"completion_tokens"`
 	} `json:"usage"`
 	Model string `json:"model"`
+}
+
+// resolveContent returns the best available content from a message.
+// Priority: content (standard) → reasoning_content (thinking models).
+// WHY: reasoning models like DeepSeek-V4-Flash, Qwen3.x, Claude thinking
+// mode leave content="" and put the actual answer in reasoning_content.
+// Without this fallback, every reasoning model call returns empty content
+// → ChinaWall rejects → unnecessary 2nd LLM call → 34+ second latency.
+func resolveContent(content, reasoningContent string) string {
+	if strings.TrimSpace(content) != "" {
+		return content
+	}
+	return reasoningContent
 }
 
 // doOpenAICompatibleCall executes an HTTP request and parses the
@@ -62,13 +91,23 @@ func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName st
 		return nil, fmt.Errorf("empty choices in response")
 	}
 
+	// Use resolveContent: handles both standard models (content field)
+	// and reasoning models (reasoning_content field when content is empty).
+	content := resolveContent(
+		result.Choices[0].Message.Content,
+		result.Choices[0].Message.ReasoningContent,
+	)
+	if content == "" {
+		return nil, fmt.Errorf("empty content in response")
+	}
+
 	usedModel := result.Model
 	if usedModel == "" {
 		usedModel = modelName
 	}
 
 	return &gtypes.ProviderResponse{
-		Content:      result.Choices[0].Message.Content,
+		Content:      content,
 		InputTokens:  result.Usage.PromptTokens,
 		OutputTokens: result.Usage.CompletionTokens,
 		ModelUsed:    usedModel,
@@ -88,6 +127,12 @@ func doOpenAICompatibleCall(client *http.Client, req *http.Request, modelName st
 //   With ctx: select on ctx.Done() in the token-send path ensures the
 //   goroutine exits cleanly when the caller's context is cancelled
 //   (request disconnect, streaming timeout, orchestrator timeout).
+//
+// WHY reasoning_content forwarded as tokens:
+//   Reasoning models stream thinking tokens in delta.reasoning_content
+//   instead of delta.content. Without forwarding these, the user sees
+//   nothing for 20-30s while the model thinks, then gets the answer
+//   all at once — defeating the purpose of streaming.
 func doOpenAICompatibleStream(
 	ctx context.Context,
 	client *http.Client,
@@ -148,7 +193,14 @@ func doOpenAICompatibleStream(
 				outputTokens = chunk.Usage.CompletionTokens
 			}
 			if len(chunk.Choices) > 0 {
-				token := chunk.Choices[0].Delta.Content
+				// resolveContent per delta: forward whichever field has
+				// the token. Standard models use delta.content; reasoning
+				// models use delta.reasoning_content. Both are forwarded
+				// so the user sees output immediately in either case.
+				token := resolveContent(
+					chunk.Choices[0].Delta.Content,
+					chunk.Choices[0].Delta.ReasoningContent,
+				)
 				if token != "" {
 					fullContent.WriteString(token)
 					// Send token or exit if context cancelled.
