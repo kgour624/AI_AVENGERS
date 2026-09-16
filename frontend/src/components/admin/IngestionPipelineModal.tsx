@@ -19,6 +19,8 @@ const STAGES = [
 const STAGE_ORDER: Record<string, number> = {
   pending: 0, chunking: 1, topic_extraction: 2, charter_extraction: 3,
   embedding: 4, storing: 5, smoke_test: 6, complete: 7, failed: -1,
+  // FIX: paused was missing — getStageStatus returned wrong result for paused jobs
+  paused: -1,
 }
 
 type StageStatus = 'waiting' | 'active' | 'done' | 'failed'
