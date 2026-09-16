@@ -161,29 +161,43 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 
 		// ============================================================
-		// FETCH TRAINING CONTEXT: Expert's course_chunks via RAG.
-		// WHY: Real engineer model — expert uses their training knowledge
-		// + blackboard (peers' work) to solve new problems.
-		// APPLY_PRINCIPLES: chunks don't need to contain exact answer.
-		// "Distributed systems" training applies to "URL shortener" task.
-		// Failure: non-fatal — empty chunks = blackboard-only context.
-		// Only fetch on iteration 1: training doesn't change mid-loop.
+		// GATE SYSTEM: 3-gate knowledge access (iter==1 only).
+		// Design phases: Gates 1+2+3 active.
+		// Implementation phase: Gate 1 only (no generic allowed).
 		// ============================================================
-		var trainingChunks []chinawall.CourseChunk
-		if iter == 1 && a.assembler != nil {
-			chunks, fetchErr := a.assembler.GetCourseChunksForWorkflow(
-				ctx, req.Expert.ID, req.TaskDescription, 5,
-			)
-			if fetchErr != nil {
-				a.logger.Warn("agent loop: training fetch failed (continuing without training context)",
-					zap.String("expert", req.Expert.Name),
-					zap.Error(fetchErr),
+		var gateResult *GateResult
+		if iter == 1 && a.gateSystem != nil {
+			isDesignPhase := req.WorkflowPhase == PhaseHighLevelDesign ||
+				req.WorkflowPhase == PhaseDetailedDesign ||
+				req.WorkflowPhase == ""
+
+			if isDesignPhase {
+				// Design phase: full 3-gate system
+				gr, gateErr := a.gateSystem.RunGates(
+					ctx, req.Expert, req.TaskDescription, req.AllExperts,
 				)
+				if gateErr != nil {
+					a.logger.Warn("agent loop: gate system failed (continuing)",
+						zap.String("expert", req.Expert.Name),
+						zap.Error(gateErr),
+					)
+				} else {
+					gateResult = gr
+				}
 			} else {
-				trainingChunks = chunks
-				a.logger.Info("agent loop: training context fetched",
+				// Implementation phase: Gate 1 only, generic BLOCKED
+				chunks, fetchErr := a.assembler.GetCourseChunksForWorkflow(
+					ctx, req.Expert.ID, req.TaskDescription, 10,
+				)
+				if fetchErr == nil {
+					gateResult = &GateResult{
+						TrainingChunks: chunks,
+						Gate1Passed:    len(chunks) > 0,
+						GenericAllowed: false, // NEVER in implementation phase
+					}
+				}
+				a.logger.Info("agent loop: implementation phase — Gate 1 only, generic blocked",
 					zap.String("expert", req.Expert.Name),
-					zap.Int("chunks", len(trainingChunks)),
 				)
 			}
 		}
