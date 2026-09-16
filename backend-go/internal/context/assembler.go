@@ -500,6 +500,34 @@ func flattenTemplateSections(raw []byte) string {
 	return sb.String()
 }
 
+// GetCourseChunksForWorkflow retrieves training chunks for a workflow expert.
+// Used by AgentLoop to give experts their training knowledge as context.
+//
+// WHY exported (not getCourseChunks which is unexported):
+//   getCourseChunks is chat-flow only (called inside Assemble()).
+//   Workflow needs the same retrieval but without the full Assemble() overhead
+//   (no rolling summary, no L2 memory, no recent messages — just chunks).
+//
+// WHY topK=5 default:
+//   Workflow context already has blackboard artifacts.
+//   5 chunks * ~500 tokens = 2500 tokens — enough for principles without
+//   crowding out blackboard context.
+//
+// Failure policy: non-fatal.
+//   Empty slice returned on any error — AgentLoop continues with
+//   blackboard-only context. Expert never refuses due to missing training.
+func (a *Assembler) GetCourseChunksForWorkflow(
+	ctx context.Context,
+	expertID uuid.UUID,
+	taskDescription string,
+	topK int,
+) ([]chinawall.CourseChunk, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	return a.getCourseChunks(ctx, expertID, taskDescription, topK)
+}
+
 // getReplyThreadMaxDepth reads system_settings.reply_thread_max_depth.
 // Falls back to 10 (same default migration 010 seeds) if the row is
 // missing or its value is not a valid integer — never blocks reply
