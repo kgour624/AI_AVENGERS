@@ -1,10 +1,12 @@
 import { useParams } from 'react-router-dom'
 import { useQuery } from '@tanstack/react-query'
-import { getKanban, getWorkflow } from '@/api/workflows'
+import { getWorkflow } from '@/api/workflows'
+import { useKanbanStream } from '@/hooks/useKanbanStream'
 import type { KanbanTask } from '@/api/workflows'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
+import { cn } from '@/utils/cn'
 
 // Kanban column definitions
 const COLUMNS: { key: KanbanTask['status']; label: string; color: string }[] = [
@@ -30,29 +32,42 @@ function TaskCard({ task }: { task: KanbanTask }) {
 function KanbanPage() {
   const { id } = useParams<{ id: string }>()
 
+  // Workflow metadata: title, status, cost — poll every 10s (lightweight)
   const { data: workflow } = useQuery({
     queryKey: ['workflow', id],
     queryFn: () => getWorkflow(id!),
     enabled: !!id,
-    refetchInterval: 5000,
+    refetchInterval: 10000,
   })
 
-  const { data: kanban, isLoading } = useQuery({
-    queryKey: ['workflow', id, 'kanban'],
-    queryFn: () => getKanban(id!),
-    enabled: !!id,
-    refetchInterval: 5000, // poll every 5s — SSE upgrade is Phase F scope
-  })
-
-  const tasks = kanban?.tasks ?? []
+  // Live Kanban state via SSE — replaces 5s polling
+  // WHY SSE: instant updates when expert posts artifact or changes status.
+  // 5s polling = user sees stale board for up to 5s after each update.
+  const stream = useKanbanStream(id ?? null)
+  const tasks = stream.tasks
+  const isLoading = !stream.isConnected && tasks.length === 0 && !stream.isDone
 
   return (
     <div className="p-6">
       {/* Header */}
       <div className="mb-6">
-        <h1 className="text-xl font-semibold text-text-primary">
-          {workflow?.title ?? 'Workflow'}
-        </h1>
+        <div className="flex items-center justify-between">
+          <h1 className="text-xl font-semibold text-text-primary">
+            {workflow?.title ?? 'Workflow'}
+          </h1>
+          {/* SSE connection indicator */}
+          <div className="flex items-center gap-1.5">
+            <span className={cn(
+              'h-2 w-2 rounded-full',
+              stream.isDone ? 'bg-mode-advise'
+              : stream.isConnected ? 'bg-mode-advise animate-pulse'
+              : 'bg-glow-amber animate-pulse'
+            )} />
+            <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
+              {stream.isDone ? 'Complete' : stream.isConnected ? 'Live' : 'Connecting...'}
+            </span>
+          </div>
+        </div>
         <div className="mt-1 flex items-center gap-3">
           {workflow && (
             <>
@@ -92,12 +107,29 @@ function KanbanPage() {
                     <TaskCard key={task.id} task={task} />
                   ))}
                   {colTasks.length === 0 && (
-                    <p className="text-center text-xs text-text-disabled py-4">Empty</p>
+                    <p className="py-4 text-center text-xs text-text-disabled">Empty</p>
                   )}
                 </div>
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* Approval gate notice */}
+      {workflow?.status === 'paused_for_approval' && (
+        <div className="mt-4 rounded-lg border border-glow-amber/40 bg-glow-amber/10 p-4">
+          <p className="text-sm font-medium text-glow-amber">{'\u23f8'} Waiting for Approval</p>
+          <p className="mt-1 text-xs text-text-secondary">
+            Workflow is paused. Review the plan and approve to continue.
+          </p>
+        </div>
+      )}
+
+      {/* Completion notice */}
+      {stream.isDone && (
+        <div className="mt-4 rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-4 text-center">
+          <p className="text-sm font-medium text-mode-advise">{'\u2705'} Workflow Complete</p>
         </div>
       )}
     </div>
