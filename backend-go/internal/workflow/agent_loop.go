@@ -59,8 +59,8 @@ type AgentLoop struct {
 	logger    *zap.Logger
 }
 
-func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *gateway.ModelGateway, logger *zap.Logger) *AgentLoop {
-	return &AgentLoop{db: db, tools: tools, store: store, gateway: gw, logger: logger}
+func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *gateway.ModelGateway, assembler *appcontext.Assembler, logger *zap.Logger) *AgentLoop {
+	return &AgentLoop{db: db, tools: tools, store: store, gateway: gw, assembler: assembler, logger: logger}
 }
 
 type AgentLoopRequest struct {
