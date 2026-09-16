@@ -339,14 +339,17 @@ func (h *Handler) Send(c *gin.Context) {
 }
 
 // saveAssistantMessage saves an expert's response to the messages table.
+// Returns the saved message ID so the caller can include it in SSEDone.
+// WHY return ID: frontend needs message_id to render the Reply button.
+// If save fails, returns uuid.Nil — caller sends SSEDone without message_id.
 func (h *Handler) saveAssistantMessage(
 	ctx context.Context,
 	chatID uuid.UUID,
 	resp orchestrator.ExpertResponse,
 	turnNumber int,
-) {
+) uuid.UUID {
 	if resp.Error != "" {
-		return // Don't save failed responses
+		return uuid.Nil // Don't save failed responses
 	}
 
 	// FIXED 2026-09-08 (RCA round 7, migration 011): this WAS a documented
