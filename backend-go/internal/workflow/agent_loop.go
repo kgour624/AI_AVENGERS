@@ -12,7 +12,6 @@ import (
 
 	"ai_avengers/backend/internal/blackboard"
 	appcontext "ai_avengers/backend/internal/context"
-	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/gateway"
 )
 
