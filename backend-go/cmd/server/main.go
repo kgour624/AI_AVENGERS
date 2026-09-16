@@ -320,8 +320,7 @@ func buildRouter(
 	// WHY background context: must outlive the HTTP server startup.
 	go wfRunner.ResumeOrphanWorkflows(context.Background())
 	// Projector for each running workflow is started by RunWorkflow handler.
-	// wfProjector is passed to handler for use in RunWorkflow.
-	_ = wfProjector // used by wfHandler.RunWorkflow
+	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, wfProjector, logger)
 
 	// ============================================================
 	// Health check — no auth required
