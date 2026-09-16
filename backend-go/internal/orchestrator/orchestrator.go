@@ -368,6 +368,17 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		req.ReplyToMessageID,
 		req.TokenCh,
 	)
+	timer.Stop("decision_engine")
+
+	// Log phase breakdown for observability
+	for _, p := range timer.Results() {
+		o.logger.Info("pipeline phase timing",
+			zap.String("expert", expert.Name),
+			zap.String("phase", p.Phase),
+			zap.Int64("ms", p.Duration.Milliseconds()),
+		)
+	}
+
 	if err != nil {
 		o.logger.Error("decision engine failed", zap.String("expert", expert.Name), zap.Error(err))
 		return ExpertResponse{
