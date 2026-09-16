@@ -297,100 +297,40 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 	return result, nil
 }
 
-// buildContext builds the context string for the LLM.
-// Combines: training chunks (expert's knowledge) + blackboard artifacts (peers' work).
-//
-// Context structure:
-//   [TRAINING MATERIAL] — expert's course_chunks (APPLY_PRINCIPLES mode)
-//   [BLACKBOARD]        — peers' artifacts (summarized if > threshold)
-//
-// WHY training first:
-//   LLM reads top-down. Training principles should frame how the expert
-//   interprets the blackboard context. "I know X principle, now I see
-//   my peer proposed Y — I can apply X to improve Y."
-//
-// Mental execution:
-//   trainingChunks = ["consistent hashing", "CAP theorem", "sharding"]
-//   artifacts = [requirement_captured, PM's task breakdown]
-//   output:
-//     [TRAINING MATERIAL - 3 chunks]
-//     consistent hashing: ...
-//     CAP theorem: ...
-//     [BLACKBOARD - 2 artifacts]
-//     requirement_captured: ...
-//     task_plan_ready: ...
-func (a *AgentLoop) buildContext(ctx context.Context, artifacts []blackboard.Event, trainingChunks []chinawall.CourseChunk) (string, error) {
-	var sb strings.Builder
-
-	// Section 1: Training material (expert's knowledge base)
-	if len(trainingChunks) > 0 {
-		sb.WriteString(fmt.Sprintf("[TRAINING MATERIAL — %d relevant chunks from your knowledge base]\n", len(trainingChunks)))
-		sb.WriteString("Apply these principles to the task. You don't need an exact match — transfer the principles.\n\n")
-		for _, chunk := range trainingChunks {
-			if chunk.Topic != "" {
-				sb.WriteString(fmt.Sprintf("[Topic: %s | Relevance: %.2f]\n", chunk.Topic, chunk.RerankScore))
-			}
-			sb.WriteString(chunk.Text)
-			sb.WriteString("\n\n")
-		}
-	} else {
-		sb.WriteString("[TRAINING MATERIAL: No specific training chunks found. Use your general domain expertise.]\n\n")
-	}
-
-	// Section 2: Blackboard artifacts (peers' work)
+// buildBlackboardContext builds context from blackboard artifacts only.
+// Summarizes old artifacts if count exceeds threshold.
+// Renamed from buildContext — gate context is now handled by FormatGateContext.
+func (a *AgentLoop) buildBlackboardContext(ctx context.Context, artifacts []blackboard.Event) (string, error) {
 	if len(artifacts) == 0 {
-		sb.WriteString("[BLACKBOARD: No prior artifacts. You are the first expert to work on this.]\n")
-		return sb.String(), nil
+		return "No prior artifacts from peers.", nil
 	}
-
 	if len(artifacts) <= contextSummarizeThreshold {
-		sb.WriteString(fmt.Sprintf("[BLACKBOARD — %d artifacts from peers]\n", len(artifacts)))
-		sb.WriteString(formatArtifacts(artifacts))
-		return sb.String(), nil
+		return formatArtifacts(artifacts), nil
 	}
-
-	// Too many artifacts: summarize old ones, keep recent raw.
 	splitAt := len(artifacts) - recentArtifactsToKeepRaw
 	if splitAt < 0 {
 		splitAt = 0
 	}
 	old := artifacts[:splitAt]
 	recent := artifacts[splitAt:]
-
 	oldText := formatArtifacts(old)
 	summaryResp, err := a.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelCheap,
-		SystemPrompt: "You are a technical summarizer. Summarize the following expert artifacts concisely. Preserve key decisions, data models, API contracts, and design choices. Max 500 words.",
+		SystemPrompt: "Summarize these expert artifacts concisely. Preserve key decisions, data models, API contracts. Max 500 words.",
 		UserPrompt:   oldText,
 		MaxTokens:    700,
 		Temperature:  0.1,
 	})
 	if err != nil {
-		return "", fmt.Errorf("summarizer LLM failed: %w", err)
+		return "", fmt.Errorf("summarizer failed: %w", err)
 	}
-
-	sb.WriteString(fmt.Sprintf("[BLACKBOARD SUMMARY — %d older artifacts]\n", len(old)))
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("[SUMMARY OF %d OLDER ARTIFACTS]\n", len(old)))
 	sb.WriteString(summaryResp.Content)
 	sb.WriteString("\n\n")
-	sb.WriteString(fmt.Sprintf("[RECENT %d ARTIFACTS (full detail)]\n", len(recent)))
+	sb.WriteString(fmt.Sprintf("[RECENT %d ARTIFACTS]\n", len(recent)))
 	sb.WriteString(formatArtifacts(recent))
 	return sb.String(), nil
-}
-
-// buildContextFallback is used when buildContext's LLM summarizer fails.
-// Returns training + raw artifacts without summarization.
-func buildContextFallback(artifacts []blackboard.Event, trainingChunks []chinawall.CourseChunk) string {
-	var sb strings.Builder
-	if len(trainingChunks) > 0 {
-		sb.WriteString(fmt.Sprintf("[TRAINING MATERIAL — %d chunks]\n", len(trainingChunks)))
-		for _, chunk := range trainingChunks {
-			sb.WriteString(chunk.Text)
-			sb.WriteString("\n\n")
-		}
-	}
-	sb.WriteString("[BLACKBOARD]\n")
-	sb.WriteString(formatArtifacts(artifacts))
-	return sb.String()
 }
 
 // formatArtifacts formats a slice of blackboard events as readable text.
