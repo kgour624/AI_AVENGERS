@@ -206,20 +206,20 @@ func (h *Handler) GetKanban(c *gin.Context) {
 }
 
 // RunWorkflow POST /api/v1/workflows/:id/run
-// Starts the WorkflowRunner in a background goroutine.
-// Returns immediately — client polls GET /kanban or streams GET /kanban/stream.
-//
-// WHY background goroutine:
-//   WorkflowRunner can take minutes (multiple LLM calls per expert).
-//   HTTP request must return immediately.
-//   Client tracks progress via Kanban SSE stream.
+// Starts WorkflowRunner + Projector in background goroutines.
+// Returns 202 immediately.
 //
 // Mental execution:
 //   POST /workflows/abc/run
-//   1. Verify workflow exists and is in 'running' status
-//      (client must call POST /start before /run)
-//   2. Launch goroutine: go runner.Run(ctx, workflowID)
-//   3. Return 202 Accepted immediately
+//   1. Verify workflow exists + status=running
+//   2. go projector.Run(ctx, workflowID)  <- projects blackboard events to workflow_tasks
+//   3. go runner.Run(ctx, workflowID)     <- drives workflow to completion
+//   4. Return 202 Accepted
+//
+// WHY Projector starts first:
+//   Runner will post task_plan_ready event almost immediately.
+//   Projector must be subscribed before that event arrives.
+//   Starting Projector first ensures no events are missed.
 func (h *Handler) RunWorkflow(runner *WorkflowRunner) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		id, err := uuid.Parse(c.Param("id"))
@@ -227,8 +227,6 @@ func (h *Handler) RunWorkflow(runner *WorkflowRunner) gin.HandlerFunc {
 			response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
 			return
 		}
-
-		// Verify workflow exists and is in running status.
 		wf, err := h.engine.GetByID(c.Request.Context(), id)
 		if err != nil {
 			response.NotFound(c, "workflow")
@@ -236,23 +234,26 @@ func (h *Handler) RunWorkflow(runner *WorkflowRunner) gin.HandlerFunc {
 		}
 		if wf.Status != StatusRunning {
 			response.BadRequest(c, "INVALID_STATUS",
-				fmt.Sprintf("workflow must be in 'running' status to run (current: %s). Call POST /start first.", wf.Status))
+				fmt.Sprintf("workflow must be 'running' (current: %s). Call POST /start first.", wf.Status))
 			return
 		}
 
-		// Launch WorkflowRunner in background.
-		// WHY context.Background() not c.Request.Context():
-		//   Request context is cancelled when HTTP response is sent.
-		//   Runner must outlive the HTTP request.
-		go runner.Run(context.Background(), id)
+		// WHY context.Background(): both goroutines must outlive the HTTP request.
+		runCtx := context.Background()
 
-		h.logger.Info("workflow runner launched",
+		// Start Projector FIRST: must be subscribed before Runner posts events.
+		go h.projector.Run(runCtx, id)
+
+		// Start Runner: drives workflow to completion.
+		go runner.Run(runCtx, id)
+
+		h.logger.Info("workflow runner + projector launched",
 			zap.String("workflow_id", id.String()),
 		)
 		c.JSON(202, map[string]interface{}{
 			"status":      "accepted",
 			"workflow_id": id.String(),
-			"message":     "WorkflowRunner started. Track progress via GET /kanban/stream",
+			"message":     "WorkflowRunner started. Track via GET /kanban/stream",
 		})
 	}
 }
