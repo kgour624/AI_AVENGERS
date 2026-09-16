@@ -237,6 +237,7 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.logger.Info("resume: skipping topic batches", zap.Int("skip_to_batch", resumeTopicBatch))
 	}
 
+	ptimer.Start("topic_extract")
 	for batchStart := 0; batchStart < len(chunks); batchStart += topicBatchSize {
 		batchIdx := batchStart / topicBatchSize
 		// Skip already-processed batches on resume
