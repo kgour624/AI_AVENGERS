@@ -200,7 +200,9 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.logger.Info("resume: loaded chunks from DB", zap.Int("count", len(chunks)))
 	} else {
 		p.updateStage(ctx, jobID, StageChunking, "Splitting transcript...")
+		ptimer.Start("chunk")
 		chunks = p.chunker.Chunk(transcript)
+		ptimer.Stop("chunk")
 		if len(chunks) == 0 {
 			err := fmt.Errorf("no chunks created from transcript")
 			p.updateJobStatus(ctx, jobID, "failed", err.Error(), 0, 0)
