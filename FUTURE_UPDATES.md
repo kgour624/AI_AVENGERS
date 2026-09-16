@@ -682,7 +682,23 @@ Graceful shutdown already implemented:
 
 ---
 
-## Implementation Order (When Time Comes)
+## Item 7: Workflow Hybrid Context — Training RAG + Blackboard
+
+**Status:** `DONE` (2026-09-16)
+**Files changed:**
+  - `backend-go/internal/context/assembler.go` — `GetCourseChunksForWorkflow()` exported
+  - `backend-go/internal/workflow/agent_loop.go` — training fetch in OBSERVE step
+  - `backend-go/cmd/server/main.go` — assembler injected into AgentLoop
+
+**What was done:**
+  AgentLoop now fetches expert's training chunks (RAG) in OBSERVE step.
+  Context = Training material (APPLY_PRINCIPLES) + Blackboard (peers' work).
+  System prompt instructs expert to apply principles, not just copy answers.
+  Expert never refuses — graceful degradation to blackboard-only if no training.
+
+---
+
+
 
 ```
 1. Item 4 (useKanbanStream)  — IN PROGRESS, highest UX value
