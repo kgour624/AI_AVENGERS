@@ -189,7 +189,10 @@ func NewOrchestrator(
 		// WHY these numbers: LLM providers typically allow 5-10 RPM per key.
 		// 2 req/s = 120 RPM, well within provider limits.
 		// Burst=5 allows short spikes (e.g. user sends 3 messages quickly).
-		expertLimiter: ratelimit.NewTokenBucketLimiter(5, 2.0),
+		expertLimiter:        ratelimit.NewTokenBucketLimiter(5, 2.0),
+		// WHY 3: single admin user, 3 concurrent experts is the realistic max.
+		// Prevents goroutine explosion when LLM calls take 2-10s each.
+		expertMaxConcurrency: 3,
 	}
 }
 
