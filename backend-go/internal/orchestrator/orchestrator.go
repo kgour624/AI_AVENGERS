@@ -309,12 +309,18 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 
 	// SELF-LEARNING MODE: Understand → Extract → Verify.
 	// Converts raw question into domain-specific signal before RAG.
-	// WHY here: must run after context assembly (chunks available for
-	// domain context) but before decision engine (Gate 1 uses question).
-	// WHY nil check: selfLearning=nil means disabled — zero regression,
-	// original question used unchanged, no log spam.
+	//
+	// SKIP HEURISTIC (OCP — open for extension):
+	//   Problem-solving domains (DSA, coding, algorithms) already have
+	//   precise technical vocabulary. Self-learning adds 3 LLM calls
+	//   (~4-5s) with minimal accuracy gain for these domains because
+	//   the question is already domain-aligned.
+	//   IsProblemSolvingDomain() is the single source of truth for this
+	//   classification — same function Gate 1 uses, no duplication.
+	//
+	// WHY nil check: selfLearning=nil means disabled — zero regression.
 	questionForRAG := req.Message
-	if o.selfLearning != nil {
+	if o.selfLearning != nil && !chinawall.IsProblemSolvingDomain(expert.Domain) {
 		processed := o.selfLearning.Process(
 			ctx,
 			req.Message,
@@ -335,6 +341,11 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 				zap.String("reason", processed.SkippedReason),
 			)
 		}
+	} else if o.selfLearning != nil {
+		o.logger.Debug("self-learning: skipped for problem-solving domain",
+			zap.String("expert", expert.Name),
+			zap.String("domain", expert.Domain),
+		)
 	}
 
 	result, err := o.decisionEng.Process(
