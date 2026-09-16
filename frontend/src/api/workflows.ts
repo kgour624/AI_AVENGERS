@@ -78,6 +78,13 @@ export const startWorkflow = (workflowId: string) =>
     .post<ApiResponse<Workflow>>(`/api/v1/workflows/${workflowId}/start`)
     .then((res) => res.data.data!)
 
+export const runWorkflow = (workflowId: string) =>
+  baseAPI
+    .post<ApiResponse<{ status: string; workflowId: string; message: string }>>(
+      `/api/v1/workflows/${workflowId}/run`
+    )
+    .then((res) => res.data.data!)
+
 export const getKanban = (workflowId: string) =>
   baseAPI
     .get<ApiResponse<{ workflowId: string; tasks: KanbanTask[] }>>(
