@@ -307,7 +307,7 @@ func buildRouter(
 	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, validationPipeline, logger)
 	// WorkflowRunner: drives workflows from start to completion.
 	wfPlanner := workflow.NewPlanner(modelGateway, logger)
-	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, logger)
+	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, contextAssembler, logger)
 	wfRunner := workflow.NewWorkflowRunner(
 		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop,
 		wfTools, bbStore, modelGateway, logger,
