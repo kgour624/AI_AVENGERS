@@ -149,6 +149,21 @@ type Orchestrator struct {
 	// which would cause LLM provider rate limit hits.
 	// Strategy pattern: swap NoopLimiter for testing, TokenBucketLimiter for prod.
 	expertLimiter ratelimit.RateLimiter
+	// expertSemaphores enforces per-expert concurrency limits.
+	// Each expert gets a buffered channel of size expertMaxConcurrency.
+	// Acquiring = send to channel. Releasing = receive from channel.
+	// WHY separate from rate limiter:
+	//   Rate limiter: controls request rate (requests/second).
+	//   Semaphore: controls concurrent in-flight requests.
+	//   Both are needed: rate limiter prevents burst, semaphore prevents
+	//   goroutine explosion when requests are slow (LLM latency 2-10s).
+	// WHY sync.Map: keys are expert IDs (strings), created lazily.
+	//   sync.Map is optimized for write-once, read-many — perfect here.
+	expertSemaphores sync.Map // map[string]chan struct{}
+	// expertMaxConcurrency: max concurrent requests per expert.
+	// WHY 3: single admin user, 3 concurrent experts is the realistic max.
+	// Higher = goroutine explosion under LLM latency. Lower = unnecessary queuing.
+	expertMaxConcurrency int
 	logger      *zap.Logger
 }
 
