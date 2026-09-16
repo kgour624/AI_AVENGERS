@@ -305,8 +305,15 @@ func buildRouter(
 	wfEngine := workflow.NewEngine(postgres.Pool, logger)
 	validationPipeline := validation.NewPipeline(modelGateway, logger)
 	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, validationPipeline, logger)
-	_ = wfTools // used by expert execution loop (Phase E)
-	wfHandler := workflow.NewHandler(wfEngine, bbStore, logger)
+	// WorkflowRunner: drives workflows from start to completion.
+	// Planner + AgentLoop are the two core components.
+	wfPlanner := workflow.NewPlanner(modelGateway, logger)
+	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, modelGateway, logger)
+	wfRunner := workflow.NewWorkflowRunner(
+		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop,
+		wfTools, bbStore, modelGateway, logger,
+	)
+	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, logger)
 
 	// ============================================================
 	// Health check — no auth required
