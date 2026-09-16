@@ -161,14 +161,79 @@ func (a *Assembler) Assemble(
 	includeFullThread bool,
 ) (*AssembledContext, error) {
 
-	assembled := &AssembledContext{}
-	tokensUsed := 0
 	budget := a.maxTokens
 
+	// ── Fan-out: all independent context sources run concurrently ──────
+	// Each goroutine writes into its own typed result channel (buffered=1).
+	// No shared mutable state between goroutines — no mutex needed.
+	type summaryResult struct {
+		text string
+		err  error
+	}
+	type l2Result struct {
+		projCtx *memory.ProjectContext
+		err     error
+	}
+	type recentResult struct {
+		msgs []Message
+		err  error
+	}
+	type historyResult struct {
+		entries []HistoryEntry
+		err     error
+	}
+	type chunksResult struct {
+		chunks []chinawall.CourseChunk
+		err    error
+	}
+
+	summaryCh    := make(chan summaryResult, 1)
+	l2Ch         := make(chan l2Result, 1)
+	recentCh     := make(chan recentResult, 1)
+	historyCh    := make(chan historyResult, 1)
+	chunksCh     := make(chan chunksResult, 1)
+	repoChunksCh := make(chan chunksResult, 1)
+
+	go func() {
+		s, err := a.getRollingSummary(ctx, chatID)
+		summaryCh <- summaryResult{s, err}
+	}()
+	go func() {
+		pc, err := a.memManager.GetProjectContext(ctx, projectID, expertID, question)
+		l2Ch <- l2Result{pc, err}
+	}()
+	go func() {
+		msgs, err := a.getRecentMessages(ctx, chatID, a.recentMsgs)
+		recentCh <- recentResult{msgs, err}
+	}()
+	go func() {
+		h, err := a.searchChatHistory(ctx, chatID, question, a.semanticTopK)
+		historyCh <- historyResult{h, err}
+	}()
+	go func() {
+		c, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
+		chunksCh <- chunksResult{c, err}
+	}()
+	go func() {
+		c, err := a.getRepoChunks(ctx, projectID, question, a.chunksTopK)
+		repoChunksCh <- chunksResult{c, err}
+	}()
+
+	// Collect all fan-out results
+	summaryRes    := <-summaryCh
+	l2Res         := <-l2Ch
+	recentRes     := <-recentCh
+	historyRes    := <-historyCh
+	chunksRes     := <-chunksCh
+	repoChunksRes := <-repoChunksCh
+
+	// ── Merge + budget enforcement ──────────────────────────────────────
+	assembled := &AssembledContext{}
+	tokensUsed := 0
+
 	// 1. Rolling summary (10% budget)
-	summary, err := a.getRollingSummary(ctx, chatID)
-	if err == nil && summary != "" {
-		summaryTokens := estimateTokens(summary)
+	if summaryRes.err == nil && summaryRes.text != "" {
+		summaryTokens := estimateTokens(summaryRes.text)
 		if tokensUsed+summaryTokens <= budget*10/100+500 {
 			assembled.RollingSummary = summary
 			tokensUsed += summaryTokens
