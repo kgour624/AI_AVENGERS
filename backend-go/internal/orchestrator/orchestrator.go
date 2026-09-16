@@ -17,6 +17,7 @@ import (
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/memory"
+	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/selflearning"
 )
 
