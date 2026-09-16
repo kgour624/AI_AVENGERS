@@ -623,3 +623,22 @@ func formatReplyContext(thread []appcontext.ReplyThreadEntry) string {
 func parseJSON(data []byte, dst interface{}) error {
 	return json.Unmarshal(data, dst)
 }
+
+// getExpertSemaphore returns the semaphore channel for the given expert ID.
+// Creates a new buffered channel lazily on first access.
+//
+// WHY sync.Map.LoadOrStore:
+//   Multiple goroutines may call this simultaneously for the same expert.
+//   LoadOrStore is atomic — only one channel is ever created per expert.
+//   The "loser" goroutine discards its newly created channel and uses
+//   the winner's channel. No mutex needed.
+//
+// WHY buffered channel as semaphore:
+//   Buffered channel of size N = semaphore with N slots.
+//   Send = acquire. Receive = release.
+//   Non-blocking select in caller = try-acquire without waiting.
+func (o *Orchestrator) getExpertSemaphore(expertID string) chan struct{} {
+	newSem := make(chan struct{}, o.expertMaxConcurrency)
+	actual, _ := o.expertSemaphores.LoadOrStore(expertID, newSem)
+	return actual.(chan struct{})
+}
