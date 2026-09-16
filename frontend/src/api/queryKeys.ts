@@ -39,6 +39,11 @@ export const queryKeys = {
   chats: {
     messages: (id: string) => ['chats', id, 'messages'] as const,
   },
+  workflows: {
+    all: ['workflows'] as const,
+    detail: (id: string) => ['workflows', id] as const,
+    kanban: (id: string) => ['workflows', id, 'kanban'] as const,
+  },
   admin: {
     experts: ['admin', 'experts'] as const,
     clients: ['admin', 'clients'] as const,
