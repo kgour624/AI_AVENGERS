@@ -273,6 +273,24 @@ collected:
 func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRequest, expert expertRecord) ExpertResponse {
 	timer := observability.NewPhaseTimer()
 
+	// Per-expert rate limiting (Strategy pattern).
+	// Prevents a single expert from being overwhelmed by concurrent requests.
+	// expertLimiter is a TokenBucketLimiter in production, NoopLimiter in tests.
+	if !o.expertLimiter.Allow(ctx, ratelimit.ExpertKey(expert.ID)) {
+		o.logger.Warn("expert rate limit exceeded",
+			zap.String("expert_id", expert.ID),
+			zap.String("expert_name", expert.Name),
+		)
+		return ExpertResponse{
+			ExpertID:   expert.ID,
+			ExpertName: expert.Name,
+			Domain:     expert.Domain,
+			Mode:       decision.ModeREFUSE,
+			Content:    "Expert is busy. Please try again in a moment.",
+			Error:      "rate_limit_exceeded",
+		}
+	}
+
 	// Phase: context assembly (parallel fan-out inside Assemble)
 	timer.Start("context_assembly")
 	assembledCtx, err := o.assembler.Assemble(
