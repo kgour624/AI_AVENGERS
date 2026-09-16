@@ -623,6 +623,16 @@ func (p *IngestionPipeline) IngestTranscript(
 		zap.Bool("smoke_test_passed", smokeTestPassed),
 	)
 
+	// Log per-step phase breakdown for ingestion observability.
+	// Admin can see which step is the bottleneck (embed is typically 60-80%).
+	for _, phase := range ptimer.Results() {
+		p.logger.Info("ingestion phase timing",
+			zap.String("expert_id", expertID.String()),
+			zap.String("phase", phase.Name),
+			zap.Int64("ms", phase.DurationMs),
+		)
+	}
+
 	return &IngestionResult{
 		ExpertID:      expertID,
 		TotalChunks:   len(chunks),
