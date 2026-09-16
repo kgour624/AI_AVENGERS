@@ -103,24 +103,30 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
             const jobData = (data as { type: string; job: IngestionJob; ts: string })
             const job = jobData.job
             const isDone = data.type === 'complete' || data.type === 'failed'
+            // FIX: paused is also a terminal state for the SSE stream.
+            // Backend stops sending updates when job is paused.
+            // Close connection so we don't keep reconnecting forever.
+            const isPaused = job.status === 'paused'
 
             // Build human-readable log entry
             let logMsg = ''
             if (data.type === 'complete') {
-              logMsg = `✅ Complete — ${job.totalChunks} chunks stored`
+              logMsg = `\u2705 Complete \u2014 ${job.totalChunks} chunks stored`
             } else if (data.type === 'failed') {
-              logMsg = `❌ FAILED: ${job.errorMessage || 'Unknown error'}`
+              logMsg = `\u274c FAILED: ${job.errorMessage || 'Unknown error'}`
+            } else if (isPaused) {
+              logMsg = `\u23f8 PAUSED at ${job.currentStage ?? 'unknown stage'}: ${job.errorMessage || 'Charter LLM failed \u2014 waiting for admin action'}`
             } else {
               const pct = job.totalChunks > 0
                 ? Math.round((job.processedChunks / job.totalChunks) * 100)
                 : 0
-              logMsg = `${job.currentStage ?? job.status} — ${job.stageDetail || `${pct}%`}`
+              logMsg = `${job.currentStage ?? job.status} \u2014 ${job.stageDetail || `${pct}%`}`
               if (job.costUsd && job.costUsd > 0) {
-                logMsg += ` — $${job.costUsd.toFixed(4)}`
+                logMsg += ` \u2014 $${job.costUsd.toFixed(4)}`
               }
             }
 
-            addLog(data.type, logMsg, jobData.ts)
+            addLog(isPaused ? 'paused' : data.type, logMsg, jobData.ts)
 
             setState((prev) => ({
               ...prev,
@@ -130,8 +136,10 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
               error: data.type === 'failed' ? (job.errorMessage || 'Ingestion failed') : null,
             }))
 
-            // Close connection when done
-            if (isDone) {
+            // Close connection when done OR paused
+            // WHY close on paused: backend stops sending events.
+            // Keeping connection open causes infinite reconnect loop.
+            if (isDone || isPaused) {
               es.close()
               esRef.current = null
             }
