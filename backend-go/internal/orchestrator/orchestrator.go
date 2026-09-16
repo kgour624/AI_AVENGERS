@@ -388,10 +388,23 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// from chinawall (would create a circular dependency).
 	replyContext := formatReplyContext(assembledCtx.ReplyThread)
 
-	// Phase: self-learning (skipped for problem-solving domains)
+	// Phase: self-learning
+	// WHY self-learning is CRITICAL for DSA/problem-solving domains:
+	//   DSA problems are deliberately story-wrapped:
+	//   "Alice on chessboard, knight moves, find minimum moves"
+	//   RAG searches for "chessboard", "Alice", "knight" → wrong chunks.
+	//   Self-learning converts this to:
+	//   "BFS shortest path on grid, minimum distance between two cells"
+	//   → correct chunks retrieved.
+	//   Problem-solving domains need self-learning MORE than factual domains,
+	//   not less. Factual domains (medical/legal) have literal questions;
+	//   DSA problems are always obfuscated with story noise.
+	//
+	// Previous (WRONG) logic: skip for IsProblemSolvingDomain.
+	// Correct logic: run for ALL domains when selfLearning is non-nil.
 	timer.Start("self_learning")
 	questionForRAG := req.Message
-	if o.selfLearning != nil && !chinawall.IsProblemSolvingDomain(expert.Domain) {
+	if o.selfLearning != nil {
 		processed := o.selfLearning.Process(
 			ctx,
 			req.Message,
@@ -412,11 +425,6 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 				zap.String("reason", processed.SkippedReason),
 			)
 		}
-	} else if o.selfLearning != nil {
-		o.logger.Debug("self-learning: skipped for problem-solving domain",
-			zap.String("expert", expert.Name),
-			zap.String("domain", expert.Domain),
-		)
 	}
 	timer.Stop("self_learning")
 
