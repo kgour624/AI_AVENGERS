@@ -382,6 +382,7 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.logger.Info("resume: skipping embed batches", zap.Int("skip_to_batch", resumeEmbedBatch))
 	}
 
+	ptimer.Start("embed")
 	for batchStart := 0; batchStart < len(chunks); batchStart += embedBatchSize {
 		batchIdx := batchStart / embedBatchSize
 		if batchIdx < resumeEmbedBatch {
