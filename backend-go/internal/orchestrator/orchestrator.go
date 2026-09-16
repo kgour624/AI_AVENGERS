@@ -568,6 +568,122 @@ func (o *Orchestrator) synthesize(responses []ExpertResponse) *SynthesisResult {
 	return result
 }
 
+// allSameDomain returns true when every expert in the slice shares the same domain.
+// Used by Process() to decide between collaborative and parallel modes.
+//
+// WHY case-insensitive: domain field is user-entered (admin panel).
+// "DSA" and "dsa" should be treated as the same domain.
+func allSameDomain(experts []expertRecord) bool {
+	if len(experts) < 2 {
+		return false // single expert: no collaboration needed
+	}
+	first := strings.ToLower(experts[0].Domain)
+	for _, e := range experts[1:] {
+		if strings.ToLower(e.Domain) != first {
+			return false
+		}
+	}
+	return true
+}
+
+// processCollaborative runs same-domain experts in Plan-Execute sequence.
+//
+// PATTERN: Plan-Execute (Arpit Bhiyani AI Masterclass)
+//   Expert 1 (Analyst): analyze problem, propose approach, identify key concepts
+//   Expert 2 (Solver):  read Expert 1's analysis, produce enhanced final answer
+//   Expert N:           each reads all previous outputs, adds its perspective
+//
+// WHY sequential not parallel:
+//   Expert 2 NEEDS Expert 1's output as input.
+//   Parallel would give 2 independent answers — not collaboration.
+//
+// WHY inject prior analysis as replyContext:
+//   replyContext is already wired through the entire pipeline:
+//   orchestrator → decision engine → chinawall enforcer → LLM system prompt.
+//   Reusing this path means zero new wiring — Expert 2 sees Expert 1's
+//   analysis as "prior context" in its system prompt, exactly like a
+//   human expert reading a colleague's notes before answering.
+//
+// OUTPUT: single ExpertResponse from the last expert (the final answer).
+// All intermediate analyses are included in the response content so the
+// user can see the collaboration chain.
+func (o *Orchestrator) processCollaborative(
+	ctx context.Context,
+	req OrchestratorRequest,
+	experts []expertRecord,
+	start time.Time,
+) (*OrchestratorResponse, error) {
+	o.logger.Info("collaborative mode: same-domain experts",
+		zap.Int("expert_count", len(experts)),
+		zap.String("domain", experts[0].Domain),
+	)
+
+	// collaborativeContext accumulates each expert's output.
+	// Passed to the next expert as additional context.
+	// Format: "[ExpertName Analysis]\n{content}\n"
+	var collaborativeContext strings.Builder
+
+	var expertResponses []ExpertResponse
+
+	for i, expert := range experts {
+		// Build request for this expert.
+		// For Expert 2+: inject prior analyses as replyContext.
+		// We do this by appending to the message — the simplest, most
+		// reliable injection point that requires no new pipeline wiring.
+		expertReq := req
+		if i > 0 && collaborativeContext.Len() > 0 {
+			// Inject prior expert analyses into the question.
+			// WHY append to message not a separate field:
+			//   self-learning reads req.Message for RAG query.
+			//   context assembler reads req.Message for embedding.
+			//   Both benefit from seeing the prior analysis.
+			//   A separate field would require wiring through 5 layers.
+			expertReq.Message = fmt.Sprintf(
+				"%s\n\n--- PRIOR EXPERT ANALYSIS (read before answering) ---\n%s\n--- END PRIOR ANALYSIS ---",
+				req.Message,
+				collaborativeContext.String(),
+			)
+			// Only the last expert streams tokens (user sees final answer).
+			// Intermediate experts run blocking (no streaming).
+			expertReq.TokenCh = nil
+		}
+		// Last expert gets the original TokenCh for streaming.
+		if i == len(experts)-1 {
+			expertReq.TokenCh = req.TokenCh
+		}
+
+		result := o.processWithExpert(ctx, expertReq, expert)
+		expertResponses = append(expertResponses, result)
+
+		// If this expert produced a useful answer, add it to the
+		// collaborative context for the next expert.
+		if result.Error == "" && result.Content != "" &&
+			result.Mode != decision.ModeREFUSE {
+			collaborativeContext.WriteString(fmt.Sprintf(
+				"[%s]:\n%s\n\n",
+				expert.Name,
+				result.Content,
+			))
+		}
+
+		o.logger.Info("collaborative: expert completed",
+			zap.Int("step", i+1),
+			zap.Int("total", len(experts)),
+			zap.String("expert", expert.Name),
+			zap.String("mode", string(result.Mode)),
+		)
+	}
+
+	// Update memory async (non-blocking)
+	go o.updateMemory(context.Background(), req, expertResponses)
+
+	return &OrchestratorResponse{
+		ExpertResponses: expertResponses,
+		TurnNumber:      req.TurnNumber,
+		DurationMs:      time.Since(start).Milliseconds(),
+	}, nil
+}
+
 // updateMemory records the turn in all memory levels.
 func (o *Orchestrator) updateMemory(ctx context.Context, req OrchestratorRequest, responses []ExpertResponse) {
 	for _, resp := range responses {
