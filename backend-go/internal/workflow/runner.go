@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -454,17 +455,11 @@ func buildPlanContent(tasks []TaskSpec, experts []workflowExpert) map[string]int
 }
 
 // sleepCh returns a channel that closes after n seconds.
-// Used by waitForResume to avoid importing time.Sleep directly.
+// Used by waitForResume to avoid blocking the goroutine with time.Sleep.
 func sleepCh(seconds int) <-chan struct{} {
 	ch := make(chan struct{})
 	go func() {
-		// Use a simple counter loop to avoid importing time in this file.
-		// time is already imported via uuid indirectly, but explicit import
-		// would be cleaner. This is acceptable for a 2s poll interval.
-		// TODO: replace with time.After if this file imports time.
-		for i := 0; i < seconds*10; i++ {
-			// 100ms * 20 = 2s
-		}
+		time.Sleep(time.Duration(seconds) * time.Second)
 		close(ch)
 	}()
 	return ch
