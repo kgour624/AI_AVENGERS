@@ -35,6 +35,54 @@ func NewHandler(engine *Engine, store *blackboard.Store, redisClient *redis.Clie
 	}
 }
 
+// ListWorkflows GET /api/v1/workflows
+// Returns all workflows for the authenticated client, newest first.
+func (h *Handler) ListWorkflows(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+
+	rows, err := h.engine.db.Query(c.Request.Context(),
+		`SELECT id, client_id, project_id, title, status, current_phase,
+		        phase_started_at, phase_completed_at,
+		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
+		        cost_soft_limit_pct, cost_hard_limit_pct,
+		        created_at, updated_at
+		 FROM workflows
+		 WHERE client_id = $1
+		 ORDER BY updated_at DESC
+		 LIMIT 50`,
+		clientID,
+	)
+	if err != nil {
+		h.logger.Error("list workflows failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	defer rows.Close()
+
+	var workflows []Workflow
+	for rows.Next() {
+		var w Workflow
+		var expertIDsRaw []byte
+		if err := rows.Scan(
+			&w.ID, &w.ClientID, &w.ProjectID, &w.Title, &w.Status, &w.CurrentPhase,
+			&w.PhaseStartedAt, &w.PhaseCompletedAt,
+			&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
+			&w.CostSoftLimitPct, &w.CostHardLimitPct,
+			&w.CreatedAt, &w.UpdatedAt,
+		); err != nil {
+			continue
+		}
+		if len(expertIDsRaw) > 0 {
+			_ = json.Unmarshal(expertIDsRaw, &w.SelectedExpertIDs)
+		}
+		workflows = append(workflows, w)
+	}
+	if workflows == nil {
+		workflows = []Workflow{}
+	}
+	response.OK(c, workflows)
+}
+
 // CreateWorkflow POST /api/v1/workflows
 // Body: {project_id, title, selected_expert_ids, cost_budget_usd?}
 func (h *Handler) CreateWorkflow(c *gin.Context) {
