@@ -364,7 +364,7 @@ func (h *Handler) saveAssistantMessage(
 	// now stores exactly what was streamed, so ListMessages/reload renders
 	// identically to the live stream.
 	expertID := resp.ExpertID
-	_, err := h.chatSvc.SaveMessage(ctx, chat.Message{
+	savedID, err := h.chatSvc.SaveMessage(ctx, chat.Message{
 		ChatID:              chatID,
 		Role:                "assistant",
 		Content:             resp.Content,
@@ -402,8 +402,11 @@ func (h *Handler) saveAssistantMessage(
 			zap.String("expert", resp.ExpertName),
 			zap.Error(err),
 		)
+		_ = h.chatSvc.IncrementMessageCount(ctx, chatID)
+		return uuid.Nil
 	}
 	_ = h.chatSvc.IncrementMessageCount(ctx, chatID)
+	return savedID
 }
 
 // indexTurn creates a chat_index entry for semantic search.
