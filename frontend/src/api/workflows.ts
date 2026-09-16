@@ -53,6 +53,11 @@ export interface BlackboardEvent {
 // API functions
 // ============================================================
 
+export const listWorkflows = () =>
+  baseAPI
+    .get<ApiResponse<Workflow[]>>('/api/v1/workflows')
+    .then((res) => res.data.data ?? [])
+
 export const createWorkflow = (req: {
   projectId: string
   title: string
