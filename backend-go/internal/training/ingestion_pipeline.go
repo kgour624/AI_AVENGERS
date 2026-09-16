@@ -159,7 +159,9 @@ func (p *IngestionPipeline) IngestTranscript(
 	if transcript != "" {
 		cleaner := NewTranscriptCleaner()
 		originalLen := len(transcript)
+		ptimer.Start("clean")
 		transcript = cleaner.Clean(transcript)
+		ptimer.Stop("clean")
 		cleanedLen := len(transcript)
 		reductionPct := 0
 		if originalLen > 0 {
