@@ -36,7 +36,9 @@
 | 013 | `013_message_template_sections` | `messages` (template_sections JSONB) | Structured section-wise answers persist karne ke liye. Page reload pe blank answer bug fix. |
 | 014 | `014_workflow_recovery` | `workflows` (runner_state JSONB, current_task_cursor BIGINT), `workflow_tasks` (UNIQUE constraint on workflow_id + assigned_expert_id) | WorkflowRunner pod-restart recovery. Projector ON CONFLICT support. |
 
-**Next migration number: `015`**
+| 015 | `015_pending_experience` | `pending_experience` (new table) | Experience Bank staging area. Generic knowledge from Gate 3 saved here for admin review before promoting to course_chunks. |
+
+**Next migration number: `016`**
 
 ---
 
