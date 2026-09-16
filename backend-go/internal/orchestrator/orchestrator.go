@@ -318,9 +318,9 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// Per-expert rate limiting (Strategy pattern).
 	// Prevents a single expert from being overwhelmed by concurrent requests.
 	// expertLimiter is a TokenBucketLimiter in production, NoopLimiter in tests.
-	if !o.expertLimiter.Allow(ctx, ratelimit.ExpertKey(expert.ID)) {
+	if !o.expertLimiter.Allow(ctx, ratelimit.ExpertKey(expert.ID.String())) {
 		o.logger.Warn("expert rate limit exceeded",
-			zap.String("expert_id", expert.ID),
+			zap.String("expert_id", expert.ID.String()),
 			zap.String("expert_name", expert.Name),
 		)
 		return ExpertResponse{
@@ -338,7 +338,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// Acquire semaphore slot. If full: return busy response immediately.
 	// WHY non-blocking (select with default): we never want to block the
 	// caller goroutine. Queuing would hide backpressure from the user.
-	sem := o.getExpertSemaphore(expert.ID)
+	sem := o.getExpertSemaphore(expert.ID.String())
 	select {
 	case sem <- struct{}{}:
 		// Slot acquired. Release when function returns.
@@ -346,7 +346,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	default:
 		// All slots occupied. Return busy immediately.
 		o.logger.Warn("expert concurrency limit exceeded",
-			zap.String("expert_id", expert.ID),
+			zap.String("expert_id", expert.ID.String()),
 			zap.String("expert_name", expert.Name),
 			zap.Int("max_concurrency", o.expertMaxConcurrency),
 		)

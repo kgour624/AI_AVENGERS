@@ -628,8 +628,8 @@ func (p *IngestionPipeline) IngestTranscript(
 	for _, phase := range ptimer.Results() {
 		p.logger.Info("ingestion phase timing",
 			zap.String("expert_id", expertID.String()),
-			zap.String("phase", phase.Name),
-			zap.Int64("ms", phase.DurationMs),
+			zap.String("phase", phase.Phase),
+			zap.Int64("ms", phase.Duration.Milliseconds()),
 		)
 	}
 
