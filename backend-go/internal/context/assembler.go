@@ -235,7 +235,7 @@ func (a *Assembler) Assemble(
 	if summaryRes.err == nil && summaryRes.text != "" {
 		summaryTokens := estimateTokens(summaryRes.text)
 		if tokensUsed+summaryTokens <= budget*10/100+500 {
-			assembled.RollingSummary = summary
+			assembled.RollingSummary = summaryRes.text
 			tokensUsed += summaryTokens
 		}
 	}
