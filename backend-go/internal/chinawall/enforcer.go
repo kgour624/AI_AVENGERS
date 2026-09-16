@@ -664,45 +664,29 @@ COURSE CONTENT:
 	return &generatedAnswer{Answer: resp.Content, Citations: citations}, nil
 }
 
-// generateStructured is the CT-B1 structured JSON generation branch.
-// Called from generateWithCitations only when the expert's category has
-// a non-empty template_schema. Builds a JSON-only prompt (template.go's
-// buildStructuredPrompt), calls the strong model once, parses the result
-// into per-section text (template.go's parseStructuredResponse), then
-// extracts citations independently per section so Layer 4 can strip each
-// prose section on its own (CT-B2) without touching code/test_cases text.
+// generateStructured generates a structured answer section-by-section.
 //
-// Mental execution (fixed, post-RCA):
-// sections = [pattern(prose), idea(prose), code(code), walkthrough(prose), test_cases(test_cases)]
-// LLM returns valid JSON with all 5 keys -> parseStructuredResponse succeeds
-//   -> 5 TemplateSectionResult entries, citations extracted per prose section
-//   -> allCitations = union of pattern/idea/walkthrough citations (code/test_cases
-//      sections are not expected to contain [CHUNK_xxx] tokens per the prompt's
-//      rule #4, so extractCitations on them normally returns empty, which is
-//      correct — not a bug).
+// DESIGN DECISION (2026-09-16):
+//   Previous approach: one LLM call requesting ALL sections as a single
+//   JSON object. This failed reliably because:
+//   1. DeepSeek and reasoning models emit <think> blocks before JSON.
+//      Even after stripping, the JSON was often malformed or truncated.
+//   2. 5 heavy sections (prose + full code + test cases) in one JSON
+//      object routinely exceeded 32K tokens, truncating mid-JSON.
+//   3. JSON format forced the model to escape code (\n, \") — LLMs
+//      are unreliable at this, producing invalid JSON on complex code.
 //
-// Edge case (RCA 2026-09-08, real production symptom — reported as:
-// mode badge / confidence % / citations all render correctly, but the
-// actual answer body is garbled or near-empty): a DSA-style question
-// needs prose + a full working code block + 4 test-case buckets ALL
-// inside one JSON object — this routinely exceeds MaxTokens and the
-// model's response gets cut off mid-JSON. json.Unmarshal on a
-// truncated object always fails. The PREVIOUS fix for this dumped the
-// raw, half-formed JSON text straight into Answer as a "fallback" —
-// this is not a real fallback, it is broken output disguised as one:
-// stray braces/quotes/[CHUNK_xxx] tokens render as garbled or
-// near-invisible markdown, while Layer 1-2's mode/confidence and
-// Layer 3's extracted citations (independent metadata) still display
-// correctly — producing exactly the reported symptom.
+//   New approach: one LLM call PER SECTION, sequentially.
+//   WHY sequential not parallel:
+//   - User reads Pattern → Idea → Code → Walkthrough → TestCases in order.
+//     Sequential streaming lets them read each section as it arrives.
+//   - Each section is independently China-Wall enforced with citations.
+//   - No JSON format — plain text per section, no escaping issues.
+//   - Any model works: DeepSeek, Claude, Gemini — all return plain text.
 //
-// REAL fix: when parsing fails, fall back to generateFlatText — the
-// SAME reliable flat-prose+code generation path every non-categorized
-// expert already uses. This produces a genuine, complete answer
-// instead of surfacing a parser failure as content. The caller
-// (Enforce) already treats a zero-TemplateSections, non-empty-Answer
-// generatedAnswer as the flat path, so this transparently degrades
-// the WHOLE response to flat-text for this one turn — not a
-// half-structured, half-broken hybrid.
+//   SOLID: Single Responsibility — each section call has one job.
+//   OCP: New section types extend by adding a case, not modifying core.
+//   LSP: TemplateSectionResult contract unchanged — callers unaffected.
 func (e *Enforcer) generateStructured(
 	ctx context.Context,
 	question string,
@@ -717,50 +701,29 @@ func (e *Enforcer) generateStructured(
 	tokenCh chan<- string,
 ) (*generatedAnswer, error) {
 	if defaultLanguage == "" {
-		defaultLanguage = "java" // CT-L5: hardcoded default, admin-overridable per category
+		defaultLanguage = "java"
 	}
 
-	systemPrompt := buildStructuredPrompt(expertName, reasoningCharter, contextText, sections, defaultLanguage, profile)
-
-	// Inject reply context when the user is replying to a prior message.
-	// Empty string for fresh questions — no-op (CT-L2).
-	if replyContext != "" {
-		systemPrompt += "\n\n" + replyContext
-	}
-
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
-		Model:        gateway.ModelStrong,
-		SystemPrompt: systemPrompt,
-		UserPrompt:   question,
-		// Admin-configurable per domain (profile.MaxTokensStructured),
-		// falls back to DefaultMaxTokensStructured (3500) when unset (0).
-		// See DomainProfile's field comment for the 2026-09-08 RCA this
-		// setting exists to prevent from recurring on a different domain.
-		MaxTokens:   resolveMaxTokens(profile.MaxTokensStructured, DefaultMaxTokensStructured),
-		Temperature: 0.4,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	parsed, parseErr := parseStructuredResponse(resp.Content, sections)
-	if parseErr != nil {
-		e.logger.Warn("structured response parse failed (likely truncated JSON) — falling back to flat-text generation for this turn",
-			zap.Error(parseErr),
-			zap.Int("raw_response_length", len(resp.Content)),
-		)
-		return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextText, tokenCh)
-	}
-
-	// 2026-09-08 RCA: initialized non-nil - a structured answer with
-	// zero prose citations (e.g. only code/test_cases sections) must
-	// not marshal this as JSON null (crashes frontend citations.map()).
 	allCitations := []Citation{}
 	seen := make(map[string]bool)
 	resultSections := make([]TemplateSectionResult, 0, len(sections))
-	for _, s := range sections {
-		text := parsed[s.Key]
-		secCitations := e.extractCitations(text, chunks)
+
+	for _, section := range sections {
+		content, secCitations, err := e.generateOneSection(
+			ctx, question, chunks, expertName, reasoningCharter,
+			replyContext, contextText, section, defaultLanguage, profile, tokenCh,
+		)
+		if err != nil {
+			// One section failing should not kill the whole answer.
+			// Log and continue — user gets partial answer, not blank screen.
+			e.logger.Warn("section generation failed — using empty content",
+				zap.String("section", section.Key),
+				zap.Error(err),
+			)
+			content = ""
+			secCitations = []Citation{}
+		}
+
 		for _, c := range secCitations {
 			key := c.ChunkID.String()
 			if !seen[key] {
@@ -769,10 +732,10 @@ func (e *Enforcer) generateStructured(
 			}
 		}
 		resultSections = append(resultSections, TemplateSectionResult{
-			Key:       s.Key,
-			Label:     s.Label,
-			Type:      s.Type,
-			Content:   text,
+			Key:       section.Key,
+			Label:     section.Label,
+			Type:      section.Type,
+			Content:   content,
 			Citations: secCitations,
 		})
 	}
@@ -781,6 +744,176 @@ func (e *Enforcer) generateStructured(
 		Citations:        allCitations,
 		TemplateSections: resultSections,
 	}, nil
+}
+
+// generateOneSection generates content for a single template section.
+//
+// Each section type gets a purpose-built prompt:
+//   - prose:      explain + cite training material principles
+//   - code:       complete working code, no citations inside code block
+//   - test_cases: concrete test cases covering BASE/EDGE/CORNER/STRESS
+//
+// Streaming: if tokenCh is non-nil, tokens stream to the caller as they
+// arrive. A section label header ("## Pattern\n\n") is sent first so the
+// user knows which section is streaming.
+func (e *Enforcer) generateOneSection(
+	ctx context.Context,
+	question string,
+	chunks []CourseChunk,
+	expertName string,
+	reasoningCharter string,
+	replyContext string,
+	contextText string,
+	section category.TemplateSection,
+	defaultLanguage string,
+	profile *DomainProfile,
+	tokenCh chan<- string,
+) (string, []Citation, error) {
+	systemPrompt := e.buildSectionPrompt(
+		expertName, reasoningCharter, contextText,
+		section, defaultLanguage, profile,
+	)
+	if replyContext != "" {
+		systemPrompt += "\n\n" + replyContext
+	}
+
+	userPrompt := fmt.Sprintf(
+		"Question: %s\n\nGenerate ONLY the %s section. Plain text only — no JSON, no markdown wrapper.",
+		question, section.Label,
+	)
+
+	// Send section header to SSE stream so user sees which section is coming.
+	if tokenCh != nil {
+		header := fmt.Sprintf("\n\n## %s\n\n", section.Label)
+		select {
+		case tokenCh <- header:
+		case <-ctx.Done():
+			return "", nil, ctx.Err()
+		}
+	}
+
+	var content string
+
+	if tokenCh != nil {
+		// Streaming path: stream tokens to caller as they arrive.
+		streamCtx, streamCancel := context.WithTimeout(ctx, 60*time.Second)
+		rawTokenCh, rawRespCh, streamErr := e.gateway.StreamCall(streamCtx, gateway.LLMRequest{
+			Model:        gateway.ModelStrong,
+			SystemPrompt: systemPrompt,
+			UserPrompt:   userPrompt,
+			MaxTokens:    resolveMaxTokens(profile.MaxTokensFlat, DefaultMaxTokensFlat),
+			Temperature:  0.4,
+		})
+		if streamErr == nil {
+			var sb strings.Builder
+			for token := range rawTokenCh {
+				sb.WriteString(token)
+				select {
+				case tokenCh <- token:
+				case <-ctx.Done():
+					streamCancel()
+					return "", nil, ctx.Err()
+				}
+			}
+			<-rawRespCh
+			streamCancel()
+			content = sb.String()
+		} else {
+			streamCancel()
+		}
+	}
+
+	// Blocking fallback: streaming failed or tokenCh is nil.
+	if content == "" {
+		resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
+			Model:        gateway.ModelStrong,
+			SystemPrompt: systemPrompt,
+			UserPrompt:   userPrompt,
+			MaxTokens:    resolveMaxTokens(profile.MaxTokensFlat, DefaultMaxTokensFlat),
+			Temperature:  0.4,
+		})
+		if err != nil {
+			return "", nil, fmt.Errorf("section %s generation failed: %w", section.Key, err)
+		}
+		content = resp.Content
+	}
+
+	// Extract citations from the generated content.
+	// Code sections are citation-exempt by design (code IS the application
+	// of cited principles — no per-line citations needed in code blocks).
+	var citations []Citation
+	if section.Type != category.SectionTypeCode {
+		citations = e.extractCitations(content, chunks)
+	} else {
+		citations = []Citation{}
+	}
+
+	return content, citations, nil
+}
+
+// buildSectionPrompt builds a focused system prompt for one section.
+// Each section type gets purpose-built instructions — no JSON format,
+// no multi-section confusion, just one clear job per call.
+func (e *Enforcer) buildSectionPrompt(
+	expertName string,
+	reasoningCharter string,
+	contextText string,
+	section category.TemplateSection,
+	defaultLanguage string,
+	profile *DomainProfile,
+) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("You are %s, a domain expert.\n\n", expertName))
+	sb.WriteString(fmt.Sprintf("REASONING CHARTER:\n%s\n\n", reasoningCharter))
+	sb.WriteString("YOUR TRAINING MATERIAL:\n")
+	sb.WriteString(contextText)
+	sb.WriteString("\n\n")
+
+	switch section.Type {
+	case category.SectionTypeCode:
+		sb.WriteString(fmt.Sprintf(
+			"Write COMPLETE, WORKING %s code that solves the problem.\n"+
+				"Rules:\n"+
+				"1. Output ONLY the code in a fenced code block (```%s ... ```)\n"+
+				"2. Code must be correct and runnable\n"+
+				"3. No explanation outside the code block\n"+
+				"4. No [CHUNK_xxx] tokens inside the code\n",
+			defaultLanguage, defaultLanguage,
+		))
+
+	case category.SectionTypeTestCases:
+		sb.WriteString(
+			"Generate concrete test cases covering: BASE (normal), EDGE (boundary), CORNER (tricky), STRESS (large input).\n" +
+				"Format each as: Input → Expected Output (brief explanation).\n" +
+				"No code, no JSON — plain readable text.\n",
+		)
+
+	default: // prose sections: pattern, idea, walkthrough, complexity, etc.
+		guidance := sectionGuidance(section)
+		sb.WriteString(fmt.Sprintf("Write the %s section.\n", section.Label))
+		sb.WriteString(fmt.Sprintf("What to write: %s\n\n", guidance))
+
+		if profile.CitationMode == CitationModeLoose {
+			sb.WriteString(
+				"Citation rules:\n" +
+					"- Cite the training-material principles you apply using [CHUNK_uuid] format\n" +
+					"- Explain your full reasoning FIRST — citations support the explanation\n" +
+					"- NEVER answer with citations alone\n",
+			)
+		} else {
+			sb.WriteString(
+				"Citation rules:\n" +
+					"- Every factual claim MUST cite a source using [CHUNK_uuid] format\n" +
+					"- If information is not in your training material, say so explicitly\n",
+			)
+		}
+	}
+
+	if profile.SystemPromptExt != "" {
+		sb.WriteString(fmt.Sprintf("\nAdditional rules: %s\n", profile.SystemPromptExt))
+	}
+
+	return sb.String()
 }
 
 // extractCitations finds [CHUNK_uuid] references in the answer.
