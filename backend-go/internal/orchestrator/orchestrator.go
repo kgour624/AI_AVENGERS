@@ -314,18 +314,8 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// from chinawall (would create a circular dependency).
 	replyContext := formatReplyContext(assembledCtx.ReplyThread)
 
-	// SELF-LEARNING MODE: Understand → Extract → Verify.
-	// Converts raw question into domain-specific signal before RAG.
-	//
-	// SKIP HEURISTIC (OCP — open for extension):
-	//   Problem-solving domains (DSA, coding, algorithms) already have
-	//   precise technical vocabulary. Self-learning adds 3 LLM calls
-	//   (~4-5s) with minimal accuracy gain for these domains because
-	//   the question is already domain-aligned.
-	//   IsProblemSolvingDomain() is the single source of truth for this
-	//   classification — same function Gate 1 uses, no duplication.
-	//
-	// WHY nil check: selfLearning=nil means disabled — zero regression.
+	// Phase: self-learning (skipped for problem-solving domains)
+	timer.Start("self_learning")
 	questionForRAG := req.Message
 	if o.selfLearning != nil && !chinawall.IsProblemSolvingDomain(expert.Domain) {
 		processed := o.selfLearning.Process(
