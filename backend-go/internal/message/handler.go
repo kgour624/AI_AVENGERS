@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/chat"
+	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/ml"
