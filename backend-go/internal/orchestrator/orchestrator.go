@@ -344,7 +344,10 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 			zap.String("domain", expert.Domain),
 		)
 	}
+	timer.Stop("self_learning")
 
+	// Phase: decision engine (Gates 1-5 including LLM generation)
+	timer.Start("decision_engine")
 	result, err := o.decisionEng.Process(
 		ctx,
 		questionForRAG,
