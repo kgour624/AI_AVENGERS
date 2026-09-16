@@ -258,15 +258,17 @@ collected:
 }
 
 // processWithExpert runs one expert through the full pipeline.
+// Uses PhaseTimer (Observer pattern) to record per-phase latency.
 func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRequest, expert expertRecord) ExpertResponse {
-	// Assemble context. ReplyToMessageID/IncludeFullThread (CT-C1/C2) are
-	// nil/false for every fresh question — Assemble's reply-thread branch
-	// (source 7) is a pure no-op in that case, identical to before this
-	// feature existed.
+	timer := observability.NewPhaseTimer()
+
+	// Phase: context assembly (parallel fan-out inside Assemble)
+	timer.Start("context_assembly")
 	assembledCtx, err := o.assembler.Assemble(
 		ctx, req.ChatID, req.ProjectID, expert.ID, req.Message, req.TurnNumber,
 		req.ReplyToMessageID, req.IncludeFullThread,
 	)
+	timer.Stop("context_assembly")
 	if err != nil {
 		o.logger.Warn("context assembly failed", zap.String("expert", expert.Name), zap.Error(err))
 		return ExpertResponse{
