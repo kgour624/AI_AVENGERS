@@ -203,14 +203,24 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 
 		// ============================================================
-		// CONTEXT MANAGEMENT: Summarize if too many artifacts.
-		// WHY: 10+ artifacts * ~2k tokens = 20k+ tokens -> cost + limit.
-		// Fix: summarize old artifacts, keep recent ones in full.
+		// CONTEXT MANAGEMENT: Build context from gate result + blackboard.
 		// ============================================================
-		contextText, err := a.buildContext(ctx, allArtifacts, trainingChunks)
-		if err != nil {
-			a.logger.Warn("agent loop: buildContext failed, using raw", zap.Error(err))
-			contextText = buildContextFallback(allArtifacts, trainingChunks)
+		var contextText string
+		if gateResult != nil {
+			// Gate system ran: use gate-controlled context
+			gateCtx := FormatGateContext(gateResult)
+			blackboardCtx, bErr := a.buildBlackboardContext(ctx, allArtifacts)
+			if bErr != nil {
+				blackboardCtx = formatArtifacts(allArtifacts)
+			}
+			contextText = gateCtx + "\n[BLACKBOARD — peers' work]\n" + blackboardCtx
+		} else {
+			// No gate system (assembler nil): fallback to blackboard only
+			var bErr error
+			contextText, bErr = a.buildBlackboardContext(ctx, allArtifacts)
+			if bErr != nil {
+				contextText = formatArtifacts(allArtifacts)
+			}
 		}
 
 		// ============================================================
