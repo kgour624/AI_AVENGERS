@@ -499,6 +499,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	}
 
 	// Step 8: Build capability table
+	ptimer.Start("capability_build")
 	capabilities, err := p.capability.Build(ctx, chunks, topicResults)
 	if err != nil {
 		p.logger.Warn("capability build failed (LLM), falling back to chunk-based capabilities",
@@ -511,6 +512,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	} else {
 		p.storeCapabilities(ctx, expertID, capabilities)
 	}
+	ptimer.Stop("capability_build")
 
 	// Step 9: Update expert stats.
 	// BUG FIX (2026-09-08): previously used len(chunks)/uniqueTopics
