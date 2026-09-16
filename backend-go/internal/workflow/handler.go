@@ -17,19 +17,21 @@ import (
 
 // Handler handles all workflow + approval HTTP endpoints.
 type Handler struct {
-	engine *Engine
-	store  *blackboard.Store
-	redis  *redis.Client
-	logger *zap.Logger
+	engine    *Engine
+	store     *blackboard.Store
+	redis     *redis.Client
+	projector *Projector
+	logger    *zap.Logger
 }
 
 // NewHandler creates a new workflow handler.
-func NewHandler(engine *Engine, store *blackboard.Store, redisClient *redis.Client, logger *zap.Logger) *Handler {
+func NewHandler(engine *Engine, store *blackboard.Store, redisClient *redis.Client, projector *Projector, logger *zap.Logger) *Handler {
 	return &Handler{
-		engine: engine,
-		store:  store,
-		redis:  redisClient,
-		logger: logger,
+		engine:    engine,
+		store:     store,
+		redis:     redisClient,
+		projector: projector,
+		logger:    logger,
 	}
 }
 
