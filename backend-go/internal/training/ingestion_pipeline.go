@@ -319,7 +319,9 @@ func (p *IngestionPipeline) IngestTranscript(
 
 	if !charterAlreadyDone {
 		p.updateStage(ctx, jobID, StageCharterExtraction, "Extracting expert charter...")
+		ptimer.Start("charter_extract")
 		extractedCharter, extractErr := p.charters.Extract(ctx, transcript, expertName)
+		ptimer.Stop("charter_extract")
 		if extractErr != nil {
 			// Charter LLM failed (API error, rate limit, timeout, or bad output).
 			// Do NOT silently fall back to a default charter — charter quality
