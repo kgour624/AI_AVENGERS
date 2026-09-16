@@ -466,6 +466,4 @@ func (r *WorkflowRunner) ResumeOrphanWorkflows(ctx context.Context) {
 	}
 }
 
-// buildPlanContent uses strings.Builder internally.
-// Ensure strings import is used.
-var _ = strings.Builder{}
+
