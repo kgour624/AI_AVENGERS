@@ -314,13 +314,11 @@ func buildRouter(
 	)
 	// Projector: blackboard events -> workflow_tasks projection (single write path).
 	wfProjector := workflow.NewProjector(postgres.Pool, bbStore, bbSubscriber, logger)
-	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, logger)
+	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, wfProjector, logger)
 
 	// Resume any workflows that were running before pod restart.
 	// WHY background context: must outlive the HTTP server startup.
 	go wfRunner.ResumeOrphanWorkflows(context.Background())
-	// Projector for each running workflow is started by RunWorkflow handler.
-	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, wfProjector, logger)
 
 	// ============================================================
 	// Health check — no auth required
