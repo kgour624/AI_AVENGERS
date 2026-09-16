@@ -206,22 +206,20 @@ func NewOrchestrator(
 // Step 2: Launch 2 goroutines simultaneously
 //   Goroutine 1: DB Expert processes question
 //   Goroutine 2: SD Expert processes question
-// Step 3: Collect results (timeout: 30s)
+// Step 3: Collect results (timeout: 120s)
 // Step 4: If 2+ experts responded → synthesize
 // Step 5: Update memory async
 // Step 6: Return combined response
 //
-// COLLABORATIVE MODE (same-domain multi-expert):
-// When 2+ experts share the same domain (e.g. both DSA), they collaborate
-// instead of answering independently:
-//   Expert 1 (Analyst): analyze problem, propose approach
-//   Expert 2 (Solver):  read Expert 1's analysis, produce enhanced final answer
-// This matches the product tagline: "team of specialized AI Domain Experts"
-// working together, not independently.
+// WHY parallel (not sequential):
+//   Chat flow = conversational Q&A. Each expert answers independently
+//   from their own training corpus. No expert needs another's output
+//   to answer a chat question — they have different knowledge domains.
 //
-// WHY same-domain check:
-//   Different domains (DB + System Design) = independent answers = correct.
-//   Same domain (DSA + DSA) = parallel answers = redundant, not collaborative.
+//   Multi-agent COLLABORATION (where Expert B reads Expert A's output)
+//   happens in the WORKFLOW flow (/api/v1/workflows), not here.
+//   Workflow uses the Blackboard pattern — experts post artifacts,
+//   others read them, OTA loop drives each expert.
 func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*OrchestratorResponse, error) {
 	start := time.Now()
 
@@ -238,19 +236,10 @@ func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*O
 		return nil, fmt.Errorf("no active experts found")
 	}
 
-	// COLLABORATIVE MODE: same-domain experts work sequentially.
-	// Expert 1 analyzes → Expert 2 reads analysis → produces enhanced answer.
-	// WHY sequential not parallel: Expert 2 NEEDS Expert 1's output as input.
-	// This is the Plan-Execute pattern (Arpit Bhiyani AI Masterclass):
-	//   Planner produces structured analysis → Executor uses it to solve.
-	if len(experts) > 1 && allSameDomain(experts) {
-		return o.processCollaborative(ctx, req, experts, start)
-	}
-
-	// PARALLEL MODE: different-domain experts answer independently.
-	// DB Expert + System Design Expert = each has unique knowledge.
-	// Parallel is correct here — no dependency between domains.
-	// Run experts in parallel
+	// Run experts in parallel.
+	// WHY parallel: each expert has independent knowledge corpus.
+	// DB Expert and System Design Expert don't need each other's output
+	// to answer a chat question — they answer from their own training.
 	resultCh := make(chan ExpertResponse, len(experts))
 	var wg sync.WaitGroup
 
