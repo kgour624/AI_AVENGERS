@@ -118,7 +118,16 @@ func (e *Enforcer) Enforce(
 	profile := e.registry.Get(expertDomain)
 
 	// LAYER 1: Reranker threshold
+	// Priority: domain profile override > config default > relaxed (last retry).
+	// WHY domain override: principle-transfer domains (DSA) need lower threshold.
+	// WHY config default: factual domains (medical/legal) use strict 0.35.
+	// WHY relaxed on last retry: last-resort fallback to avoid total refusal.
 	threshold := e.cfg.RerankerThreshold
+	if profile.RerankerThreshold > 0 {
+		// Domain profile overrides config default.
+		// 0 means "use config default" (backward compatible).
+		threshold = profile.RerankerThreshold
+	}
 	if attempt >= e.cfg.MaxRetries-1 {
 		threshold = e.cfg.RelaxedThreshold // Last resort
 	}
