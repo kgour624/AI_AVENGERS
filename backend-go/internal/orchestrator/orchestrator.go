@@ -56,6 +56,10 @@ type OrchestratorResponse struct {
 	TurnNumber      int
 	TotalTokens     int
 	DurationMs      int64
+	// PhaseTimings holds per-phase latency breakdown for observability.
+	// Populated by processWithExpert via PhaseTimer (Observer pattern).
+	// Nil when no experts ran (error path).
+	PhaseTimings []observability.PhaseResult
 }
 
 // ExpertResponse is one expert's response.
