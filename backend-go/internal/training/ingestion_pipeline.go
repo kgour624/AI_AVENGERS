@@ -110,6 +110,10 @@ func (p *IngestionPipeline) IngestTranscript(
 	replaceExisting bool,
 ) (*IngestionResult, error) {
 	start := time.Now()
+	// PhaseTimer records per-step latency for ingestion observability.
+	// Logged at the end of IngestTranscript so admin can see which step
+	// is the bottleneck (embed is typically 60-80% of total time).
+	ptimer := observability.NewPhaseTimer()
 
 	p.logger.Info("ingestion started",
 		zap.String("expert_id", expertID.String()),
