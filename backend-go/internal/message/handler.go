@@ -345,6 +345,11 @@ func (h *Handler) Send(c *gin.Context) {
 		sendSSE(w, SSEDone, map[string]interface{}{
 			"turn_number":  turnNumber,
 			"duration_ms":  orchestratorResp.DurationMs,
+			// message_ids: expert_id -> saved message_id.
+			// Frontend uses this to render the Reply button immediately
+			// after SSEDone, without a separate API call to fetch message_id.
+			// Empty map when all saves failed (graceful degradation).
+			"message_ids": savedMessageIDs,
 		})
 
 		return false // Stop streaming
