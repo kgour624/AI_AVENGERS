@@ -144,6 +144,11 @@ type Orchestrator struct {
 	// domain-specific signal, improving RAG retrieval accuracy.
 	// WHY nil-safe: allows disabling self-learning without code change.
 	selfLearning *selflearning.QuestionProcessor
+	// expertLimiter enforces per-expert request rate limits.
+	// Prevents a single expert from being overwhelmed by concurrent requests
+	// which would cause LLM provider rate limit hits.
+	// Strategy pattern: swap NoopLimiter for testing, TokenBucketLimiter for prod.
+	expertLimiter ratelimit.RateLimiter
 	logger      *zap.Logger
 }
 
