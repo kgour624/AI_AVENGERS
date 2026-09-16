@@ -201,7 +201,57 @@ func (h *Handler) GetKanban(c *gin.Context) {
 	})
 }
 
-// RespondToApproval POST /api/v1/workflows/:id/approvals/:aid/respond
+// RunWorkflow POST /api/v1/workflows/:id/run
+// Starts the WorkflowRunner in a background goroutine.
+// Returns immediately — client polls GET /kanban or streams GET /kanban/stream.
+//
+// WHY background goroutine:
+//   WorkflowRunner can take minutes (multiple LLM calls per expert).
+//   HTTP request must return immediately.
+//   Client tracks progress via Kanban SSE stream.
+//
+// Mental execution:
+//   POST /workflows/abc/run
+//   1. Verify workflow exists and is in 'running' status
+//      (client must call POST /start before /run)
+//   2. Launch goroutine: go runner.Run(ctx, workflowID)
+//   3. Return 202 Accepted immediately
+func (h *Handler) RunWorkflow(runner *WorkflowRunner) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
+			return
+		}
+
+		// Verify workflow exists and is in running status.
+		wf, err := h.engine.GetByID(c.Request.Context(), id)
+		if err != nil {
+			response.NotFound(c, "workflow")
+			return
+		}
+		if wf.Status != StatusRunning {
+			response.BadRequest(c, "INVALID_STATUS",
+				fmt.Sprintf("workflow must be in 'running' status to run (current: %s). Call POST /start first.", wf.Status))
+			return
+		}
+
+		// Launch WorkflowRunner in background.
+		// WHY context.Background() not c.Request.Context():
+		//   Request context is cancelled when HTTP response is sent.
+		//   Runner must outlive the HTTP request.
+		go runner.Run(context.Background(), id)
+
+		h.logger.Info("workflow runner launched",
+			zap.String("workflow_id", id.String()),
+		)
+		c.JSON(202, map[string]interface{}{
+			"status":      "accepted",
+			"workflow_id": id.String(),
+			"message":     "WorkflowRunner started. Track progress via GET /kanban/stream",
+		})
+	}
+}
 // Body: {decision, notes?}
 // decision: approve | approve_with_notes | request_changes | reject_and_restart_phase | cancel_workflow
 func (h *Handler) RespondToApproval(c *gin.Context) {
