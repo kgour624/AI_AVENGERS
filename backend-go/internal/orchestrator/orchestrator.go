@@ -309,6 +309,33 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		}
 	}
 
+	// Per-expert concurrency limit (Semaphore pattern).
+	// Prevents goroutine explosion when LLM calls take 2-10s each.
+	// Acquire semaphore slot. If full: return busy response immediately.
+	// WHY non-blocking (select with default): we never want to block the
+	// caller goroutine. Queuing would hide backpressure from the user.
+	sem := o.getExpertSemaphore(expert.ID)
+	select {
+	case sem <- struct{}{}:
+		// Slot acquired. Release when function returns.
+		defer func() { <-sem }()
+	default:
+		// All slots occupied. Return busy immediately.
+		o.logger.Warn("expert concurrency limit exceeded",
+			zap.String("expert_id", expert.ID),
+			zap.String("expert_name", expert.Name),
+			zap.Int("max_concurrency", o.expertMaxConcurrency),
+		)
+		return ExpertResponse{
+			ExpertID:   expert.ID,
+			ExpertName: expert.Name,
+			Domain:     expert.Domain,
+			Mode:       decision.ModeREFUSE,
+			Content:    "Expert is handling too many requests. Please try again in a moment.",
+			Error:      "concurrency_limit_exceeded",
+		}
+	}
+
 	// Phase: context assembly (parallel fan-out inside Assemble)
 	timer.Start("context_assembly")
 	assembledCtx, err := o.assembler.Assemble(
