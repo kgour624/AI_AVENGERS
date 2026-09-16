@@ -293,6 +293,14 @@ func (h *Handler) Send(c *gin.Context) {
 		}
 
 		// Stream each expert response
+		// savedMessageIDs: collect message_id per expert for SSEDone.
+		// WHY sync save (not async goroutine):
+		//   Frontend needs message_id to render the Reply button.
+		//   If save is async, SSEDone arrives before DB write completes,
+		//   message_id is unavailable, Reply button never renders.
+		//   Save is fast (single INSERT, <5ms) — sync cost is negligible
+		//   compared to the 2-10s LLM generation that just completed.
+		savedMessageIDs := make(map[string]string) // expert_id -> message_id
 		for _, expertResp := range orchestratorResp.ExpertResponses {
 			// Send complete expert response
 			sendSSE(w, SSEComplete, map[string]interface{}{
@@ -312,8 +320,13 @@ func (h *Handler) Send(c *gin.Context) {
 				"template_sections": expertResp.TemplateSections,
 			})
 
-			// Save assistant message to DB (async)
-			go h.saveAssistantMessage(context.Background(), chatID, expertResp, turnNumber)
+			// Save assistant message SYNCHRONOUSLY.
+			// WHY sync: message_id needed in SSEDone for Reply button.
+			// Save is <5ms — negligible after 2-10s LLM generation.
+			savedID := h.saveAssistantMessage(context.Background(), chatID, expertResp, turnNumber)
+			if savedID.String() != uuid.Nil.String() {
+				savedMessageIDs[expertResp.ExpertID.String()] = savedID.String()
+			}
 		}
 
 		// Send synthesis if multiple experts
