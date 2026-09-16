@@ -432,6 +432,11 @@ func buildRouter(
 			workflows.POST("/:id/start", wfHandler.StartWorkflow)
 			workflows.GET("/:id/blackboard", wfHandler.GetBlackboard)
 			workflows.GET("/:id/kanban", wfHandler.GetKanban)
+			// POST /:id/run — starts WorkflowRunner in background goroutine.
+			// Returns immediately; client polls GET /kanban or streams GET /kanban/stream.
+			workflows.POST("/:id/run", wfHandler.RunWorkflow(wfRunner))
+			// GET /:id/kanban/stream — SSE stream of live Kanban updates.
+			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
 		}
 	}
