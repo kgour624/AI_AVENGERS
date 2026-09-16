@@ -565,7 +565,9 @@ func (p *IngestionPipeline) IngestTranscript(
 	// Step 10: Smoke test — verify the expert is actually retrievable.
 	// WHY here: chunks + capabilities are in DB, so retrieval is possible.
 	// WHY before marking complete: training_status must reflect real state.
+	ptimer.Start("smoke_test")
 	smokeTestPassed, smokePassCount, smokeErr := p.runSmokeTest(ctx, expertID, expertName)
+	ptimer.Stop("smoke_test")
 	if smokeErr != nil {
 		p.logger.Warn("smoke test error (non-fatal, expert stays draft)",
 			zap.String("expert_id", expertID.String()),
