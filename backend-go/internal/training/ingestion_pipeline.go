@@ -14,6 +14,7 @@ import (
 
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
+	"ai_avengers/backend/internal/observability"
 )
 
 // IngestionPipeline orchestrates the full transcript ingestion process.
