@@ -273,9 +273,15 @@ func (r *WorkflowRunner) executeWaves(
 				_, err := r.agentLoop.Run(ctx, AgentLoopRequest{
 					WorkflowID:      workflowID,
 					Expert:          expert,
-					TaskID:          uuid.Nil, // TaskID resolved by Projector from expert_id
+					TaskID:          uuid.Nil,
 					TaskTitle:       t.Title,
 					TaskDescription: t.Description,
+					// WorkflowPhase: passed so AgentLoop knows design vs implementation.
+					// Design phases: Gates 1+2+3 active.
+					// Implementation phase: Gate 1 only, generic BLOCKED.
+					WorkflowPhase: state.Phase,
+					// AllExperts: all workflow experts for Gate 2 peer poll.
+					AllExperts: experts,
 				})
 				if err != nil {
 					r.logger.Error("runner: task failed",
