@@ -38,6 +38,15 @@ const router = createBrowserRouter([
           { path: '/projects/:projectId', ...projectRoute },
           { path: '/projects/:projectId/chats/:chatId', ...chatRoute },
           { path: '/experts', ...expertsRoute },
+          // Workflow routes — were unregistered (404). Now wired.
+          {
+            path: '/workflows',
+            lazy: () => import('@/pages/workflows/WorkflowsPage'),
+          },
+          {
+            path: '/workflows/:id/kanban',
+            lazy: () => import('@/pages/workflows/KanbanPage'),
+          },
         ],
       },
 
