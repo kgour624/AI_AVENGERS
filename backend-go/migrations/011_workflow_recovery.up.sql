@@ -15,3 +15,17 @@ ALTER TABLE messages
 CREATE INDEX IF NOT EXISTS idx_messages_reply_to
     ON messages(reply_to_message_id)
     WHERE reply_to_message_id IS NOT NULL;
+
+-- Unique constraint required by Projector's ON CONFLICT (workflow_id, assigned_expert_id) DO NOTHING.
+-- Without this, INSERT in projector.go fails with: there is no unique constraint matching ON CONFLICT.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'workflow_tasks_workflow_expert_unique'
+    ) THEN
+        ALTER TABLE workflow_tasks
+            ADD CONSTRAINT workflow_tasks_workflow_expert_unique
+            UNIQUE (workflow_id, assigned_expert_id);
+    END IF;
+END $$;
