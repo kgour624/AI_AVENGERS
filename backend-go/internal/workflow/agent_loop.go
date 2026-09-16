@@ -264,6 +264,16 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 
 		if strings.Contains(llmResp.Content, doneMarker) {
+			// Save generic claims to Experience Bank before exiting
+			if a.experienceBank != nil && gateResult != nil && gateResult.GenericAllowed {
+				claims := ExtractGenericClaims(llmResp.Content)
+				if len(claims) > 0 {
+					a.experienceBank.SaveGenericClaims(
+						ctx, req.Expert.ID, req.WorkflowID,
+						req.TaskTitle, req.Expert.Domain, claims,
+					)
+				}
+			}
 			result.Completed = true
 			break
 		}
