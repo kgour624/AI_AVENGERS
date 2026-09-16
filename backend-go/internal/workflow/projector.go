@@ -1,0 +1,245 @@
+package workflow
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/blackboard"
+)
+
+// Projector subscribes to blackboard events and projects them into
+// the workflow_tasks table (Kanban state).
+//
+// DESIGN: Single Write Path
+//   Runner → Post event on blackboard
+//   Projector → reads event → updates workflow_tasks
+//   Kanban SSE → reads from same Redis channel (no DB polling)
+//
+// WHY Projector not direct INSERT:
+//   If Runner writes directly to workflow_tasks AND blackboard,
+//   they can diverge on failure (e.g. blackboard write succeeds,
+//   DB write fails). Projector ensures workflow_tasks is always
+//   a faithful projection of blackboard_events.
+//
+// Event → Projection mapping:
+//   task_plan_ready      → INSERT workflow_tasks rows
+//   task_status_changed  → UPDATE workflow_tasks.status
+//   task_failed          → UPDATE workflow_tasks.status = 'failed'
+//   artifact posted      → UPDATE workflow_tasks.produced_artifact_event_id
+type Projector struct {
+	db     *pgxpool.Pool
+	store  *blackboard.Store
+	sub    *blackboard.Subscriber
+	logger *zap.Logger
+}
+
+// NewProjector creates a new Projector.
+func NewProjector(db *pgxpool.Pool, store *blackboard.Store, sub *blackboard.Subscriber, logger *zap.Logger) *Projector {
+	return &Projector{db: db, store: store, sub: sub, logger: logger}
+}
+
+// Run starts the projection loop for a workflow.
+// Designed to run in a goroutine alongside WorkflowRunner.
+// Stops when ctx is cancelled (workflow complete or failed).
+//
+// Mental execution:
+//   workflowID = abc
+//   Subscribe from seq=0
+//
+//   Event: task_plan_ready {tasks: [{expert_id, title, description}, ...]}
+//   → INSERT workflow_tasks for each task
+//
+//   Event: task_status_changed {expert_id, status: "in_progress"}
+//   → UPDATE workflow_tasks SET status='in_progress' WHERE assigned_expert_id=expert_id
+//
+//   Event: architecture_decision (artifact)
+//   → UPDATE workflow_tasks SET produced_artifact_event_id=event.ID
+//      WHERE assigned_expert_id=event.PostedByExpertID
+func (p *Projector) Run(ctx context.Context, workflowID uuid.UUID) {
+	p.logger.Info("projector started", zap.String("workflow_id", workflowID.String()))
+
+	eventCh, errCh := p.sub.Subscribe(ctx, workflowID, uuid.Nil, 0)
+
+	for {
+		select {
+		case event, ok := <-eventCh:
+			if !ok {
+				p.logger.Info("projector: event channel closed",
+					zap.String("workflow_id", workflowID.String()),
+				)
+				return
+			}
+			p.project(ctx, workflowID, event)
+
+		case err := <-errCh:
+			if err != nil {
+				p.logger.Warn("projector: subscriber error",
+					zap.String("workflow_id", workflowID.String()),
+					zap.Error(err),
+				)
+			}
+			return
+
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// project handles one blackboard event and updates workflow_tasks accordingly.
+func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event blackboard.Event) {
+	switch event.EventType {
+
+	case "task_plan_ready":
+		// INSERT workflow_tasks rows from the plan.
+		// Content: {tasks: [{expert_id, title, description}, ...]}
+		var plan struct {
+			Tasks []struct {
+				ExpertID    string `json:"expert_id"`
+				Title       string `json:"title"`
+				Description string `json:"description"`
+			} `json:"tasks"`
+		}
+		if err := json.Unmarshal(event.Content, &plan); err != nil {
+			p.logger.Warn("projector: parse task_plan_ready failed", zap.Error(err))
+			return
+		}
+		for _, t := range plan.Tasks {
+			expertID, err := uuid.Parse(t.ExpertID)
+			if err != nil {
+				continue
+			}
+			_, err = p.db.Exec(ctx,
+				`INSERT INTO workflow_tasks
+					(workflow_id, assigned_expert_id, title, description, status)
+				 VALUES ($1, $2, $3, $4, 'todo')
+				 ON CONFLICT (workflow_id, assigned_expert_id) DO NOTHING`,
+				workflowID, expertID, t.Title, t.Description,
+			)
+			if err != nil {
+				p.logger.Warn("projector: insert task failed",
+					zap.String("expert_id", t.ExpertID),
+					zap.Error(err),
+				)
+			}
+		}
+
+	case "task_status_changed":
+		// UPDATE workflow_tasks.status
+		// Content: {expert_id, status, started_at?, completed_at?}
+		var payload struct {
+			ExpertID string `json:"expert_id"`
+			Status   string `json:"status"`
+		}
+		if err := json.Unmarshal(event.Content, &payload); err != nil {
+			return
+		}
+		expertID, err := uuid.Parse(payload.ExpertID)
+		if err != nil {
+			return
+		}
+		_, _ = p.db.Exec(ctx,
+			`UPDATE workflow_tasks SET
+				status = $1,
+				started_at   = CASE WHEN $1 = 'in_progress' AND started_at IS NULL THEN NOW() ELSE started_at END,
+				completed_at = CASE WHEN $1 IN ('done','failed') THEN NOW() ELSE completed_at END,
+				updated_at   = NOW()
+			 WHERE workflow_id = $2 AND assigned_expert_id = $3`,
+			payload.Status, workflowID, expertID,
+		)
+
+	case "task_failed":
+		// UPDATE workflow_tasks.status = 'failed'
+		// Content: {expert_id, reason}
+		var payload struct {
+			ExpertID string `json:"expert_id"`
+		}
+		if err := json.Unmarshal(event.Content, &payload); err != nil {
+			return
+		}
+		expertID, err := uuid.Parse(payload.ExpertID)
+		if err != nil {
+			return
+		}
+		_, _ = p.db.Exec(ctx,
+			`UPDATE workflow_tasks SET status='failed', completed_at=NOW(), updated_at=NOW()
+			 WHERE workflow_id=$1 AND assigned_expert_id=$2`,
+			workflowID, expertID,
+		)
+
+	default:
+		// Artifact events: update produced_artifact_event_id.
+		artifactTypes := map[string]bool{
+			"architecture_decision":  true,
+			"data_model_proposed":    true,
+			"api_contract_proposed":  true,
+			"module_design_proposed": true,
+			"code_artifact_produced": true,
+			"test_case_proposed":     true,
+			"requirement_captured":   true,
+		}
+		if !artifactTypes[event.EventType] {
+			return
+		}
+		if event.PostedByExpertID == nil {
+			return
+		}
+		_, _ = p.db.Exec(ctx,
+			`UPDATE workflow_tasks
+			 SET produced_artifact_event_id = $1, updated_at = NOW()
+			 WHERE workflow_id = $2 AND assigned_expert_id = $3`,
+			event.ID, workflowID, *event.PostedByExpertID,
+		)
+	}
+}
+
+// AddUniqueConstraintSQL is the SQL needed to support ON CONFLICT in project().
+// Must be run as part of migration 011 or separately.
+// workflow_tasks needs (workflow_id, assigned_expert_id) unique constraint.
+const AddUniqueConstraintSQL = `
+ALTER TABLE workflow_tasks
+    ADD CONSTRAINT IF NOT EXISTS workflow_tasks_workflow_expert_unique
+    UNIQUE (workflow_id, assigned_expert_id);
+`
+
+// PostTaskStatus posts a task_status_changed event on the blackboard.
+// Called by AgentLoop instead of direct DB write.
+// Projector will pick this up and update workflow_tasks.
+func PostTaskStatus(ctx context.Context, store *blackboard.Store, workflowID, expertID uuid.UUID, status string) error {
+	_, err := store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:       workflowID,
+		EventType:        "task_status_changed",
+		PostedByExpertID: &expertID,
+		Content: map[string]string{
+			"expert_id": expertID.String(),
+			"status":    status,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("PostTaskStatus: %w", err)
+	}
+	return nil
+}
+
+// PostTaskFailed posts a task_failed event on the blackboard.
+// Called by AgentLoop when LLM call fails fatally.
+func PostTaskFailed(ctx context.Context, store *blackboard.Store, workflowID, expertID uuid.UUID, reason string) error {
+	_, err := store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:       workflowID,
+		EventType:        "task_failed",
+		PostedByExpertID: &expertID,
+		Content: map[string]interface{}{
+			"expert_id": expertID.String(),
+			"reason":    reason,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("PostTaskFailed: %w", err)
+	}
+	return nil
+}
