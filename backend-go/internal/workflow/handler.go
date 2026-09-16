@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/blackboard"
@@ -16,14 +17,16 @@ import (
 type Handler struct {
 	engine *Engine
 	store  *blackboard.Store
+	redis  *redis.Client
 	logger *zap.Logger
 }
 
 // NewHandler creates a new workflow handler.
-func NewHandler(engine *Engine, store *blackboard.Store, logger *zap.Logger) *Handler {
+func NewHandler(engine *Engine, store *blackboard.Store, redisClient *redis.Client, logger *zap.Logger) *Handler {
 	return &Handler{
 		engine: engine,
 		store:  store,
+		redis:  redisClient,
 		logger: logger,
 	}
 }
