@@ -246,23 +246,12 @@ func (a *Assembler) Assemble(
 	// tokensUsed before running). Every L2Entry's tokens were added
 	// unconditionally, so a long-running conversation with many
 	// cross-expert decisions could silently consume far more than its
-	// declared 20% share — leaving nothing for step 5 (course chunks,
-	// declared "most important") once its own 90%-of-budget guard was
-	// reached. That crowd-out is exactly what caused a trained DSA
-	// expert to see ZERO course chunks and refuse "This topic is not in
-	// my training material" on later turns of a conversation, while an
-	// earlier turn (fresh budget) worked fine. Fix: enforce the SAME
-	// 20% cap this step already claims in its own comment, by capping
-	// entries actually kept (both here AND in assembled.ProjectContext,
-	// since FormatForPrompt below reads straight from that field —
-	// capping tokensUsed alone without also trimming the real entries
-	// list would not have fixed anything).
-	projCtx, err := a.memManager.GetProjectContext(ctx, projectID, expertID, question)
-	if err == nil {
+	// 2. L2 project memory (20% budget) — from fan-out result
+	if l2Res.err == nil && l2Res.projCtx != nil {
 		l2Budget := budget * 20 / 100
 		l2Tokens := 0
-		kept := projCtx.L2Entries[:0:0] // fresh slice, never aliases the original backing array
-		for _, entry := range projCtx.L2Entries {
+		kept := l2Res.projCtx.L2Entries[:0:0]
+		for _, entry := range l2Res.projCtx.L2Entries {
 			t := estimateTokens(entry.Content)
 			if l2Tokens+t > l2Budget && len(kept) > 0 {
 				break
@@ -270,174 +259,94 @@ func (a *Assembler) Assemble(
 			kept = append(kept, entry)
 			l2Tokens += t
 		}
-		if len(kept) < len(projCtx.L2Entries) {
+		if len(kept) < len(l2Res.projCtx.L2Entries) {
 			a.logger.Debug("L2 project memory truncated to stay within its 20% budget",
 				zap.Int("kept", len(kept)),
-				zap.Int("total", len(projCtx.L2Entries)),
+				zap.Int("total", len(l2Res.projCtx.L2Entries)),
 			)
 		}
-		projCtx.L2Entries = kept
-		assembled.ProjectContext = projCtx
+		l2Res.projCtx.L2Entries = kept
+		assembled.ProjectContext = l2Res.projCtx
 		tokensUsed += l2Tokens
 	}
 
-	// 3. Recent messages (20% budget)
-	// FIX (2026-09-08 RCA, same class of bug as step 2 above): the
-	// pre-entry check below only decided WHETHER to run this step, not
-	// how much of it to keep once running — every message's tokens were
-	// added unconditionally afterward. A long assistant answer (a full
-	// DSA solution with code) could alone consume several times this
-	// step's declared 20% share. Same fix pattern: cap greedily, keep at
-	// least the single most recent message even if it alone exceeds the
-	// cap (recency matters more than a hard budget wall here — dropping
-	// the newest message entirely would be worse than slightly
-	// exceeding this step's soft cap).
-	if tokensUsed < budget*60/100 {
-		recent, err := a.getRecentMessages(ctx, chatID, a.recentMsgs)
-		if err == nil {
-			recentBudget := budget * 20 / 100
-			recentTokens := 0
-			var kept []Message
-			// getRecentMessages already returns chronological (oldest->newest)
-			// order (it reverses its own DESC query) — iterate from the END
-			// (newest first) so truncation drops the OLDEST messages first,
-			// then restore chronological order for FormatForPrompt.
-			for i := len(recent) - 1; i >= 0; i-- {
-				t := estimateTokens(recent[i].Content)
-				if recentTokens+t > recentBudget && len(kept) > 0 {
-					break
-				}
-				kept = append(kept, recent[i])
-				recentTokens += t
+	// 3. Recent messages (20% budget) — from fan-out result
+	if recentRes.err == nil {
+		recentBudget := budget * 20 / 100
+		recentTokens := 0
+		var kept []Message
+		for i := len(recentRes.msgs) - 1; i >= 0; i-- {
+			t := estimateTokens(recentRes.msgs[i].Content)
+			if recentTokens+t > recentBudget && len(kept) > 0 {
+				break
 			}
-			for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
-				kept[i], kept[j] = kept[j], kept[i]
-			}
-			if len(kept) < len(recent) {
-				a.logger.Debug("recent messages truncated to stay within 20% budget",
-					zap.Int("kept", len(kept)),
-					zap.Int("total", len(recent)),
-				)
-			}
-			assembled.RecentMessages = kept
-			tokensUsed += recentTokens
+			kept = append(kept, recentRes.msgs[i])
+			recentTokens += t
 		}
+		for i, j := 0, len(kept)-1; i < j; i, j = i+1, j-1 {
+			kept[i], kept[j] = kept[j], kept[i]
+		}
+		if len(kept) < len(recentRes.msgs) {
+			a.logger.Debug("recent messages truncated to stay within 20% budget",
+				zap.Int("kept", len(kept)),
+				zap.Int("total", len(recentRes.msgs)),
+			)
+		}
+		assembled.RecentMessages = kept
+		tokensUsed += recentTokens
 	}
 
-	// 4. Semantic history (15% budget)
-	// Same enforcement pattern as steps 2/3 — lower risk in practice
-	// (OneLineSummary entries are short one-liners), but fixed for the
-	// same reason: a step that claims a % budget must actually enforce
-	// it, not just gate its own entry.
-	if tokensUsed < budget*75/100 {
-		history, err := a.searchChatHistory(ctx, chatID, question, a.semanticTopK)
-		if err == nil {
-			historyBudget := budget * 15 / 100
-			historyTokens := 0
-			var kept []HistoryEntry
-			for _, h := range history {
-				t := estimateTokens(h.OneLineSummary)
-				if historyTokens+t > historyBudget && len(kept) > 0 {
-					break
-				}
-				kept = append(kept, h)
-				historyTokens += t
+	// 4. Semantic history (15% budget) — from fan-out result
+	if historyRes.err == nil {
+		historyBudget := budget * 15 / 100
+		historyTokens := 0
+		var kept []HistoryEntry
+		for _, h := range historyRes.entries {
+			t := estimateTokens(h.OneLineSummary)
+			if historyTokens+t > historyBudget && len(kept) > 0 {
+				break
 			}
-			assembled.RelevantHistory = kept
-			tokensUsed += historyTokens
+			kept = append(kept, h)
+			historyTokens += t
 		}
+		assembled.RelevantHistory = kept
+		tokensUsed += historyTokens
 	}
 
-	// 5. Course chunks — "most important" (per this function's own doc
-	// comment above). FIX (2026-09-08 RCA): previously gated behind
-	// `if tokensUsed < budget*90/100`, which is exactly what let steps
-	// 2/3/4's budget overruns silently starve this step to ZERO chunks
-	// on later conversation turns — the root cause of a trained expert
-	// refusing with "This topic is not in my training material" despite
-	// having real, relevant course content. Chunk COUNT is already
-	// bounded by a.chunksTopK (config), so running this unconditionally
-	// cannot cause unbounded growth — it can, in a pathological case,
-	// modestly exceed the soft `budget` ceiling, which is an intentional
-	// trade-off: a refused answer is a much worse failure mode than a
-	// prompt slightly over its token budget (same rationale already
-	// documented on the reply-thread step below, applied here to the
-	// step whose own doc comment calls it "most important").
-	chunks, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
-	if err != nil {
-		// FIX (2026-09-08 RCA): this error was previously swallowed
-		// completely silently — zero chunks reached decision.Engine's
-		// Gate 2, which then refused with "This topic is not in my
-		// training material", indistinguishable from a genuine
-		// coverage gap. An admin debugging that refusal had no way to
-		// tell "ML sidecar down / embedding failed" apart from "this
-		// expert genuinely never trained on this topic" without this
-		// log line. Warn (not Error): a single question failing
-		// retrieval is degraded service, not a crash — matches this
-		// file's existing severity convention (getReplyThread already
-		// Warns on its own non-fatal failures).
+	// 5. Course chunks — most important, always include (from fan-out result)
+	if chunksRes.err != nil {
 		a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
 			zap.String("expert_id", expertID.String()),
-			zap.Error(err),
+			zap.Error(chunksRes.err),
 		)
 	} else {
-		assembled.CourseChunks = chunks
-		for _, c := range chunks {
+		assembled.CourseChunks = chunksRes.chunks
+		for _, c := range chunksRes.chunks {
 			tokensUsed += estimateTokens(c.Text)
 		}
-		if len(chunks) == 0 {
-			// No error, but genuinely zero candidates found (vector
-			// search itself returned 0 rows for this expert_id — e.g.
-			// wrong/stale expert_id, or the table really is empty).
-			// Distinct from the err!=nil branch above: this is NOT a
-			// transient failure, it is a real "no candidates" result —
-			// logging it separately so the two causes are never
-			// conflated when reading logs later.
-			a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content and matches the expert actually selected",
+		if len(chunksRes.chunks) == 0 {
+			a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content",
 				zap.String("expert_id", expertID.String()),
 				zap.String("question_preview", question[:minInt(80, len(question))]),
 			)
 		}
 	}
 
-	// 6. Connected repo code chunks (client's own codebase, if any).
-	// Bug 3.3 fix (docs bug list): repo_chunks table + sync pipeline
-	// (migration 003, repo.Service.SyncRepo) already populate this per
-	// project, but nothing in this file ever queried it - connecting a
-	// GitHub/GitLab repo silently had zero effect on any expert's
-	// answers. Appended into the SAME CourseChunks slice (reuses
-	// chinawall.CourseChunk, not a new type) so this flows through the
-	// exact `chunks` parameter decision.Engine.Process and
-	// chinawall.Enforcer already consume - no other file needs to
-	// change for this context to actually reach the LLM prompt.
-	// Cheap no-op for projects with no connected repo: the query is
-	// scoped by project_id (indexed), so it simply returns 0 rows.
-	if tokensUsed < budget*95/100 {
-		repoChunks, err := a.getRepoChunks(ctx, projectID, question, a.chunksTopK)
-		if err != nil {
-			// Same fix as getCourseChunks above — was silently swallowed.
-			// Warn only (not the same "likely causing a refusal" wording):
-			// repo chunks are additive/optional context, a project with no
-			// connected repo is EXPECTED to have this return nothing, so
-			// this failure alone should never be read as the cause of a
-			// Gate 2 refusal the way a course-chunk failure would be.
-			a.logger.Warn("getRepoChunks failed — continuing without connected-repo context",
-				zap.String("project_id", projectID.String()),
-				zap.Error(err),
-			)
-		} else if len(repoChunks) > 0 {
-			assembled.CourseChunks = append(assembled.CourseChunks, repoChunks...)
-			for _, c := range repoChunks {
-				tokensUsed += estimateTokens(c.Text)
-			}
+	// 6. Connected repo code chunks (additive, optional) — from fan-out result
+	if repoChunksRes.err != nil {
+		a.logger.Warn("getRepoChunks failed — continuing without connected-repo context",
+			zap.String("project_id", projectID.String()),
+			zap.Error(repoChunksRes.err),
+		)
+	} else if len(repoChunksRes.chunks) > 0 && tokensUsed < budget*95/100 {
+		assembled.CourseChunks = append(assembled.CourseChunks, repoChunksRes.chunks...)
+		for _, c := range repoChunksRes.chunks {
+			tokensUsed += estimateTokens(c.Text)
 		}
 	}
 
-	// 7. Reply thread (CT-C2). Runs regardless of remaining budget %
-	// (unlike sources 1-6 above) because a reply is an explicit client
-	// action — pinning the wrong/missing context on a reply the client
-	// specifically asked to reference would be a worse failure mode than
-	// slightly exceeding the soft budget checkpoints above. Still counted
-	// into tokensUsed/TotalTokens for accurate reporting.
+	// 7. Reply thread (CT-C2). Runs after fan-out — depends on replyToMessageID.
+	// Runs regardless of remaining budget: a reply is an explicit client action.
 	if replyToMessageID != nil {
 		thread, err := a.getReplyThread(ctx, *replyToMessageID, includeFullThread)
 		if err != nil {
