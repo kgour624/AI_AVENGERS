@@ -297,6 +297,7 @@ func (p *IngestionPipeline) IngestTranscript(
 				fmt.Sprintf("%d/%d chunks tagged", batchEnd, len(chunks)))
 		}
 	}
+	ptimer.Stop("topic_extract")
 	p.logger.Info("topic extraction complete")
 
 	// ============================================================
