@@ -198,15 +198,6 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 	}
 }
 
-// AddUniqueConstraintSQL is the SQL needed to support ON CONFLICT in project().
-// Must be run as part of migration 011 or separately.
-// workflow_tasks needs (workflow_id, assigned_expert_id) unique constraint.
-const AddUniqueConstraintSQL = `
-ALTER TABLE workflow_tasks
-    ADD CONSTRAINT IF NOT EXISTS workflow_tasks_workflow_expert_unique
-    UNIQUE (workflow_id, assigned_expert_id);
-`
-
 // PostTaskStatus posts a task_status_changed event on the blackboard.
 // Called by AgentLoop instead of direct DB write.
 // Projector will pick this up and update workflow_tasks.
