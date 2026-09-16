@@ -449,7 +449,8 @@ func buildAgentSystemPrompt(req AgentLoopRequest) string {
 // buildAgentUserPrompt builds the user prompt for each OTA iteration.
 func buildAgentUserPrompt(req AgentLoopRequest, contextText string, iter int) string {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("BLACKBOARD CONTEXT:\n%s\n\n", contextText))
+	// contextText already contains [TRAINING MATERIAL] + [BLACKBOARD] sections
+	sb.WriteString(fmt.Sprintf("CONTEXT:\n%s\n\n", contextText))
 	sb.WriteString(fmt.Sprintf("ITERATION: %d\n", iter))
 	sb.WriteString(fmt.Sprintf("YOUR TASK: %s\n\n", req.TaskTitle))
 	sb.WriteString("Produce your artifact. Use PostArtifact to publish it. Output TASK_COMPLETE when done.")
