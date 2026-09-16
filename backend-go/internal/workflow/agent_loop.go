@@ -33,24 +33,30 @@ const recentArtifactsToKeepRaw = 5
 //
 // PATTERN: OTA Loop (Arpit Bhiyani AI Masterclass)
 //   Observe: ReadBlackboard(since=lastSeq) + summarize if needed
-//   Think:   LLM call with charter + task + context
+//            + FetchTrainingContext (expert's course_chunks via RAG)
+//   Think:   LLM call with charter + task + training + blackboard context
 //   Act:     Execute tool calls: PostArtifact, AskExpert
 //   Repeat until TASK_COMPLETE or max iterations
+//
+// HYBRID CONTEXT (Real Engineer Model):
+//   Expert = Training knowledge (course_chunks RAG) + Blackboard (peers' work)
+//   WHY: Like a real engineer who uses their past experience + team's work.
+//   Training chunks: APPLY_PRINCIPLES mode — principles transfer to new problems.
+//   Expert never refuses due to missing exact training — principles apply.
 //
 // STATUS UPDATES: via blackboard events (not direct DB writes).
 //   PostTaskStatus() -> task_status_changed event -> Projector -> workflow_tasks
 //   PostTaskFailed() -> task_failed event -> Projector -> workflow_tasks
-//
-// CONTEXT MANAGEMENT (Fix 4):
-//   > contextSummarizeThreshold artifacts -> summarize old ones
-//   Keep recentArtifactsToKeepRaw in full detail
-//   Prevents 40k+ token context explosion
 type AgentLoop struct {
-	db      *pgxpool.Pool
-	tools   *Tools
-	store   *blackboard.Store
-	gateway *gateway.ModelGateway
-	logger  *zap.Logger
+	db        *pgxpool.Pool
+	tools     *Tools
+	store     *blackboard.Store
+	gateway   *gateway.ModelGateway
+	// assembler: used to fetch expert's training chunks (RAG).
+	// Gives workflow experts their domain knowledge, not just generic LLM.
+	// nil = no training context (graceful degradation, not a crash).
+	assembler *appcontext.Assembler
+	logger    *zap.Logger
 }
 
 func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *gateway.ModelGateway, logger *zap.Logger) *AgentLoop {
