@@ -32,35 +32,43 @@ const recentArtifactsToKeepRaw = 5
 // AgentLoop runs one expert through the OTA (Observe-Think-Act) loop.
 //
 // PATTERN: OTA Loop (Arpit Bhiyani AI Masterclass)
-//   Observe: ReadBlackboard(since=lastSeq) + summarize if needed
-//            + FetchTrainingContext (expert's course_chunks via RAG)
-//   Think:   LLM call with charter + task + training + blackboard context
+//   Observe: ReadBlackboard + 3-Gate knowledge access
+//   Think:   LLM call with gate-controlled context
 //   Act:     Execute tool calls: PostArtifact, AskExpert
 //   Repeat until TASK_COMPLETE or max iterations
 //
-// HYBRID CONTEXT (Real Engineer Model):
-//   Expert = Training knowledge (course_chunks RAG) + Blackboard (peers' work)
-//   WHY: Like a real engineer who uses their past experience + team's work.
-//   Training chunks: APPLY_PRINCIPLES mode — principles transfer to new problems.
-//   Expert never refuses due to missing exact training — principles apply.
+// 3-GATE KNOWLEDGE ACCESS (Human Brain Model):
+//   Gate 1: Own training (70-80% knowledge) — generic BLOCKED if passes
+//   Gate 2: Peer knowledge (team's work) — generic BLOCKED if covers task
+//   Gate 3: Generic gap filling (20-30%) — only when Gates 1+2 fail
+//   Generic claims saved to pending_experience for admin review.
 //
-// STATUS UPDATES: via blackboard events (not direct DB writes).
-//   PostTaskStatus() -> task_status_changed event -> Projector -> workflow_tasks
-//   PostTaskFailed() -> task_failed event -> Projector -> workflow_tasks
+// 2-PHASE BEHAVIOR:
+//   Design phase (high_level_design): Gates 1+2+3 active
+//   Implementation phase (implementation): Gate 1 only, China Wall strict
 type AgentLoop struct {
-	db        *pgxpool.Pool
-	tools     *Tools
-	store     *blackboard.Store
-	gateway   *gateway.ModelGateway
-	// assembler: used to fetch expert's training chunks (RAG).
-	// Gives workflow experts their domain knowledge, not just generic LLM.
-	// nil = no training context (graceful degradation, not a crash).
-	assembler *appcontext.Assembler
-	logger    *zap.Logger
+	db             *pgxpool.Pool
+	tools          *Tools
+	store          *blackboard.Store
+	gateway        *gateway.ModelGateway
+	assembler      *appcontext.Assembler
+	gateSystem     *GateSystem
+	experienceBank *ExperienceBank
+	logger         *zap.Logger
 }
 
 func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *gateway.ModelGateway, assembler *appcontext.Assembler, logger *zap.Logger) *AgentLoop {
-	return &AgentLoop{db: db, tools: tools, store: store, gateway: gw, assembler: assembler, logger: logger}
+	var gs *GateSystem
+	var eb *ExperienceBank
+	if assembler != nil {
+		gs = NewGateSystem(assembler, gw, logger)
+		eb = NewExperienceBank(db, logger)
+	}
+	return &AgentLoop{
+		db: db, tools: tools, store: store, gateway: gw,
+		assembler: assembler, gateSystem: gs, experienceBank: eb,
+		logger: logger,
+	}
 }
 
 type AgentLoopRequest struct {
