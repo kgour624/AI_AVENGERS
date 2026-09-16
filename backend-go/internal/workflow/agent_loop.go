@@ -146,14 +146,42 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 
 		// ============================================================
+		// FETCH TRAINING CONTEXT: Expert's course_chunks via RAG.
+		// WHY: Real engineer model — expert uses their training knowledge
+		// + blackboard (peers' work) to solve new problems.
+		// APPLY_PRINCIPLES: chunks don't need to contain exact answer.
+		// "Distributed systems" training applies to "URL shortener" task.
+		// Failure: non-fatal — empty chunks = blackboard-only context.
+		// Only fetch on iteration 1: training doesn't change mid-loop.
+		// ============================================================
+		var trainingChunks []chinawall.CourseChunk
+		if iter == 1 && a.assembler != nil {
+			chunks, fetchErr := a.assembler.GetCourseChunksForWorkflow(
+				ctx, req.Expert.ID, req.TaskDescription, 5,
+			)
+			if fetchErr != nil {
+				a.logger.Warn("agent loop: training fetch failed (continuing without training context)",
+					zap.String("expert", req.Expert.Name),
+					zap.Error(fetchErr),
+				)
+			} else {
+				trainingChunks = chunks
+				a.logger.Info("agent loop: training context fetched",
+					zap.String("expert", req.Expert.Name),
+					zap.Int("chunks", len(trainingChunks)),
+				)
+			}
+		}
+
+		// ============================================================
 		// CONTEXT MANAGEMENT: Summarize if too many artifacts.
 		// WHY: 10+ artifacts * ~2k tokens = 20k+ tokens -> cost + limit.
 		// Fix: summarize old artifacts, keep recent ones in full.
 		// ============================================================
-		contextText, err := a.buildContext(ctx, allArtifacts)
+		contextText, err := a.buildContext(ctx, allArtifacts, trainingChunks)
 		if err != nil {
 			a.logger.Warn("agent loop: buildContext failed, using raw", zap.Error(err))
-			contextText = formatArtifacts(allArtifacts)
+			contextText = buildContextFallback(allArtifacts, trainingChunks)
 		}
 
 		// ============================================================
