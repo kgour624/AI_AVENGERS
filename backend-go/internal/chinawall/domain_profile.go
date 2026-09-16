@@ -132,6 +132,20 @@ type DomainProfile struct {
 	// buckets all inside ONE JSON object - routinely needs a much higher
 	// cap than a flat answer for the SAME domain.
 	MaxTokensStructured int
+
+	// RerankerThreshold: minimum rerank score for Layer 1 to pass.
+	// 0 means "use config default" (e.cfg.RerankerThreshold, typically 0.35).
+	//
+	// WHY per-domain threshold:
+	//   DSA/algorithms: principles transfer to new problems.
+	//   A chunk about "two pointers" is relevant to a new sliding window
+	//   question even if cosine similarity is lower (0.25 is fine).
+	//   Medical/legal: facts must be in the transcript.
+	//   A chunk with score 0.30 for a medical question is too risky.
+	//   Static 0.35 is wrong for both — too strict for DSA, too loose for medical.
+	//
+	// ADMIN PANEL: configurable per domain without redeploy.
+	RerankerThreshold float64
 }
 
 // DomainRule is a single domain-specific rule.
