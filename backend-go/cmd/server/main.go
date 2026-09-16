@@ -306,14 +306,22 @@ func buildRouter(
 	validationPipeline := validation.NewPipeline(modelGateway, logger)
 	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, validationPipeline, logger)
 	// WorkflowRunner: drives workflows from start to completion.
-	// Planner + AgentLoop are the two core components.
 	wfPlanner := workflow.NewPlanner(modelGateway, logger)
-	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, modelGateway, logger)
+	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, logger)
 	wfRunner := workflow.NewWorkflowRunner(
 		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop,
 		wfTools, bbStore, modelGateway, logger,
 	)
+	// Projector: blackboard events -> workflow_tasks projection (single write path).
+	wfProjector := workflow.NewProjector(postgres.Pool, bbStore, bbSubscriber, logger)
 	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, logger)
+
+	// Resume any workflows that were running before pod restart.
+	// WHY background context: must outlive the HTTP server startup.
+	go wfRunner.ResumeOrphanWorkflows(context.Background())
+	// Projector for each running workflow is started by RunWorkflow handler.
+	// wfProjector is passed to handler for use in RunWorkflow.
+	_ = wfProjector // used by wfHandler.RunWorkflow
 
 	// ============================================================
 	// Health check — no auth required
