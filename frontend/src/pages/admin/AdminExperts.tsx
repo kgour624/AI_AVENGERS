@@ -36,6 +36,7 @@ const STAGE_LABELS: Record<string, string> = {
   smoke_test: 'Step 6/6: Running smoke test',
   complete: 'Complete',
   failed: 'Failed',
+  paused: 'Paused — waiting for admin action',
 }
 
 function ExpertRow({
