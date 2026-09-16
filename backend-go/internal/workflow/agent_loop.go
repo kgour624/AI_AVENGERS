@@ -77,6 +77,13 @@ type AgentLoopRequest struct {
 	TaskID          uuid.UUID
 	TaskTitle       string
 	TaskDescription string
+	// WorkflowPhase: current phase of the workflow.
+	// Design phases (high_level_design, detailed_design): Gates 1+2+3 active.
+	// Implementation phase: Gate 1 only (China Wall strict, no generic).
+	WorkflowPhase string
+	// AllExperts: all experts in this workflow.
+	// Used by Gate 2 to poll peers for knowledge.
+	AllExperts []workflowExpert
 }
 
 type AgentLoopResult struct {
