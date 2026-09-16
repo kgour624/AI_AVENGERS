@@ -420,6 +420,7 @@ func (p *IngestionPipeline) IngestTranscript(
 		tracker.UpdateDB(ctx, batchEnd, StageEmbedding,
 			fmt.Sprintf("%d/%d embeddings generated", batchEnd, len(chunks)))
 	}
+	ptimer.Stop("embed")
 	p.logger.Info("embeddings generated", zap.Int("count", len(embeddings)))
 
 	// Step 5: Optional cleanup for full-replace mode.
