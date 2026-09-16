@@ -427,29 +427,22 @@ func (a *AgentLoop) act(ctx context.Context, req AgentLoopRequest, llmContent st
 }
 
 // buildAgentSystemPrompt builds the LLM system prompt for this expert's task.
+// APPLY_PRINCIPLES mode: training = principles to apply, not exact answers.
 func buildAgentSystemPrompt(req AgentLoopRequest) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("You are %s, a domain expert in %s.\n\n", req.Expert.Name, req.Expert.Domain))
 	sb.WriteString(fmt.Sprintf("REASONING CHARTER:\n%s\n\n", req.Expert.ReasoningCharter))
 	sb.WriteString(fmt.Sprintf("YOUR TASK:\n%s\n\n", req.TaskDescription))
-	sb.WriteString(`AVAILABLE TOOLS:
-Call tools by outputting a JSON block:
-
-<tool_call>
-{"tool": "PostArtifact", "event_type": "<type>", "content": {<artifact>}}
-</tool_call>
-
-Tool: PostArtifact
-  event_type: architecture_decision | data_model_proposed | api_contract_proposed |
-              module_design_proposed | code_artifact_produced | test_case_proposed |
-              requirement_captured
-
-Tool: AskExpert
-  <tool_call>{"tool": "AskExpert", "to_expert_id": "<uuid>", "question": "<text>"}</tool_call>
-
-WHEN DONE: Output TASK_COMPLETE as the last line.
-Do NOT output TASK_COMPLETE until you have posted your artifact via PostArtifact.
-`)
+	sb.WriteString("HOW TO USE YOUR CONTEXT:\n")
+	sb.WriteString("1. TRAINING MATERIAL: Principles from your training. Apply them to the new problem.\n")
+	sb.WriteString("   You do NOT need an exact match. 'consistent hashing' training applies to 'URL shortener'.\n")
+	sb.WriteString("   Think like a senior engineer: use past experience on new problems.\n")
+	sb.WriteString("2. BLACKBOARD: Work done by other experts. Build on it, don't repeat it.\n\n")
+	sb.WriteString("AVAILABLE TOOLS:\n")
+	sb.WriteString("<tool_call>{\"tool\": \"PostArtifact\", \"event_type\": \"<type>\", \"content\": {<artifact>}}</tool_call>\n")
+	sb.WriteString("event_type: architecture_decision | data_model_proposed | api_contract_proposed | module_design_proposed | code_artifact_produced | test_case_proposed\n\n")
+	sb.WriteString("<tool_call>{\"tool\": \"AskExpert\", \"to_expert_id\": \"<uuid>\", \"question\": \"<text>\"}</tool_call>\n\n")
+	sb.WriteString("WHEN DONE: Output TASK_COMPLETE as the last line after posting your artifact.\n")
 	return sb.String()
 }
 
