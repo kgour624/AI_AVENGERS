@@ -167,6 +167,7 @@ export function IngestionPipelineModal({
                   'h-full rounded-full transition-all duration-500 ease-arc',
                   isDone ? 'bg-mode-advise shadow-[0_0_8px_oklch(68%_0.18_145_/_0.6)]'
                   : isFailed ? 'bg-mode-refuse'
+                  : isPaused ? 'bg-glow-amber shadow-[0_0_8px_oklch(78%_0.18_80_/_0.5)]'
                   : 'bg-brand shadow-[0_0_8px_oklch(68%_0.28_295_/_0.5)]',
                 )}
                 style={{ width: `${progress}%` }}
