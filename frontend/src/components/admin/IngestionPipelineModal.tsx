@@ -107,6 +107,8 @@ export function IngestionPipelineModal({
     : 0
   const isDone = job?.status === 'complete'
   const isFailed = job?.status === 'failed'
+  // FIX: paused was not handled — UI showed "Extracting..." frozen for 30+ min
+  const isPaused = job?.status === 'paused'
 
   const handleResume = async () => {
     if (!expertId || !job?.id) return
