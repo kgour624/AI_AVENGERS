@@ -138,6 +138,21 @@ export function Sidebar() {
       )}>
         {sidebarOpen && (
           <nav className="p-4">
+            {/* Workflows link — was missing, no way to navigate to /workflows */}
+            <div className="mb-4">
+              <Link
+                to="/workflows"
+                className={cn(
+                  'flex items-center gap-2 rounded-md px-2.5 py-2 text-xs font-medium',
+                  'border border-transparent transition-all duration-150 ease-arc',
+                  'text-text-secondary hover:bg-surface-overlay/60 hover:text-text-primary hover:border-glow-purple/30',
+                )}
+              >
+                <span className="text-base">{'\u26a1'}</span>
+                <span>Workflows</span>
+              </Link>
+            </div>
+
             <div className="mb-3 flex items-center justify-between">
               <p className="text-[10px] font-semibold uppercase tracking-[0.2em] text-text-disabled">Projects</p>
               <Link to="/" className="text-[10px] font-medium uppercase tracking-wider text-glow-purple/60 hover:text-glow-purple">
