@@ -123,14 +123,28 @@ func NewAssembler(
 
 // Assemble builds the full context for a turn.
 //
+// Assemble builds the full context for a turn.
+//
+// DESIGN PATTERN: Fan-Out / Parallel Fetch
+//   Steps 1-6 are independent DB/ML queries. Running them sequentially
+//   wastes wall-clock time proportional to N*avg_query_latency.
+//   Fan-out runs all independent steps concurrently, then merges results
+//   and enforces per-step token budgets.
+//
+// SOLID:
+//   SRP: each private helper fetches exactly one context source.
+//   OCP: new sources added as new goroutine + channel, no budget logic change.
+//
 // Mental execution:
 // Turn 25, Expert: DB Expert, Question: "should I shard?"
-// 1. Rolling summary (turns 1-20) → 500 tokens
-// 2. L2 memory (SD Expert decided PostgreSQL) → 300 tokens
-// 3. Recent messages (turns 22-24) → 400 tokens
-// 4. Semantic history (turns about database) → 200 tokens
-// 5. Course chunks (sharding content) → 2000 tokens
-// Total: ~3400 tokens (well under 10k limit)
+// Fan-out (all concurrent):
+//   g1: getRollingSummary  → 500 tokens
+//   g2: getL2Memory        → 300 tokens
+//   g3: getRecentMessages  → 400 tokens
+//   g4: searchChatHistory  → 200 tokens
+//   g5: getCourseChunks    → 2000 tokens
+//   g6: getRepoChunks      → 0 tokens (no repo connected)
+// Merge + budget enforce → ~3400 tokens total
 func (a *Assembler) Assemble(
 	ctx context.Context,
 	chatID uuid.UUID,
