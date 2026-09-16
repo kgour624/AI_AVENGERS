@@ -52,13 +52,14 @@ function ExpertRow({
 
   if (!latestJob) return null
 
-  const isActive = latestJob.status === 'running' || latestJob.status === 'pending'
+  // FIX: paused added — was missing, so "View Progress" never showed for paused jobs
+  const isActive = latestJob.status === 'running' || latestJob.status === 'pending' || latestJob.status === 'paused'
   const stageLabel = STAGE_LABELS[latestJob.currentStage ?? latestJob.status] ?? latestJob.status
 
   return (
     <div className="mt-1 flex items-center justify-between">
       <p className="text-xs text-text-secondary">
-        {latestJob.status === 'complete' ? '\u2705' : latestJob.status === 'failed' ? '\u274c' : '\u23f3'}{' '}
+        {latestJob.status === 'complete' ? '\u2705' : latestJob.status === 'failed' ? '\u274c' : latestJob.status === 'paused' ? '\u23f8' : '\u23f3'}{' '}
         {stageLabel}
         {latestJob.processedChunks > 0 && (
           <span className="ml-1 text-text-disabled">
