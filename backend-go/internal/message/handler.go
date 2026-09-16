@@ -302,6 +302,13 @@ func (h *Handler) Send(c *gin.Context) {
 		//   compared to the 2-10s LLM generation that just completed.
 		savedMessageIDs := make(map[string]string) // expert_id -> message_id
 		for _, expertResp := range orchestratorResp.ExpertResponses {
+			// Ensure citations is never null in SSE payload.
+			// WHY: frontend calls citations.map() — null crashes JS.
+			// REFUSE/ASK modes have no citations — send [] not null.
+			citations := expertResp.Citations
+			if citations == nil {
+				citations = []chinawall.Citation{}
+			}
 			// Send complete expert response
 			sendSSE(w, SSEComplete, map[string]interface{}{
 				"expert_id":   expertResp.ExpertID,
@@ -309,7 +316,7 @@ func (h *Handler) Send(c *gin.Context) {
 				"domain":      expertResp.Domain,
 				"mode":        expertResp.Mode,
 				"content":     expertResp.Content,
-				"citations":   expertResp.Citations,
+				"citations":   citations,
 				"confidence":  expertResp.Confidence,
 				"gate_stopped": expertResp.GateStopped,
 				"warning":     expertResp.Warning,
