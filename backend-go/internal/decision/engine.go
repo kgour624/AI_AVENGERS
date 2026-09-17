@@ -210,9 +210,29 @@ func (e *Engine) Process(
 			Warning:          warning,
 			TemplateSections: enforceResult.TemplateSections,
 		}, nil
-	}
 
-	return &DecisionResult{Mode: ModeREFUSE, Content: "Unexpected error"}, nil
+	case "partial":
+		// China Wall returned partial coverage after multiple attempts.
+		// enforceResult.Answer is empty (enforcer.go:174 only sets Reason).
+		// Return clear refusal explaining what's missing.
+		return &DecisionResult{
+			Mode:        ModeREFUSE,
+			Content:     fmt.Sprintf("Cannot provide complete answer: %s", enforceResult.Reason),
+			GateStopped: 5,
+			Reason:      enforceResult.Reason,
+		}, nil
+
+	default:
+		// Should never happen - log for debugging
+		e.logger.Error("Unknown China Wall status",
+			zap.String("status", enforceResult.Status),
+			zap.String("reason", enforceResult.Reason))
+		return &DecisionResult{
+			Mode:    ModeREFUSE,
+			Content: fmt.Sprintf("Unexpected status: %s", enforceResult.Status),
+		}, nil
+	}
+}
 }
 
 // gate1 checks if we have enough information to answer.
