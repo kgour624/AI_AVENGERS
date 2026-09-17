@@ -175,6 +175,77 @@ func main() {
 		}
 	}()
 
+	// Workspace cleanup job: delete workspaces older than 7 days.
+	// WHY here: server-lifecycle concern, runs for lifetime of process.
+	// Runs every 24 hours, deletes workspaces from completed/failed/cancelled workflows.
+	// WHY 7 days: balance between debugging needs and disk space.
+	// WHY 24-hour interval: daily cleanup is sufficient, low overhead.
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		// Run immediately on startup (don't wait 24 hours)
+		cleanupWorkspaces := func() {
+			ctx := context.Background()
+			// Find completed/failed/cancelled workflows
+			rows, err := postgres.Query(ctx,
+				`SELECT id FROM workflows
+				 WHERE status IN ('completed', 'failed', 'cancelled')
+				   AND updated_at < NOW() - INTERVAL '7 days'`,
+			)
+			if err != nil {
+				logger.Warn("workspace cleanup: DB query error", zap.Error(err))
+				return
+			}
+			defer rows.Close()
+
+			var deletedCount int
+			for rows.Next() {
+				var workflowID uuid.UUID
+				if err := rows.Scan(&workflowID); err != nil {
+					logger.Warn("workspace cleanup: scan error", zap.Error(err))
+					continue
+				}
+
+				workspaceDir := filepath.Join(workspaceRoot, workflowID.String())
+				// Check if workspace exists
+				if _, err := os.Stat(workspaceDir); os.IsNotExist(err) {
+					continue
+				}
+
+				// Delete workspace
+				if err := os.RemoveAll(workspaceDir); err != nil {
+					logger.Warn("workspace cleanup: delete error",
+						zap.String("workspace", workspaceDir),
+						zap.Error(err),
+					)
+					continue
+				}
+
+				deletedCount++
+				logger.Info("workspace cleanup: deleted workspace",
+					zap.String("workflow_id", workflowID.String()),
+				)
+			}
+
+			if deletedCount > 0 {
+				logger.Info("workspace cleanup: completed",
+					zap.Int("deleted", deletedCount),
+				)
+			}
+		}
+		// Run immediately on startup
+		cleanupWorkspaces()
+		// Then run every 24 hours
+		for {
+			select {
+			case <-ticker.C:
+				cleanupWorkspaces()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
 	// Build HTTP server
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
