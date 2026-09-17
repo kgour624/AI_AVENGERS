@@ -392,3 +392,66 @@ func referencesEvent(event blackboard.Event, targetID uuid.UUID) bool {
 func marshalJSON(v interface{}) ([]byte, error) {
 	return json.Marshal(v)
 }
+
+// extractCodeFromContent extracts filename and code from a code_artifact_produced
+// content object. Expected format: {"filename": "handler.go", "code": "..."}
+//
+// Returns ("", "") if content is not in expected format or fields are missing.
+// Caller treats empty return as "skip validation" (safe fallback).
+//
+// Mental execution:
+//   content = map[string]interface{}{"filename": "handler.go", "code": "package main..."}
+//   -> filename = "handler.go", code = "package main..."
+//
+//   content = map[string]interface{}{"decision": "Use PostgreSQL"}
+//   -> filename = "", code = "" (not a code artifact)
+func extractCodeFromContent(content interface{}) (filename, code string) {
+	if content == nil {
+		return "", ""
+	}
+	// Try map[string]interface{} (most common from JSON unmarshal)
+	if m, ok := content.(map[string]interface{}); ok {
+		if f, ok := m["filename"].(string); ok {
+			filename = f
+		}
+		if c, ok := m["code"].(string); ok {
+			code = c
+		}
+		return filename, code
+	}
+	// Try map[string]string
+	if m, ok := content.(map[string]string); ok {
+		return m["filename"], m["code"]
+	}
+	return "", ""
+}
+
+// injectFixedCode returns a new content object with the code field replaced
+// by the validation pipeline's fixed version.
+// Used when validation passes after LLM revision rounds.
+//
+// Mental execution:
+//   content = {"filename": "handler.go", "code": "package main // broken"}
+//   fixedCode = "package main // fixed"
+//   -> {"filename": "handler.go", "code": "package main // fixed"}
+func injectFixedCode(content interface{}, fixedCode string) interface{} {
+	if m, ok := content.(map[string]interface{}); ok {
+		// Copy map to avoid mutating original
+		newMap := make(map[string]interface{}, len(m))
+		for k, v := range m {
+			newMap[k] = v
+		}
+		newMap["code"] = fixedCode
+		return newMap
+	}
+	if m, ok := content.(map[string]string); ok {
+		newMap := make(map[string]string, len(m))
+		for k, v := range m {
+			newMap[k] = v
+		}
+		newMap["code"] = fixedCode
+		return newMap
+	}
+	// Unknown content type: return as-is (safe fallback)
+	return content
+}
