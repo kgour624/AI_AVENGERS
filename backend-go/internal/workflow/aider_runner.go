@@ -304,3 +304,292 @@ func (a *AiderRunner) artifactToFilename(eventType string) string {
 		return "DESIGN.md"
 	}
 }
+
+// runAiderLoop executes the OTA loop: Observe → Think → Act.
+//
+// MENTAL MODEL:
+//   Max 5 iterations (balance between thoroughness and cost)
+//   Each iteration:
+//     1. Observe: git status, build errors, test failures
+//     2. Think: Aider CLI call with task + observations
+//     3. Act: Aider applies patches, commits changes
+//   Exit when: TASK_COMPLETE or max iterations reached
+//
+// CROSS-QUESTIONS:
+//   Q: Why max 5 iterations?
+//   A: Balance between fixing issues and preventing infinite loops
+//      Most tasks complete in 2-3 iterations (initial + 1-2 fixes)
+//
+//   Q: Why observe before think?
+//   A: Provide context (build errors, test failures) to Aider
+//      Without observations, Aider can't fix errors
+//
+//   Q: What if max iterations reached?
+//   A: Return partial completion (Completed=false)
+//      Caller can decide: retry, escalate, or accept partial
+func (a *AiderRunner) runAiderLoop(
+	ctx context.Context,
+	req AiderRunRequest,
+	workspacePath string,
+) (*AiderRunResult, error) {
+	const maxIterations = 5
+	var commitSHAs []string
+
+	for iteration := 1; iteration <= maxIterations; iteration++ {
+		a.logger.Info("aider iteration starting",
+			zap.Int("iteration", iteration),
+			zap.Int("max", maxIterations),
+		)
+
+		// Step 1: Observe workspace state
+		observations, err := a.observeWorkspace(ctx, workspacePath)
+		if err != nil {
+			return nil, fmt.Errorf("observe workspace: %w", err)
+		}
+
+		// Step 2: Think + Act (Aider iteration)
+		commitSHA, taskComplete, err := a.runAiderIteration(
+			ctx,
+			req,
+			workspacePath,
+			observations,
+			iteration,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("aider iteration %d: %w", iteration, err)
+		}
+
+		if commitSHA != "" {
+			commitSHAs = append(commitSHAs, commitSHA)
+		}
+
+		// Check if task complete
+		if taskComplete {
+			a.logger.Info("task completed",
+				zap.Int("iterations", iteration),
+			)
+			return &AiderRunResult{
+				CommitSHAs: commitSHAs,
+				Iterations: iteration,
+				Completed:  true,
+			}, nil
+		}
+	}
+
+	// Max iterations reached
+	a.logger.Warn("max iterations reached",
+		zap.Int("iterations", maxIterations),
+	)
+
+	return &AiderRunResult{
+		CommitSHAs: commitSHAs,
+		Iterations: maxIterations,
+		Completed:  false, // Partial completion
+	}, nil
+}
+
+// observeWorkspace gathers current workspace state for Aider.
+//
+// MENTAL MODEL:
+//   Observations = context for Aider's next iteration
+//   Includes:
+//     - Git status (what files changed)
+//     - Build errors (compile failures)
+//     - Test failures (test output)
+//
+// CROSS-QUESTIONS:
+//   Q: Why git status?
+//   A: Shows what files Aider created/modified
+//      Helps Aider understand current state
+//
+//   Q: Why build errors?
+//   A: Aider needs to see compile errors to fix them
+//      Without errors, Aider doesn't know what's wrong
+//
+//   Q: Why test failures?
+//   A: Aider needs test output to fix failing tests
+//      Test output shows expected vs actual behavior
+func (a *AiderRunner) observeWorkspace(
+	ctx context.Context,
+	workspacePath string,
+) (string, error) {
+	var observations strings.Builder
+
+	// Git status
+	cmd := exec.CommandContext(ctx, "git", "status", "--short")
+	cmd.Dir = workspacePath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Non-fatal: continue without git status
+		a.logger.Warn("git status failed", zap.Error(err))
+	} else if len(output) > 0 {
+		observations.WriteString("Git Status:\n")
+		observations.Write(output)
+		observations.WriteString("\n")
+	}
+
+	// Build errors
+	buildOutput, buildErr := a.runBuild(ctx, workspacePath)
+	if buildErr != nil {
+		observations.WriteString("Build Errors:\n")
+		observations.WriteString(buildOutput)
+		observations.WriteString("\n")
+	}
+
+	// Test failures
+	testOutput, testErr := a.runTests(ctx, workspacePath)
+	if testErr != nil {
+		observations.WriteString("Test Failures:\n")
+		observations.WriteString(testOutput)
+		observations.WriteString("\n")
+	}
+
+	// If no observations, return empty (first iteration)
+	if observations.Len() == 0 {
+		return "", nil
+	}
+
+	return observations.String(), nil
+}
+
+// runBuild executes go build and captures output.
+//
+// MENTAL MODEL:
+//   go build ./... compiles all packages
+//   Returns: (output, error)
+//     - error != nil: build failed (compile errors)
+//     - error == nil: build succeeded
+//
+// CROSS-QUESTIONS:
+//   Q: Why go build ./...?
+//   A: Builds all packages in workspace (not just main)
+//      Catches compile errors in all files
+//
+//   Q: Why capture output?
+//   A: Output contains error messages for Aider
+//      Aider needs to see errors to fix them
+func (a *AiderRunner) runBuild(
+	ctx context.Context,
+	workspacePath string,
+) (string, error) {
+	cmd := exec.CommandContext(ctx, "go", "build", "./...")
+	cmd.Dir = workspacePath
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// runTests executes go test and captures output.
+//
+// MENTAL MODEL:
+//   go test ./... runs all tests
+//   Returns: (output, error)
+//     - error != nil: tests failed
+//     - error == nil: tests passed
+//
+// CROSS-QUESTIONS:
+//   Q: Why go test ./...?
+//   A: Runs all tests in workspace
+//      Catches test failures in all packages
+//
+//   Q: Why capture output?
+//   A: Output contains test failure details
+//      Aider needs to see failures to fix them
+func (a *AiderRunner) runTests(
+	ctx context.Context,
+	workspacePath string,
+) (string, error) {
+	cmd := exec.CommandContext(ctx, "go", "test", "./...")
+	cmd.Dir = workspacePath
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+// runAiderIteration executes one Aider iteration.
+//
+// MENTAL MODEL:
+//   Aider CLI call with task + observations
+//   Aider generates patches, applies them, commits
+//   Returns: (commitSHA, taskComplete, error)
+//
+// CROSS-QUESTIONS:
+//   Q: Why --yes flag?
+//   A: Auto-accept all changes (no interactive mode)
+//      We trust Aider's decisions (can rollback via git)
+//
+//   Q: How detect TASK_COMPLETE?
+//   A: Check Aider output for "TASK_COMPLETE" marker
+//      Or: build + tests pass (heuristic)
+//
+//   Q: What if Aider fails?
+//   A: Return error, caller retries or escalates
+func (a *AiderRunner) runAiderIteration(
+	ctx context.Context,
+	req AiderRunRequest,
+	workspacePath string,
+	observations string,
+	iteration int,
+) (commitSHA string, taskComplete bool, err error) {
+	// Build Aider message
+	message := req.TaskDescription
+	if observations != "" {
+		message += "\n\nObservations from previous iteration:\n" + observations
+	}
+
+	// TODO: Add expert training (Phase 2 Task 4)
+	// message += "\n\nExpert Training:\n" + req.Expert.Training
+
+	// Run Aider CLI
+	// aider --yes --message "<message>" *.go
+	cmd := exec.CommandContext(ctx, "aider", "--yes", "--message", message)
+	cmd.Dir = workspacePath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		a.logger.Error("aider failed",
+			zap.Error(err),
+			zap.String("output", string(output)),
+		)
+		return "", false, fmt.Errorf("aider: %w (output: %s)", err, string(output))
+	}
+
+	a.logger.Debug("aider output",
+		zap.String("output", string(output)),
+	)
+
+	// Extract commit SHA
+	commitSHA, err = a.extractCommitSHA(ctx, workspacePath)
+	if err != nil {
+		return "", false, fmt.Errorf("extract commit SHA: %w", err)
+	}
+
+	// Check if task complete
+	// Heuristic: build + tests pass
+	_, buildErr := a.runBuild(ctx, workspacePath)
+	_, testErr := a.runTests(ctx, workspacePath)
+	taskComplete = (buildErr == nil && testErr == nil)
+
+	a.logger.Info("aider iteration completed",
+		zap.Int("iteration", iteration),
+		zap.String("commit", commitSHA),
+		zap.Bool("task_complete", taskComplete),
+	)
+
+	return commitSHA, taskComplete, nil
+}
+
+// extractCommitSHA gets the latest commit SHA.
+//
+// MENTAL MODEL:
+//   git rev-parse HEAD returns current commit SHA
+//   Used to track which commits Aider created
+func (a *AiderRunner) extractCommitSHA(
+	ctx context.Context,
+	workspacePath string,
+) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
+	cmd.Dir = workspacePath
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse: %w", err)
+	}
+	return strings.TrimSpace(string(output)), nil
+}
