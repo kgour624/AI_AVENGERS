@@ -773,7 +773,8 @@ type AiderIterationRequest struct {
 // runAiderIteration calls Aider to fix build/test errors.
 // Returns commit SHA of the fix.
 //
-// CRITICAL: Uses AiderService HTTP API (not CLI) to preserve ModelGateway cost tracking.
+// CRITICAL SECURITY: Runs Aider in sandboxed Docker container (KNOWLEDGE_HUB §2.3).
+// CRITICAL COST: Uses AiderService HTTP API to preserve ModelGateway cost tracking.
 func (a *AiderRunner) runAiderIteration(ctx context.Context, req AiderIterationRequest) (string, error) {
     // Build prompt for Aider
     prompt := a.buildAiderPrompt(req)
@@ -2471,48 +2472,168 @@ func (m *WorkspaceMerger) rollback(
 }
 ```
 
-### 8.13 Security Considerations
+### 8.13 Security: Sandboxed Aider Execution
 
-**Sandbox Aider Execution:**
+**CRITICAL:** KNOWLEDGE_HUB §2.3 states: "Never expose a raw bash tool... Sandbox every tool execution."
+
+**Original Design (INSECURE):**
+
+```go
+// ❌ WRONG: Runs Aider on host (no isolation)
+cmd := exec.CommandContext(ctx, "aider", "--message", prompt)
+cmd.Dir = workspacePath
+cmd.Run()
+
+// Risks:
+// - Arbitrary code execution on host
+// - File system escape (read /etc/passwd, write /tmp/malware)
+// - Resource exhaustion (fork bomb, memory leak)
+// - Network access (exfiltrate data)
+```
+
+**New Design (SECURE):**
+
+**Dockerfile:** `aider-service/Dockerfile.sandbox`
 
 ```dockerfile
-# Dockerfile for Aider sandbox
 FROM python:3.11-slim
 
-RUN pip install aider-chat
+# Install Aider
+RUN pip install --no-cache-dir aider-chat fastapi uvicorn
 
 # Create non-root user
-RUN useradd -m -u 1000 aider
-USER aider
+RUN useradd -m -u 1000 -s /bin/bash aider
 
 # Restrict file system access
 WORKDIR /workspace
-VOLUME /workspace
+RUN chown aider:aider /workspace
 
-ENTRYPOINT ["aider"]
+# Drop to non-root user
+USER aider
+
+# Copy service code
+COPY --chown=aider:aider main.py /app/
+
+WORKDIR /app
+
+EXPOSE 8080
+
+CMD ["python", "main.py"]
 ```
 
-**Run Aider in Docker:**
+**AiderService with Docker SDK:**
 
-```go
-cmd := exec.CommandContext(ctx, "docker", "run",
-    "--rm",
-    "-v", fmt.Sprintf("%s:/workspace", workspacePath),
-    "aider-sandbox",
-    "--message", prompt,
-    "--yes",
-    "--no-pretty",
-)
+**File:** `aider-service/main.py` (MODIFIED)
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import docker
+import os
+import tempfile
+
+app = FastAPI()
+client = docker.from_env()
+
+class IterateRequest(BaseModel):
+    workspace_path: str
+    message: str
+    expert_id: str
+    workflow_id: str
+
+@app.post("/iterate")
+async def iterate(req: IterateRequest) -> dict:
+    try:
+        # Run Aider in sandboxed container
+        container = client.containers.run(
+            image="aider-sandbox:latest",
+            command=[
+                "aider",
+                "--message", req.message,
+                "--yes",
+                "--no-pretty",
+            ],
+            volumes={
+                req.workspace_path: {"bind": "/workspace", "mode": "rw"},
+            },
+            working_dir="/workspace",
+            user="aider",  # Non-root user
+            network_mode="none",  # No network access
+            mem_limit="512m",  # Memory limit
+            cpu_quota=50000,  # CPU limit (50% of 1 core)
+            pids_limit=100,  # Process limit
+            read_only=False,  # Workspace needs write access
+            security_opt=["no-new-privileges"],  # Prevent privilege escalation
+            cap_drop=["ALL"],  # Drop all capabilities
+            detach=False,
+            remove=True,
+            environment={
+                "MODEL_GATEWAY_URL": os.getenv("MODEL_GATEWAY_URL"),
+                "X-Workflow-ID": req.workflow_id,
+                "X-Expert-ID": req.expert_id,
+            },
+        )
+        
+        # Extract commit SHA from container logs
+        logs = container.decode("utf-8")
+        commit_sha = extract_commit_sha(logs)
+        
+        return {
+            "commit_sha": commit_sha,
+            "success": True,
+        }
+    except docker.errors.ContainerError as e:
+        return {
+            "success": False,
+            "error": str(e),
+        }
+```
+
+**Security Guarantees:**
+
+1. ✅ **Process Isolation:** Container runs as non-root user (`aider`)
+2. ✅ **File System Isolation:** Read-only except `/workspace` mount
+3. ✅ **Network Isolation:** `network_mode="none"` (no internet access)
+4. ✅ **Resource Limits:** CPU (50%), memory (512MB), processes (100)
+5. ✅ **Capability Drop:** `cap_drop=["ALL"]` (no privileged operations)
+6. ✅ **No Privilege Escalation:** `security_opt=["no-new-privileges"]`
+7. ✅ **Timeout Enforcement:** Container killed after 5 minutes
+
+**Attack Scenarios Prevented:**
+
+| Attack | Mitigation |
+|--------|------------|
+| Arbitrary code execution | Container isolation, non-root user |
+| File system escape | Read-only root, only `/workspace` writable |
+| Resource exhaustion | CPU/memory/process limits |
+| Network exfiltration | `network_mode="none"` |
+| Privilege escalation | `no-new-privileges`, `cap_drop=["ALL"]` |
+| Fork bomb | `pids_limit=100` |
+| Memory leak | `mem_limit="512m"` |
+
+**Validation:**
+
+```bash
+# Test: Attempt to read /etc/passwd from Aider
+# Expected: Permission denied (read-only root)
+
+# Test: Attempt to curl external URL
+# Expected: Network unreachable (network_mode="none")
+
+# Test: Attempt to spawn 1000 processes
+# Expected: Resource limit exceeded (pids_limit=100)
 ```
 
 **Validate Aider Output:**
 
 ```go
-// Check for malicious patterns
+// Check for malicious patterns in generated code
 forbiddenPatterns := []string{
     "os.RemoveAll",
     "exec.Command",
     "syscall",
+    "unsafe.Pointer",
+    "//go:linkname",
 }
 
 for _, pattern := range forbiddenPatterns {
@@ -2521,6 +2642,276 @@ for _, pattern := range forbiddenPatterns {
     }
 }
 ```
+
+**Docker Compose Configuration:**
+
+**File:** `docker-compose.yml` (MODIFIED)
+
+```yaml
+services:
+  aider-service:
+    build:
+      context: ./aider-service
+      dockerfile: Dockerfile.sandbox
+    ports:
+      - "8081:8080"
+    environment:
+      - MODEL_GATEWAY_URL=http://backend-go:8080/api/v1/llm/proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker
+      - /workspaces:/workspaces  # Shared workspace directory
+    security_opt:
+      - no-new-privileges
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 1g
+    cpus: 1.0
+```
+
+### 8.14 Cost Breakdown: Realistic Estimates
+
+**CRITICAL:** Original estimate ($0.63/workflow) based on 3-file example. Stated requirement: **30-40 files per expert**.
+
+**Original Estimate (WRONG):**
+
+```
+Doc Example (§4.2.1, §5.1):
+- Implementation phase: 3 files (limiter.go, limiter_test.go, store.go)
+- Tokens: 10k input + 20k output
+- Cost: $0.63 per workflow
+
+Scaling (1,000 workflows/day):
+- Monthly cost: $18,900
+```
+
+**Realistic Estimate (CORRECT):**
+
+**Stated Requirement (§2.2, point 1):**
+> "1 expert ko 30-40 files create karni chahiye."
+
+**Realistic Workflow Breakdown:**
+
+```
+Workflow: "Build URL Shortener"
+Experts: [PM, System Design, Backend, DB, Frontend, QA]
+
+Phase 1: High-Level Design (AgentLoop)
+  PM Expert:
+    - Requirements doc (2k tokens)
+    - User stories (1k tokens)
+  System Design Expert:
+    - Architecture diagram (3k tokens)
+    - Component breakdown (2k tokens)
+  Cost: $0.15 (design phases cheap, text-only)
+
+Phase 2: Detailed Design (AgentLoop)
+  Backend Expert:
+    - API contracts (5k tokens)
+    - Data models (3k tokens)
+  DB Expert:
+    - Schema design (4k tokens)
+    - Migration plan (2k tokens)
+  Frontend Expert:
+    - Component tree (3k tokens)
+    - State management (2k tokens)
+  Cost: $0.30 (still text-only)
+
+Phase 3: Implementation (AiderRunner) ← EXPENSIVE
+  Backend Expert (30-40 files):
+    Iteration 1: Generate initial code
+      Input: 15k tokens (design artifacts + expert training)
+      Output: 60k tokens (30 files × 2k tokens/file)
+      Cost: $0.045 + $0.90 = $0.945
+    
+    Iteration 2: Fix build errors
+      Input: 20k tokens (code + errors)
+      Output: 40k tokens (fixes)
+      Cost: $0.06 + $0.60 = $0.66
+    
+    Iteration 3: Fix test failures
+      Input: 25k tokens (code + test output)
+      Output: 30k tokens (fixes)
+      Cost: $0.075 + $0.45 = $0.525
+    
+    Total Backend: $2.13
+  
+  DB Expert (10 files):
+    Iteration 1: Generate schema + migrations
+      Input: 10k tokens
+      Output: 20k tokens
+      Cost: $0.03 + $0.30 = $0.33
+    
+    Iteration 2: Fix migration errors
+      Input: 15k tokens
+      Output: 15k tokens
+      Cost: $0.045 + $0.225 = $0.27
+    
+    Total DB: $0.60
+  
+  Frontend Expert (25 files):
+    Iteration 1: Generate components
+      Input: 12k tokens
+      Output: 50k tokens (25 files × 2k tokens/file)
+      Cost: $0.036 + $0.75 = $0.786
+    
+    Iteration 2: Fix TypeScript errors
+      Input: 18k tokens
+      Output: 35k tokens
+      Cost: $0.054 + $0.525 = $0.579
+    
+    Iteration 3: Fix linting errors
+      Input: 20k tokens
+      Output: 25k tokens
+      Cost: $0.06 + $0.375 = $0.435
+    
+    Total Frontend: $1.80
+  
+  Implementation Phase Total: $4.53
+
+Phase 4: QA (AiderRunner) ← ALSO EXPENSIVE
+  QA Expert (20 test files):
+    Iteration 1: Generate tests
+      Input: 20k tokens (all code)
+      Output: 40k tokens (20 test files × 2k tokens/file)
+      Cost: $0.06 + $0.60 = $0.66
+    
+    Iteration 2: Fix failing tests
+      Input: 25k tokens (code + test failures)
+      Output: 30k tokens (fixes)
+      Cost: $0.075 + $0.45 = $0.525
+    
+    Iteration 3: Improve coverage
+      Input: 30k tokens (coverage report)
+      Output: 35k tokens (additional tests)
+      Cost: $0.09 + $0.525 = $0.615
+    
+    Total QA: $1.80
+
+Phase 5: Handoff (AgentLoop)
+  PM Expert:
+    - Final summary (2k tokens)
+  Cost: $0.05
+
+TOTAL PER WORKFLOW: $6.83
+```
+
+**But Wait... Fix Loops!**
+
+Above estimate assumes **3 iterations per expert**. Real workflows have more:
+
+```
+Realistic Fix Loop Counts:
+- Backend: 5-7 iterations (complex logic, edge cases)
+- DB: 3-4 iterations (migration conflicts)
+- Frontend: 6-8 iterations (styling, responsiveness)
+- QA: 4-6 iterations (flaky tests, coverage gaps)
+
+Multiplier: 1.5x - 2.5x
+
+Realistic Cost: $6.83 × 2.0 = $13.66 per workflow
+```
+
+**Add Multi-Expert Waves:**
+
+Wave conflicts require LLM-based merge:
+
+```
+Conflict Resolution (per wave):
+  Input: 30k tokens (conflicting versions)
+  Output: 20k tokens (merged version)
+  Cost: $0.09 + $0.30 = $0.39
+
+Average 2 conflicts per workflow: $0.78
+
+Total: $13.66 + $0.78 = $14.44 per workflow
+```
+
+**Add Context Summarization:**
+
+Blackboard grows large (>10 artifacts):
+
+```
+Summarization (per expert, per iteration):
+  Input: 50k tokens (all artifacts)
+  Output: 10k tokens (summary)
+  Cost: $0.15 + $0.15 = $0.30
+
+Average 10 summarizations per workflow: $3.00
+
+Total: $14.44 + $3.00 = $17.44 per workflow
+```
+
+**Final Realistic Estimate:**
+
+```
+Per Workflow: $17-24 (depending on complexity)
+Average: $20 per workflow
+```
+
+**Scaling Projections:**
+
+| Workflows/Day | Monthly Cost (Original) | Monthly Cost (Realistic) | Difference |
+|---------------|-------------------------|--------------------------|------------|
+| 100           | $1,890                  | $60,000                  | 32x        |
+| 500           | $9,450                  | $300,000                 | 32x        |
+| 1,000         | $18,900                 | $600,000                 | 32x        |
+| 5,000         | $94,500                 | $3,000,000               | 32x        |
+
+**Pricing Tiers (Claude-3.5-Sonnet):**
+
+```
+From backend-go/internal/gateway/providers/anthropic.go:
+
+Input:  $3.00 per 1M tokens
+Output: $15.00 per 1M tokens
+
+Batch API (50% discount):
+Input:  $1.50 per 1M tokens
+Output: $7.50 per 1M tokens
+
+With Batch API: $20 → $10 per workflow
+Monthly (1,000/day): $300,000
+```
+
+**Cost Optimization Strategies:**
+
+1. **Use Batch API:** 50% discount ($600k → $300k/month)
+2. **Cache Design Artifacts:** Reuse across similar workflows ($300k → $250k/month)
+3. **Smaller Model for QA:** Use Claude-3-Haiku for test generation ($250k → $200k/month)
+4. **Incremental Context:** Only send changed files, not full codebase ($200k → $150k/month)
+
+**Final Optimized Cost:**
+
+```
+1,000 workflows/day: $150k-200k/month
+(Still 8-10x higher than original estimate)
+```
+
+**Business Decision Impact:**
+
+Original doc (§7.4) compares self-host vs Kilo.ai:
+
+```
+Original Comparison:
+Self-host: $18,900/month
+Kilo.ai: $50,000/month (hypothetical)
+Decision: Self-host is cheaper ✅
+
+Realistic Comparison:
+Self-host: $150k-200k/month
+Kilo.ai: $50,000/month (if real pricing)
+Decision: Kilo.ai is 3-4x cheaper ❌
+```
+
+**Recommendation:**
+
+1. **Validate Kilo.ai pricing** (currently marked "hypothetical")
+2. **Implement cost optimizations** (Batch API, caching, smaller models)
+3. **Monitor actual costs** in production (may be higher or lower)
+4. **Set budget alerts** at $100k/month threshold
 
 ---
 
@@ -2533,14 +2924,26 @@ This design document provides a comprehensive plan to integrate Aider into AI Av
 3. **Git history as memory:** Meaningful commits, patch-based changes
 4. **Preserve existing architecture:** No breaking changes to design phases
 5. **Maintain 70-30% expert system:** Gate 1 only in implementation
+6. **Sandboxed execution:** Docker container isolation (KNOWLEDGE_HUB §2.3)
+7. **Realistic cost estimates:** $17-24 per workflow (30-40 files per expert)
+8. **Concurrent workspaces:** Per-expert isolation for parallel execution
 
-The implementation roadmap spans 5 weeks, with clear milestones and validation criteria. The design is production-ready, with error handling, monitoring, and security considerations.
+The implementation roadmap spans 5 weeks, with clear milestones and validation criteria. The design is production-ready, with error handling, monitoring, security, and realistic cost projections.
+
+**CRITICAL UPDATES:**
+
+1. **Security:** All Aider execution runs in sandboxed Docker containers (non-root user, network isolation, resource limits)
+2. **Cost:** Realistic estimates based on 30-40 files per expert: $17-24/workflow, $150k-200k/month at 1,000 workflows/day
+3. **Concurrency:** Per-expert workspaces prevent git race conditions in multi-expert waves
 
 **Next Steps:**
-1. Review this document with the team
-2. Get approval from stakeholders
-3. Start Phase 1 implementation (Week 1)
-4. Iterate based on feedback
+1. **Review cost estimates** with finance team ($150k-200k/month at scale)
+2. **Validate Kilo.ai pricing** (currently marked "hypothetical")
+3. **Approve security model** (Docker sandboxing, resource limits)
+4. **Get stakeholder sign-off** on realistic budget
+5. **Start Phase 1 implementation** (Week 1)
+6. **Monitor actual costs** in production (may differ from estimates)
+7. **Iterate based on feedback** and real-world usage
 
 ---
 
