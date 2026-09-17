@@ -470,12 +470,17 @@ func (r *WorkflowRunner) executeWaves(
 
 **New File:** `backend-go/internal/workflow/aider_runner.go`
 
+**CRITICAL:** Aider is used as **library** (not CLI), with **ModelGateway proxy** to preserve cost tracking.
+
 ```go
 package workflow
 
 import (
+    "bytes"
     "context"
+    "encoding/json"
     "fmt"
+    "net/http"
     "os"
     "os/exec"
     "path/filepath"
@@ -767,33 +772,66 @@ type AiderIterationRequest struct {
 
 // runAiderIteration calls Aider to fix build/test errors.
 // Returns commit SHA of the fix.
+//
+// CRITICAL: Uses AiderService HTTP API (not CLI) to preserve ModelGateway cost tracking.
 func (a *AiderRunner) runAiderIteration(ctx context.Context, req AiderIterationRequest) (string, error) {
     // Build prompt for Aider
     prompt := a.buildAiderPrompt(req)
     
-    // Call Aider CLI
-    // TODO: Replace with actual Aider SDK/API call
-    cmd := exec.CommandContext(ctx, "aider",
-        "--message", prompt,
-        "--yes", // Auto-accept changes
-        "--no-pretty", // Machine-readable output
-    )
-    cmd.Dir = req.WorkspacePath
-    output, err := cmd.CombinedOutput()
-    if err != nil {
-        return "", fmt.Errorf("aider failed: %s", string(output))
+    // Call AiderService HTTP API
+    // AiderService wraps Aider library and routes LLM calls through ModelGateway
+    reqBody := AiderServiceRequest{
+        WorkspacePath: req.WorkspacePath,
+        Message:       prompt,
+        ExpertID:      req.Expert.ID.String(),
+        WorkflowID:    a.getCurrentWorkflowID(ctx), // For cost tracking
     }
     
-    // Extract commit SHA from Aider output
-    commitSHA := a.extractCommitSHA(string(output))
+    bodyBytes, _ := json.Marshal(reqBody)
+    httpReq, _ := http.NewRequestWithContext(ctx, "POST",
+        "http://aider-service:8080/iterate",
+        bytes.NewReader(bodyBytes),
+    )
+    httpReq.Header.Set("Content-Type", "application/json")
+    
+    resp, err := http.DefaultClient.Do(httpReq)
+    if err != nil {
+        return "", fmt.Errorf("aider service call failed: %w", err)
+    }
+    defer resp.Body.Close()
+    
+    if resp.StatusCode != http.StatusOK {
+        return "", fmt.Errorf("aider service returned %d", resp.StatusCode)
+    }
+    
+    var result AiderServiceResponse
+    if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+        return "", fmt.Errorf("decode aider response: %w", err)
+    }
     
     a.logger.Info("aider iteration completed",
         zap.String("expert", req.Expert.Name),
         zap.Int("iteration", req.Iteration),
-        zap.String("commit", commitSHA),
+        zap.String("commit", result.CommitSHA),
+        zap.Float64("cost_usd", result.CostUSD), // Cost tracked via ModelGateway
     )
     
-    return commitSHA, nil
+    return result.CommitSHA, nil
+}
+
+type AiderServiceRequest struct {
+    WorkspacePath string `json:"workspace_path"`
+    Message       string `json:"message"`
+    ExpertID      string `json:"expert_id"`
+    WorkflowID    string `json:"workflow_id"`
+}
+
+type AiderServiceResponse struct {
+    CommitSHA    string  `json:"commit_sha"`
+    FilesChanged []string `json:"files_changed"`
+    CostUSD      float64 `json:"cost_usd"` // Tracked by ModelGateway
+    Success      bool    `json:"success"`
+    Error        string  `json:"error,omitempty"`
 }
 
 // buildAiderPrompt constructs prompt for Aider based on errors.
@@ -878,7 +916,248 @@ func (a *AiderRunner) publishCodeArtifacts(ctx context.Context, workflowID, expe
 }
 ```
 
-### 5.4 Workspace Management
+### 5.4 Cost Tracking Integration
+
+**CRITICAL:** All Aider LLM calls must route through ModelGateway to preserve centralized cost tracking.
+
+**Flow:**
+
+```
+AiderRunner (Go)
+    |
+    | HTTP POST /iterate
+    v
+AiderService (Python FastAPI)
+    |
+    | Aider library call
+    v
+Aider (Python)
+    |
+    | LLM API call
+    v
+LiteLLM Proxy (Python)
+    |
+    | HTTP POST /chat/completions
+    v
+ModelGateway (Go)
+    |
+    | Provider selection, retry, fallback
+    | Cost tracking in messages.cost_usd
+    v
+Anthropic/OpenAI/etc.
+```
+
+**Why This Works:**
+
+1. **AiderService** wraps Aider library, exposes HTTP API
+2. **LiteLLM Proxy** intercepts Aider's LLM calls, forwards to ModelGateway
+3. **ModelGateway** handles provider switching, retry, fallback, cost tracking
+4. **messages.cost_usd** remains single source of truth (AgentLoop + AiderRunner)
+
+**Configuration:**
+
+```python
+# aider-service/config.py
+import os
+from litellm import completion
+
+# Configure LiteLLM to proxy through ModelGateway
+os.environ["LITELLM_PROXY_URL"] = "http://backend-go:8080/api/v1/llm/proxy"
+
+# Aider will use this proxy for all LLM calls
+from aider.coders import Coder
+coder = Coder.create(
+    model="gpt-4",
+    api_base="http://backend-go:8080/api/v1/llm/proxy",  # ModelGateway proxy
+)
+```
+
+**ModelGateway Proxy Endpoint:**
+
+**New File:** `backend-go/internal/gateway/proxy.go`
+
+```go
+package gateway
+
+import (
+    "encoding/json"
+    "net/http"
+    
+    "github.com/gin-gonic/gin"
+    "go.uber.org/zap"
+)
+
+// ProxyHandler handles LLM requests from AiderService.
+// Routes through ModelGateway to preserve cost tracking.
+func (g *ModelGateway) ProxyHandler(c *gin.Context) {
+    var req LLMRequest
+    if err := c.ShouldBindJSON(&req); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+    
+    // Extract workflow_id from headers (set by AiderService)
+    workflowID := c.GetHeader("X-Workflow-ID")
+    expertID := c.GetHeader("X-Expert-ID")
+    
+    g.logger.Info("proxy llm call",
+        zap.String("workflow_id", workflowID),
+        zap.String("expert_id", expertID),
+        zap.String("model", req.Model),
+    )
+    
+    // Call ModelGateway (existing logic)
+    resp, err := g.Call(c.Request.Context(), req)
+    if err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+    
+    // Track cost in messages table
+    // TODO: Save to messages table with workflow_id, expert_id
+    // This ensures cost appears in same table as AgentLoop costs
+    
+    c.JSON(http.StatusOK, resp)
+}
+```
+
+**Register Proxy Route:**
+
+**File:** `backend-go/cmd/server/main.go` (modified)
+
+```go
+// Add proxy endpoint for AiderService
+api.POST("/llm/proxy", modelGateway.ProxyHandler)
+```
+
+### 5.5 AiderService (Python)
+
+**New Service:** `aider-service/` (Python FastAPI)
+
+**File:** `aider-service/main.py`
+
+```python
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import os
+from aider.coders import Coder
+from aider.models import Model
+
+app = FastAPI()
+
+# Configure Aider to use ModelGateway proxy
+MODEL_GATEWAY_URL = os.getenv("MODEL_GATEWAY_URL", "http://backend-go:8080/api/v1/llm/proxy")
+
+class IterateRequest(BaseModel):
+    workspace_path: str
+    message: str
+    expert_id: str
+    workflow_id: str
+
+class IterateResponse(BaseModel):
+    commit_sha: str
+    files_changed: list[str]
+    cost_usd: float
+    success: bool
+    error: str = None
+
+@app.post("/iterate")
+async def iterate(req: IterateRequest) -> IterateResponse:
+    try:
+        # Create Aider coder with ModelGateway proxy
+        model = Model(
+            name="gpt-4",
+            api_base=MODEL_GATEWAY_URL,
+            api_key="dummy",  # Not used, ModelGateway handles auth
+        )
+        
+        coder = Coder.create(
+            model=model,
+            fnames=[],  # Auto-detect files in workspace
+            auto_commits=True,
+            dirty_commits=False,
+            git_dname=req.workspace_path,
+        )
+        
+        # Set headers for cost tracking
+        coder.model.headers = {
+            "X-Workflow-ID": req.workflow_id,
+            "X-Expert-ID": req.expert_id,
+        }
+        
+        # Run Aider iteration
+        result = coder.run(req.message)
+        
+        # Extract commit SHA from git log
+        import subprocess
+        commit_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=req.workspace_path,
+        ).decode().strip()
+        
+        # Get files changed
+        files_changed = subprocess.check_output(
+            ["git", "diff", "--name-only", "HEAD~1"],
+            cwd=req.workspace_path,
+        ).decode().strip().split("\n")
+        
+        # Cost is tracked by ModelGateway, returned in response
+        # TODO: Extract from ModelGateway response headers
+        cost_usd = 0.0  # Placeholder, actual cost in messages.cost_usd
+        
+        return IterateResponse(
+            commit_sha=commit_sha,
+            files_changed=files_changed,
+            cost_usd=cost_usd,
+            success=True,
+        )
+    except Exception as e:
+        return IterateResponse(
+            commit_sha="",
+            files_changed=[],
+            cost_usd=0.0,
+            success=False,
+            error=str(e),
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
+```
+
+**Dockerfile:** `aider-service/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install Aider
+RUN pip install aider-chat fastapi uvicorn
+
+# Copy service code
+COPY main.py .
+
+EXPOSE 8080
+
+CMD ["python", "main.py"]
+```
+
+**Docker Compose:** `docker-compose.yml` (add service)
+
+```yaml
+services:
+  aider-service:
+    build: ./aider-service
+    ports:
+      - "8081:8080"
+    environment:
+      - MODEL_GATEWAY_URL=http://backend-go:8080/api/v1/llm/proxy
+    volumes:
+      - /workspaces:/workspaces  # Shared workspace directory
+```
+
+### 5.6 Workspace Management
 
 **Directory Structure:**
 
@@ -1167,32 +1446,52 @@ func TestAiderRunner_QAPhase(t *testing.T) {
 
 ## 8. Appendix
 
-### 8.1 Aider CLI Reference
+### 8.1 Aider Integration Approach
 
-**Installation:**
+**CRITICAL DECISION: Library Mode, Not CLI**
+
+**Why Not CLI:**
 ```bash
-pip install aider-chat
+# ❌ WRONG: Aider CLI bypasses ModelGateway
+aider --message "Fix bug" --yes
+# Uses $ANTHROPIC_API_KEY directly
+# No cost tracking in messages.cost_usd
+# No provider switching/retry/fallback
+# Split cost accounting
 ```
 
-**Basic Usage:**
-```bash
-aider --message "Fix the build error" --yes --no-pretty
+**Why Library Mode:**
+```python
+# ✅ CORRECT: Aider library with ModelGateway proxy
+from aider.coders import Coder
+
+coder = Coder.create(
+    model="gpt-4",
+    api_base="http://backend-go:8080/api/v1/llm/proxy",  # ModelGateway
+)
+coder.run("Fix bug")
+# All LLM calls route through ModelGateway
+# Cost tracked in messages.cost_usd
+# Provider switching/retry/fallback preserved
+# Unified cost accounting
 ```
 
-**Options:**
-- `--message`: Prompt for Aider
-- `--yes`: Auto-accept changes (no interactive prompt)
-- `--no-pretty`: Machine-readable output
-- `--model`: LLM model (default: gpt-4)
-- `--no-git`: Disable git commits
+**Architecture:**
 
-**Output Format:**
 ```
-Committed: abc123def456
-Files changed: 2
-- auth.go
-- auth_test.go
+AiderRunner (Go) → HTTP → AiderService (Python) → Aider Library → LiteLLM → ModelGateway (Go) → Anthropic/OpenAI
+                                                                                    |
+                                                                                    v
+                                                                          messages.cost_usd
 ```
+
+**Benefits:**
+
+1. ✅ **Centralized Cost Tracking:** All costs in `messages.cost_usd` (single source of truth)
+2. ✅ **Provider Switching:** ModelGateway handles Anthropic → OpenAI fallback
+3. ✅ **Retry Logic:** ModelGateway retries on rate limits
+4. ✅ **No API Key Leakage:** Aider never sees `$ANTHROPIC_API_KEY`
+5. ✅ **Consistent Accounting:** AgentLoop + AiderRunner costs in same table
 
 ### 8.2 Git Commands Reference
 
@@ -1324,7 +1623,73 @@ workspace_disk_usage_bytes{workflow_id="abc-123"}
 - Workspace disk usage
 - Build/test failure rate
 
-### 8.8 Security Considerations
+### 8.9 Cost Tracking Verification
+
+**CRITICAL:** Verify all Aider costs appear in `messages.cost_usd`.
+
+**Query to Verify:**
+
+```sql
+-- All costs for a workflow (AgentLoop + AiderRunner)
+SELECT 
+    m.id,
+    m.workflow_id,
+    m.expert_id,
+    m.role,
+    m.content_preview,
+    m.cost_usd,
+    m.created_at
+FROM messages m
+WHERE m.workflow_id = 'abc-123'
+ORDER BY m.created_at;
+
+-- Total cost breakdown by phase
+SELECT 
+    w.current_phase,
+    COUNT(*) as message_count,
+    SUM(m.cost_usd) as total_cost_usd
+FROM messages m
+JOIN workflows w ON m.workflow_id = w.id
+WHERE m.workflow_id = 'abc-123'
+GROUP BY w.current_phase;
+```
+
+**Expected Output:**
+
+```
+current_phase       | message_count | total_cost_usd
+--------------------|---------------|---------------
+high_level_design   | 15            | 0.45
+detailed_design     | 20            | 0.60
+implementation      | 30            | 1.20  ← Aider costs here
+qa                  | 25            | 0.90  ← Aider costs here
+handoff             | 5             | 0.15
+```
+
+**Validation:**
+
+1. ✅ All phases have costs in `messages.cost_usd`
+2. ✅ Implementation/QA costs include Aider iterations
+3. ✅ No missing costs (compare with ModelGateway logs)
+4. ✅ Cost matches provider invoices (Anthropic/OpenAI)
+
+**Alert if:**
+
+```sql
+-- Alert: Workflow completed but no implementation costs
+SELECT w.id, w.title
+FROM workflows w
+WHERE w.status = 'completed'
+  AND w.current_phase = 'completed'
+  AND NOT EXISTS (
+      SELECT 1 FROM messages m
+      WHERE m.workflow_id = w.id
+        AND m.cost_usd > 0
+        AND w.current_phase IN ('implementation', 'qa')
+  );
+```
+
+### 8.10 Security Considerations
 
 **Sandbox Aider Execution:**
 
