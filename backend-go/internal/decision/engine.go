@@ -185,7 +185,10 @@ func (e *Engine) Process(
 			// re-run gateStructurePermission's DB lookup against the
 			// ALREADY-rewritten question and incorrectly re-append the
 			// preference text a second time.
-		return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil, nil)
+			//
+			// tokenCh is passed through (not nil) so streaming continues
+			// on retry — user sees continuous token flow, not frozen stream.
+		return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil, tokenCh)
 		}
 		return &DecisionResult{
 			Mode:        ModeREFUSE,
