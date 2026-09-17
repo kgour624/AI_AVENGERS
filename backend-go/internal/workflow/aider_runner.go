@@ -121,8 +121,10 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 		zap.String("phase", req.WorkflowPhase),
 	)
 
-	// Step 1: Initialize workspace
-	workspacePath := filepath.Join(a.workspaceDir, req.WorkflowID.String())
+	// Step 1: Initialize workspace (per-expert isolation)
+	// WHY per-expert: Prevent git race conditions in parallel execution
+	// Path: /workspaces/{workflow_id}/{expert_id}/
+	workspacePath := filepath.Join(a.workspaceDir, req.WorkflowID.String(), req.Expert.ID.String())
 	if err := a.initWorkspace(ctx, workspacePath); err != nil {
 		return nil, fmt.Errorf("init workspace: %w", err)
 	}
