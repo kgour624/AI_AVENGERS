@@ -49,14 +49,15 @@ type runnerState struct {
 //   Projector reads events and updates workflow_tasks.
 //   Runner never writes directly to workflow_tasks.
 type WorkflowRunner struct {
-	db        *pgxpool.Pool
-	engine    *Engine
-	planner   *Planner
-	agentLoop *AgentLoop
-	tools     *Tools
-	store     *blackboard.Store
-	gateway   *gateway.ModelGateway
-	logger    *zap.Logger
+	db          *pgxpool.Pool
+	engine      *Engine
+	planner     *Planner
+	agentLoop   *AgentLoop
+	aiderRunner *AiderRunner // NEW: Aider integration for implementation/qa phases
+	tools       *Tools
+	store       *blackboard.Store
+	gateway     *gateway.ModelGateway
+	logger      *zap.Logger
 }
 
 func NewWorkflowRunner(
@@ -64,6 +65,7 @@ func NewWorkflowRunner(
 	engine *Engine,
 	planner *Planner,
 	agentLoop *AgentLoop,
+	aiderRunner *AiderRunner, // NEW: Aider integration
 	tools *Tools,
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
@@ -71,7 +73,8 @@ func NewWorkflowRunner(
 ) *WorkflowRunner {
 	return &WorkflowRunner{
 		db: db, engine: engine, planner: planner,
-		agentLoop: agentLoop, tools: tools, store: store,
+		agentLoop: agentLoop, aiderRunner: aiderRunner,
+		tools: tools, store: store,
 		gateway: gw, logger: logger,
 	}
 }
@@ -253,10 +256,17 @@ func (r *WorkflowRunner) executeWaves(
 	var firstErr error
 	var errMu sync.Mutex
 
+	// NEW: Check if current phase requires Aider (implementation/qa)
+	// Design phases (high_level_design, detailed_design, handoff) use AgentLoop
+	// Implementation/QA phases use AiderRunner (file system + git)
+	useAider := state.Phase == PhaseImplementation || state.Phase == PhaseQA
+
 	for waveIdx, wave := range waves {
 		r.logger.Info("runner: executing wave",
 			zap.Int("wave", waveIdx),
 			zap.Int("tasks", len(wave)),
+			zap.String("phase", state.Phase),
+			zap.Bool("use_aider", useAider),
 		)
 
 		var wg sync.WaitGroup
@@ -270,34 +280,64 @@ func (r *WorkflowRunner) executeWaves(
 					return
 				}
 
-				_, err := r.agentLoop.Run(ctx, AgentLoopRequest{
-					WorkflowID:      workflowID,
-					Expert:          expert,
-					TaskID:          uuid.Nil,
-					TaskTitle:       t.Title,
-					TaskDescription: t.Description,
-					// WorkflowPhase: passed so AgentLoop knows design vs implementation.
-					// Design phases: Gates 1+2+3 active.
-					// Implementation phase: Gate 1 only, generic BLOCKED.
-					WorkflowPhase: state.Phase,
-					// AllExperts: all workflow experts for Gate 2 peer poll.
-					AllExperts: experts,
-				})
-				if err != nil {
-					r.logger.Error("runner: task failed",
-						zap.String("expert", expert.Name),
-						zap.Error(err),
-					)
-					errMu.Lock()
-					if firstErr == nil {
-						firstErr = err
+				// NEW: Route to appropriate executor based on phase
+				if useAider {
+					// Implementation/QA: Use AiderRunner (file system + git)
+					_, err := r.aiderRunner.Run(ctx, AiderRunRequest{
+						WorkflowID:      workflowID,
+						Expert:          expert,
+						TaskID:          uuid.Nil,
+						TaskTitle:       t.Title,
+						TaskDescription: t.Description,
+						WorkflowPhase:   state.Phase,
+					})
+					if err != nil {
+						r.logger.Error("runner: aider task failed",
+							zap.String("expert", expert.Name),
+							zap.Error(err),
+						)
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = err
+						}
+						state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
+						errMu.Unlock()
+					} else {
+						errMu.Lock()
+						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
+						errMu.Unlock()
 					}
-					state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
-					errMu.Unlock()
 				} else {
-					errMu.Lock()
-					state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
-					errMu.Unlock()
+					// Design phases: Use AgentLoop (blackboard-based, existing code)
+					_, err := r.agentLoop.Run(ctx, AgentLoopRequest{
+						WorkflowID:      workflowID,
+						Expert:          expert,
+						TaskID:          uuid.Nil,
+						TaskTitle:       t.Title,
+						TaskDescription: t.Description,
+						// WorkflowPhase: passed so AgentLoop knows design vs implementation.
+						// Design phases: Gates 1+2+3 active.
+						// Implementation phase: Gate 1 only, generic BLOCKED.
+						WorkflowPhase: state.Phase,
+						// AllExperts: all workflow experts for Gate 2 peer poll.
+						AllExperts: experts,
+					})
+					if err != nil {
+						r.logger.Error("runner: task failed",
+							zap.String("expert", expert.Name),
+							zap.Error(err),
+						)
+						errMu.Lock()
+						if firstErr == nil {
+							firstErr = err
+						}
+						state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
+						errMu.Unlock()
+					} else {
+						errMu.Lock()
+						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
+						errMu.Unlock()
+					}
 				}
 
 				// Save checkpoint after each task.
