@@ -308,8 +308,20 @@ func buildRouter(
 	// WorkflowRunner: drives workflows from start to completion.
 	wfPlanner := workflow.NewPlanner(modelGateway, logger)
 	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, contextAssembler, logger)
+	// AiderRunner: executes implementation/qa phases using Aider.
+	// WHY separate from AgentLoop: File system as context, git history as memory.
+	// Workspace root: configurable via AIDER_WORKSPACE_ROOT env var.
+	// Default: /tmp/ai_avengers_workspaces (dev convenience, auto-cleanup on reboot)
+	// Production: set AIDER_WORKSPACE_ROOT=/data/workspaces
+	// Docker: set AIDER_WORKSPACE_ROOT=/workspaces (volume mount)
+	workspaceRoot := os.Getenv("AIDER_WORKSPACE_ROOT")
+	if workspaceRoot == "" {
+		workspaceRoot = "/tmp/ai_avengers_workspaces"
+	}
+	wfAiderRunner := workflow.NewAiderRunner(workspaceRoot, bbStore, logger)
+	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfRunner := workflow.NewWorkflowRunner(
-		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop,
+		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner,
 		wfTools, bbStore, modelGateway, logger,
 	)
 	// Projector: blackboard events -> workflow_tasks projection (single write path).
