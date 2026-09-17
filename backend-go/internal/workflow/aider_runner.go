@@ -535,8 +535,17 @@ func (a *AiderRunner) runAiderIteration(
 		message += "\n\nObservations from previous iteration:\n" + observations
 	}
 
-	// TODO: Add expert training (Phase 2 Task 4)
-	// message += "\n\nExpert Training:\n" + req.Expert.Training
+	// Add expert training (Gate 1 only)
+	training, err := a.loadExpertTraining(ctx, req.Expert.ID)
+	if err != nil {
+		a.logger.Warn("failed to load expert training",
+			zap.Error(err),
+			zap.String("expert_id", req.Expert.ID.String()),
+		)
+		// Non-fatal: continue without training
+	} else if training != "" {
+		message += "\n\nExpert Training (Gate 1 - Domain Patterns):\n" + training
+	}
 
 	// Run Aider CLI
 	// aider --yes --message "<message>" *.go
@@ -592,4 +601,48 @@ func (a *AiderRunner) extractCommitSHA(
 		return "", fmt.Errorf("git rev-parse: %w", err)
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+// loadExpertTraining loads expert's training from DB (Gate 1 only).
+//
+// MENTAL MODEL:
+//   Gate 1: Domain-specific patterns (auth, caching, schema design)
+//   Gate 2: Peer review (not used in implementation phase)
+//   Gate 3: Approval (not used in implementation phase)
+//
+// CROSS-QUESTIONS:
+//   Q: Why Gate 1 only?
+//   A: Implementation phase doesn't need peer review/approval
+//      Gate 1 provides domain patterns (sufficient for coding)
+//
+//   Q: What if training is empty?
+//   A: Non-fatal, Aider works without training (less optimal)
+//      Training improves quality but isn't required
+//
+//   Q: How is training structured?
+//   A: Free-form text with patterns, examples, anti-patterns
+//      Expert admin defines training content
+//
+// EXAMPLE TRAINING (Backend Expert):
+//   Authentication Patterns:
+//   - Use bcrypt for password hashing (cost 12)
+//   - JWT tokens with 15-minute expiry
+//   - Refresh tokens in HTTP-only cookies
+//
+//   Anti-patterns:
+//   - Never store passwords in plain text
+//   - Never use MD5/SHA1 for passwords
+func (a *AiderRunner) loadExpertTraining(
+	ctx context.Context,
+	expertID uuid.UUID,
+) (string, error) {
+	var training string
+	err := a.db.QueryRow(ctx,
+		`SELECT COALESCE(reasoning_charter, '') FROM experts WHERE id = $1`,
+		expertID,
+	).Scan(&training)
+	if err != nil {
+		return "", fmt.Errorf("query expert training: %w", err)
+	}
+	return training, nil
 }
