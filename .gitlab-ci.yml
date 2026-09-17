@@ -1,0 +1,13 @@
+# Add gofmt check to CI pipeline
+stages:
+  - lint
+
+gofmt:
+  stage: lint
+  image: golang:1.21
+  script:
+    - gofmt -l . | tee /tmp/gofmt.txt
+    - test ! -s /tmp/gofmt.txt
+  only:
+    - merge_requests
+    - main
