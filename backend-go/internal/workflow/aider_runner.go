@@ -132,17 +132,17 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 		return nil, fmt.Errorf("seed workspace: %w", err)
 	}
 
-	// Step 3: Run Aider loop (TODO: Phase 2)
-	// For now, just return success
-	result := &AiderRunResult{
-		CommitSHAs: []string{},
-		Iterations: 0,
-		Completed:  true,
+	// Step 3: Run Aider loop (OTA: Observe → Think → Act)
+	result, err := a.runAiderLoop(ctx, req, workspacePath)
+	if err != nil {
+		return nil, fmt.Errorf("aider loop: %w", err)
 	}
 
-	a.logger.Info("aider runner completed (skeleton)",
+	a.logger.Info("aider runner completed",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
+		zap.Int("iterations", result.Iterations),
+		zap.Bool("completed", result.Completed),
 	)
 
 	return result, nil
