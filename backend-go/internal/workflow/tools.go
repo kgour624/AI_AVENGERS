@@ -64,17 +64,61 @@ type PostArtifactRequest struct {
 }
 
 // PostArtifact publishes an artifact to the blackboard.
-// This is the primary output mechanism for all experts.
+// For code_artifact_produced events: validation pipeline runs first.
+// Validation failure BLOCKS publication (Locked Decision L4).
 //
-// Mental execution:
-//   Expert: System Design, EventType: architecture_decision
-//   Content: {"decision": "Use PostgreSQL", "rationale": "..."}
-//   → blackboard.Store.Post() → INSERT blackboard_events
-//   → Redis PUBLISH workflow:{id}:events
-//   → Return event with sequence_number
+// Mental execution (code artifact):
+//   EventType: "code_artifact_produced"
+//   Content: {"filename": "handler.go", "code": "package main..."}
+//   1. Extract filename + code from content
+//   2. validation.Validate() -> OTA fix loop (max 3 rounds)
+//   3. If Passed: store.Post() with finalCode (may be LLM-fixed)
+//   4. If !Passed: return error -> artifact BLOCKED
+//
+// Mental execution (non-code artifact):
+//   EventType: "architecture_decision"
+//   -> validation skipped (not code)
+//   -> store.Post() directly
 func (t *Tools) PostArtifact(ctx context.Context, req PostArtifactRequest) (*blackboard.Event, error) {
 	if req.EventType == "" {
 		return nil, fmt.Errorf("PostArtifact: event_type is required")
+	}
+
+	// Validation: only for code artifacts.
+	// WHY only code_artifact_produced:
+	//   Architecture decisions, data models, API contracts are text.
+	//   Text artifacts have no syntax to validate.
+	//   Code artifacts (Go, TS, JS) must compile/typecheck before shipping.
+	if req.EventType == "code_artifact_produced" && t.validation != nil {
+		filename, code := extractCodeFromContent(req.Content)
+		if filename != "" && code != "" {
+			result := t.validation.Validate(ctx, validation.ArtifactRequest{
+				Filename: filename,
+				Code:     code,
+				ExpertID: req.PostedByExpertID.String(),
+			})
+			if !result.Passed {
+				t.logger.Error("PostArtifact: validation BLOCKED code artifact",
+					zap.String("filename", filename),
+					zap.String("expert_id", req.PostedByExpertID.String()),
+					zap.String("error", result.Error),
+					zap.Int("revision_rounds", result.RevisionRounds),
+				)
+				return nil, fmt.Errorf(
+					"PostArtifact: code validation failed after %d rounds: %s",
+					result.RevisionRounds, result.Error,
+				)
+			}
+			// Validation passed (possibly with LLM fixes).
+			// Update content with finalCode so the fixed version is stored.
+			if result.RevisionRounds > 0 {
+				t.logger.Info("PostArtifact: code fixed by validation pipeline",
+					zap.String("filename", filename),
+					zap.Int("revision_rounds", result.RevisionRounds),
+				)
+				req.Content = injectFixedCode(req.Content, result.FinalCode)
+			}
+		}
 	}
 
 	expertID := req.PostedByExpertID
