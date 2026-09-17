@@ -390,7 +390,7 @@ func buildRouter(
 	if workspaceRoot == "" {
 		workspaceRoot = "/tmp/ai_avengers_workspaces"
 	}
-	wfAiderRunner := workflow.NewAiderRunner(workspaceRoot, bbStore, logger)
+	wfAiderRunner := workflow.NewAiderRunner(postgres.Pool, bbStore, modelGateway, workspaceRoot, logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfRunner := workflow.NewWorkflowRunner(
 		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner,
