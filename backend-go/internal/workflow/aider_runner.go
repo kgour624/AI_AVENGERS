@@ -711,17 +711,42 @@ func (a *AiderRunner) runAiderIteration(
 		return "", false, fmt.Errorf("extract commit SHA: %w", err)
 	}
 
-	// Check if task complete
-	// Heuristic: build + tests pass
-	_, buildErr := a.runBuild(ctx, workspacePath)
-	_, testErr := a.runTests(ctx, workspacePath)
-	taskComplete = (buildErr == nil && testErr == nil)
+	// Check if task complete (phase-specific criteria)
+	if req.WorkflowPhase == "qa" {
+		// QA phase: tests pass + coverage >80%
+		testOutput, coverage, testErr := a.runTestsWithCoverage(ctx, workspacePath)
+		taskComplete = (testErr == nil && coverage >= 80.0)
 
-	a.logger.Info("aider iteration completed",
-		zap.Int("iteration", iteration),
-		zap.String("commit", commitSHA),
-		zap.Bool("task_complete", taskComplete),
-	)
+		a.logger.Info("aider iteration completed (QA phase)",
+			zap.Int("iteration", iteration),
+			zap.String("commit", commitSHA),
+			zap.Float64("coverage", coverage),
+			zap.Bool("tests_pass", testErr == nil),
+			zap.Bool("task_complete", taskComplete),
+		)
+
+		// Log warning if coverage is close but not enough
+		if testErr == nil && coverage >= 75.0 && coverage < 80.0 {
+			a.logger.Warn("coverage close to target but not sufficient",
+				zap.Float64("coverage", coverage),
+				zap.Float64("target", 80.0),
+				zap.String("test_output", testOutput),
+			)
+		}
+	} else {
+		// Implementation phase: build + tests pass
+		_, buildErr := a.runBuild(ctx, workspacePath)
+		_, testErr := a.runTests(ctx, workspacePath)
+		taskComplete = (buildErr == nil && testErr == nil)
+
+		a.logger.Info("aider iteration completed (implementation phase)",
+			zap.Int("iteration", iteration),
+			zap.String("commit", commitSHA),
+			zap.Bool("build_pass", buildErr == nil),
+			zap.Bool("tests_pass", testErr == nil),
+			zap.Bool("task_complete", taskComplete),
+		)
+	}
 
 	return commitSHA, taskComplete, nil
 }
