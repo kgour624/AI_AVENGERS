@@ -18,9 +18,9 @@ import (
 // runnerState is the checkpoint saved after each task completes.
 // Written to workflows.runner_state for pod-restart recovery.
 type runnerState struct {
-	Phase              string      `json:"phase"`
-	CompletedExpertIDs []string    `json:"completed_expert_ids"`
-	FailedExpertIDs    []string    `json:"failed_expert_ids"`
+	Phase              string   `json:"phase"`
+	CompletedExpertIDs []string `json:"completed_expert_ids"`
+	FailedExpertIDs    []string `json:"failed_expert_ids"`
 }
 
 // WorkflowRunner drives a workflow from start to completion.
@@ -49,15 +49,16 @@ type runnerState struct {
 //   Projector reads events and updates workflow_tasks.
 //   Runner never writes directly to workflow_tasks.
 type WorkflowRunner struct {
-	db          *pgxpool.Pool
-	engine      *Engine
-	planner     *Planner
-	agentLoop   *AgentLoop
-	aiderRunner *AiderRunner // NEW: Aider integration for implementation/qa phases
-	tools       *Tools
-	store       *blackboard.Store
-	gateway     *gateway.ModelGateway
-	logger      *zap.Logger
+	db              *pgxpool.Pool
+	engine          *Engine
+	planner         *Planner
+	agentLoop       *AgentLoop
+	aiderRunner     *AiderRunner     // Aider integration for implementation/qa phases
+	workspaceMerger *WorkspaceMerger // Merges per-expert workspaces after each Aider wave
+	tools           *Tools
+	store           *blackboard.Store
+	gateway         *gateway.ModelGateway
+	logger          *zap.Logger
 }
 
 func NewWorkflowRunner(
@@ -65,17 +66,24 @@ func NewWorkflowRunner(
 	engine *Engine,
 	planner *Planner,
 	agentLoop *AgentLoop,
-	aiderRunner *AiderRunner, // NEW: Aider integration
+	aiderRunner *AiderRunner,
+	workspaceMerger *WorkspaceMerger,
 	tools *Tools,
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
 	logger *zap.Logger,
 ) *WorkflowRunner {
 	return &WorkflowRunner{
-		db: db, engine: engine, planner: planner,
-		agentLoop: agentLoop, aiderRunner: aiderRunner,
-		tools: tools, store: store,
-		gateway: gw, logger: logger,
+		db:              db,
+		engine:          engine,
+		planner:         planner,
+		agentLoop:       agentLoop,
+		aiderRunner:     aiderRunner,
+		workspaceMerger: workspaceMerger,
+		tools:           tools,
+		store:           store,
+		gateway:         gw,
+		logger:          logger,
 	}
 }
 
@@ -241,6 +249,11 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 //   errgroup cancels all goroutines on first error.
 //   We want ALL tasks in a wave to complete (even if some fail).
 //   Failed tasks are marked via blackboard events, not by cancelling others.
+//
+// WORKSPACE MERGE (Aider phases only):
+//   After each wave completes, WorkspaceMerger merges per-expert workspaces
+//   into a shared main/ workspace so the next wave's experts see all prior work.
+//   Merge errors are non-fatal: logged and execution continues.
 func (r *WorkflowRunner) executeWaves(
 	ctx context.Context,
 	workflowID uuid.UUID,
@@ -256,10 +269,14 @@ func (r *WorkflowRunner) executeWaves(
 	var firstErr error
 	var errMu sync.Mutex
 
-	// NEW: Check if current phase requires Aider (implementation/qa)
-	// Design phases (high_level_design, detailed_design, handoff) use AgentLoop
-	// Implementation/QA phases use AiderRunner (file system + git)
+	// Check if current phase requires Aider (implementation/qa).
+	// Design phases (high_level_design, detailed_design, handoff) use AgentLoop.
+	// Implementation/QA phases use AiderRunner (file system + git).
 	useAider := state.Phase == PhaseImplementation || state.Phase == PhaseQA
+
+	// workflowWorkspace is the base dir for all expert workspaces in this workflow.
+	// Structure: /workspaces/{workflow_id}/{expert_id}/
+	workflowWorkspace := fmt.Sprintf("%s/%s", r.aiderRunner.workspaceDir, workflowID.String())
 
 	for waveIdx, wave := range waves {
 		r.logger.Info("runner: executing wave",
@@ -268,6 +285,10 @@ func (r *WorkflowRunner) executeWaves(
 			zap.String("phase", state.Phase),
 			zap.Bool("use_aider", useAider),
 		)
+
+		// Track which expert IDs succeeded in this wave (for post-wave merge).
+		var waveMu sync.Mutex
+		var waveExpertIDs []string
 
 		var wg sync.WaitGroup
 		for _, task := range wave {
@@ -280,9 +301,9 @@ func (r *WorkflowRunner) executeWaves(
 					return
 				}
 
-				// NEW: Route to appropriate executor based on phase
+				// Route to appropriate executor based on phase.
 				if useAider {
-					// Implementation/QA: Use AiderRunner (file system + git)
+					// Implementation/QA: Use AiderRunner (file system + git).
 					_, err := r.aiderRunner.Run(ctx, AiderRunRequest{
 						WorkflowID:      workflowID,
 						Expert:          expert,
@@ -306,9 +327,13 @@ func (r *WorkflowRunner) executeWaves(
 						errMu.Lock()
 						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
 						errMu.Unlock()
+						// Track for post-wave merge (only successful experts).
+						waveMu.Lock()
+						waveExpertIDs = append(waveExpertIDs, expert.ID.String())
+						waveMu.Unlock()
 					}
 				} else {
-					// Design phases: Use AgentLoop (blackboard-based, existing code)
+					// Design phases: Use AgentLoop (blackboard-based, existing code).
 					_, err := r.agentLoop.Run(ctx, AgentLoopRequest{
 						WorkflowID:      workflowID,
 						Expert:          expert,
@@ -345,6 +370,33 @@ func (r *WorkflowRunner) executeWaves(
 			}(task)
 		}
 		wg.Wait()
+
+		// Post-wave workspace merge (Aider phases only).
+		// Merge all successful expert workspaces into main/ so the next wave
+		// starts with a unified view of all prior work.
+		//
+		// WHY after wg.Wait(): all goroutines have finished writing to their
+		// workspaces — safe to read and merge without race conditions.
+		//
+		// WHY non-fatal: merge failure (e.g. conflict) should not abort the
+		// entire workflow. Log the error so operators can investigate.
+		if useAider && len(waveExpertIDs) > 0 {
+			r.logger.Info("runner: merging wave workspaces",
+				zap.Int("wave", waveIdx),
+				zap.Strings("expert_ids", waveExpertIDs),
+			)
+			if mergeErr := r.workspaceMerger.MergeWave(ctx, workflowWorkspace, waveExpertIDs); mergeErr != nil {
+				r.logger.Error("runner: workspace merge failed (non-fatal)",
+					zap.Int("wave", waveIdx),
+					zap.Error(mergeErr),
+				)
+			} else {
+				r.logger.Info("runner: wave workspaces merged",
+					zap.Int("wave", waveIdx),
+					zap.Int("experts_merged", len(waveExpertIDs)),
+				)
+			}
+		}
 	}
 
 	errMu.Lock()
@@ -511,5 +563,3 @@ func (r *WorkflowRunner) ResumeOrphanWorkflows(ctx context.Context) {
 		go r.Run(ctx, id)
 	}
 }
-
-
