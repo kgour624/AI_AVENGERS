@@ -172,6 +172,99 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 			workflowID, expertID,
 		)
 
+	case "code_artifact_produced":
+		// INSERT new workflow_tasks row for each code file.
+		// Each file is a separate artifact that should be visible in Kanban.
+		//
+		// MENTAL MODEL:
+		//   Input: event with {filename, file_path, content, language, lines_of_code}
+		//   Action: INSERT workflow_tasks row
+		//   Output: New row with status='done', artifact_type='code_file'
+		//
+		// CROSS-QUESTION:
+		//   Q: Why INSERT instead of UPDATE?
+		//   A: Multiple files should create multiple rows, not overwrite one row
+		//
+		//   Q: Why status='done'?
+		//   A: File already created by Aider, not a future task
+		//
+		//   Q: What if event.PostedByExpertID is nil?
+		//   A: Skip event (invalid, should always have expert_id)
+		//
+		// EXAMPLE:
+		//   Event: {filename: "auth.go", language: "go", lines_of_code: 150}
+		//   Result: INSERT workflow_tasks (
+		//     title = "Generated: auth.go",
+		//     status = 'done',
+		//     artifact_type = 'code_file',
+		//     artifact_data = {filename, file_path, language, lines_of_code}
+		//   )
+		if event.PostedByExpertID == nil {
+			p.logger.Warn("code_artifact_produced: missing expert_id",
+				zap.String("event_id", event.ID.String()),
+			)
+			return
+		}
+
+		// Parse event data
+		var artifactData struct {
+			Filename     string `json:"filename"`
+			FilePath     string `json:"file_path"`
+			Language     string `json:"language"`
+			LinesOfCode  int    `json:"lines_of_code"`
+			CommitSHA    string `json:"commit_sha"`
+		}
+		if err := json.Unmarshal(event.Content, &artifactData); err != nil {
+			p.logger.Warn("code_artifact_produced: parse failed",
+				zap.String("event_id", event.ID.String()),
+				zap.Error(err),
+			)
+			return
+		}
+
+		// INSERT workflow_tasks row
+		title := fmt.Sprintf("Generated: %s", artifactData.Filename)
+		description := fmt.Sprintf("Code file: %s (%s, %d lines)",
+			artifactData.FilePath,
+			artifactData.Language,
+			artifactData.LinesOfCode,
+		)
+
+		_, err := p.db.Exec(ctx,
+			`INSERT INTO workflow_tasks (
+				workflow_id,
+				assigned_expert_id,
+				title,
+				description,
+				status,
+				artifact_type,
+				artifact_data,
+				produced_artifact_event_id,
+				started_at,
+				completed_at
+			) VALUES ($1, $2, $3, $4, 'done', 'code_file', $5, $6, NOW(), NOW())`,
+			workflowID,
+			*event.PostedByExpertID,
+			title,
+			description,
+			event.Content, // Store full artifact data as JSON
+			event.ID,
+		)
+		if err != nil {
+			p.logger.Warn("code_artifact_produced: insert task failed",
+				zap.String("filename", artifactData.Filename),
+				zap.Error(err),
+			)
+			return
+		}
+
+		p.logger.Info("code_artifact_produced: task created",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("filename", artifactData.Filename),
+			zap.String("language", artifactData.Language),
+			zap.Int("lines", artifactData.LinesOfCode),
+		)
+
 	default:
 		// Artifact events: update produced_artifact_event_id.
 		artifactTypes := map[string]bool{
