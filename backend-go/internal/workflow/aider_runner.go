@@ -14,10 +14,12 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/ml"
 )
 
 // AiderRunner executes implementation/qa tasks using Aider.
@@ -66,8 +68,9 @@ type AiderRunner struct {
 	db              *pgxpool.Pool
 	store           *blackboard.Store
 	gateway         *gateway.ModelGateway
-	workspaceDir    string // Base directory: /workspaces/
-	aiderServiceURL string // AiderService HTTP API URL
+	mlClient        *ml.SidecarClient // For embedding task descriptions -> RAG on course_chunks
+	workspaceDir    string            // Base directory: /workspaces/
+	aiderServiceURL string            // AiderService HTTP API URL
 	httpClient      *http.Client
 	logger          *zap.Logger
 }
@@ -80,6 +83,7 @@ func NewAiderRunner(
 	db *pgxpool.Pool,
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
+	mlClient *ml.SidecarClient,
 	workspaceDir string,
 	aiderServiceURL string,
 	logger *zap.Logger,
@@ -88,6 +92,7 @@ func NewAiderRunner(
 		db:              db,
 		store:           store,
 		gateway:         gw,
+		mlClient:        mlClient,
 		workspaceDir:    workspaceDir,
 		aiderServiceURL: aiderServiceURL,
 		httpClient:      &http.Client{Timeout: 10 * time.Minute},
@@ -1108,48 +1113,157 @@ func (a *AiderRunner) buildQAPrompt(taskDescription string, observations string)
 	return prompt.String()
 }
 
-// loadExpertTraining loads expert's training from DB (Gate 1 only).
+// loadExpertTraining loads expert's actual training knowledge via RAG.
 //
 // MENTAL MODEL:
-//   Gate 1: Domain-specific patterns (auth, caching, schema design)
-//   Gate 2: Peer review (not used in implementation phase)
-//   Gate 3: Approval (not used in implementation phase)
+//   Two parts returned as one string:
+//
+//   Part 1 — RULES (reasoning_charter):
+//     "Never use microservices for team < 10"
+//     "Always use bcrypt cost 12 for passwords"
+//     These are hard rules the expert MUST follow.
+//
+//   Part 2 — KNOWLEDGE (course_chunks via vector search):
+//     Embed the task description -> find top-10 most relevant chunks
+//     from this expert's training corpus (course_chunks WHERE expert_id=X).
+//     These are the actual patterns, examples, code snippets from transcripts.
+//
+// WHY RAG not just charter:
+//   Charter = rules (what to do/not do).
+//   Chunks = knowledge (HOW to do it, with examples).
+//   Without chunks, expert has rules but no knowledge of HOW.
+//   With chunks, expert codes from its own training, not generic LLM knowledge.
 //
 // CROSS-QUESTIONS:
-//   Q: Why Gate 1 only?
-//   A: Implementation phase doesn't need peer review/approval
-//      Gate 1 provides domain patterns (sufficient for coding)
+//   Q: Why embed task description for retrieval?
+//   A: We want chunks most relevant to THIS task.
+//      "Implement JWT auth" -> retrieves auth chunks, not caching chunks.
 //
-//   Q: What if training is empty?
-//   A: Non-fatal, Aider works without training (less optimal)
-//      Training improves quality but isn't required
+//   Q: Why top-10 chunks?
+//   A: ~500 tokens/chunk * 10 = ~5000 tokens. Fits in Aider's budget.
+//      More chunks = better coverage but higher cost.
 //
-//   Q: How is training structured?
-//   A: Free-form text with patterns, examples, anti-patterns
-//      Expert admin defines training content
+//   Q: What if expert has no chunks (not trained yet)?
+//   A: Return charter only. Log warning. Workflow continues.
+//      Admin must upload transcripts before expert is useful.
 //
-// EXAMPLE TRAINING (Backend Expert):
-//   Authentication Patterns:
-//   - Use bcrypt for password hashing (cost 12)
-//   - JWT tokens with 15-minute expiry
-//   - Refresh tokens in HTTP-only cookies
+//   Q: What if ML sidecar is down?
+//   A: Fall back to charter only. Non-fatal. Log error.
 //
-//   Anti-patterns:
-//   - Never store passwords in plain text
-//   - Never use MD5/SHA1 for passwords
+//   Q: What if task description is empty?
+//   A: Skip RAG, return charter only.
 func (a *AiderRunner) loadExpertTraining(
 	ctx context.Context,
 	expertID uuid.UUID,
+	taskDescription string,
 ) (string, error) {
-	var training string
+	// Step 1: Load reasoning_charter (rules)
+	var charter string
 	err := a.db.QueryRow(ctx,
 		`SELECT COALESCE(reasoning_charter, '') FROM experts WHERE id = $1`,
 		expertID,
-	).Scan(&training)
+	).Scan(&charter)
 	if err != nil {
-		return "", fmt.Errorf("query expert training: %w", err)
+		return "", fmt.Errorf("query expert charter: %w", err)
 	}
-	return training, nil
+
+	// Step 2: RAG on course_chunks — embed task, find relevant chunks
+	//
+	// MENTAL MODEL:
+	//   taskDescription = "Implement JWT authentication with refresh tokens"
+	//   -> embed -> 768D vector
+	//   -> cosine similarity search in course_chunks WHERE expert_id = X
+	//   -> top-10 most relevant chunks returned
+	//   -> these are the expert's actual training knowledge for this task
+	var chunks []string
+
+	if taskDescription != "" && a.mlClient != nil {
+		// Embed the task description
+		embedding, embedErr := a.mlClient.EmbedSingle(ctx, taskDescription)
+		if embedErr != nil {
+			// Non-fatal: fall back to charter only
+			a.logger.Warn("loadExpertTraining: embed failed, using charter only",
+				zap.String("expert_id", expertID.String()),
+				zap.Error(embedErr),
+			)
+		} else {
+			// Vector search: top-10 most relevant chunks for this expert
+			//
+			// CROSS-QUESTION:
+			//   Q: Why pgvector cosine distance (<=>)?
+			//   A: bge-base-en-v1.5 embeddings are normalized.
+			//      Cosine distance = 1 - cosine_similarity.
+			//      Lower distance = more similar = more relevant.
+			//
+			//   Q: Why ORDER BY distance ASC LIMIT 10?
+			//   A: ASC = closest first. LIMIT 10 = top-10 most relevant.
+			rows, queryErr := a.db.Query(ctx,
+				`SELECT chunk_text
+				 FROM course_chunks
+				 WHERE expert_id = $1
+				 ORDER BY embedding <=> $2
+				 LIMIT 10`,
+				expertID,
+				pgvector.NewVector(embedding),
+			)
+			if queryErr != nil {
+				a.logger.Warn("loadExpertTraining: chunk query failed, using charter only",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(queryErr),
+				)
+			} else {
+				defer rows.Close()
+				for rows.Next() {
+					var chunkText string
+					if scanErr := rows.Scan(&chunkText); scanErr == nil {
+						chunks = append(chunks, chunkText)
+					}
+				}
+			}
+		}
+	}
+
+	// Step 3: Build training string
+	//
+	// MENTAL MODEL:
+	//   Final string sent to Aider:
+	//
+	//   === YOUR RULES (follow strictly) ===
+	//   Never use microservices for team < 10
+	//   Always use bcrypt cost 12
+	//
+	//   === YOUR TRAINING KNOWLEDGE (use this, not generic LLM knowledge) ===
+	//   [Chunk 1]: JWT tokens should be short-lived (15 min)...
+	//   [Chunk 2]: Refresh tokens stored in httpOnly cookies...
+	//   ...
+	var sb strings.Builder
+
+	if charter != "" {
+		sb.WriteString("=== YOUR RULES (follow strictly, no exceptions) ===\n")
+		sb.WriteString(charter)
+		sb.WriteString("\n\n")
+	}
+
+	if len(chunks) > 0 {
+		sb.WriteString("=== YOUR TRAINING KNOWLEDGE (use THIS, not generic LLM knowledge) ===\n")
+		sb.WriteString("The following is from your training transcripts. "
+			+ "Code and design based on these patterns ONLY.\n\n")
+		for i, chunk := range chunks {
+			sb.WriteString(fmt.Sprintf("[Training %d]:\n%s\n\n", i+1, chunk))
+		}
+		a.logger.Info("loadExpertTraining: RAG complete",
+			zap.String("expert_id", expertID.String()),
+			zap.Int("chunks_retrieved", len(chunks)),
+		)
+	} else {
+		// No chunks found — expert not trained yet
+		a.logger.Warn("loadExpertTraining: no training chunks found for expert",
+			zap.String("expert_id", expertID.String()),
+			zap.String("action", "admin must upload transcripts for this expert"),
+		)
+	}
+
+	return sb.String(), nil
 }
 
 // publishCodeArtifacts walks the workspace and posts all code files to blackboard.
