@@ -104,6 +104,56 @@ type AiderRunResult struct {
 	Completed  bool     // True if task completed successfully
 }
 
+// AiderCheckpoint represents saved state for resuming after pod restart.
+//
+// PHASE 5: Production Hardening - Error Recovery
+//
+// MENTAL MODEL:
+//   Pod crashes during iteration 3 of 5
+//   On restart:
+//     1. Load checkpoint from DB
+//     2. Resume from iteration 4
+//     3. Continue OTA loop
+//
+// CROSS-QUESTIONS:
+//   Q: What state needs to be saved?
+//   A: Iteration number, commits, observations, completion status
+//
+//   Q: Where to save?
+//   A: Database table: aider_checkpoints
+//      Key: (workflow_id, expert_id, task_id)
+//
+//   Q: When to save?
+//   A: After each successful iteration (before next iteration starts)
+//
+//   Q: How to resume?
+//   A: Load checkpoint, skip completed iterations, continue from last+1
+//
+//   Q: What if no checkpoint?
+//   A: Start from iteration 1 (normal flow, first run)
+//
+//   Q: When to delete checkpoint?
+//   A: After task completes successfully (cleanup)
+//
+// EXAMPLE:
+//   Iteration 1: Create auth.go → Save checkpoint (iteration=1, commits=[abc123])
+//   Iteration 2: Fix import → Save checkpoint (iteration=2, commits=[abc123, def456])
+//   [POD CRASH]
+//   On restart: Load checkpoint → Resume from iteration 3
+//   Iteration 3: Add tests → Save checkpoint (iteration=3, commits=[abc123, def456, ghi789])
+//   Task complete → Delete checkpoint
+type AiderCheckpoint struct {
+	WorkflowID       uuid.UUID `json:"workflow_id"`
+	ExpertID         uuid.UUID `json:"expert_id"`
+	TaskID           uuid.UUID `json:"task_id"`
+	CurrentIteration int       `json:"current_iteration"` // Last completed iteration
+	CommitSHAs       []string  `json:"commit_shas"`       // All commits produced so far
+	LastObservation  string    `json:"last_observation"`  // Observations from last iteration
+	Completed        bool      `json:"completed"`         // True if task completed
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
+}
+
 // Run executes the Aider loop for one expert's task.
 //
 // CRITICAL: This is Phase 1 skeleton - no actual Aider calls yet.
