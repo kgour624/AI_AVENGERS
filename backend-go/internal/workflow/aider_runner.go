@@ -530,6 +530,109 @@ func (a *AiderRunner) runTests(
 	return string(output), err
 }
 
+// runTestsWithCoverage executes go test with coverage and captures output.
+//
+// PHASE 4: QA Phase Support
+//
+// MENTAL MODEL:
+//   go test -cover ./... outputs:
+//     ok      package1    0.123s  coverage: 85.7% of statements
+//     ok      package2    0.456s  coverage: 92.3% of statements
+//
+//   Parse output to extract coverage percentage
+//
+// CROSS-QUESTIONS:
+//   Q: Why separate method?
+//   A: runTests() doesn't capture coverage, need -cover flag
+//
+//   Q: What if no tests?
+//   A: Coverage = 0%, not an error (first iteration)
+//
+//   Q: What if multiple packages?
+//   A: Average coverage across all packages
+//
+// RETURNS:
+//   output: Full test output (for debugging)
+//   coverage: Average coverage percentage (0-100)
+//   error: Non-nil if tests failed to run (not if tests failed)
+func (a *AiderRunner) runTestsWithCoverage(
+	ctx context.Context,
+	workspacePath string,
+) (output string, coverage float64, err error) {
+	cmd := exec.CommandContext(ctx, "go", "test", "-cover", "./...")
+	cmd.Dir = workspacePath
+	outputBytes, cmdErr := cmd.CombinedOutput()
+	output = string(outputBytes)
+
+	// Parse coverage from output
+	coverage = a.parseCoverage(output)
+
+	// Return command error (if any)
+	return output, coverage, cmdErr
+}
+
+// parseCoverage extracts average coverage percentage from go test output.
+//
+// PHASE 4: QA Phase Support
+//
+// MENTAL MODEL:
+//   Input:
+//     ok      package1    0.123s  coverage: 85.7% of statements
+//     ok      package2    0.456s  coverage: 92.3% of statements
+//   Output: 89.0 (average of 85.7 and 92.3)
+//
+// CROSS-QUESTIONS:
+//   Q: Why average?
+//   A: Single metric for overall coverage
+//      Alternative: weighted by package size (future)
+//
+//   Q: What if no coverage lines?
+//   A: Return 0.0 (no tests yet)
+//
+//   Q: What if parse fails?
+//   A: Return 0.0 (graceful degradation)
+//
+// REGEX:
+//   coverage: (\d+\.\d+)% of statements
+//   Captures: 85.7, 92.3, etc.
+func (a *AiderRunner) parseCoverage(output string) float64 {
+	// Regex to match: coverage: 85.7% of statements
+	// Note: Using simple string parsing instead of regex for clarity
+	lines := strings.Split(output, "\n")
+	var totalCoverage float64
+	var count int
+
+	for _, line := range lines {
+		// Look for "coverage: XX.X% of statements"
+		if strings.Contains(line, "coverage:") && strings.Contains(line, "% of statements") {
+			// Extract percentage
+			// Example: "ok  	package	0.123s	coverage: 85.7% of statements"
+			parts := strings.Split(line, "coverage:")
+			if len(parts) < 2 {
+				continue
+			}
+			// parts[1] = " 85.7% of statements"
+			percentPart := strings.TrimSpace(parts[1])
+			// percentPart = "85.7% of statements"
+			percentStr := strings.Split(percentPart, "%")[0]
+			// percentStr = "85.7"
+
+			// Parse float
+			var percent float64
+			if _, err := fmt.Sscanf(percentStr, "%f", &percent); err == nil {
+				totalCoverage += percent
+				count++
+			}
+		}
+	}
+
+	// Return average
+	if count == 0 {
+		return 0.0
+	}
+	return totalCoverage / float64(count)
+}
+
 // runAiderIteration executes one Aider iteration.
 //
 // MENTAL MODEL:
