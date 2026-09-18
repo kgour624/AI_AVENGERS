@@ -304,6 +304,9 @@ func (e *Enforcer) enforceStructured(
 			clean, n := e.stripUncited(s.Content, profile.StripMode)
 			s.Content = clean
 			strippedCount += n
+			// SECURITY FIX: Remove [CHUNK_xxx] tokens from prose sections.
+			// Same rationale as flat-text path above.
+			s.Content = e.cleanChunkIDs(s.Content)
 		}
 		if strings.TrimSpace(s.Content) != "" {
 			anyContent = true
