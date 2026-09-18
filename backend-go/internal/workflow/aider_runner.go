@@ -461,15 +461,27 @@ func (a *AiderRunner) runAiderLoop(
 			return nil, fmt.Errorf("observe workspace: %w", err)
 		}
 
-		// Step 2: Think + Act (Aider iteration)
+		// Step 2: Think + Act (Aider iteration) with timeout
+		// PHASE 5: Add 5-minute timeout per iteration
+		iterationCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 		commitSHA, taskComplete, err := a.runAiderIteration(
-			ctx,
+			iterationCtx,
 			req,
 			workspacePath,
 			observations,
 			iteration,
 		)
+		cancel() // Always cancel to release resources
+
 		if err != nil {
+			// Check if timeout
+			if iterationCtx.Err() == context.DeadlineExceeded {
+				a.logger.Error("aider iteration timeout",
+					zap.Int("iteration", iteration),
+					zap.Duration("timeout", 5*time.Minute),
+				)
+				return nil, fmt.Errorf("aider iteration %d timeout after 5 minutes", iteration)
+			}
 			return nil, fmt.Errorf("aider iteration %d: %w", iteration, err)
 		}
 
