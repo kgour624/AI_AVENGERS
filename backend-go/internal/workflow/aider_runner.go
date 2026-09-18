@@ -1393,7 +1393,7 @@ func (a *AiderRunner) publishCodeArtifacts(
 		if postErr != nil {
 			a.logger.Error("failed to post code artifact",
 				zap.String("file", relPath),
-				zap.Error(err),
+				zap.Error(postErr),
 			)
 			return nil // Continue walking even if one post fails
 		}
