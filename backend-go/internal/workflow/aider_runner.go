@@ -455,6 +455,32 @@ func (a *AiderRunner) runAiderLoop(
 			zap.Int("max", maxIterations),
 		)
 
+		// PHASE 5: Check workspace size before iteration
+		// Prevent disk exhaustion from runaway code generation
+		workspaceSize, err := a.getWorkspaceSize(workspacePath)
+		if err != nil {
+			a.logger.Warn("failed to check workspace size",
+				zap.Error(err),
+				zap.String("workspace", workspacePath),
+			)
+			// Non-fatal: continue without size check
+		} else {
+			const maxWorkspaceSize = 1024 * 1024 * 1024 // 1GB
+			if workspaceSize > maxWorkspaceSize {
+				a.logger.Error("workspace size exceeded limit",
+					zap.Int64("size_bytes", workspaceSize),
+					zap.Int64("limit_bytes", maxWorkspaceSize),
+					zap.String("workspace", workspacePath),
+				)
+				return nil, fmt.Errorf("workspace size %d bytes exceeds limit %d bytes",
+					workspaceSize, maxWorkspaceSize)
+			}
+			a.logger.Debug("workspace size check passed",
+				zap.Int64("size_bytes", workspaceSize),
+				zap.Float64("size_mb", float64(workspaceSize)/(1024*1024)),
+			)
+		}
+
 		// Step 1: Observe workspace state (phase-aware)
 		observations, err := a.observeWorkspace(ctx, req.WorkflowPhase, workspacePath)
 		if err != nil {
