@@ -2014,7 +2014,7 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 	response.OK(c, map[string]interface{}{
 		"active_provider":     provider,
 		"fallback_provider":   fallbackProvider,
-		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini", "codecraftapi"},
+		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini", "codecraftapi", "cavoti"},
 		"api_keys_configured": maskedKeys,
 		"note": "API keys are masked. To update, POST to this endpoint with new values.",
 	})
@@ -2037,6 +2037,10 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 		CodeCraftAPIModelCheap  string `json:"codecraftapi_model_cheap"`
 		CodeCraftAPIModelStrong string `json:"codecraftapi_model_strong"`
 		CodeCraftAPIModelFast   string `json:"codecraftapi_model_fast"`
+		// Cavoti per-tier model names (optional — only used when provider=cavoti)
+		CavotiModelCheap  string `json:"cavoti_model_cheap"`
+		CavotiModelStrong string `json:"cavoti_model_strong"`
+		CavotiModelFast   string `json:"cavoti_model_fast"`
 		// ClearFallback: set to true to explicitly remove the fallback provider.
 		// WHY a separate flag: empty string in FallbackProvider is ambiguous
 		// ("not provided" vs "clear it"). ClearFallback=true is unambiguous.
@@ -2050,16 +2054,16 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 	validProviders := map[string]bool{
 		"openrouter": true, "deepseek": true,
 		"anthropic": true, "gemini": true,
-		"codecraftapi": true,
+		"codecraftapi": true, "cavoti": true,
 	}
 	if req.Provider != "" && !validProviders[req.Provider] {
 		response.BadRequest(c, "INVALID_PROVIDER",
-			"provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi")
+			"provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi, cavoti")
 		return
 	}
 	if req.FallbackProvider != "" && !validProviders[req.FallbackProvider] {
 		response.BadRequest(c, "INVALID_FALLBACK_PROVIDER",
-			"fallback_provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi")
+			"fallback_provider must be: openrouter, deepseek, anthropic, gemini, codecraftapi, cavoti")
 		return
 	}
 
@@ -2147,11 +2151,14 @@ func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 		}
 	}
 
-	// Save CodeCraftAPI per-tier model names (only when provided)
+	// Save per-tier model names for CodeCraftAPI and Cavoti (only when provided)
 	modelSettings := map[string]string{
 		"codecraftapi_model_cheap":  req.CodeCraftAPIModelCheap,
 		"codecraftapi_model_strong": req.CodeCraftAPIModelStrong,
 		"codecraftapi_model_fast":   req.CodeCraftAPIModelFast,
+		"cavoti_model_cheap":        req.CavotiModelCheap,
+		"cavoti_model_strong":       req.CavotiModelStrong,
+		"cavoti_model_fast":         req.CavotiModelFast,
 	}
 	for key, value := range modelSettings {
 		if value == "" {
