@@ -746,6 +746,9 @@ func (a *AiderRunner) publishCodeArtifacts(
 		zap.String("expert", req.Expert.Name),
 	)
 
+	// Track validation start time for metrics
+	validationStart := time.Now()
+
 	// Create timeout context for validation
 	// MENTAL MODEL:
 	//   Build/tests may hang forever (infinite loop, deadlock)
