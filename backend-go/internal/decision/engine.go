@@ -236,7 +236,6 @@ func (e *Engine) Process(
 		}, nil
 	}
 }
-}
 
 // gate1 checks if we have enough information to answer.
 // Uses double-check pattern:
