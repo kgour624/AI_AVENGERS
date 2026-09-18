@@ -360,6 +360,14 @@ func (h *Handler) Send(c *gin.Context) {
 			"message_ids": savedMessageIDs,
 		})
 
+		// CRITICAL: Flush the writer to ensure SSEDone reaches frontend immediately.
+		// WHY: Without flush, Gin may buffer the final event, causing frontend
+		// to show "Streaming..." indefinitely even though backend is done.
+		// BUG FIX: Frontend "Streaming..." persists after completion.
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+
 		return false // Stop streaming
 	})
 }
