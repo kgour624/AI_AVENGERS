@@ -30,6 +30,14 @@ import { handleAPIError } from '@/utils/errors'
  * 4. Separate Save buttons for LLM settings and embedding settings.
  *    WHY separate: they write to different system_settings keys and have
  *    different side effects (LLM change = next call; embedding change = must re-ingest).
+ * 5. Added Cavoti as 6th provider option (backend already wired: see
+ *    internal/gateway/providers/cavoti.go + model_gateway.go + config.go).
+ *    Cavoti model picker uses manual text Inputs, NOT a "Fetch Available
+ *    Models" button like CodeCraftAPI — the backend has no
+ *    GET /admin/cavoti/models proxy endpoint (only codecraftapi/models
+ *    exists), so there is nothing to fetch from yet. Same fallback
+ *    pattern already used below for the embedding model Input when no
+ *    catalog has been fetched.
  */
 
 const PROVIDERS = [
@@ -38,6 +46,7 @@ const PROVIDERS = [
   { value: 'anthropic',    label: 'Anthropic (direct)',                 desc: 'Direct Anthropic API — use your own Claude key' },
   { value: 'gemini',       label: 'Google Gemini (direct)',             desc: 'Direct Gemini API — use your own Google AI key' },
   { value: 'codecraftapi', label: 'CodeCraftAPI (multi-model gateway)', desc: 'Single key, access to multiple AI models. Also supports embeddings.' },
+  { value: 'cavoti',       label: 'Cavoti (multi-model gateway)',       desc: 'OpenAI-compatible, sk- prefix API key. Multiple models via one key.' },
 ]
 
 function AdminLLMSettings() {
@@ -69,6 +78,14 @@ function AdminLLMSettings() {
   const [fetchingModels, setFetchingModels] = useState(false)
   const [fetchModelsError, setFetchModelsError] = useState('')
 
+  // Cavoti model selection state — manual text inputs, no catalog fetch.
+  // WHY no "Fetch Available Models" button here: backend has no
+  // GET /admin/cavoti/models proxy (only /admin/codecraftapi/models
+  // exists). Admin types the model ID from the Cavoti dashboard.
+  const [cavotiModelCheap, setCavotiModelCheap] = useState('')
+  const [cavotiModelStrong, setCavotiModelStrong] = useState('')
+  const [cavotiModelFast, setCavotiModelFast] = useState('')
+
   // Embedding settings state
   const [embeddingProvider, setEmbeddingProvider] = useState<'sidecar' | 'codecraftapi' | ''>('')
   const [embeddingModel, setEmbeddingModel] = useState('')
@@ -87,6 +104,9 @@ function AdminLLMSettings() {
         codecraftapiModelCheap:  ccModelCheap  || undefined,
         codecraftapiModelStrong: ccModelStrong || undefined,
         codecraftapiModelFast:   ccModelFast   || undefined,
+        cavotiModelCheap:  cavotiModelCheap  || undefined,
+        cavotiModelStrong: cavotiModelStrong || undefined,
+        cavotiModelFast:   cavotiModelFast   || undefined,
       }),
     onSuccess: () => {
       setSuccess('Settings saved. Takes effect on next LLM call.')
@@ -273,6 +293,42 @@ function AdminLLMSettings() {
                   ))}
                 </div>
               )}
+            </Card>
+          )}
+
+          {/* Cavoti Model Selection — only shown when cavoti is selected.
+              WHY manual text Inputs, not a dropdown fed by a "Fetch Available
+              Models" button (unlike CodeCraftAPI above): the backend has no
+              GET /admin/cavoti/models proxy endpoint. Admin copies the model
+              ID from the Cavoti dashboard's Models tab and pastes it here. */}
+          {activeProvider === 'cavoti' && (
+            <Card>
+              <p className="text-sm font-medium text-text-primary mb-1">
+                Cavoti Model Selection
+              </p>
+              <p className="text-xs text-text-secondary mb-3">
+                Enter the model ID for each tier, copied from the Cavoti dashboard's Models tab.
+              </p>
+              <div className="flex flex-col gap-3">
+                <Input
+                  label="Cheap tier (tagging, metadata, coverage checks)"
+                  placeholder="e.g. deepseek-chat"
+                  value={cavotiModelCheap}
+                  onChange={(e) => setCavotiModelCheap(e.target.value)}
+                />
+                <Input
+                  label="Strong tier (answer generation, charter extraction)"
+                  placeholder="e.g. claude-3-5-sonnet"
+                  value={cavotiModelStrong}
+                  onChange={(e) => setCavotiModelStrong(e.target.value)}
+                />
+                <Input
+                  label="Fast tier (quick checks, simple tasks)"
+                  placeholder="e.g. gemini-flash"
+                  value={cavotiModelFast}
+                  onChange={(e) => setCavotiModelFast(e.target.value)}
+                />
+              </div>
             </Card>
           )}
 

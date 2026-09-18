@@ -31,6 +31,7 @@ import (
 	"ai_avengers/backend/internal/message"
 	"ai_avengers/backend/internal/middleware"
 	"ai_avengers/backend/internal/ml"
+	"ai_avengers/backend/internal/monitoring"
 	"ai_avengers/backend/internal/orchestrator"
 	"ai_avengers/backend/internal/project"
 	"ai_avengers/backend/internal/rating"
@@ -181,6 +182,15 @@ func main() {
 	// Runs every 24 hours, deletes workspaces from completed/failed/cancelled workflows.
 	// WHY 7 days: balance between debugging needs and disk space.
 	// WHY 24-hour interval: daily cleanup is sufficient, low overhead.
+	//
+	// WHY re-read AIDER_WORKSPACE_ROOT here instead of sharing buildRouter's
+	// local: buildRouter's workspaceRoot is scoped to that function (used to
+	// construct AiderRunner) and is not visible from main(). Same env var,
+	// same default — kept in sync with buildRouter's copy below.
+	workspaceRoot := os.Getenv("AIDER_WORKSPACE_ROOT")
+	if workspaceRoot == "" {
+		workspaceRoot = "/tmp/ai_avengers_workspaces"
+	}
 	go func() {
 		ticker := time.NewTicker(24 * time.Hour)
 		defer ticker.Stop()

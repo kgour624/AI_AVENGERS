@@ -302,6 +302,15 @@ export const updateLLMSettings = (req: {
   codecraftapiModelCheap?: string
   codecraftapiModelStrong?: string
   codecraftapiModelFast?: string
+  // Cavoti per-tier model IDs — same snakeifyKeys conversion as above:
+  //   cavotiModelCheap  → cavoti_model_cheap
+  //   cavotiModelStrong → cavoti_model_strong
+  //   cavotiModelFast   → cavoti_model_fast
+  // Backend json tags match exactly: json:"cavoti_model_cheap" etc.
+  // (see UpdateLLMSettings request struct in admin_handler.go).
+  cavotiModelCheap?: string
+  cavotiModelStrong?: string
+  cavotiModelFast?: string
 }) =>
   baseAPI
     .post<ApiResponse<{ status: string; provider: string; note: string }>>(
