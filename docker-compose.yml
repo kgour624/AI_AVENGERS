@@ -58,6 +58,8 @@ services:
       - BASE_URL=${BASE_URL:-http://localhost:8080}
       # CORS: allow dev frontend (port 3000 and 3001). Add more origins comma-separated.
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001}
+      - AIDER_SERVICE_URL=http://aider-service:8082
+      - AIDER_WORKSPACE_ROOT=/workspaces
     depends_on:
       postgres:
         condition: service_healthy
@@ -70,6 +72,29 @@ services:
         # migrate exits with code 0 after applying migrations.
         # api must not start until migrations are done.
         condition: service_completed_successfully
+      aider-service:
+        condition: service_started
+    volumes:
+      - workspaces:/workspaces
+    restart: unless-stopped
+    networks:
+      - avengers-network
+
+  # ============================================================
+  # Aider Service — Python FastAPI wrapper for Aider
+  # WHY separate service: Aider is Python-native, routes LLM calls
+  # through ModelGateway proxy for centralized cost tracking.
+  # ============================================================
+  aider-service:
+    build:
+      context: .
+      dockerfile: aider-service/Dockerfile
+    ports:
+      - "8082:8082"
+    environment:
+      - MODEL_GATEWAY_URL=http://api:8080/api/v1/llm/proxy
+    volumes:
+      - workspaces:/workspaces
     restart: unless-stopped
     networks:
       - avengers-network
@@ -173,6 +198,8 @@ volumes:
   redis-data:
   ml-models:
     # Persist downloaded model weights
+  workspaces:
+    # Shared workspace directory for Aider (api + aider-service both mount this)
 
 networks:
   avengers-network:
