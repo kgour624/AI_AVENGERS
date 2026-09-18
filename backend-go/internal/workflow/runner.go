@@ -55,6 +55,7 @@ type WorkflowRunner struct {
 	agentLoop       *AgentLoop
 	aiderRunner     *AiderRunner     // Aider integration for implementation/qa phases
 	workspaceMerger *WorkspaceMerger // Merges per-expert workspaces after each Aider wave
+	crossVerifier   *CrossVerifier   // Cross-verification protocol (§8)
 	tools           *Tools
 	store           *blackboard.Store
 	gateway         *gateway.ModelGateway
@@ -68,6 +69,7 @@ func NewWorkflowRunner(
 	agentLoop *AgentLoop,
 	aiderRunner *AiderRunner,
 	workspaceMerger *WorkspaceMerger,
+	crossVerifier *CrossVerifier,
 	tools *Tools,
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
@@ -80,6 +82,7 @@ func NewWorkflowRunner(
 		agentLoop:       agentLoop,
 		aiderRunner:     aiderRunner,
 		workspaceMerger: workspaceMerger,
+		crossVerifier:   crossVerifier,
 		tools:           tools,
 		store:           store,
 		gateway:         gw,
@@ -334,6 +337,9 @@ func (r *WorkflowRunner) executeWaves(
 			zap.Bool("use_aider", useAider),
 		)
 
+			// Track last blackboard sequence before wave starts (for cross-verification scoping).
+		lastSeqBefore := r.getLastBlackboardSeq(ctx, workflowID)
+
 		// Track which expert IDs succeeded in this wave (for post-wave merge).
 		var waveMu sync.Mutex
 		var waveExpertIDs []string
@@ -420,14 +426,6 @@ func (r *WorkflowRunner) executeWaves(
 		wg.Wait()
 
 		// Post-wave workspace merge (Aider phases only).
-		// Merge all successful expert workspaces into main/ so the next wave
-		// starts with a unified view of all prior work.
-		//
-		// WHY after wg.Wait(): all goroutines have finished writing to their
-		// workspaces — safe to read and merge without race conditions.
-		//
-		// WHY non-fatal: merge failure (e.g. conflict) should not abort the
-		// entire workflow. Log the error so operators can investigate.
 		if useAider && len(waveExpertIDs) > 0 {
 			r.logger.Info("runner: merging wave workspaces",
 				zap.Int("wave", waveIdx),
@@ -445,11 +443,40 @@ func (r *WorkflowRunner) executeWaves(
 				)
 			}
 		}
+
+		// Post-wave cross-verification (all phases).
+		// Run after workspace merge so artifacts are on blackboard.
+		// Non-fatal: log error but continue to next wave.
+		if r.crossVerifier != nil {
+			if cvErr := r.crossVerifier.VerifyWaveArtifacts(
+				ctx, workflowID, experts, lastSeqBefore,
+			); cvErr != nil {
+				r.logger.Error("runner: cross-verification failed (non-fatal)",
+					zap.Int("wave", waveIdx),
+					zap.Error(cvErr),
+				)
+			}
+		}
 	}
 
 	errMu.Lock()
 	defer errMu.Unlock()
 	return firstErr
+}
+
+// getLastBlackboardSeq returns the current max sequence_number on the blackboard.
+// Used to scope cross-verification to artifacts from the current wave only.
+func (r *WorkflowRunner) getLastBlackboardSeq(ctx context.Context, workflowID uuid.UUID) int64 {
+	var seq int64
+	err := r.db.QueryRow(ctx,
+		`SELECT COALESCE(MAX(sequence_number), 0) FROM blackboard_events WHERE workflow_id = $1`,
+		workflowID,
+	).Scan(&seq)
+	if err != nil {
+		r.logger.Warn("runner: getLastBlackboardSeq failed", zap.Error(err))
+		return 0
+	}
+	return seq
 }
 
 // saveRunnerState writes runner_state + current_task_cursor to workflows table.

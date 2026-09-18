@@ -397,8 +397,9 @@ func buildRouter(
 	wfAiderRunner := workflow.NewAiderRunner(postgres.Pool, bbStore, modelGateway, mlClient, workspaceRoot, aiderServiceURL, logger)
 	wfWorkspaceMerger := workflow.NewWorkspaceMerger(logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
+	wfCrossVerifier := workflow.NewCrossVerifier(bbStore, modelGateway, wfAgentLoop, wfTools, logger)
 	wfRunner := workflow.NewWorkflowRunner(
-		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfWorkspaceMerger,
+		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfWorkspaceMerger, wfCrossVerifier,
 		wfTools, bbStore, modelGateway, logger,
 	)
 	// Projector: blackboard events -> workflow_tasks projection (single write path).

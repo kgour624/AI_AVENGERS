@@ -2,7 +2,6 @@ package workflow
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -346,8 +345,8 @@ func (cv *CrossVerifier) runReview(
 		artifact.EventType, artifactContent,
 	)
 
-	resp, callErr := cv.gateway.Call(ctx, LLMRequest{
-		Model:        ModelCheap, // Reviews use cheap model (fast, low cost)
+	resp, callErr := cv.gateway.Call(ctx, gateway.LLMRequest{
+		Model:        gateway.ModelCheap, // Reviews use cheap model (fast, low cost)
 		SystemPrompt: systemPrompt,
 		UserPrompt:   userPrompt,
 		MaxTokens:    500,
@@ -414,5 +413,3 @@ func parseReviewResponse(response string) (status string, comment string) {
 	return "approved", ""
 }
 
-// LLMRequest is defined in agent_loop.go — reuse it here.
-// (No redefinition needed — same package)
