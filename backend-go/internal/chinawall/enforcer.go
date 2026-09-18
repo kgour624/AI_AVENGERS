@@ -925,6 +925,27 @@ func (e *Enforcer) buildSectionPrompt(
 	return sb.String()
 }
 
+// cleanChunkIDs removes [CHUNK_xxx] tokens from the answer text.
+// WHY: These are internal citation markers for the LLM, not user-facing text.
+// SECURITY: Exposing chunk UUIDs leaks internal database structure.
+// UX: Users should see clean text, not technical IDs.
+//
+// MENTAL MODEL:
+//   Input:  "Use bcrypt [CHUNK_abc-123] for passwords"
+//   Output: "Use bcrypt for passwords"
+//
+// CROSS-QUESTION:
+//   Q: Why not remove during generation?
+//   A: LLM needs them for citation tracking, remove after extraction
+//
+//   Q: What if chunk ID is in code block?
+//   A: Regex removes all [CHUNK_xxx] tokens, including in code
+//      (code blocks should never have chunk IDs anyway)
+func (e *Enforcer) cleanChunkIDs(answer string) string {
+	pattern := regexp.MustCompile(`\[CHUNK_[a-f0-9-]+\]`)
+	return pattern.ReplaceAllString(answer, "")
+}
+
 // extractCitations finds [CHUNK_uuid] references in the answer.
 func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citation {
 	pattern := regexp.MustCompile(`\[CHUNK_([a-f0-9-]+)\]`)
