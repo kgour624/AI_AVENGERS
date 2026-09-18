@@ -477,6 +477,26 @@ func (a *AiderRunner) runAiderLoop(
 			commitSHAs = append(commitSHAs, commitSHA)
 		}
 
+		// PHASE 5: Save checkpoint after successful iteration
+		// This allows resuming from this point if pod crashes
+		checkpointToSave := &AiderCheckpoint{
+			WorkflowID:       req.WorkflowID,
+			ExpertID:         req.Expert.ID,
+			TaskID:           req.TaskID,
+			CurrentIteration: iteration,
+			CommitSHAs:       commitSHAs,
+			LastObservation:  observations,
+			Completed:        taskComplete,
+		}
+		if err := a.saveCheckpoint(ctx, checkpointToSave); err != nil {
+			// Non-fatal: log error but continue
+			// Worst case: restart from beginning on pod crash
+			a.logger.Error("failed to save checkpoint",
+				zap.Error(err),
+				zap.Int("iteration", iteration),
+			)
+		}
+
 		// Check if task complete
 		if taskComplete {
 			a.logger.Info("task completed",
