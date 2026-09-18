@@ -888,8 +888,15 @@ func (a *AiderRunner) runAiderIteration(
 		}
 	}
 
-	// Add expert training (Gate 1 only)
-	training, err := a.loadExpertTraining(ctx, req.Expert.ID)
+	// Gate 1: Load expert's actual training knowledge via RAG.
+	//
+	// MENTAL MODEL:
+	//   This is the 70% rule from the design doc.
+	//   Expert must code from its OWN training, not generic LLM knowledge.
+	//   RAG fetches the most relevant chunks from course_chunks for this task.
+	//   Charter provides the rules (never do X, always do Y).
+	//   Together: expert has both knowledge AND rules from its training.
+	training, err := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
 	if err != nil {
 		a.logger.Warn("failed to load expert training",
 			zap.Error(err),
@@ -897,7 +904,7 @@ func (a *AiderRunner) runAiderIteration(
 		)
 		// Non-fatal: continue without training
 	} else if training != "" {
-		message += "\n\nExpert Training (Gate 1 - Domain Patterns):\n" + training
+		message += "\n\n" + training
 	}
 
 	// Call AiderService HTTP API

@@ -394,7 +394,7 @@ func buildRouter(
 	if aiderServiceURL == "" {
 		aiderServiceURL = "http://localhost:8082"
 	}
-	wfAiderRunner := workflow.NewAiderRunner(postgres.Pool, bbStore, modelGateway, workspaceRoot, aiderServiceURL, logger)
+	wfAiderRunner := workflow.NewAiderRunner(postgres.Pool, bbStore, modelGateway, mlClient, workspaceRoot, aiderServiceURL, logger)
 	wfWorkspaceMerger := workflow.NewWorkspaceMerger(logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfRunner := workflow.NewWorkflowRunner(
