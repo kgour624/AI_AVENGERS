@@ -746,8 +746,37 @@ func (a *AiderRunner) publishCodeArtifacts(
 		zap.String("expert", req.Expert.Name),
 	)
 
+	// Create timeout context for validation
+	// MENTAL MODEL:
+	//   Build/tests may hang forever (infinite loop, deadlock)
+	//   Timeout prevents blocking workflow indefinitely
+	//   15 minutes is generous (most builds < 5 min, tests < 10 min)
+	//
+	// CROSS-QUESTION:
+	//   Q: Why 15 minutes?
+	//   A: Covers slow builds (large codebases) + slow tests (integration tests)
+	//      If validation takes > 15 min, something is wrong
+	//
+	//   Q: Should timeout be configurable?
+	//   A: Future enhancement. For now, fixed 15 minutes.
+	//
+	//   Q: What happens on timeout?
+	//   A: Return error, don't publish. Task marked as failed.
+	validationCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+
 	// Validate build
-	buildOutput, buildErr := a.runBuild(ctx, workspacePath)
+	buildOutput, buildErr := a.runBuild(validationCtx, workspacePath)
+	if buildErr != nil {
+		// Check if timeout
+		if validationCtx.Err() == context.DeadlineExceeded {
+			a.logger.Error("build validation timeout",
+				zap.String("workflow_id", req.WorkflowID.String()),
+				zap.String("expert", req.Expert.Name),
+				zap.Duration("timeout", 15*time.Minute),
+			)
+			return fmt.Errorf("build validation timeout (15 minutes)")
+		}
 	if buildErr != nil {
 		a.logger.Error("build validation failed",
 			zap.String("workflow_id", req.WorkflowID.String()),
@@ -759,8 +788,17 @@ func (a *AiderRunner) publishCodeArtifacts(
 	}
 
 	// Validate tests
-	testOutput, testErr := a.runTests(ctx, workspacePath)
+	testOutput, testErr := a.runTests(validationCtx, workspacePath)
 	if testErr != nil {
+		// Check if timeout
+		if validationCtx.Err() == context.DeadlineExceeded {
+			a.logger.Error("test validation timeout",
+				zap.String("workflow_id", req.WorkflowID.String()),
+				zap.String("expert", req.Expert.Name),
+				zap.Duration("timeout", 15*time.Minute),
+			)
+			return fmt.Errorf("test validation timeout (15 minutes)")
+		}
 		a.logger.Error("test validation failed",
 			zap.String("workflow_id", req.WorkflowID.String()),
 			zap.String("expert", req.Expert.Name),
