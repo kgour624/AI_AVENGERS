@@ -13,6 +13,7 @@ import (
 
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/monitoring"
 )
 
 // runnerState is the checkpoint saved after each task completes.
@@ -53,9 +54,10 @@ type WorkflowRunner struct {
 	engine          *Engine
 	planner         *Planner
 	agentLoop       *AgentLoop
-	aiderRunner     *AiderRunner     // Aider integration for implementation/qa phases
-	workspaceMerger *WorkspaceMerger // Merges per-expert workspaces after each Aider wave
-	crossVerifier   *CrossVerifier   // Cross-verification protocol (§8)
+	aiderRunner     *AiderRunner          // Aider integration for implementation/qa phases
+	workspaceMerger *WorkspaceMerger      // Merges per-expert workspaces after each Aider wave
+	crossVerifier   *CrossVerifier        // Cross-verification protocol (§8)
+	costMonitor     *monitoring.CostMonitor // Per-workflow budget cap enforcement
 	tools           *Tools
 	store           *blackboard.Store
 	gateway         *gateway.ModelGateway
@@ -70,6 +72,7 @@ func NewWorkflowRunner(
 	aiderRunner *AiderRunner,
 	workspaceMerger *WorkspaceMerger,
 	crossVerifier *CrossVerifier,
+	costMonitor *monitoring.CostMonitor,
 	tools *Tools,
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
@@ -83,6 +86,7 @@ func NewWorkflowRunner(
 		aiderRunner:     aiderRunner,
 		workspaceMerger: workspaceMerger,
 		crossVerifier:   crossVerifier,
+		costMonitor:     costMonitor,
 		tools:           tools,
 		store:           store,
 		gateway:         gw,
@@ -337,7 +341,46 @@ func (r *WorkflowRunner) executeWaves(
 			zap.Bool("use_aider", useAider),
 		)
 
-			// Track last blackboard sequence before wave starts (for cross-verification scoping).
+		// Per-workflow budget cap check before each wave.
+		// WHY before wave not after: prevent spending on a wave that would breach the cap.
+		// Soft limit: warn + continue (admin visibility, non-blocking).
+		// Hard limit: post cost_limit_exceeded event, fail workflow immediately.
+		if r.costMonitor != nil {
+			softHit, hardHit, costErr := r.costMonitor.CheckWorkflowLimits(ctx, workflowID.String())
+			if costErr != nil {
+				// Non-fatal: log and continue. Don't block workflow on monitoring failure.
+				r.logger.Warn("runner: cost limit check failed (non-fatal)",
+					zap.Int("wave", waveIdx),
+					zap.Error(costErr),
+				)
+			} else if hardHit {
+				// Hard limit hit: stop workflow immediately.
+				r.logger.Error("runner: workflow hard cost limit hit, stopping",
+					zap.Int("wave", waveIdx),
+					zap.String("workflow_id", workflowID.String()),
+				)
+				_, _ = r.store.Post(ctx, blackboard.PostRequest{
+					WorkflowID:     workflowID,
+					EventType:      "cost_limit_exceeded",
+					PostedByClient: false,
+					Content: map[string]interface{}{
+						"limit_type": "hard",
+						"wave":       waveIdx,
+						"phase":      state.Phase,
+					},
+				})
+				_ = r.engine.Fail(ctx, workflowID, "hard cost limit exceeded")
+				return fmt.Errorf("hard cost limit exceeded at wave %d", waveIdx)
+			} else if softHit {
+				// Soft limit hit: warn, continue.
+				r.logger.Warn("runner: workflow soft cost limit hit, continuing",
+					zap.Int("wave", waveIdx),
+					zap.String("workflow_id", workflowID.String()),
+				)
+			}
+		}
+
+		// Track last blackboard sequence before wave starts (for cross-verification scoping).
 		lastSeqBefore := r.getLastBlackboardSeq(ctx, workflowID)
 
 		// Track which expert IDs succeeded in this wave (for post-wave merge).

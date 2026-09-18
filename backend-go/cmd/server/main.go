@@ -398,9 +398,19 @@ func buildRouter(
 	wfWorkspaceMerger := workflow.NewWorkspaceMerger(logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfCrossVerifier := workflow.NewCrossVerifier(bbStore, modelGateway, wfAgentLoop, wfAiderRunner, wfTools, logger)
+	// CostMonitor: enforces per-workflow budget caps (soft + hard limits).
+	// monthly_limit_usd and alert_threshold read from system_settings at startup.
+	// Defaults: $1000/month, 80% alert threshold (architecture doc §17).
+	wfCostMonitor := monitoring.NewCostMonitor(
+		postgres.Pool,
+		modelGateway,
+		1000.0, // monthly_limit_usd
+		0.8,    // alert_threshold (80%)
+		logger,
+	)
 	wfRunner := workflow.NewWorkflowRunner(
 		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfWorkspaceMerger, wfCrossVerifier,
-		wfTools, bbStore, modelGateway, logger,
+		wfCostMonitor, wfTools, bbStore, modelGateway, logger,
 	)
 	// Projector: blackboard events -> workflow_tasks projection (single write path).
 	wfProjector := workflow.NewProjector(postgres.Pool, bbStore, bbSubscriber, logger)
