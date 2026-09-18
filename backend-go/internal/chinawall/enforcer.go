@@ -244,6 +244,8 @@ func (e *Enforcer) Enforce(
 				return nil, fmt.Errorf("base profile generation failed: %w", err)
 			}
 			cleanAnswer, _ = e.stripUncited(baseGenerated.Answer, BaseProfile.StripMode)
+			// SECURITY FIX: Clean chunk IDs from BaseProfile retry path too.
+			cleanAnswer = e.cleanChunkIDs(cleanAnswer)
 			if strings.TrimSpace(cleanAnswer) == "" {
 				return e.buildRefusal("empty_after_strip", "Could not generate a properly cited answer"), nil
 			}
