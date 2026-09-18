@@ -640,14 +640,20 @@ func (a *AiderRunner) parseCoverage(output string) float64 {
 //   Aider generates patches, applies them, commits
 //   Returns: (commitSHA, taskComplete, error)
 //
+// PHASE 4 ADDITION:
+//   QA Phase:
+//     - Different prompt (focus on test generation)
+//     - Check coverage in completion criteria
+//     - Validate test quality
+//
 // CROSS-QUESTIONS:
 //   Q: Why --yes flag?
 //   A: Auto-accept all changes (no interactive mode)
 //      We trust Aider's decisions (can rollback via git)
 //
 //   Q: How detect TASK_COMPLETE?
-//   A: Check Aider output for "TASK_COMPLETE" marker
-//      Or: build + tests pass (heuristic)
+//   A: Implementation: build + tests pass
+//      QA: tests pass + coverage >80%
 //
 //   Q: What if Aider fails?
 //   A: Return error, caller retries or escalates
@@ -658,10 +664,16 @@ func (a *AiderRunner) runAiderIteration(
 	observations string,
 	iteration int,
 ) (commitSHA string, taskComplete bool, err error) {
-	// Build Aider message
-	message := req.TaskDescription
-	if observations != "" {
-		message += "\n\nObservations from previous iteration:\n" + observations
+	// Build Aider message (phase-specific)
+	var message string
+	if req.WorkflowPhase == "qa" {
+		message = a.buildQAPrompt(req.TaskDescription, observations)
+	} else {
+		// Implementation phase
+		message = req.TaskDescription
+		if observations != "" {
+			message += "\n\nObservations from previous iteration:\n" + observations
+		}
 	}
 
 	// Add expert training (Gate 1 only)
