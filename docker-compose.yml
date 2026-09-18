@@ -72,8 +72,6 @@ services:
         # migrate exits with code 0 after applying migrations.
         # api must not start until migrations are done.
         condition: service_completed_successfully
-      aider-service:
-        condition: service_started
     volumes:
       - workspaces:/workspaces
     restart: unless-stopped
