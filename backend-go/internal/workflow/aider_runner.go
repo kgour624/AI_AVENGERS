@@ -316,28 +316,32 @@ func (a *AiderRunner) initWorkspace(ctx context.Context, workspacePath string) e
 	return nil
 }
 
-// seedWorkspace loads design artifacts from blackboard and creates seed files.
+// seedWorkspace loads design artifacts from blackboard AND copies files from
+// the shared main/ workspace (populated by WorkspaceMerger after prior waves).
 //
-// MENTAL MODEL:
-//   Blackboard events:
-//     - architecture_decision → ARCHITECTURE.md
-//     - data_model_proposed → DATA_MODEL.md
-//     - api_contract_proposed → API_CONTRACT.yaml
-//     - module_design_proposed → MODULE_DESIGN.md
-//   
-//   Actions:
-//     1. Query blackboard for design artifacts
-//     2. For each artifact: create file with content
-//     3. git add . && git commit -m "chore: seed workspace with design artifacts"
-//   
-//   Output: Workspace with design files committed
+// MENTAL MODEL — two seed sources:
 //
-// WHY seed from blackboard?
-//   - Design artifacts provide context for implementation
-//   - Aider can reference architecture decisions
-//   - Git history shows what was provided vs generated
+//   Source 1: Blackboard design events
+//     architecture_decision  → ARCHITECTURE.md
+//     data_model_proposed    → DATA_MODEL.md
+//     api_contract_proposed  → API_CONTRACT.yaml
+//     module_design_proposed → MODULE_DESIGN.md
+//
+//   Source 2: main/ workspace (prior wave code files)
+//     /workspaces/{workflow_id}/main/auth.go
+//     /workspaces/{workflow_id}/main/handler.go
+//     ... → rsync'd into this expert's workspace
+//
+// WHY Source 2 is critical (Bug #2 fix):
+//   WorkspaceMerger.MergeWave() merges Wave 1 experts' code into main/.
+//   Without copying main/ here, Wave 2 experts start with empty workspaces.
+//   They see design docs but NOT the actual code Wave 1 wrote.
+//   With this fix: Wave 2 experts see all prior code files in their workspace.
+//
+// ORDER: blackboard first, then main/ overlay.
+//   main/ files take precedence (they are the latest merged state).
 func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, workspacePath string) error {
-	// Load design artifacts from blackboard
+	// --- Source 1: Blackboard design artifacts ---
 	events, err := a.store.GetByType(ctx, workflowID, []string{
 		"architecture_decision",
 		"data_model_proposed",
@@ -348,40 +352,60 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 		return fmt.Errorf("load design artifacts: %w", err)
 	}
 
-	if len(events) == 0 {
-		a.logger.Info("no design artifacts to seed",
-			zap.String("workflow_id", workflowID.String()),
-		)
-		return nil
-	}
-
-	// Create seed files
 	for _, ev := range events {
 		filename := a.artifactToFilename(ev.EventType)
-		content := string(ev.Content)
-
 		filePath := filepath.Join(workspacePath, filename)
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		if err := os.WriteFile(filePath, ev.Content, 0644); err != nil {
 			return fmt.Errorf("write %s: %w", filename, err)
 		}
-
-		a.logger.Debug("seed file created",
+		a.logger.Debug("seed file created from blackboard",
 			zap.String("file", filename),
 			zap.String("event_type", ev.EventType),
 		)
 	}
 
-	// Git commit seed files
+	// --- Source 2: main/ workspace (prior wave code files) ---
+	// /workspaces/{workflow_id}/main/ is populated by WorkspaceMerger after each wave.
+	// If it exists and has files, rsync them into this expert's workspace.
+	// This is what makes Wave 2+ experts see Wave 1's actual code.
+	mainWorkspace := filepath.Join(a.workspaceDir, workflowID.String(), "main")
+	if info, statErr := os.Stat(mainWorkspace); statErr == nil && info.IsDir() {
+		entries, _ := os.ReadDir(mainWorkspace)
+		hasFiles := false
+		for _, e := range entries {
+			if e.Name() != ".git" {
+				hasFiles = true
+				break
+			}
+		}
+		if hasFiles {
+			cmd := exec.CommandContext(ctx, "rsync", "-a", "--exclude", ".git",
+				mainWorkspace+"/", workspacePath+"/")
+			if output, rsyncErr := cmd.CombinedOutput(); rsyncErr != nil {
+				// Non-fatal: log and continue with blackboard artifacts only.
+				a.logger.Warn("seedWorkspace: rsync from main/ failed (non-fatal)",
+					zap.String("main", mainWorkspace),
+					zap.String("output", string(output)),
+					zap.Error(rsyncErr),
+				)
+			} else {
+				a.logger.Info("seedWorkspace: copied prior wave files from main/",
+					zap.String("workflow_id", workflowID.String()),
+			)
+			}
+		}
+	}
+
+	// Git commit all seeded files
 	cmd := exec.CommandContext(ctx, "git", "add", ".")
 	cmd.Dir = workspacePath
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("git add: %w", err)
 	}
 
-	cmd = exec.CommandContext(ctx, "git", "commit", "-m", "chore: seed workspace with design artifacts")
+	cmd = exec.CommandContext(ctx, "git", "commit", "-m", "chore: seed workspace with design artifacts and prior wave output")
 	cmd.Dir = workspacePath
 	if output, err := cmd.CombinedOutput(); err != nil {
-		// Ignore error if nothing to commit (no design artifacts)
 		if !strings.Contains(string(output), "nothing to commit") {
 			return fmt.Errorf("git commit: %w (output: %s)", err, string(output))
 		}
@@ -389,7 +413,7 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 
 	a.logger.Info("workspace seeded",
 		zap.String("workflow_id", workflowID.String()),
-		zap.Int("files", len(events)),
+		zap.Int("blackboard_artifacts", len(events)),
 	)
 
 	return nil
@@ -1390,8 +1414,8 @@ func (a *AiderRunner) loadExpertTraining(
 
 	if len(chunks) > 0 {
 		sb.WriteString("=== YOUR TRAINING KNOWLEDGE (use THIS, not generic LLM knowledge) ===\n")
-		sb.WriteString("The following is from your training transcripts. "
-			+ "Code and design based on these patterns ONLY.\n\n")
+		sb.WriteString("The following is from your training transcripts. ")
+		sb.WriteString("Code and design based on these patterns ONLY.\n\n")
 		for i, chunk := range chunks {
 			sb.WriteString(fmt.Sprintf("[Training %d]:\n%s\n\n", i+1, chunk))
 		}

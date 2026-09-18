@@ -1,12 +1,86 @@
 import { useParams } from 'react-router-dom'
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { getWorkflow } from '@/api/workflows'
+import { getWorkflow, respondToApproval } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
 import type { KanbanTask } from '@/api/workflows'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { cn } from '@/utils/cn'
+
+// ApprovalGate component — renders Approve/Request Changes buttons.
+// Shown when workflow.status === 'paused_for_approval'.
+function ApprovalGate({
+  workflowId,
+  approvalId,
+  gateName,
+  summary,
+}: {
+  workflowId: string
+  approvalId: string
+  gateName: string
+  summary: string
+}) {
+  const [notes, setNotes] = useState('')
+  const [loading, setLoading] = useState<string | null>(null)
+  const [error, setError] = useState<string | null>(null)
+
+  const respond = async (decision: 'approve' | 'request_changes') => {
+    if (!approvalId) {
+      setError('Approval ID not yet received from server. Please wait a moment and try again.')
+      return
+    }
+    setLoading(decision)
+    setError(null)
+    try {
+      await respondToApproval(workflowId, approvalId, decision, notes || undefined)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Request failed')
+    } finally {
+      setLoading(null)
+    }
+  }
+
+  return (
+    <div className="mt-4 rounded-lg border border-glow-amber/40 bg-glow-amber/10 p-4">
+      <p className="text-sm font-semibold text-glow-amber">
+        {'\u23f8'} Waiting for Approval
+        {gateName && (
+          <span className="ml-2 text-xs font-normal text-text-disabled">({gateName})</span>
+        )}
+      </p>
+      <p className="mt-1 text-xs text-text-secondary">{summary}</p>
+      <textarea
+        className="mt-3 w-full rounded border border-surface-overlay bg-surface-base px-3 py-2 text-xs text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-1 focus:ring-brand"
+        rows={2}
+        placeholder="Optional notes (shown to experts if requesting changes)"
+        value={notes}
+        onChange={(e) => setNotes(e.target.value)}
+        disabled={!!loading}
+      />
+      {error && (
+        <p className="mt-1 text-xs text-mode-refuse">{error}</p>
+      )}
+      <div className="mt-3 flex gap-2">
+        <button
+          onClick={() => respond('approve')}
+          disabled={!!loading}
+          className="rounded bg-mode-advise px-4 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+        >
+          {loading === 'approve' ? 'Approving...' : '\u2713 Approve'}
+        </button>
+        <button
+          onClick={() => respond('request_changes')}
+          disabled={!!loading}
+          className="rounded border border-glow-amber/60 px-4 py-1.5 text-xs font-semibold text-glow-amber hover:bg-glow-amber/10 disabled:opacity-50"
+        >
+          {loading === 'request_changes' ? 'Sending...' : '\u21ba Request Changes'}
+        </button>
+      </div>
+    </div>
+  )
+}
 
 // Kanban column definitions
 const COLUMNS: { key: KanbanTask['status']; label: string; color: string }[] = [
@@ -116,14 +190,14 @@ function KanbanPage() {
         </div>
       )}
 
-      {/* Approval gate notice */}
+      {/* Approval gate — interactive Approve/Request Changes controls */}
       {workflow?.status === 'paused_for_approval' && (
-        <div className="mt-4 rounded-lg border border-glow-amber/40 bg-glow-amber/10 p-4">
-          <p className="text-sm font-medium text-glow-amber">{'\u23f8'} Waiting for Approval</p>
-          <p className="mt-1 text-xs text-text-secondary">
-            Workflow is paused. Review the plan and approve to continue.
-          </p>
-        </div>
+        <ApprovalGate
+          workflowId={id!}
+          approvalId={stream.approvalGate?.approvalId ?? ''}
+          gateName={stream.approvalGate?.gateName ?? 'approval'}
+          summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
+        />
       )}
 
       {/* Completion notice */}

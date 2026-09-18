@@ -3,10 +3,17 @@ import type { KanbanTask } from '@/api/workflows'
 import { useAuthStore } from '@/stores/authStore'
 import { camelizeKeys } from '@/utils/casing'
 
+export interface ApprovalGate {
+  approvalId: string
+  gateName: string
+  summary: string
+}
+
 export interface KanbanStreamState {
   tasks: KanbanTask[]
   isConnected: boolean
   isDone: boolean
+  approvalGate: ApprovalGate | null
   eventLog: Array<{ ts: string; type: string; message: string }>
 }
 
@@ -33,6 +40,7 @@ export function useKanbanStream(workflowId: string | null): KanbanStreamState {
     tasks: [],
     isConnected: false,
     isDone: false,
+    approvalGate: null,
     eventLog: [],
   })
 
@@ -84,7 +92,7 @@ export function useKanbanStream(workflowId: string | null): KanbanStreamState {
 
           switch (type) {
             case 'kanban_done': {
-              setState((prev) => ({ ...prev, isDone: true, isConnected: false }))
+              setState((prev) => ({ ...prev, isDone: true, isConnected: false, approvalGate: null }))
               addLog('done', 'Workflow completed')
               es.close(); esRef.current = null
               break
@@ -183,7 +191,22 @@ export function useKanbanStream(workflowId: string | null): KanbanStreamState {
             }
 
             case 'kanban_approval': {
-              addLog('approval', 'Waiting for client approval')
+              // Parse approval gate details so KanbanPage can render Approve/Reject buttons.
+              const content = data?.content as {
+                approvalId?: string
+                gateName?: string
+                summary?: string
+              } | undefined
+              const approvalId = content?.approvalId ?? ''
+              const gateName = content?.gateName ?? 'approval'
+              const summary = content?.summary ?? 'Review and approve to continue.'
+              if (approvalId) {
+                setState((prev) => ({
+                  ...prev,
+                  approvalGate: { approvalId, gateName, summary },
+                }))
+              }
+              addLog('approval', `Gate: ${gateName}`)
               break
             }
 
