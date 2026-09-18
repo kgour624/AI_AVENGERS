@@ -1,7 +1,10 @@
 package providers
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -78,18 +81,78 @@ func (p *CavotiProvider) MaxTokens(tier gtypes.ModelType) int {
 	return 4096
 }
 
-func (p *CavotiProvider) ExtractContent(raw interface{ MarshalJSON() ([]byte, error) }, reasoningContent string) string {
-	return gtypes.StandardExtractContent(raw.(interface{ MarshalJSON() ([]byte, error) }), reasoningContent)
+// ExtractContent: Cavoti is OpenAI-compatible — standard plain string content.
+// Falls back to reasoningContent for DeepSeek-style models routed via Cavoti.
+func (p *CavotiProvider) ExtractContent(raw json.RawMessage, reasoningContent string) string {
+	if len(raw) == 0 {
+		return reasoningContent
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil && strings.TrimSpace(s) != "" {
+		return s
+	}
+	return reasoningContent
 }
 
+// ExtractStreamToken: standard delta.content + reasoning_content fallback.
 func (p *CavotiProvider) ExtractStreamToken(content, reasoningContent string) string {
 	return gtypes.StandardExtractStreamToken(content, reasoningContent)
 }
 
+// Call makes a blocking LLM call to Cavoti's OpenAI-compatible endpoint.
+// Builds *http.Request first, then delegates to doOpenAICompatibleCall in common.go.
+// Pattern is identical to CodeCraftAPIProvider.Call().
 func (p *CavotiProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
-	return doOpenAICompatibleCall(ctx, p.httpClient, p.baseURL, p.apiKey, p.ModelName(req.ModelTier), req)
+	var msgs []map[string]string
+	for _, m := range req.Messages {
+		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"model":       p.ModelName(req.ModelTier),
+		"messages":    msgs,
+		"max_tokens":  req.MaxTokens,
+		"temperature": req.Temperature,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("cavoti: marshal request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		p.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("cavoti: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	return doOpenAICompatibleCall(p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
 
+// StreamCall makes a streaming LLM call to Cavoti's OpenAI-compatible endpoint.
+// Pattern is identical to CodeCraftAPIProvider.StreamCall().
 func (p *CavotiProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
-	return doOpenAICompatibleStream(ctx, p.httpClient, p.baseURL, p.apiKey, p.ModelName(req.ModelTier), req)
+	var msgs []map[string]string
+	for _, m := range req.Messages {
+		msgs = append(msgs, map[string]string{"role": m.Role, "content": m.Content})
+	}
+	body, err := json.Marshal(map[string]interface{}{
+		"model":       p.ModelName(req.ModelTier),
+		"messages":    msgs,
+		"max_tokens":  req.MaxTokens,
+		"temperature": req.Temperature,
+		"stream":      true,
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("cavoti stream: marshal: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		p.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, fmt.Errorf("cavoti stream: build request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
+	return doOpenAICompatibleStream(ctx, p, p.httpClient, httpReq, p.ModelName(req.ModelTier))
 }
+
+// Compile-time interface check — fails at build time if CavotiProvider
+// does not fully implement gtypes.LLMProvider.
+var _ gtypes.LLMProvider = (*CavotiProvider)(nil)
