@@ -140,6 +140,18 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 		return nil, fmt.Errorf("aider loop: %w", err)
 	}
 
+	// Step 4: Publish code artifacts to blackboard (Phase 3)
+	// WHY: Other experts need to see generated code, frontend needs to display it
+	if err := a.publishCodeArtifacts(ctx, req, workspacePath, result.CommitSHAs); err != nil {
+		// Non-fatal: log error but don't fail the task
+		// Code is already generated and committed to git
+		a.logger.Error("failed to publish code artifacts",
+			zap.String("workflow_id", req.WorkflowID.String()),
+			zap.String("expert", req.Expert.Name),
+			zap.Error(err),
+		)
+	}
+
 	a.logger.Info("aider runner completed",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
