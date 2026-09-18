@@ -1417,15 +1417,26 @@ func (h *AdminHandler) ResumeIngestionJob(c *gin.Context) {
 	_, _ = h.db.Exec(ctx, `UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
 
 	// Resume in background with SAME jobID — LoadCheckpoint() will find the checkpoint
+	// WHY 2-hour timeout: same as initial upload. Resume runs the full pipeline.
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		defer cancel()
+
 		_, err := h.ingestion.IngestTranscript(
-			context.Background(),
+			ctx,
 			jobID, expertID, expertName,
 			transcriptContent, // empty if chunks already in DB
 			job.SourcePath,
 			false,
 		)
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				h.logger.Error("resume ingestion timeout: exceeded 2-hour deadline",
+					zap.String("job_id", jobID.String()),
+					zap.Error(err),
+				)
+				return
+			}
 			h.logger.Error("resume ingestion failed",
 				zap.String("job_id", jobID.String()),
 				zap.Error(err),
@@ -1535,9 +1546,13 @@ func (h *AdminHandler) RetryIngestionJob(c *gin.Context) {
 
 	// Retry in background with SAME jobID — LoadCheckpoint() finds the
 	// StagePaused checkpoint and skips chunking + topic extraction.
+	// WHY 2-hour timeout: same as initial upload. Retry runs the full pipeline.
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		defer cancel()
+
 		_, err := h.ingestion.IngestTranscript(
-			context.Background(),
+			ctx,
 			jobID, expertID, job.ExpertName,
 			job.TranscriptContent,
 			job.SourcePath,
@@ -1549,6 +1564,13 @@ func (h *AdminHandler) RetryIngestionJob(c *gin.Context) {
 				// Admin will see another llm_failure_decision_required SSE event.
 				h.logger.Warn("retry ingestion: charter LLM failed again — job re-paused",
 					zap.String("job_id", jobID.String()),
+				)
+				return
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				h.logger.Error("retry ingestion timeout: exceeded 2-hour deadline",
+					zap.String("job_id", jobID.String()),
+					zap.Error(err),
 				)
 				return
 			}
