@@ -711,6 +711,70 @@ func (a *AiderRunner) publishCodeArtifacts(
 		return nil
 	}
 
+	// STEP 1: Validate code before publishing
+	//
+	// MENTAL MODEL:
+	//   Only publish code that compiles and passes tests
+	//   Broken code should not appear in Kanban as "done"
+	//
+	// CROSS-QUESTIONS:
+	//   Q: Why validate here? Aider already checked build/tests.
+	//   A: Aider may have exited after max iterations (5) with broken code.
+	//      This is the final gate before publishing.
+	//
+	//   Q: Should validation be optional?
+	//   A: Future enhancement. For now, always validate.
+	//      Some projects have flaky tests, may want to skip.
+	//
+	//   Q: What if validation fails?
+	//   A: Return error, don't publish. Task marked as failed.
+	//      Expert needs to investigate why code is broken.
+	//
+	// EXAMPLE:
+	//   Scenario 1: Valid code
+	//     runBuild() → error == nil ✅
+	//     runTests() → error == nil ✅
+	//     Continue to publish ✅
+	//
+	//   Scenario 2: Broken code
+	//     runBuild() → error != nil ❌
+	//     Return error, don't publish ✅
+	//     Task marked as failed ✅
+
+	a.logger.Info("validating code before publishing",
+		zap.String("workflow_id", req.WorkflowID.String()),
+		zap.String("expert", req.Expert.Name),
+	)
+
+	// Validate build
+	buildOutput, buildErr := a.runBuild(ctx, workspacePath)
+	if buildErr != nil {
+		a.logger.Error("build validation failed",
+			zap.String("workflow_id", req.WorkflowID.String()),
+			zap.String("expert", req.Expert.Name),
+			zap.String("output", buildOutput),
+			zap.Error(buildErr),
+		)
+		return fmt.Errorf("build validation failed: %w\nOutput: %s", buildErr, buildOutput)
+	}
+
+	// Validate tests
+	testOutput, testErr := a.runTests(ctx, workspacePath)
+	if testErr != nil {
+		a.logger.Error("test validation failed",
+			zap.String("workflow_id", req.WorkflowID.String()),
+			zap.String("expert", req.Expert.Name),
+			zap.String("output", testOutput),
+			zap.Error(testErr),
+		)
+		return fmt.Errorf("test validation failed: %w\nOutput: %s", testErr, testOutput)
+	}
+
+	a.logger.Info("validation passed, proceeding to publish",
+		zap.String("workflow_id", req.WorkflowID.String()),
+		zap.String("expert", req.Expert.Name),
+	)
+
 	// Use latest commit SHA for all artifacts
 	latestCommitSHA := commitSHAs[len(commitSHAs)-1]
 
