@@ -267,12 +267,12 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 
 	default:
 		// Artifact events: update produced_artifact_event_id.
+		// Note: code_artifact_produced has its own case handler above.
 		artifactTypes := map[string]bool{
 			"architecture_decision":  true,
 			"data_model_proposed":    true,
 			"api_contract_proposed":  true,
 			"module_design_proposed": true,
-			"code_artifact_produced": true,
 			"test_case_proposed":     true,
 			"requirement_captured":   true,
 		}
