@@ -434,6 +434,11 @@ func (a *AiderRunner) runAiderLoop(
 //     - Git status (what files changed)
 //     - Build errors (compile failures)
 //     - Test failures (test output)
+//     - Coverage (QA phase only)
+//
+// PHASE 4 ADDITION:
+//   QA Phase: Include test coverage in observations
+//   Example: "Coverage: 45.2% (target: 80.0%)"
 //
 // CROSS-QUESTIONS:
 //   Q: Why git status?
@@ -447,8 +452,13 @@ func (a *AiderRunner) runAiderLoop(
 //   Q: Why test failures?
 //   A: Aider needs test output to fix failing tests
 //      Test output shows expected vs actual behavior
+//
+//   Q: Why coverage in QA only?
+//   A: Implementation doesn't need coverage (no tests yet)
+//      QA needs to know current coverage to improve it
 func (a *AiderRunner) observeWorkspace(
 	ctx context.Context,
+	phase string,
 	workspacePath string,
 ) (string, error) {
 	var observations strings.Builder
@@ -474,12 +484,25 @@ func (a *AiderRunner) observeWorkspace(
 		observations.WriteString("\n")
 	}
 
-	// Test failures
-	testOutput, testErr := a.runTests(ctx, workspacePath)
-	if testErr != nil {
-		observations.WriteString("Test Failures:\n")
-		observations.WriteString(testOutput)
-		observations.WriteString("\n")
+	// Test failures and coverage (phase-specific)
+	if phase == "qa" {
+		// QA phase: run tests with coverage
+		testOutput, coverage, testErr := a.runTestsWithCoverage(ctx, workspacePath)
+		if testErr != nil {
+			observations.WriteString("Test Failures:\n")
+			observations.WriteString(testOutput)
+			observations.WriteString("\n")
+		}
+		// Always show coverage (even if 0%)
+		observations.WriteString(fmt.Sprintf("Current Coverage: %.1f%% (target: 80.0%%)\n\n", coverage))
+	} else {
+		// Implementation phase: run tests without coverage
+		testOutput, testErr := a.runTests(ctx, workspacePath)
+		if testErr != nil {
+			observations.WriteString("Test Failures:\n")
+			observations.WriteString(testOutput)
+			observations.WriteString("\n")
+		}
 	}
 
 	// If no observations, return empty (first iteration)
