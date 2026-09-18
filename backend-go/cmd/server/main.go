@@ -390,7 +390,11 @@ func buildRouter(
 	if workspaceRoot == "" {
 		workspaceRoot = "/tmp/ai_avengers_workspaces"
 	}
-	wfAiderRunner := workflow.NewAiderRunner(postgres.Pool, bbStore, modelGateway, workspaceRoot, logger)
+	aiderServiceURL := os.Getenv("AIDER_SERVICE_URL")
+	if aiderServiceURL == "" {
+		aiderServiceURL = "http://localhost:8082"
+	}
+	wfAiderRunner := workflow.NewAiderRunner(postgres.Pool, bbStore, modelGateway, workspaceRoot, aiderServiceURL, logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfRunner := workflow.NewWorkflowRunner(
 		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner,
@@ -460,6 +464,10 @@ func buildRouter(
 		// lets it restore fullName + email + role from the server
 		// using the refresh token cookie.
 		protected.GET("/auth/me", handleGetMe(authService))
+
+		// LLM proxy for AiderService — routes Aider LLM calls through ModelGateway
+		// WHY protected: cost attribution requires knowing which workflow/expert
+		protected.POST("/llm/proxy", modelGateway.ProxyHandler)
 
 		// Expert routes (read-only for clients)
 		experts := protected.Group("/experts")
