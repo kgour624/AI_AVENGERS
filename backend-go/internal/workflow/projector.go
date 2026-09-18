@@ -222,6 +222,22 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 			return
 		}
 
+		// Validate required fields
+		if artifactData.Filename == "" {
+			p.logger.Warn("code_artifact_produced: missing filename",
+				zap.String("event_id", event.ID.String()),
+			)
+			return
+		}
+
+		// Use fallback for optional fields
+		if artifactData.Language == "" {
+			artifactData.Language = "unknown"
+		}
+		if artifactData.FilePath == "" {
+			artifactData.FilePath = artifactData.Filename
+		}
+
 		// INSERT workflow_tasks row
 		title := fmt.Sprintf("Generated: %s", artifactData.Filename)
 		description := fmt.Sprintf("Code file: %s (%s, %d lines)",
