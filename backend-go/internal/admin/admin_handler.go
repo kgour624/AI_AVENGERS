@@ -1314,7 +1314,11 @@ func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
 				zap.String("expert_id", expertID.String()),
 				zap.Error(dbErr),
 			)
-			_, _ = h.db.Exec(bgCtx,
+			// Reset is_training so expert is not stuck in training state
+			// Use fresh context with 5s timeout (original context may be cancelled)
+			resetCtx, resetCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer resetCancel()
+			_, _ = h.db.Exec(resetCtx,
 				`UPDATE experts SET is_training=FALSE, updated_at=NOW() WHERE id=$1`,
 				expertID,
 			)
