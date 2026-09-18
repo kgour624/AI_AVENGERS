@@ -1452,3 +1452,233 @@ func (a *AiderRunner) countPackages(output string) int {
 	}
 	return count
 }
+
+// saveCheckpoint saves current iteration state to DB for recovery.
+//
+// PHASE 5: Production Hardening - Error Recovery
+//
+// MENTAL MODEL:
+//   After each successful iteration, save state:
+//     INSERT INTO aider_checkpoints (...)
+//     ON CONFLICT (workflow_id, expert_id, task_id)
+//     DO UPDATE SET current_iteration = ..., updated_at = NOW()
+//
+// CROSS-QUESTIONS:
+//   Q: What if save fails?
+//   A: Log error but don't fail iteration (non-fatal)
+//      Worst case: restart from beginning (acceptable)
+//
+//   Q: Should we use transaction?
+//   A: No, checkpoint is independent of main workflow
+//      Failure to save checkpoint shouldn't rollback iteration
+//
+//   Q: What about concurrent saves?
+//   A: ON CONFLICT handles race conditions
+//      Last write wins (acceptable for checkpoints)
+//
+// SQL:
+//   CREATE TABLE aider_checkpoints (
+//     workflow_id UUID NOT NULL,
+//     expert_id UUID NOT NULL,
+//     task_id UUID NOT NULL,
+//     current_iteration INT NOT NULL,
+//     commit_shas JSONB NOT NULL,
+//     last_observation TEXT,
+//     completed BOOLEAN DEFAULT FALSE,
+//     created_at TIMESTAMPTZ DEFAULT NOW(),
+//     updated_at TIMESTAMPTZ DEFAULT NOW(),
+//     PRIMARY KEY (workflow_id, expert_id, task_id)
+//   );
+func (a *AiderRunner) saveCheckpoint(
+	ctx context.Context,
+	checkpoint *AiderCheckpoint,
+) error {
+	// Convert commit SHAs to JSONB
+	commitSHAsJSON, err := json.Marshal(checkpoint.CommitSHAs)
+	if err != nil {
+		return fmt.Errorf("marshal commit_shas: %w", err)
+	}
+
+	// Upsert checkpoint
+	query := `
+		INSERT INTO aider_checkpoints (
+			workflow_id,
+			expert_id,
+			task_id,
+			current_iteration,
+			commit_shas,
+			last_observation,
+			completed,
+			created_at,
+			updated_at
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+		ON CONFLICT (workflow_id, expert_id, task_id)
+		DO UPDATE SET
+			current_iteration = EXCLUDED.current_iteration,
+			commit_shas = EXCLUDED.commit_shas,
+			last_observation = EXCLUDED.last_observation,
+			completed = EXCLUDED.completed,
+			updated_at = NOW()
+	`
+
+	_, err = a.db.Exec(ctx, query,
+		checkpoint.WorkflowID,
+		checkpoint.ExpertID,
+		checkpoint.TaskID,
+		checkpoint.CurrentIteration,
+		commitSHAsJSON,
+		checkpoint.LastObservation,
+		checkpoint.Completed,
+	)
+	if err != nil {
+		return fmt.Errorf("upsert checkpoint: %w", err)
+	}
+
+	a.logger.Debug("checkpoint saved",
+		zap.String("workflow_id", checkpoint.WorkflowID.String()),
+		zap.String("expert_id", checkpoint.ExpertID.String()),
+		zap.Int("iteration", checkpoint.CurrentIteration),
+	)
+
+	return nil
+}
+
+// loadCheckpoint loads saved state from DB for recovery.
+//
+// PHASE 5: Production Hardening - Error Recovery
+//
+// MENTAL MODEL:
+//   On pod restart, check if checkpoint exists:
+//     SELECT * FROM aider_checkpoints
+//     WHERE workflow_id = ? AND expert_id = ? AND task_id = ?
+//
+//   If exists: Resume from checkpoint.CurrentIteration + 1
+//   If not exists: Start from iteration 1 (normal flow)
+//
+// CROSS-QUESTIONS:
+//   Q: What if checkpoint doesn't exist?
+//   A: Return nil, nil (not an error, just no checkpoint)
+//
+//   Q: What if query fails?
+//   A: Return error (caller decides: fail or start fresh)
+//
+//   Q: Should we validate checkpoint?
+//   A: Yes, check if completed=true (shouldn't happen)
+//      If completed, delete checkpoint and start fresh
+func (a *AiderRunner) loadCheckpoint(
+	ctx context.Context,
+	workflowID, expertID, taskID uuid.UUID,
+) (*AiderCheckpoint, error) {
+	query := `
+		SELECT
+			workflow_id,
+			expert_id,
+			task_id,
+			current_iteration,
+			commit_shas,
+			last_observation,
+			completed,
+			created_at,
+			updated_at
+		FROM aider_checkpoints
+		WHERE workflow_id = $1
+		  AND expert_id = $2
+		  AND task_id = $3
+	`
+
+	var checkpoint AiderCheckpoint
+	var commitSHAsJSON []byte
+
+	err := a.db.QueryRow(ctx, query, workflowID, expertID, taskID).Scan(
+		&checkpoint.WorkflowID,
+		&checkpoint.ExpertID,
+		&checkpoint.TaskID,
+		&checkpoint.CurrentIteration,
+		&commitSHAsJSON,
+		&checkpoint.LastObservation,
+		&checkpoint.Completed,
+		&checkpoint.CreatedAt,
+		&checkpoint.UpdatedAt,
+	)
+
+	if err != nil {
+		if err.Error() == "no rows in result set" {
+			// No checkpoint exists (normal case for first run)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("query checkpoint: %w", err)
+	}
+
+	// Unmarshal commit SHAs
+	if err := json.Unmarshal(commitSHAsJSON, &checkpoint.CommitSHAs); err != nil {
+		return nil, fmt.Errorf("unmarshal commit_shas: %w", err)
+	}
+
+	// Validate checkpoint
+	if checkpoint.Completed {
+		// Checkpoint marked as completed but still exists
+		// This shouldn't happen, but if it does, delete it
+		a.logger.Warn("found completed checkpoint, deleting",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("expert_id", expertID.String()),
+		)
+		if err := a.deleteCheckpoint(ctx, workflowID, expertID, taskID); err != nil {
+			a.logger.Error("failed to delete completed checkpoint", zap.Error(err))
+		}
+		return nil, nil
+	}
+
+	a.logger.Info("checkpoint loaded",
+		zap.String("workflow_id", workflowID.String()),
+		zap.String("expert_id", expertID.String()),
+		zap.Int("iteration", checkpoint.CurrentIteration),
+		zap.Int("commits", len(checkpoint.CommitSHAs)),
+	)
+
+	return &checkpoint, nil
+}
+
+// deleteCheckpoint removes checkpoint from DB after task completes.
+//
+// PHASE 5: Production Hardening - Error Recovery
+//
+// MENTAL MODEL:
+//   After task completes successfully, cleanup:
+//     DELETE FROM aider_checkpoints
+//     WHERE workflow_id = ? AND expert_id = ? AND task_id = ?
+//
+// CROSS-QUESTIONS:
+//   Q: When to delete?
+//   A: After task completes (Completed=true)
+//      Also after loading completed checkpoint (cleanup)
+//
+//   Q: What if delete fails?
+//   A: Log error but don't fail task (non-fatal)
+//      Checkpoint will be cleaned up by TTL job
+//
+//   Q: Should we delete on failure?
+//   A: No, keep checkpoint for debugging
+//      TTL job will clean up old checkpoints (>7 days)
+func (a *AiderRunner) deleteCheckpoint(
+	ctx context.Context,
+	workflowID, expertID, taskID uuid.UUID,
+) error {
+	query := `
+		DELETE FROM aider_checkpoints
+		WHERE workflow_id = $1
+		  AND expert_id = $2
+		  AND task_id = $3
+	`
+
+	_, err := a.db.Exec(ctx, query, workflowID, expertID, taskID)
+	if err != nil {
+		return fmt.Errorf("delete checkpoint: %w", err)
+	}
+
+	a.logger.Debug("checkpoint deleted",
+		zap.String("workflow_id", workflowID.String()),
+		zap.String("expert_id", expertID.String()),
+	)
+
+	return nil
+}
