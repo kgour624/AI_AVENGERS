@@ -16,53 +16,47 @@ import (
 //
 // MENTAL MODEL:
 //   After each wave, scan blackboard for new artifacts.
-//   For each artifact, find mandatory reviewers (from reviewer matrix).
+//   For each artifact, find mandatory reviewers (from ReviewerMatrix in reviewers.go).
 //   Each reviewer reads the artifact and posts review_comment.
 //   If all approve -> artifact is final.
-//   If any requests changes -> producer revises (max 3 rounds).
+//   If any requests changes -> producer re-runs via AiderRunner with feedback (max MaxRevisionRounds).
 //   If any blocks -> escalate to client.
 //
-// REVIEWER MATRIX (from design doc §8.1):
+// REVIEWER MATRIX: defined in reviewers.go (single source of truth).
 //   code_artifact_produced  -> Code Reviewer, QA
 //   architecture_decision   -> Security, LLD
 //   data_model_proposed     -> System Design, Backend
 //   api_contract_proposed   -> Frontend, Security
 //   module_design_proposed  -> Code Reviewer
-//   test_case_proposed      -> Backend or Frontend (owner)
+//   test_case_proposed      -> artifact owner
 type CrossVerifier struct {
-	store     *blackboard.Store
-	gateway   *gateway.ModelGateway
-	agentLoop *AgentLoop
-	tools     *Tools
-	logger    *zap.Logger
+	store       *blackboard.Store
+	gateway     *gateway.ModelGateway
+	agentLoop   *AgentLoop
+	aiderRunner *AiderRunner // used to re-run producer on changes_requested
+	tools       *Tools
+	logger      *zap.Logger
 }
 
 // NewCrossVerifier creates a new CrossVerifier.
+// aiderRunner is required for the revision loop (Step 2).
+// Pass nil only in tests where revision is not needed.
 func NewCrossVerifier(
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
 	agentLoop *AgentLoop,
+	aiderRunner *AiderRunner,
 	tools *Tools,
 	logger *zap.Logger,
 ) *CrossVerifier {
 	return &CrossVerifier{
-		store:     store,
-		gateway:   gw,
-		agentLoop: agentLoop,
-		tools:     tools,
-		logger:    logger,
+		store:       store,
+		gateway:     gw,
+		agentLoop:   agentLoop,
+		aiderRunner: aiderRunner,
+		tools:       tools,
+		logger:      logger,
 	}
-}
-
-// reviewerMatrix maps artifact event types to mandatory reviewer domains.
-// Domain strings must match experts.domain column values.
-var reviewerMatrix = map[string][]string{
-	"code_artifact_produced": {"code_review", "qa"},
-	"architecture_decision":  {"security", "lld"},
-	"data_model_proposed":    {"system_design", "backend"},
-	"api_contract_proposed":  {"frontend", "security"},
-	"module_design_proposed": {"code_review"},
-	"test_case_proposed":     {"backend", "frontend"},
 }
 
 // VerifyWaveArtifacts runs cross-verification on all artifacts posted
@@ -71,7 +65,7 @@ var reviewerMatrix = map[string][]string{
 // MENTAL MODEL:
 //   Input: workflowID, lastSeqBefore (sequence number before wave started)
 //   1. Fetch all new events since lastSeqBefore
-//   2. Filter to artifact event types (those in reviewerMatrix)
+//   2. Filter to artifact event types (those in ReviewerMatrix)
 //   3. For each artifact: find reviewers, run review loop
 //   4. Return error if any artifact is blocked (escalate to client)
 //
@@ -108,16 +102,28 @@ func (cv *CrossVerifier) VerifyWaveArtifacts(
 		domainToExpert[e.Domain] = e
 	}
 
-	// Process each artifact that needs review
+	// Build ID -> expert map for producer lookup in runProducerRevision
+	idToExpert := make(map[uuid.UUID]workflowExpert)
+	for _, e := range experts {
+		idToExpert[e.ID] = e
+	}
+
+	// Process each artifact that needs review.
+	// Use ReviewerMatrix from reviewers.go — single source of truth.
+	// (Removed duplicate lowercase reviewerMatrix that was here before.)
 	for _, artifact := range newEvents {
-		mandatoryDomains, needsReview := reviewerMatrix[artifact.EventType]
-		if !needsReview {
+		rule := GetReviewerRule(artifact.EventType)
+		if len(rule.MandatoryReviewers) == 0 {
 			continue
 		}
 
 		// Find which mandatory reviewers are in this workflow
 		var reviewers []workflowExpert
-		for _, domain := range mandatoryDomains {
+		for _, domain := range rule.MandatoryReviewers {
+			// Skip placeholder domains (e.g. "_artifact_owner" resolved at runtime)
+			if strings.HasPrefix(domain, "_") {
+				continue
+			}
 			if reviewer, ok := domainToExpert[domain]; ok {
 				reviewers = append(reviewers, reviewer)
 			}
@@ -127,13 +133,13 @@ func (cv *CrossVerifier) VerifyWaveArtifacts(
 			// No reviewers in this workflow — auto-approve
 			cv.logger.Warn("cross-verify: no reviewers in workflow, auto-approving",
 				zap.String("event_type", artifact.EventType),
-				zap.Strings("needed_domains", mandatoryDomains),
+				zap.Strings("needed_domains", rule.MandatoryReviewers),
 			)
 			continue
 		}
 
 		// Run review loop for this artifact
-		if err := cv.reviewArtifact(ctx, workflowID, artifact, reviewers, experts); err != nil {
+		if err := cv.reviewArtifact(ctx, workflowID, artifact, reviewers, experts, idToExpert); err != nil {
 			return fmt.Errorf("cross-verify: artifact %s: %w", artifact.ID, err)
 		}
 	}
@@ -144,37 +150,48 @@ func (cv *CrossVerifier) VerifyWaveArtifacts(
 // reviewArtifact runs the review loop for one artifact.
 //
 // MENTAL MODEL:
-//   Max 3 revision rounds (design doc §8.3).
+//   Max MaxRevisionRounds revision rounds (reviewers.go §8.3).
 //   Each round:
 //     1. Each reviewer reads artifact + posts review_comment
 //     2. If all approved -> done
-//     3. If any changes_requested -> producer revises
+//     3. If any changes_requested -> find producer, re-run AiderRunner with feedback
 //     4. If any blocked -> escalate to client
+//
+// STEP 2 — PRODUCER RE-RUN:
+//   When changes_requested:
+//     - Find producer expert from artifact.PostedByExpertID
+//     - Build revised TaskDescription = artifact summary + reviewer feedback
+//     - Call aiderRunner.Run() with revised description
+//     - Aider re-writes code with feedback in prompt
+//     - Next round: reviewers check the new code
 //
 // CROSS-QUESTIONS:
 //   Q: How does reviewer "read" the artifact?
 //   A: We build a review prompt with artifact content.
-//      Reviewer's AgentLoop runs with this prompt.
+//      Reviewer's ModelGateway call runs with this prompt.
 //      Reviewer posts review_comment event.
 //
 //   Q: How does producer "revise"?
-//   A: We post a revision_requested event to blackboard.
-//      Producer's next iteration picks this up via observations.
-//      (Simplified: in current impl, we log and continue)
+//   A: aiderRunner.Run() called with feedback injected into TaskDescription.
+//      Aider sees: original task + "REVISION REQUIRED: [reviewer comments]"
+//      Aider re-writes code addressing the feedback.
 //
 //   Q: What is "blocked"?
 //   A: Reviewer posts review_comment with status=blocked.
 //      This means a hard stop — client must decide.
+//
+//   Q: What if aiderRunner is nil?
+//   A: Log warning, skip re-run, continue to next round.
+//      Graceful degradation: review loop still runs, just no code fix.
 func (cv *CrossVerifier) reviewArtifact(
 	ctx context.Context,
 	workflowID uuid.UUID,
 	artifact blackboard.Event,
 	reviewers []workflowExpert,
 	allExperts []workflowExpert,
+	idToExpert map[uuid.UUID]workflowExpert,
 ) error {
-	const maxRevisions = 3
-
-	for round := 1; round <= maxRevisions; round++ {
+	for round := 1; round <= MaxRevisionRounds; round++ {
 		cv.logger.Info("cross-verify: review round",
 			zap.String("artifact_id", artifact.ID.String()),
 			zap.String("event_type", artifact.EventType),
@@ -250,27 +267,38 @@ func (cv *CrossVerifier) reviewArtifact(
 			return nil
 		}
 
-		// Changes requested — post revision request
-		if round < maxRevisions {
-			_, _ = cv.store.Post(ctx, blackboard.PostRequest{
-				WorkflowID:         workflowID,
-				EventType:          "revision_requested",
-				ReferencesEventIDs: []uuid.UUID{artifact.ID},
-				Content: map[string]interface{}{
-					"artifact_id":     artifact.ID.String(),
-					"artifact_type":   artifact.EventType,
-					"round":           round,
-					"change_requests": changeRequests,
-				},
-			})
-			cv.logger.Info("cross-verify: revision requested",
-				zap.String("artifact_type", artifact.EventType),
-				zap.Int("round", round),
-				zap.Strings("requests", changeRequests),
-			)
-			// In current implementation: log and continue to next round.
-			// Future: trigger producer to revise and re-post artifact.
-			// For now, we give the reviewer another chance in next round.
+		// Changes requested — post revision_requested event to blackboard.
+		_, _ = cv.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:         workflowID,
+			EventType:          "revision_requested",
+			ReferencesEventIDs: []uuid.UUID{artifact.ID},
+			Content: map[string]interface{}{
+				"artifact_id":     artifact.ID.String(),
+				"artifact_type":   artifact.EventType,
+				"round":           round,
+				"change_requests": changeRequests,
+			},
+		})
+
+		// STEP 2: Re-run producer with reviewer feedback.
+		//
+		// MENTAL MODEL:
+		//   artifact.PostedByExpertID = Backend expert UUID
+		//   changeRequests = ["Code Reviewer: error handling missing", "QA: no nil test"]
+		//   → build revised task description with feedback appended
+		//   → aiderRunner.Run() → Aider sees feedback in prompt → fixes code
+		//   → new code_artifact_produced event on blackboard
+		//   → next round: reviewers check the new code
+		//
+		// WHY aiderRunner not agentLoop:
+		//   code_artifact_produced artifacts come from AiderRunner (implementation phase).
+		//   AgentLoop handles design artifacts (architecture_decision, etc.).
+		//   Revision must use the same executor as the original production.
+		//   For non-code artifacts (architecture_decision), agentLoop would be used.
+		//   Current implementation: only code artifacts trigger aiderRunner revision.
+		//   Design artifact revision via agentLoop is future work.
+		if round < MaxRevisionRounds {
+			cv.runProducerRevision(ctx, workflowID, artifact, changeRequests, idToExpert)
 		}
 	}
 
@@ -289,6 +317,150 @@ func (cv *CrossVerifier) reviewArtifact(
 	})
 	// Non-fatal: workflow continues. Client sees escalation on Kanban.
 	return nil
+}
+
+// runProducerRevision finds the producer expert and re-runs AiderRunner
+// with reviewer feedback injected into the task description.
+//
+// MENTAL MODEL:
+//   artifact.PostedByExpertID = *uuid.UUID pointing to Backend expert
+//   idToExpert[*artifact.PostedByExpertID] = workflowExpert{Backend}
+//   revisedDescription = artifact content summary +
+//                        "\n\nREVISION REQUIRED:\n- Code Reviewer: ..."
+//   aiderRunner.Run(ctx, AiderRunRequest{
+//     WorkflowID:      workflowID,
+//     Expert:          backendExpert,
+//     TaskID:          uuid.New(),   // fresh ID for this revision run
+//     TaskTitle:       "Revision: " + artifact.EventType,
+//     TaskDescription: revisedDescription,
+//     WorkflowPhase:   PhaseImplementation,
+//   })
+//
+// CROSS-QUESTIONS:
+//   Q: Why uuid.New() for TaskID?
+//   A: Each revision is a distinct Aider run. Fresh ID prevents
+//      checkpoint collision with the original run.
+//
+//   Q: What if artifact.PostedByExpertID is nil?
+//   A: System-posted artifact (no expert). Skip revision. Log warning.
+//
+//   Q: What if producer not in idToExpert?
+//   A: Expert was removed from workflow. Skip revision. Log warning.
+//
+//   Q: What if aiderRunner is nil?
+//   A: Log warning, skip. Graceful degradation.
+//
+//   Q: What if aiderRunner.Run() fails?
+//   A: Log error, non-fatal. Review loop continues to next round.
+//      Reviewers will see the same old code and likely request changes again.
+//      After MaxRevisionRounds, escalates to client.
+//
+//   Q: Why only code artifacts (PhaseImplementation)?
+//   A: code_artifact_produced comes from AiderRunner.
+//      Design artifacts (architecture_decision etc.) come from AgentLoop.
+//      Revision executor must match original executor.
+//      Design artifact revision via AgentLoop is future work.
+func (cv *CrossVerifier) runProducerRevision(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	artifact blackboard.Event,
+	changeRequests []string,
+	idToExpert map[uuid.UUID]workflowExpert,
+) {
+	// Guard: aiderRunner must be available
+	if cv.aiderRunner == nil {
+		cv.logger.Warn("cross-verify: aiderRunner nil, skipping producer revision",
+			zap.String("artifact_type", artifact.EventType),
+		)
+		return
+	}
+
+	// Guard: only re-run for code artifacts (AiderRunner produced them).
+	// Design artifacts (architecture_decision, data_model_proposed, etc.)
+	// are produced by AgentLoop — revision via AgentLoop is future work.
+	if artifact.EventType != "code_artifact_produced" {
+		cv.logger.Info("cross-verify: non-code artifact, skipping aider revision (future work)",
+			zap.String("artifact_type", artifact.EventType),
+		)
+		return
+	}
+
+	// Guard: artifact must have a producer
+	if artifact.PostedByExpertID == nil {
+		cv.logger.Warn("cross-verify: artifact has no producer (system-posted), skipping revision",
+			zap.String("artifact_id", artifact.ID.String()),
+		)
+		return
+	}
+
+	// Find producer expert in workflow
+	producer, ok := idToExpert[*artifact.PostedByExpertID]
+	if !ok {
+		cv.logger.Warn("cross-verify: producer expert not in workflow, skipping revision",
+			zap.String("producer_id", artifact.PostedByExpertID.String()),
+		)
+		return
+	}
+
+	// Build revised task description.
+	// Structure:
+	//   [Original artifact content summary]
+	//
+	//   REVISION REQUIRED — Reviewer Feedback:
+	//   - Code Reviewer: error handling missing in auth flow
+	//   - QA: no test for nil token case
+	//
+	//   Fix ALL issues listed above. Re-implement the affected code.
+	artifactSummary := string(artifact.Content)
+	if len(artifactSummary) > 1000 {
+		artifactSummary = artifactSummary[:1000] + "\n... [truncated]"
+	}
+
+	var sb strings.Builder
+	sb.WriteString("You previously produced this artifact:\n")
+	sb.WriteString(artifactSummary)
+	sb.WriteString("\n\nREVISION REQUIRED — Reviewer Feedback:\n")
+	for _, req := range changeRequests {
+		sb.WriteString("- ")
+		sb.WriteString(req)
+		sb.WriteString("\n")
+	}
+	sb.WriteString("\nFix ALL issues listed above. Re-implement the affected code.")
+	sb.WriteString("\nPost the revised code_artifact_produced when done.")
+	revisedDescription := sb.String()
+
+	cv.logger.Info("cross-verify: re-running producer with reviewer feedback",
+		zap.String("producer", producer.Name),
+		zap.String("artifact_type", artifact.EventType),
+		zap.Strings("change_requests", changeRequests),
+	)
+
+	// Re-run AiderRunner for the producer expert.
+	// TaskID: fresh UUID so checkpoint doesn't collide with original run.
+	// WorkflowPhase: PhaseImplementation (code artifacts always from impl phase).
+	_, runErr := cv.aiderRunner.Run(ctx, AiderRunRequest{
+		WorkflowID:      workflowID,
+		Expert:          producer,
+		TaskID:          uuid.New(),
+		TaskTitle:       fmt.Sprintf("Revision: %s", artifact.EventType),
+		TaskDescription: revisedDescription,
+		WorkflowPhase:   PhaseImplementation,
+	})
+	if runErr != nil {
+		// Non-fatal: log error, review loop continues.
+		// Reviewers will see old code in next round and request changes again.
+		// After MaxRevisionRounds, escalates to client.
+		cv.logger.Error("cross-verify: producer revision run failed (non-fatal)",
+			zap.String("producer", producer.Name),
+			zap.Error(runErr),
+		)
+		return
+	}
+
+	cv.logger.Info("cross-verify: producer revision completed",
+		zap.String("producer", producer.Name),
+		zap.String("artifact_type", artifact.EventType),
+	)
 }
 
 // runReview asks one reviewer to review an artifact.
@@ -365,11 +537,11 @@ func (cv *CrossVerifier) runReview(
 		PostedByExpertID:   &reviewer.ID,
 		ReferencesEventIDs: []uuid.UUID{artifact.ID},
 		Content: map[string]interface{}{
-			"artifact_id":   artifact.ID.String(),
-			"artifact_type": artifact.EventType,
-			"status":        parsedStatus,
-			"comment":       parsedComment,
-			"reviewer":      reviewer.Name,
+			"artifact_id":     artifact.ID.String(),
+			"artifact_type":   artifact.EventType,
+			"status":          parsedStatus,
+			"comment":         parsedComment,
+			"reviewer":        reviewer.Name,
 			"reviewer_domain": reviewer.Domain,
 		},
 	})
@@ -412,4 +584,3 @@ func parseReviewResponse(response string) (status string, comment string) {
 	// Unexpected format — default to approved (non-blocking)
 	return "approved", ""
 }
-
