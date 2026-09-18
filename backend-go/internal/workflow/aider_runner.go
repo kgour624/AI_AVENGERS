@@ -744,6 +744,89 @@ func (a *AiderRunner) extractCommitSHA(
 	return strings.TrimSpace(string(output)), nil
 }
 
+// buildQAPrompt constructs a QA-specific prompt for test generation.
+//
+// PHASE 4: QA Phase Support
+//
+// MENTAL MODEL:
+//   QA prompt structure:
+//     1. Task description (from planner)
+//     2. Test requirements (coverage, quality)
+//     3. Observations (test failures, coverage)
+//     4. Best practices (naming, table-driven tests)
+//
+// CROSS-QUESTIONS:
+//   Q: What makes a good test?
+//   A: - Tests all public functions
+//      - Covers edge cases (empty input, nil, invalid)
+//      - Tests error paths
+//      - Clear naming: TestFunctionName_Scenario_ExpectedResult
+//
+//   Q: Why >80% coverage?
+//   A: Industry standard, balances thoroughness vs cost
+//
+//   Q: Should we enforce table-driven tests?
+//   A: Recommend in prompt, not enforce (some tests don't fit)
+//
+// EXAMPLE OUTPUT:
+//   "Generate comprehensive tests for auth.go
+//
+//    Requirements:
+//    - Test all public functions (Authenticate, ValidateToken)
+//    - Cover edge cases: empty username, invalid password, expired token
+//    - Test error paths: database errors, network failures
+//    - Achieve >80% code coverage
+//    - Use table-driven tests where appropriate
+//
+//    Naming convention:
+//    - TestFunctionName_Scenario_ExpectedResult
+//    - Example: TestAuthenticate_EmptyUsername_ReturnsError
+//
+//    Observations from previous iteration:
+//    Test Failures:
+//    TestAuthenticate_ValidCredentials failed: expected nil error, got 'db connection failed'
+//    Coverage: 45.2%"
+func (a *AiderRunner) buildQAPrompt(taskDescription string, observations string) string {
+	var prompt strings.Builder
+
+	// Task description
+	prompt.WriteString(taskDescription)
+	prompt.WriteString("\n\n")
+
+	// Test requirements
+	prompt.WriteString("Test Requirements:\n")
+	prompt.WriteString("- Test all public functions and methods\n")
+	prompt.WriteString("- Cover edge cases: empty input, nil values, invalid data, boundary conditions\n")
+	prompt.WriteString("- Test error paths: database errors, network failures, validation errors\n")
+	prompt.WriteString("- Achieve >80% code coverage\n")
+	prompt.WriteString("- Use table-driven tests where appropriate\n")
+	prompt.WriteString("\n")
+
+	// Naming convention
+	prompt.WriteString("Naming Convention:\n")
+	prompt.WriteString("- TestFunctionName_Scenario_ExpectedResult\n")
+	prompt.WriteString("- Example: TestAuthenticate_EmptyUsername_ReturnsError\n")
+	prompt.WriteString("- Example: TestValidateToken_ExpiredToken_ReturnsFalse\n")
+	prompt.WriteString("\n")
+
+	// Best practices
+	prompt.WriteString("Best Practices:\n")
+	prompt.WriteString("- Use t.Run() for subtests\n")
+	prompt.WriteString("- Use testify/assert for assertions (if available)\n")
+	prompt.WriteString("- Mock external dependencies (database, HTTP clients)\n")
+	prompt.WriteString("- Clean up resources in defer statements\n")
+	prompt.WriteString("\n")
+
+	// Observations (if any)
+	if observations != "" {
+		prompt.WriteString("Observations from previous iteration:\n")
+		prompt.WriteString(observations)
+		prompt.WriteString("\n")
+	}
+
+	return prompt.String()
+}
+
 // loadExpertTraining loads expert's training from DB (Gate 1 only).
 //
 // MENTAL MODEL:
