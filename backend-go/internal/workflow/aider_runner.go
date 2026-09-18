@@ -811,10 +811,23 @@ func (a *AiderRunner) publishCodeArtifacts(
 		return fmt.Errorf("test validation failed: %w\nOutput: %s", testErr, testOutput)
 	}
 
+	// Log validation success with duration
+	validationDuration := time.Since(validationStart)
 	a.logger.Info("validation passed, proceeding to publish",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
+		zap.Duration("validation_duration", validationDuration),
 	)
+
+	// Warn if validation took too long (> 10 minutes)
+	if validationDuration > 10*time.Minute {
+		a.logger.Warn("validation took longer than expected",
+			zap.String("workflow_id", req.WorkflowID.String()),
+			zap.String("expert", req.Expert.Name),
+			zap.Duration("duration", validationDuration),
+			zap.String("recommendation", "consider optimizing build/test performance"),
+		)
+	}
 
 	// Use latest commit SHA for all artifacts
 	latestCommitSHA := commitSHAs[len(commitSHAs)-1]
