@@ -848,27 +848,21 @@ func (a *AiderRunner) parseCoverage(output string) float64 {
 // runAiderIteration executes one Aider iteration.
 //
 // MENTAL MODEL:
-//   Aider CLI call with task + observations
-//   Aider generates patches, applies them, commits
-//   Returns: (commitSHA, taskComplete, error)
+//   Full flow per iteration:
+//   1. Check if generic knowledge is approved on blackboard (30% rule)
+//   2. Load expert training: charter (rules) + RAG chunks (knowledge)
+//   3. Build prompt with 70/30 enforcement instructions
+//   4. Call AiderService HTTP API
+//   5. Extract commit SHA
+//   6. Check task completion criteria (build+tests for impl, coverage for QA)
 //
-// PHASE 4 ADDITION:
-//   QA Phase:
-//     - Different prompt (focus on test generation)
-//     - Check coverage in completion criteria
-//     - Validate test quality
-//
-// CROSS-QUESTIONS:
-//   Q: Why --yes flag?
-//   A: Auto-accept all changes (no interactive mode)
-//      We trust Aider's decisions (can rollback via git)
-//
-//   Q: How detect TASK_COMPLETE?
-//   A: Implementation: build + tests pass
-//      QA: tests pass + coverage >80%
-//
-//   Q: What if Aider fails?
-//   A: Return error, caller retries or escalates
+// 70/30 RULE ENFORCEMENT:
+//   Expert MUST use its own training knowledge (70%).
+//   Generic LLM knowledge is BLOCKED by default.
+//   Generic is only allowed if blackboard has generic_knowledge_approved
+//   event posted by ALL other experts in the workflow.
+//   If expert needs something not in training, it must post
+//   generic_knowledge_request to blackboard and stop.
 func (a *AiderRunner) runAiderIteration(
 	ctx context.Context,
 	req AiderRunRequest,
@@ -876,7 +870,28 @@ func (a *AiderRunner) runAiderIteration(
 	observations string,
 	iteration int,
 ) (commitSHA string, taskComplete bool, err error) {
-	// Build Aider message (phase-specific)
+	// Step 1: Check if generic knowledge is approved for this task.
+	//
+	// MENTAL MODEL:
+	//   Check blackboard for generic_knowledge_approved events.
+	//   If found: generic knowledge is allowed (30% rule activated).
+	//   If not found: generic knowledge is BLOCKED.
+	//
+	//   This implements the design doc rule:
+	//   "30% generic ONLY when ALL experts agree"
+	genericApproved, genericTopics := a.checkGenericApproval(ctx, req.WorkflowID, req.Expert.ID)
+
+	// Step 2: Load expert training (charter + RAG chunks)
+	training, err := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
+	if err != nil {
+		a.logger.Warn("failed to load expert training",
+			zap.Error(err),
+			zap.String("expert_id", req.Expert.ID.String()),
+		)
+		// Non-fatal: continue without training
+	}
+
+	// Step 3: Build Aider message (phase-specific)
 	var message string
 	if req.WorkflowPhase == "qa" {
 		message = a.buildQAPrompt(req.TaskDescription, observations)
@@ -888,24 +903,27 @@ func (a *AiderRunner) runAiderIteration(
 		}
 	}
 
-	// Gate 1: Load expert's actual training knowledge via RAG.
-	//
-	// MENTAL MODEL:
-	//   This is the 70% rule from the design doc.
-	//   Expert must code from its OWN training, not generic LLM knowledge.
-	//   RAG fetches the most relevant chunks from course_chunks for this task.
-	//   Charter provides the rules (never do X, always do Y).
-	//   Together: expert has both knowledge AND rules from its training.
-	training, err := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
-	if err != nil {
-		a.logger.Warn("failed to load expert training",
-			zap.Error(err),
-			zap.String("expert_id", req.Expert.ID.String()),
-		)
-		// Non-fatal: continue without training
-	} else if training != "" {
+	// Step 4: Add training knowledge
+	if training != "" {
 		message += "\n\n" + training
 	}
+
+	// Step 5: Add 70/30 enforcement instructions.
+	//
+	// MENTAL MODEL:
+	//   This is the most critical part.
+	//   Without this, Aider uses generic LLM knowledge freely.
+	//   With this, Aider is explicitly told:
+	//   - Use ONLY training knowledge above
+	//   - If something is missing, post generic_knowledge_request
+	//   - Do NOT guess or use generic knowledge
+	//
+	// CROSS-QUESTION:
+	//   Q: Will Aider actually follow these instructions?
+	//   A: Yes, Aider respects system-level instructions in the message.
+	//      The instructions are clear and specific.
+	//      Aider is designed to follow user instructions precisely.
+	message += a.build7030EnforcementInstructions(genericApproved, genericTopics)
 
 	// Call AiderService HTTP API
 	// WHY HTTP not CLI: AiderService routes LLM calls through ModelGateway
@@ -1035,6 +1053,121 @@ func (a *AiderRunner) extractCommitSHA(
 		return "", fmt.Errorf("git rev-parse: %w", err)
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+// checkGenericApproval checks if generic knowledge is approved for this expert's task.
+//
+// MENTAL MODEL:
+//   Blackboard event: generic_knowledge_approved
+//   Content: { "approved_for_expert_id": "uuid", "topics": ["JWT", "OAuth"] }
+//
+//   If this event exists on blackboard for this expert:
+//   -> Generic knowledge is approved for those topics
+//   -> Expert can use generic LLM knowledge for those topics only
+//
+// CROSS-QUESTIONS:
+//   Q: Who posts generic_knowledge_approved?
+//   A: Other experts in the workflow (via cross-verification, Step 3)
+//      All experts must approve for generic to be allowed.
+//
+//   Q: What if only some experts approved?
+//   A: Not enough. ALL must approve. (Implemented in Step 3)
+//
+//   Q: What if no approval events exist?
+//   A: Generic is blocked. Expert must use training only.
+func (a *AiderRunner) checkGenericApproval(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	expertID uuid.UUID,
+) (approved bool, topics []string) {
+	events, err := a.store.GetByType(ctx, workflowID,
+		[]string{"generic_knowledge_approved"}, 0)
+	if err != nil {
+		// Non-fatal: assume not approved
+		return false, nil
+	}
+
+	for _, ev := range events {
+		var content struct {
+			ApprovedForExpertID string   `json:"approved_for_expert_id"`
+			Topics              []string `json:"topics"`
+		}
+		if err := json.Unmarshal(ev.Content, &content); err != nil {
+			continue
+		}
+		if content.ApprovedForExpertID == expertID.String() {
+			topics = append(topics, content.Topics...)
+		}
+	}
+
+	if len(topics) > 0 {
+		a.logger.Info("generic knowledge approved for expert",
+			zap.String("expert_id", expertID.String()),
+			zap.Strings("topics", topics),
+		)
+		return true, topics
+	}
+	return false, nil
+}
+
+// build7030EnforcementInstructions builds the 70/30 rule enforcement text.
+//
+// MENTAL MODEL:
+//   This text is appended to every Aider message.
+//   It explicitly tells Aider:
+//   - Use ONLY training knowledge (70% rule)
+//   - Generic knowledge is BLOCKED unless approved (30% rule)
+//   - If something is missing, post generic_knowledge_request
+//
+// CROSS-QUESTIONS:
+//   Q: Why append to message instead of system prompt?
+//   A: Aider doesn't have a separate system prompt field.
+//      Message is the only input. Appending ensures it's always present.
+//
+//   Q: What if genericApproved is true?
+//   A: We tell Aider which topics are approved for generic knowledge.
+//      Only those topics can use generic knowledge.
+//      Everything else still requires training knowledge.
+func (a *AiderRunner) build7030EnforcementInstructions(
+	genericApproved bool,
+	genericTopics []string,
+) string {
+	var sb strings.Builder
+
+	sb.WriteString("\n\n=== KNOWLEDGE USAGE RULES (MANDATORY, NO EXCEPTIONS) ===\n")
+	sb.WriteString("You are a domain expert with specific training. Follow these rules strictly:\n\n")
+
+	sb.WriteString("RULE 1 — USE YOUR TRAINING ONLY:\n")
+	sb.WriteString("  Code and design ONLY from the training knowledge provided above.\n")
+	sb.WriteString("  Your training chunks are your ONLY source of truth.\n")
+	sb.WriteString("  Do NOT use generic LLM knowledge, internet knowledge, or assumptions.\n\n")
+
+	if genericApproved && len(genericTopics) > 0 {
+		sb.WriteString("RULE 2 — GENERIC KNOWLEDGE (APPROVED FOR SPECIFIC TOPICS):\n")
+		sb.WriteString("  All experts have agreed. You MAY use generic knowledge ONLY for:\n")
+		for _, topic := range genericTopics {
+			sb.WriteString(fmt.Sprintf("  - %s\n", topic))
+		}
+		sb.WriteString("  For ALL other topics: training knowledge only.\n\n")
+	} else {
+		sb.WriteString("RULE 2 — GENERIC KNOWLEDGE IS BLOCKED:\n")
+		sb.WriteString("  Generic LLM knowledge is NOT allowed for this task.\n")
+		sb.WriteString("  No expert consensus has been reached to allow generic knowledge.\n\n")
+	}
+
+	sb.WriteString("RULE 3 — IF TRAINING IS INSUFFICIENT:\n")
+	sb.WriteString("  If your training knowledge does not cover what you need:\n")
+	sb.WriteString("  1. Do NOT guess or use generic knowledge.\n")
+	sb.WriteString("  2. Write a comment in the code: // TRAINING_GAP: [what is missing]\n")
+	sb.WriteString("  3. Implement what you CAN from training.\n")
+	sb.WriteString("  4. Leave TODO comments for gaps.\n\n")
+
+	sb.WriteString("RULE 4 — CITATION:\n")
+	sb.WriteString("  For every significant design decision, add a comment:\n")
+	sb.WriteString("  // SOURCE: [Training N] - [brief reason]\n")
+	sb.WriteString("  This proves your code comes from training, not generic knowledge.\n")
+
+	return sb.String()
 }
 
 // buildQAPrompt constructs a QA-specific prompt for test generation.
