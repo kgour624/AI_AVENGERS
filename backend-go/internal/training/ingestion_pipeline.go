@@ -917,25 +917,73 @@ func (p *IngestionPipeline) pauseOnLLMFailure(
 
 	// Transition job to paused state.
 	// paused_at is used by the 24h auto-fail checker in main.go.
-	_, err := p.db.Exec(ctx,
-		`UPDATE ingestion_jobs SET
-			status        = 'paused',
-			current_stage = 'paused',
-			stage_detail  = $1,
-			paused_at     = NOW(),
-			error_message = $2
-		 WHERE id = $3`,
+	//
+	// WHY fallback strategy:
+	//   If the context is already cancelled (deadline exceeded during LLM retry),
+	//   the DB update will fail immediately. We need a fallback with a fresh
+	//   context to ensure the job status is updated. Otherwise the job stays
+	//   'running' forever with no way to recover.
+	updateQuery := `UPDATE ingestion_jobs SET
+		status        = 'paused',
+		current_stage = 'paused',
+		stage_detail  = $1,
+		paused_at     = NOW(),
+		error_message = $2
+	 WHERE id = $3`
+
+	_, err := p.db.Exec(ctx, updateQuery,
 		StageLabels[StagePaused],
 		reason,
 		jobID,
 	)
 	if err != nil {
-		// DB write failed — log but still return ErrJobPaused.
-		// Pipeline must stop regardless; worst case the job stays
-		// 'running' in DB until the 24h checker or admin intervenes.
-		p.logger.Error("pauseOnLLMFailure: DB update failed",
+		p.logger.Error("pauseOnLLMFailure: primary DB update failed, trying fallback",
 			zap.String("job_id", jobID.String()),
 			zap.Error(err),
+		)
+
+		// Fallback: try with a fresh context (5s timeout).
+		// If the original context was cancelled, this gives us one last
+		// chance to update the DB before giving up.
+		fallbackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		_, fallbackErr := p.db.Exec(fallbackCtx, updateQuery,
+			StageLabels[StagePaused],
+			reason,
+			jobID,
+		)
+		if fallbackErr != nil {
+			// Both attempts failed. This is serious — DB is likely down or
+			// the connection is broken. Mark the job as 'failed' instead of
+			// 'paused' so admin knows something is wrong.
+			p.logger.Error("pauseOnLLMFailure: fallback DB update also failed — marking job as failed",
+				zap.String("job_id", jobID.String()),
+				zap.Error(fallbackErr),
+			)
+
+			// Last-ditch attempt: mark as 'failed' with a fresh context.
+			// If this also fails, there's nothing more we can do.
+			failCtx, failCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer failCancel()
+			_, _ = p.db.Exec(failCtx,
+				`UPDATE ingestion_jobs SET
+					status        = 'failed',
+					current_stage = 'failed',
+					stage_detail  = 'DB update failed',
+					error_message = $1,
+					completed_at  = NOW()
+				 WHERE id = $2`,
+				fmt.Sprintf("pauseOnLLMFailure: DB update failed twice: %s", fallbackErr.Error()),
+				jobID,
+			)
+			// Return the original error, not ErrJobPaused, because the job
+			// is not actually paused — it's failed.
+			return fmt.Errorf("pauseOnLLMFailure: failed to update job status: %w", fallbackErr)
+		}
+
+		p.logger.Info("pauseOnLLMFailure: fallback DB update succeeded",
+			zap.String("job_id", jobID.String()),
 		)
 	}
 
