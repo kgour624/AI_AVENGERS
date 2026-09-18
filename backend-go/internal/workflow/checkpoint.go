@@ -31,13 +31,13 @@ func NewCheckpointManager(db *pgxpool.Pool, logger *zap.Logger) *CheckpointManag
 // PhaseSnapshot is the data stored in a phase checkpoint.
 // Contains everything needed to resume the next phase from scratch.
 type PhaseSnapshot struct {
-	CompletedPhase    string          `json:"completed_phase"`
-	NextPhase         string          `json:"next_phase"`
-	SelectedExpertIDs []uuid.UUID     `json:"selected_expert_ids"`
-	FinalArtifacts    []ArtifactRef   `json:"final_artifacts"`   // artifacts produced in this phase
-	CostSpentUSD      float64         `json:"cost_spent_usd"`
-	CreatedAt         time.Time       `json:"created_at"`
-	Extra             json.RawMessage `json:"extra,omitempty"`   // phase-specific data
+	CompletedPhase    string        `json:"completed_phase"`
+	NextPhase         string        `json:"next_phase"`
+	SelectedExpertIDs []uuid.UUID   `json:"selected_expert_ids"`
+	FinalArtifacts    []ArtifactRef `json:"final_artifacts"`
+	CostSpentUSD      float64       `json:"cost_spent_usd"`
+	CreatedAt         time.Time     `json:"created_at"`
+	Extra             []byte        `json:"extra,omitempty"`
 }
 
 // ArtifactRef is a reference to a final artifact on the blackboard.
@@ -49,12 +49,6 @@ type ArtifactRef struct {
 }
 
 // Write writes a phase checkpoint to workflow_checkpoints.
-// Called after every phase transition and every approval response.
-//
-// Mental execution:
-//   Input: workflowID=abc, snapshot={completed_phase: "intake", ...}, lastSeq=42
-//   INSERT INTO workflow_checkpoints (workflow_id, phase, state_snapshot, blackboard_sequence_number)
-//   VALUES (abc, "intake", {...}, 42)
 func (m *CheckpointManager) Write(
 	ctx context.Context,
 	workflowID uuid.UUID,
@@ -89,8 +83,6 @@ func (m *CheckpointManager) Write(
 
 // LoadLatest loads the most recent checkpoint for a workflow.
 // Returns nil if no checkpoint exists (new workflow, start from beginning).
-//
-// Used on server restart to resume a running workflow.
 func (m *CheckpointManager) LoadLatest(
 	ctx context.Context,
 	workflowID uuid.UUID,
@@ -114,7 +106,7 @@ func (m *CheckpointManager) LoadLatest(
 	)
 	if err != nil {
 		if err.Error() == "no rows in result set" {
-			return nil, nil // no checkpoint yet
+			return nil, nil
 		}
 		return nil, fmt.Errorf("checkpoint load: %w", err)
 	}
