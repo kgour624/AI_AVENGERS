@@ -199,6 +199,11 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 		//     artifact_type = 'code_file',
 		//     artifact_data = {filename, file_path, language, lines_of_code}
 		//   )
+		p.logger.Debug("code_artifact_produced: received event",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("event_id", event.ID.String()),
+		)
+
 		if event.PostedByExpertID == nil {
 			p.logger.Warn("code_artifact_produced: missing expert_id",
 				zap.String("event_id", event.ID.String()),
