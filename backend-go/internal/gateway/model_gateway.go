@@ -113,6 +113,15 @@ func (g *ModelGateway) buildProviderByName(ctx context.Context, providerName str
 			modelCheap, modelStrong, modelFast,
 			g.httpClient,
 		)
+	case config.ProviderCavoti:
+		modelCheap := g.getModelName(ctx, "cavoti_model_cheap", "")
+		modelStrong := g.getModelName(ctx, "cavoti_model_strong", "")
+		modelFast := g.getModelName(ctx, "cavoti_model_fast", "")
+		return providers.NewCavotiProvider(
+			apiKey, g.cfg.CavotiBaseURL,
+			modelCheap, modelStrong, modelFast,
+			g.httpClient,
+		)
 	default: // openrouter
 		return providers.NewOpenRouterProvider(apiKey, g.cfg.OpenRouterBaseURL, g.httpClient)
 	}
@@ -161,6 +170,15 @@ func (g *ModelGateway) buildProvider(ctx context.Context) LLMProvider {
 		modelFast := g.getModelName(ctx, "codecraftapi_model_fast", "")
 		return providers.NewCodeCraftAPIProvider(
 			apiKey, g.cfg.CodeCraftAPIBaseURL,
+			modelCheap, modelStrong, modelFast,
+			g.httpClient,
+		)
+	case config.ProviderCavoti:
+		modelCheap := g.getModelName(ctx, "cavoti_model_cheap", "")
+		modelStrong := g.getModelName(ctx, "cavoti_model_strong", "")
+		modelFast := g.getModelName(ctx, "cavoti_model_fast", "")
+		return providers.NewCavotiProvider(
+			apiKey, g.cfg.CavotiBaseURL,
 			modelCheap, modelStrong, modelFast,
 			g.httpClient,
 		)
@@ -464,6 +482,8 @@ func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvide
 		return g.cfg.GeminiAPIKey
 	case config.ProviderCodeCraftAPI:
 		return g.cfg.CodeCraftAPIKey
+	case config.ProviderCavoti:
+		return g.cfg.CavotiAPIKey
 	default:
 		return g.cfg.OpenRouterAPIKey
 	}

@@ -64,7 +64,8 @@ const (
 	ProviderDeepSeek     LLMProvider = "deepseek"
 	ProviderAnthropic    LLMProvider = "anthropic"
 	ProviderGemini       LLMProvider = "gemini"
-	ProviderCodeCraftAPI LLMProvider = "codecraftapi" // multi-model aggregator with embeddings support
+	ProviderCodeCraftAPI LLMProvider = "codecraftapi"
+	ProviderCavoti       LLMProvider = "cavoti" // OpenAI-compatible, sk- prefix, base: https://cavoti.com/v1
 )
 
 type LLMConfig struct {
@@ -82,6 +83,11 @@ type LLMConfig struct {
 	// Base URL default: https://codecraftapi.com/v1
 	CodeCraftAPIKey     string // env: CODECRAFTAPI_KEY
 	CodeCraftAPIBaseURL string // env: CODECRAFTAPI_BASE_URL
+
+	// Cavoti (OpenAI-compatible, sk- prefix API key)
+	// Base URL default: https://cavoti.com/v1
+	CavotiAPIKey  string // env: CAVOTI_API_KEY
+	CavotiBaseURL string // env: CAVOTI_BASE_URL
 
 	// Active provider — can be overridden from admin panel via system_settings
 	// Default: openrouter
@@ -192,6 +198,8 @@ func Load() (*Config, error) {
 			GeminiAPIKey:        v.GetString("GEMINI_API_KEY"),
 			CodeCraftAPIKey:     v.GetString("CODECRAFTAPI_KEY"),
 			CodeCraftAPIBaseURL: v.GetString("CODECRAFTAPI_BASE_URL"),
+			CavotiAPIKey:        v.GetString("CAVOTI_API_KEY"),
+			CavotiBaseURL:       v.GetString("CAVOTI_BASE_URL"),
 			Provider:            LLMProvider(v.GetString("LLM_PROVIDER")),
 			ModelCheap:        v.GetString("LLM_MODEL_CHEAP"),
 			ModelStrong:       v.GetString("LLM_MODEL_STRONG"),
