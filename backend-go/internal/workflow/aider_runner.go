@@ -20,6 +20,7 @@ import (
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
+	"ai_avengers/backend/internal/validation"
 )
 
 // AiderRunner executes implementation/qa tasks using Aider.
@@ -65,14 +66,15 @@ import (
 //     Think:   Task complete
 //     Act:     Post code_artifact_produced to blackboard, exit
 type AiderRunner struct {
-	db              *pgxpool.Pool
-	store           *blackboard.Store
-	gateway         *gateway.ModelGateway
-	mlClient        *ml.SidecarClient // For embedding task descriptions -> RAG on course_chunks
-	workspaceDir    string            // Base directory: /workspaces/
-	aiderServiceURL string            // AiderService HTTP API URL
-	httpClient      *http.Client
-	logger          *zap.Logger
+	db                 *pgxpool.Pool
+	store              *blackboard.Store
+	gateway            *gateway.ModelGateway
+	mlClient           *ml.SidecarClient        // For embedding task descriptions -> RAG on course_chunks
+	validationPipeline *validation.Pipeline     // Validates code before publishing to blackboard
+	workspaceDir       string                   // Base directory: /workspaces/
+	aiderServiceURL    string                   // AiderService HTTP API URL
+	httpClient         *http.Client
+	logger             *zap.Logger
 }
 
 // NewAiderRunner creates a new AiderRunner instance.
@@ -84,19 +86,21 @@ func NewAiderRunner(
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
 	mlClient *ml.SidecarClient,
+	validationPipeline *validation.Pipeline,
 	workspaceDir string,
 	aiderServiceURL string,
 	logger *zap.Logger,
 ) *AiderRunner {
 	return &AiderRunner{
-		db:              db,
-		store:           store,
-		gateway:         gw,
-		mlClient:        mlClient,
-		workspaceDir:    workspaceDir,
-		aiderServiceURL: aiderServiceURL,
-		httpClient:      &http.Client{Timeout: 10 * time.Minute},
-		logger:          logger,
+		db:                 db,
+		store:              store,
+		gateway:            gw,
+		mlClient:           mlClient,
+		validationPipeline: validationPipeline,
+		workspaceDir:       workspaceDir,
+		aiderServiceURL:    aiderServiceURL,
+		httpClient:         &http.Client{Timeout: 10 * time.Minute},
+		logger:             logger,
 	}
 }
 
@@ -1625,8 +1629,42 @@ func (a *AiderRunner) publishCodeArtifacts(
 			relPath = filename // Fallback to just filename
 		}
 
-		// Count lines of code
-		linesOfCode := countLines(content)
+		// Step 4: Validate code before publishing.
+		//
+		// MENTAL MODEL:
+		//   Run validation pipeline (syntax, lint, format, typecheck).
+		//   If fails: OTA revision loop (max 3 rounds, LLM fixes).
+		//   Use validated/fixed code for publishing.
+		//   If still fails after 3 rounds: publish with validation_failed flag.
+		//   Code Reviewer will catch it in cross-verification.
+		finalCode := string(content)
+		validationPassed := true
+		validationError := ""
+
+		if a.validationPipeline != nil {
+			validResult := a.validationPipeline.Validate(ctx, validation.ArtifactRequest{
+				Filename: filename,
+				Code:     string(content),
+				ExpertID: req.Expert.ID.String(),
+			})
+			if validResult.Passed {
+				finalCode = validResult.FinalCode // may be fixed by LLM
+				a.logger.Info("validation passed",
+					zap.String("file", relPath),
+					zap.Int("revision_rounds", validResult.RevisionRounds),
+				)
+			} else {
+				validationPassed = false
+				validationError = validResult.Error
+				a.logger.Warn("validation failed, publishing with flag",
+					zap.String("file", relPath),
+					zap.String("error", validResult.Error),
+				)
+			}
+		}
+
+		// Count lines of code (use final validated code)
+		linesOfCode := countLines([]byte(finalCode))
 
 		// Post to blackboard
 		_, postErr := a.store.Post(ctx, blackboard.PostRequest{
@@ -1634,13 +1672,15 @@ func (a *AiderRunner) publishCodeArtifacts(
 			EventType:        "code_artifact_produced",
 			PostedByExpertID: &req.Expert.ID,
 			Content: map[string]interface{}{
-				"filename":      filename,
-				"file_path":     relPath,
-				"content":       string(content),
-				"language":      language,
-				"commit_sha":    latestCommitSHA,
-				"lines_of_code": linesOfCode,
-				"phase":         req.WorkflowPhase,
+				"filename":          filename,
+				"file_path":         relPath,
+				"content":           finalCode,
+				"language":          language,
+				"commit_sha":        latestCommitSHA,
+				"lines_of_code":     linesOfCode,
+				"phase":             req.WorkflowPhase,
+				"validation_passed": validationPassed,
+				"validation_error":  validationError,
 			},
 		})
 
