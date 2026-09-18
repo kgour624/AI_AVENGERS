@@ -502,6 +502,17 @@ func (a *AiderRunner) runAiderLoop(
 			a.logger.Info("task completed",
 				zap.Int("iterations", iteration),
 			)
+
+			// PHASE 5: Delete checkpoint on successful completion
+			if err := a.deleteCheckpoint(ctx, req.WorkflowID, req.Expert.ID, req.TaskID); err != nil {
+				// Non-fatal: log error but don't fail task
+				// TTL job will cleanup old checkpoints
+				a.logger.Error("failed to delete checkpoint",
+					zap.Error(err),
+					zap.String("workflow_id", req.WorkflowID.String()),
+				)
+			}
+
 			return &AiderRunResult{
 				CommitSHAs: commitSHAs,
 				Iterations: iteration,
