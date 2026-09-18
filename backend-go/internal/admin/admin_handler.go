@@ -1248,18 +1248,34 @@ func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
 	)
 
 	// Regenerate charter in background — same goroutine pattern as IngestTranscript
+	// WHY 10-minute timeout (not 2 hours):
+	//   RegenerateCharter only does charter extraction (single LLM call).
+	//   HTTP timeout is 120s. 10min is 5x safety margin.
+	//   Charter extraction uses first 8000 chars, takes <2 minutes normally.
 	go func() {
-		bgCtx := context.Background()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+
 		charters := training.NewCharterExtractor(h.gateway, h.logger)
 
-		charter, extractErr := charters.Extract(bgCtx, transcriptContent, expertName)
+		charter, extractErr := charters.Extract(ctx, transcriptContent, expertName)
 		if extractErr != nil {
-			h.logger.Error("charter regeneration failed",
-				zap.String("expert_id", expertID.String()),
-				zap.Error(extractErr),
-			)
+			if errors.Is(extractErr, context.DeadlineExceeded) {
+				h.logger.Error("charter regeneration timeout: exceeded 10-minute deadline",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(extractErr),
+				)
+			} else {
+				h.logger.Error("charter regeneration failed",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(extractErr),
+				)
+			}
 			// Reset is_training so expert is not stuck in training state
-			_, _ = h.db.Exec(bgCtx,
+			// Use fresh context with 5s timeout (original context may be cancelled)
+			resetCtx, resetCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer resetCancel()
+			_, _ = h.db.Exec(resetCtx,
 				`UPDATE experts SET is_training=FALSE, updated_at=NOW() WHERE id=$1`,
 				expertID,
 			)
@@ -1278,7 +1294,7 @@ func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
 		//   assignment back to JSONB for the column. Without this, PostgreSQL
 		//   raises SQLSTATE 42804 "CASE types jsonb and text cannot be matched".
 		// training_status: set to 'trained' — chunks are already verified by smoke test.
-		_, dbErr := h.db.Exec(bgCtx,
+		_, dbErr := h.db.Exec(ctx,
 			`UPDATE experts SET
 				reasoning_charter     = $1,
 				clarification_charter = CASE
