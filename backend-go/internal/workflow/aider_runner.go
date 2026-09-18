@@ -424,7 +424,32 @@ func (a *AiderRunner) runAiderLoop(
 	const maxIterations = 5
 	var commitSHAs []string
 
-	for iteration := 1; iteration <= maxIterations; iteration++ {
+	// PHASE 5: Load checkpoint for recovery
+	// Try to resume from previous run (pod restart)
+	checkpoint, err := a.loadCheckpoint(ctx, req.WorkflowID, req.Expert.ID, req.TaskID)
+	if err != nil {
+		// Non-fatal: log warning and start from beginning
+		a.logger.Warn("failed to load checkpoint, starting from beginning",
+			zap.Error(err),
+			zap.String("workflow_id", req.WorkflowID.String()),
+		)
+		checkpoint = nil
+	}
+
+	// Resume from checkpoint if exists
+	startIteration := 1
+	if checkpoint != nil {
+		// Resume from next iteration
+		startIteration = checkpoint.CurrentIteration + 1
+		commitSHAs = checkpoint.CommitSHAs
+
+		a.logger.Info("resuming from checkpoint",
+			zap.Int("start_iteration", startIteration),
+			zap.Int("commits_so_far", len(commitSHAs)),
+		)
+	}
+
+	for iteration := startIteration; iteration <= maxIterations; iteration++ {
 		a.logger.Info("aider iteration starting",
 			zap.Int("iteration", iteration),
 			zap.Int("max", maxIterations),
