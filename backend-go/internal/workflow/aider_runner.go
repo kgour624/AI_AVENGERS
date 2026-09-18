@@ -166,11 +166,17 @@ type AiderCheckpoint struct {
 //   3. TODO: Run Aider loop (Phase 2)
 //   4. TODO: Post code artifacts (Phase 3)
 func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunResult, error) {
+	// PHASE 5: Track start time for duration metrics
+	startTime := time.Now()
+
 	a.logger.Info("aider runner started",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
+		zap.String("expert_id", req.Expert.ID.String()),
 		zap.String("task", req.TaskTitle),
+		zap.String("task_id", req.TaskID.String()),
 		zap.String("phase", req.WorkflowPhase),
+		zap.Time("start_time", startTime),
 	)
 
 	// Step 1: Initialize workspace (per-expert isolation)
