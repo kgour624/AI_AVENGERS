@@ -1375,11 +1375,11 @@ func (a *AiderRunner) publishCodeArtifacts(
 		linesOfCode := countLines(content)
 
 		// Post to blackboard
-		event := blackboard.Event{
-			Type:       "code_artifact_produced",
-			WorkflowID: req.WorkflowID,
-			ExpertID:   req.Expert.ID,
-			Data: map[string]interface{}{
+		_, postErr := a.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:       req.WorkflowID,
+			EventType:        "code_artifact_produced",
+			PostedByExpertID: &req.Expert.ID,
+			Content: map[string]interface{}{
 				"filename":      filename,
 				"file_path":     relPath,
 				"content":       string(content),
@@ -1388,9 +1388,9 @@ func (a *AiderRunner) publishCodeArtifacts(
 				"lines_of_code": linesOfCode,
 				"phase":         req.WorkflowPhase,
 			},
-		}
+		})
 
-		if err := a.bbStore.Post(ctx, event); err != nil {
+		if postErr != nil {
 			a.logger.Error("failed to post code artifact",
 				zap.String("file", relPath),
 				zap.Error(err),
