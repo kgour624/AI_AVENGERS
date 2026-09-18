@@ -11,9 +11,21 @@ RUN useradd -m -u 1000 -s /bin/bash aider
 # signature, breaking the editable install of aider-main which calls it
 # internally. Installing the pinned version before the editable install
 # ensures pip resolves a compatible setuptools-scm for the entire env.
+#
+# --no-build-isolation is required on the second install: by default pip
+# builds each package in a fresh, isolated temp env and re-resolves build
+# dependencies there, which pulls the latest (incompatible) setuptools-scm
+# right back in — silently undoing the pin above. --no-build-isolation
+# makes the editable install reuse THIS image's site-packages (where the
+# pinned version now lives) instead of resolving its own.
+#
+# SETUPTOOLS_SCM_PRETEND_VERSION avoids a second, unrelated failure: aider
+# is installed from a COPY'd source tree with no .git directory, so
+# setuptools-scm has no VCS metadata to derive a version from and errors
+# out. Pretending a version skips that lookup entirely.
 COPY aider-main/ /aider-main/
 RUN pip install --no-cache-dir "setuptools-scm<8" && \
-    pip install --no-cache-dir -e /aider-main
+    SETUPTOOLS_SCM_PRETEND_VERSION="1.0.0" pip install --no-cache-dir --no-build-isolation -e /aider-main
 
 # Install service dependencies
 COPY aider-service/requirements.txt /app/requirements.txt
