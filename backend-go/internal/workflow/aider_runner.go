@@ -379,8 +379,8 @@ func (a *AiderRunner) runAiderLoop(
 			zap.Int("max", maxIterations),
 		)
 
-		// Step 1: Observe workspace state
-		observations, err := a.observeWorkspace(ctx, workspacePath)
+		// Step 1: Observe workspace state (phase-aware)
+		observations, err := a.observeWorkspace(ctx, req.WorkflowPhase, workspacePath)
 		if err != nil {
 			return nil, fmt.Errorf("observe workspace: %w", err)
 		}
