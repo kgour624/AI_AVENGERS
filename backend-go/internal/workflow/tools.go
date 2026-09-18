@@ -299,26 +299,34 @@ func (t *Tools) AskClient(ctx context.Context, req AskClientRequest) (uuid.UUID,
 		req.GateName = "ad_hoc"
 	}
 
-	// Step 1: Post question_to_client event on blackboard
+	// Step 1: Create approval_request row FIRST so we have the UUID.
+	// WHY before Post: the blackboard event must carry approval_id so the
+	// frontend kanban_approval handler can set approvalGate state and render
+	// the Approve/Request Changes buttons. Without approval_id in the event
+	// content, content?.approvalId is undefined and the if(approvalId) guard
+	// in useKanbanStream.ts always fails — buttons never appear.
+	approvalID, err := t.createApprovalRequest(ctx, req)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("AskClient: create approval: %w", err)
+	}
+
+	// Step 2: Post question_to_client event on blackboard.
+	// Include approval_id so the SSE stream carries it to the frontend.
+	// camelizeKeys in useKanbanStream.ts converts approval_id → approvalId.
 	fromExpertID := req.FromExpertID
-	_, err := t.store.Post(ctx, blackboard.PostRequest{
+	_, err = t.store.Post(ctx, blackboard.PostRequest{
 		WorkflowID:       req.WorkflowID,
 		EventType:        "question_to_client",
 		PostedByExpertID: &fromExpertID,
 		Content: map[string]interface{}{
-			"gate_name": req.GateName,
-			"summary":   req.Summary,
+			"gate_name":   req.GateName,
+			"summary":     req.Summary,
+			"approval_id": approvalID.String(),
 		},
 		ReferencesEventIDs: req.CitedEventIDs,
 	})
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("AskClient: post event: %w", err)
-	}
-
-	// Step 2: Create approval_request row
-	approvalID, err := t.createApprovalRequest(ctx, req)
-	if err != nil {
-		return uuid.Nil, fmt.Errorf("AskClient: create approval: %w", err)
 	}
 
 	// Step 3: Pause the workflow
