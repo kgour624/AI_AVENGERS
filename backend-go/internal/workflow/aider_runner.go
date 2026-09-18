@@ -660,3 +660,215 @@ func (a *AiderRunner) loadExpertTraining(
 	}
 	return training, nil
 }
+
+// publishCodeArtifacts walks the workspace and posts all code files to blackboard.
+//
+// MENTAL MODEL:
+//   Input: workspace path, expert ID, commit SHAs
+//   Actions:
+//     1. Walk workspace recursively
+//     2. Skip: .git/, design artifacts (ARCHITECTURE.md, etc.)
+//     3. For each code file:
+//        - Read content
+//        - Detect language from extension
+//        - Count lines of code
+//        - Post code_artifact_produced event to blackboard
+//   Output: N events posted (one per code file)
+//
+// CROSS-QUESTIONS:
+//   Q: Why walk recursively?
+//   A: Aider may create subdirectories (internal/auth/handler.go)
+//
+//   Q: Why skip design artifacts?
+//   A: Already in blackboard from design phase, not code
+//
+//   Q: Why detect language?
+//   A: Frontend syntax highlighting, validation
+//
+//   Q: What if no code files?
+//   A: Not an error, just post no events (task may have failed)
+//
+// EXAMPLE:
+//   Workspace: /workspaces/abc-123/backend-expert-id/
+//   Files:
+//     - ARCHITECTURE.md (skip)
+//     - shortener.go (post)
+//     - shortener_test.go (post)
+//     - internal/db/schema.sql (post)
+//   Result: 3 events posted
+func (a *AiderRunner) publishCodeArtifacts(
+	ctx context.Context,
+	req AiderRunRequest,
+	workspacePath string,
+	commitSHAs []string,
+) error {
+	if len(commitSHAs) == 0 {
+		// No commits = no code generated
+		a.logger.Info("no commits to publish",
+			zap.String("workflow_id", req.WorkflowID.String()),
+			zap.String("expert", req.Expert.Name),
+		)
+		return nil
+	}
+
+	// Use latest commit SHA for all artifacts
+	latestCommitSHA := commitSHAs[len(commitSHAs)-1]
+
+	publishedCount := 0
+	err := filepath.Walk(workspacePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories
+		if info.IsDir() {
+			return nil
+		}
+
+		// Skip .git/ directory
+		if strings.Contains(path, ".git/") || strings.Contains(path, ".git\\") {
+			return nil
+		}
+
+		// Skip design artifacts (already in blackboard from design phase)
+		filename := filepath.Base(path)
+		if filename == "ARCHITECTURE.md" ||
+			filename == "DATA_MODEL.md" ||
+			filename == "API_CONTRACTS.md" ||
+			filename == ".gitignore" ||
+			filename == "README.md" {
+			return nil
+		}
+
+		// Only publish code files
+		language := detectLanguage(path)
+		if language == "" {
+			// Unknown file type, skip
+			return nil
+		}
+
+		// Read file content
+		content, err := os.ReadFile(path)
+		if err != nil {
+			a.logger.Warn("failed to read file",
+				zap.String("path", path),
+				zap.Error(err),
+			)
+			return nil // Skip this file, continue walking
+		}
+
+		// Get relative path (remove workspace prefix)
+		relPath, err := filepath.Rel(workspacePath, path)
+		if err != nil {
+			relPath = filename // Fallback to just filename
+		}
+
+		// Count lines of code
+		linesOfCode := countLines(content)
+
+		// Post to blackboard
+		event := blackboard.Event{
+			Type:       "code_artifact_produced",
+			WorkflowID: req.WorkflowID,
+			ExpertID:   req.Expert.ID,
+			Data: map[string]interface{}{
+				"filename":      filename,
+				"file_path":     relPath,
+				"content":       string(content),
+				"language":      language,
+				"commit_sha":    latestCommitSHA,
+				"lines_of_code": linesOfCode,
+				"phase":         req.WorkflowPhase,
+			},
+		}
+
+		if err := a.bbStore.Post(ctx, event); err != nil {
+			a.logger.Error("failed to post code artifact",
+				zap.String("file", relPath),
+				zap.Error(err),
+			)
+			return nil // Continue walking even if one post fails
+		}
+
+		publishedCount++
+		a.logger.Info("published code artifact",
+			zap.String("file", relPath),
+			zap.String("language", language),
+			zap.Int("lines", linesOfCode),
+		)
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("walk workspace: %w", err)
+	}
+
+	a.logger.Info("code artifacts published",
+		zap.String("workflow_id", req.WorkflowID.String()),
+		zap.String("expert", req.Expert.Name),
+		zap.Int("count", publishedCount),
+	)
+
+	return nil
+}
+
+// detectLanguage returns the language name based on file extension.
+// Returns empty string for unknown/non-code files.
+func detectLanguage(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	switch ext {
+	case ".go":
+		return "go"
+	case ".sql":
+		return "sql"
+	case ".js", ".jsx":
+		return "javascript"
+	case ".ts", ".tsx":
+		return "typescript"
+	case ".py":
+		return "python"
+	case ".java":
+		return "java"
+	case ".rb":
+		return "ruby"
+	case ".php":
+		return "php"
+	case ".c", ".h":
+		return "c"
+	case ".cpp", ".hpp", ".cc", ".cxx":
+		return "cpp"
+	case ".rs":
+		return "rust"
+	case ".sh", ".bash":
+		return "shell"
+	case ".yaml", ".yml":
+		return "yaml"
+	case ".json":
+		return "json"
+	case ".xml":
+		return "xml"
+	case ".html", ".htm":
+		return "html"
+	case ".css":
+		return "css"
+	case ".scss", ".sass":
+		return "scss"
+	default:
+		return "" // Unknown file type
+	}
+}
+
+// countLines counts the number of lines in a file.
+func countLines(content []byte) int {
+	if len(content) == 0 {
+		return 0
+	}
+	lines := 1 // Start at 1 (file with no newlines = 1 line)
+	for _, b := range content {
+		if b == '\n' {
+			lines++
+		}
+	}
+	return lines
+}
