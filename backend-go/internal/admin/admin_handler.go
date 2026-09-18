@@ -1016,9 +1016,22 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 	// WHY replaceExisting=false: append mode per DOMAIN_EXPERT_COLLABORATION_DESIGN.md §5.4.
 	// Admin uploading a new transcript adds to the corpus; full-retrain (true) is a
 	// separate explicit operation reserved for Phase B.
+	//
+	// WHY 2-hour timeout (not context.Background()):
+	//   context.Background() has NO deadline. If any step hangs (LLM timeout,
+	//   DB deadlock, network partition), the goroutine hangs forever.
+	//   Observed bug: CodeCraft LLM hung, HTTP timeout (120s) fired, but
+	//   pauseOnLLMFailure() DB update blocked forever on a slow connection.
+	//   Job stayed 'running' for 30+ minutes with no way to recover.
+	//   2-hour timeout is generous (covers large transcripts with 60min embedding)
+	//   but prevents infinite hangs. If timeout fires, job fails with clear error.
+	//   Checkpoint system preserves progress; admin can retry from last checkpoint.
 	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
+		defer cancel() // prevent context leak
+
 		_, err := h.ingestion.IngestTranscript(
-			context.Background(),
+			ctx,
 			jobID, expertID, expertName,
 			string(content), header.Filename,
 			false, // replaceExisting=false → append mode
@@ -1033,6 +1046,17 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 					zap.String("job_id", jobID.String()),
 					zap.String("expert_id", expertID.String()),
 				)
+				return
+			}
+			// Check if timeout fired (context deadline exceeded)
+			if errors.Is(err, context.DeadlineExceeded) {
+				h.logger.Error("ingestion timeout: exceeded 2-hour deadline",
+					zap.String("job_id", jobID.String()),
+					zap.String("expert_id", expertID.String()),
+					zap.Error(err),
+				)
+				// Job should be marked 'failed' by ingestion pipeline.
+				// If not, the 24h auto-fail checker will catch it.
 				return
 			}
 			h.logger.Error("ingestion failed",
