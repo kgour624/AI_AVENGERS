@@ -222,11 +222,25 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 		}
 	}
 
+	// PHASE 5: Log comprehensive completion metrics
+	duration := time.Since(startTime)
+	workspaceSize, _ := a.getWorkspaceSize(workspacePath)
+
 	a.logger.Info("aider runner completed",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
+		zap.String("expert_id", req.Expert.ID.String()),
+		zap.String("task_id", req.TaskID.String()),
+		zap.String("phase", req.WorkflowPhase),
 		zap.Int("iterations", result.Iterations),
+		zap.Int("commits", len(result.CommitSHAs)),
 		zap.Bool("completed", result.Completed),
+		zap.Duration("duration", duration),
+		zap.Float64("duration_seconds", duration.Seconds()),
+		zap.Int64("workspace_size_bytes", workspaceSize),
+		zap.Float64("workspace_size_mb", float64(workspaceSize)/(1024*1024)),
+		zap.Time("start_time", startTime),
+		zap.Time("end_time", time.Now()),
 	)
 
 	return result, nil
