@@ -153,6 +153,18 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 		)
 	}
 
+	// Step 5: Post coverage metrics (QA phase only) - Phase 4
+	if req.WorkflowPhase == "qa" && result.Completed {
+		if err := a.postCoverageMetrics(ctx, req, workspacePath); err != nil {
+			// Non-fatal: log error but don't fail the task
+			a.logger.Error("failed to post coverage metrics",
+				zap.String("workflow_id", req.WorkflowID.String()),
+				zap.String("expert", req.Expert.Name),
+				zap.Error(err),
+			)
+		}
+	}
+
 	a.logger.Info("aider runner completed",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
