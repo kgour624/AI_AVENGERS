@@ -214,6 +214,12 @@ func (e *Enforcer) Enforce(
 		)
 	}
 
+	// SECURITY FIX: Remove [CHUNK_xxx] tokens from answer before sending to frontend.
+	// WHY: These are internal citation markers, not user-facing text.
+	// Citations are already extracted into the Citations array.
+	// Exposing chunk UUIDs leaks internal database structure.
+	cleanAnswer = e.cleanChunkIDs(cleanAnswer)
+
 	// CONFLICT RESOLUTION: Base wall safety net.
 	// IF domain rules produced empty output AND domain is strict (FULL_STRIP):
 	//   → domain rules over-relaxed something upstream, retry with BaseProfile.
