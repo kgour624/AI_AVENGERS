@@ -1733,6 +1733,63 @@ func (a *AiderRunner) loadCheckpoint(
 	return &checkpoint, nil
 }
 
+// getWorkspaceSize calculates total size of workspace directory.
+//
+// PHASE 5: Production Hardening - Resource Limits
+//
+// MENTAL MODEL:
+//   Walk workspace recursively, sum file sizes:
+//     filepath.Walk(workspacePath, func(path, info, err) {
+//       if !info.IsDir() {
+//         totalSize += info.Size()
+//       }
+//     })
+//
+// CROSS-QUESTIONS:
+//   Q: Should we include .git/?
+//   A: Yes, git history counts toward disk usage
+//      Large repos can have big .git/ directories
+//
+//   Q: What if walk fails?
+//   A: Return error (caller decides: fail or continue)
+//
+//   Q: Should we cache size?
+//   A: No, recalculate each iteration (size changes)
+//      Caching would give stale data
+//
+//   Q: What about symlinks?
+//   A: Count symlink size, not target (standard behavior)
+//
+// RETURNS:
+//   Total size in bytes (includes all files and .git/)
+func (a *AiderRunner) getWorkspaceSize(workspacePath string) (int64, error) {
+	var totalSize int64
+
+	err := filepath.Walk(workspacePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			// Skip files we can't access
+			a.logger.Warn("failed to access file during size calculation",
+				zap.String("path", path),
+				zap.Error(err),
+			)
+			return nil // Continue walking
+		}
+
+		// Sum file sizes (skip directories)
+		if !info.IsDir() {
+			totalSize += info.Size()
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return 0, fmt.Errorf("walk workspace: %w", err)
+	}
+
+	return totalSize, nil
+}
+
 // deleteCheckpoint removes checkpoint from DB after task completes.
 //
 // PHASE 5: Production Hardening - Error Recovery
