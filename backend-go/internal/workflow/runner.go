@@ -187,20 +187,68 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		return
 	}
 
-	// Step 8: Transition phase + execute waves.
-	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
+	// Step 8: Execute all phases in sequence.
+	// Each design phase runs the full wave set.
+	// After design phases, AskClient gates implementation start.
+	// Implementation and QA use AiderRunner (file system + git).
 
+	// --- Phase: High Level Design ---
+	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
 	state := &runnerState{Phase: PhaseHighLevelDesign}
 	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-		log.Error("runner: executeWaves failed", zap.Error(err))
-		// Don't fail the whole workflow on partial task failure.
-		// Individual tasks are marked failed via blackboard events.
-		// Only fail if ALL tasks failed.
+		log.Error("runner: HLD waves failed", zap.Error(err))
 		if len(state.CompletedExpertIDs) == 0 {
-			_ = r.engine.Fail(ctx, workflowID, "all tasks failed")
+			_ = r.engine.Fail(ctx, workflowID, "HLD phase: all tasks failed")
 			return
 		}
-		log.Warn("runner: some tasks failed, continuing to final approval",
+	}
+
+	// --- Phase: Detailed Design ---
+	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseDetailedDesign, nil, 0)
+	state = &runnerState{Phase: PhaseDetailedDesign}
+	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+		log.Error("runner: DetailedDesign waves failed", zap.Error(err))
+		if len(state.CompletedExpertIDs) == 0 {
+			_ = r.engine.Fail(ctx, workflowID, "DetailedDesign phase: all tasks failed")
+			return
+		}
+	}
+
+	// --- Gate: Ask client to approve implementation start ---
+	_, err = r.tools.AskClient(ctx, AskClientRequest{
+		WorkflowID:   workflowID,
+		FromExpertID: uuid.Nil,
+		GateName:     "implementation_approval",
+		Summary:      "Design phases complete. Approve to start implementation (Aider will write code).",
+	})
+	if err != nil {
+		log.Error("runner: implementation AskClient failed", zap.Error(err))
+		_ = r.engine.Fail(ctx, workflowID, "implementation AskClient failed")
+		return
+	}
+	if err := r.waitForResume(ctx, workflowID); err != nil {
+		log.Warn("runner: wait for implementation approval failed", zap.Error(err))
+		return
+	}
+
+	// --- Phase: Implementation (Aider) ---
+	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseImplementation, nil, 0)
+	state = &runnerState{Phase: PhaseImplementation}
+	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+		log.Error("runner: Implementation waves failed", zap.Error(err))
+		if len(state.CompletedExpertIDs) == 0 {
+			_ = r.engine.Fail(ctx, workflowID, "Implementation phase: all tasks failed")
+			return
+		}
+	}
+
+	// --- Phase: QA (Aider - test generation) ---
+	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseQA, nil, 0)
+	state = &runnerState{Phase: PhaseQA}
+	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+		log.Error("runner: QA waves failed", zap.Error(err))
+		// QA failure is non-fatal — code is already written
+		log.Warn("runner: QA phase had failures, continuing to handoff",
 			zap.Int("completed", len(state.CompletedExpertIDs)),
 			zap.Int("failed", len(state.FailedExpertIDs)),
 		)
