@@ -1215,7 +1215,6 @@ func (a *AiderRunner) publishCodeArtifacts(
 			)
 			return fmt.Errorf("build validation timeout (15 minutes)")
 		}
-	if buildErr != nil {
 		a.logger.Error("build validation failed",
 			zap.String("workflow_id", req.WorkflowID.String()),
 			zap.String("expert", req.Expert.Name),
