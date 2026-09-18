@@ -1237,3 +1237,145 @@ func countLines(content []byte) int {
 	}
 	return lines
 }
+
+// postCoverageMetrics posts test coverage metrics to blackboard.
+//
+// PHASE 4: QA Phase Support
+//
+// MENTAL MODEL:
+//   After QA phase completes, post coverage metrics for:
+//     - Frontend display (show coverage badge)
+//     - Audit trail (compliance requirements)
+//     - Other experts (know test quality)
+//
+// CROSS-QUESTIONS:
+//   Q: When to call this?
+//   A: After QA phase completes successfully (result.Completed == true)
+//
+//   Q: What if coverage < 80%?
+//   A: This shouldn't happen (task wouldn't complete)
+//      But if called, still post (passed: false)
+//
+//   Q: How to count tests?
+//   A: Parse test output for "PASS" or "ok" lines
+//
+//   Q: What about package-level coverage?
+//   A: Future enhancement. For now, post average.
+//
+// EVENT STRUCTURE:
+//   {
+//     "event_type": "test_coverage_achieved",
+//     "posted_by_expert_id": "expert-uuid",
+//     "content": {
+//       "coverage_percent": 85.7,
+//       "target_percent": 80.0,
+//       "passed": true,
+//       "test_count": 42,
+//       "package_count": 3
+//     }
+//   }
+func (a *AiderRunner) postCoverageMetrics(
+	ctx context.Context,
+	req AiderRunRequest,
+	workspacePath string,
+) error {
+	// Run tests with coverage
+	testOutput, coverage, testErr := a.runTestsWithCoverage(ctx, workspacePath)
+
+	// Count tests and packages
+	testCount := a.countTests(testOutput)
+	packageCount := a.countPackages(testOutput)
+
+	// Determine if coverage target met
+	const targetCoverage = 80.0
+	passed := (testErr == nil && coverage >= targetCoverage)
+
+	// Post event to blackboard
+	_, err := a.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:       req.WorkflowID,
+		EventType:        "test_coverage_achieved",
+		PostedByExpertID: &req.Expert.ID,
+		Content: map[string]interface{}{
+			"coverage_percent": coverage,
+			"target_percent":   targetCoverage,
+			"passed":           passed,
+			"test_count":       testCount,
+			"package_count":    packageCount,
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("post coverage event: %w", err)
+	}
+
+	a.logger.Info("coverage metrics posted",
+		zap.String("workflow_id", req.WorkflowID.String()),
+		zap.Float64("coverage", coverage),
+		zap.Int("test_count", testCount),
+		zap.Int("package_count", packageCount),
+		zap.Bool("passed", passed),
+	)
+
+	return nil
+}
+
+// countTests counts the number of tests from test output.
+//
+// PHASE 4: QA Phase Support
+//
+// MENTAL MODEL:
+//   Test output contains lines like:
+//     ok      package1    0.123s
+//     ok      package2    0.456s
+//   Each "ok" line represents one or more tests in that package.
+//
+//   More accurate: count "PASS: TestName" lines
+//   But "ok" lines are simpler and good enough.
+//
+// CROSS-QUESTIONS:
+//   Q: Why count "ok" lines?
+//   A: Simple heuristic, one line per package with tests
+//
+//   Q: What about individual test count?
+//   A: Would need to parse "=== RUN TestName" lines
+//      Future enhancement if needed
+//
+//   Q: What if no tests?
+//   A: Return 0 (valid case for first iteration)
+func (a *AiderRunner) countTests(output string) int {
+	lines := strings.Split(output, "\n")
+	count := 0
+	for _, line := range lines {
+		// Count lines starting with "ok" (package test summary)
+		if strings.HasPrefix(strings.TrimSpace(line), "ok") {
+			count++
+		}
+	}
+	return count
+}
+
+// countPackages counts the number of packages tested.
+//
+// PHASE 4: QA Phase Support
+//
+// MENTAL MODEL:
+//   Same as countTests() - each "ok" line is one package
+//   This is a duplicate for clarity (may diverge in future)
+//
+// CROSS-QUESTIONS:
+//   Q: Why separate method?
+//   A: Semantic clarity, may count differently in future
+//
+//   Q: What about failed packages?
+//   A: Count "FAIL" lines too
+func (a *AiderRunner) countPackages(output string) int {
+	lines := strings.Split(output, "\n")
+	count := 0
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Count "ok" and "FAIL" lines (package summaries)
+		if strings.HasPrefix(trimmed, "ok") || strings.HasPrefix(trimmed, "FAIL") {
+			count++
+		}
+	}
+	return count
+}
