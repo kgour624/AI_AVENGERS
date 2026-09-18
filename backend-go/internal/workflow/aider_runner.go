@@ -330,6 +330,13 @@ func (a *AiderRunner) artifactToFilename(eventType string) string {
 //     3. Act: Aider applies patches, commits changes
 //   Exit when: TASK_COMPLETE or max iterations reached
 //
+// PHASE 4 ADDITION:
+//   QA Phase Support:
+//     - Different prompt (focus on test generation)
+//     - Load implementation artifacts from previous phase
+//     - Track test coverage (>80% target)
+//     - Validate test quality (naming, edge cases, error paths)
+//
 // CROSS-QUESTIONS:
 //   Q: Why max 5 iterations?
 //   A: Balance between fixing issues and preventing infinite loops
@@ -342,6 +349,10 @@ func (a *AiderRunner) artifactToFilename(eventType string) string {
 //   Q: What if max iterations reached?
 //   A: Return partial completion (Completed=false)
 //      Caller can decide: retry, escalate, or accept partial
+//
+//   Q: How does QA phase differ?
+//   A: Implementation creates source code, QA creates test files
+//      QA validates coverage and test quality
 func (a *AiderRunner) runAiderLoop(
 	ctx context.Context,
 	req AiderRunRequest,
