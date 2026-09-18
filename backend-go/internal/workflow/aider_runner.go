@@ -1,9 +1,11 @@
 package workflow
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -61,11 +63,13 @@ import (
 //     Think:   Task complete
 //     Act:     Post code_artifact_produced to blackboard, exit
 type AiderRunner struct {
-	db           *pgxpool.Pool
-	store        *blackboard.Store
-	gateway      *gateway.ModelGateway
-	workspaceDir string // Base directory: /workspaces/
-	logger       *zap.Logger
+	db              *pgxpool.Pool
+	store           *blackboard.Store
+	gateway         *gateway.ModelGateway
+	workspaceDir    string // Base directory: /workspaces/
+	aiderServiceURL string // AiderService HTTP API URL
+	httpClient      *http.Client
+	logger          *zap.Logger
 }
 
 // NewAiderRunner creates a new AiderRunner instance.
@@ -77,14 +81,17 @@ func NewAiderRunner(
 	store *blackboard.Store,
 	gw *gateway.ModelGateway,
 	workspaceDir string,
+	aiderServiceURL string,
 	logger *zap.Logger,
 ) *AiderRunner {
 	return &AiderRunner{
-		db:           db,
-		store:        store,
-		gateway:      gw,
-		workspaceDir: workspaceDir,
-		logger:       logger,
+		db:              db,
+		store:           store,
+		gateway:         gw,
+		workspaceDir:    workspaceDir,
+		aiderServiceURL: aiderServiceURL,
+		httpClient:      &http.Client{Timeout: 10 * time.Minute},
+		logger:          logger,
 	}
 }
 
@@ -888,21 +895,70 @@ func (a *AiderRunner) runAiderIteration(
 		message += "\n\nExpert Training (Gate 1 - Domain Patterns):\n" + training
 	}
 
-	// Run Aider CLI
-	// aider --yes --message "<message>" *.go
-	cmd := exec.CommandContext(ctx, "aider", "--yes", "--message", message)
-	cmd.Dir = workspacePath
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		a.logger.Error("aider failed",
-			zap.Error(err),
-			zap.String("output", string(output)),
-		)
-		return "", false, fmt.Errorf("aider: %w (output: %s)", err, string(output))
+	// Call AiderService HTTP API
+	// WHY HTTP not CLI: AiderService routes LLM calls through ModelGateway
+	// for centralized cost tracking, retry, and provider switching.
+	type aiderServiceRequest struct {
+		WorkspacePath string `json:"workspace_path"`
+		Message       string `json:"message"`
+		ExpertID      string `json:"expert_id"`
+		WorkflowID    string `json:"workflow_id"`
+	}
+	type aiderServiceResponse struct {
+		CommitSHA    string   `json:"commit_sha"`
+		FilesChanged []string `json:"files_changed"`
+		Success      bool     `json:"success"`
+		Error        string   `json:"error"`
 	}
 
-	a.logger.Debug("aider output",
-		zap.String("output", string(output)),
+	reqBody := aiderServiceRequest{
+		WorkspacePath: workspacePath,
+		Message:       message,
+		ExpertID:      req.Expert.ID.String(),
+		WorkflowID:    req.WorkflowID.String(),
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", false, fmt.Errorf("marshal aider request: %w", err)
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		a.aiderServiceURL+"/iterate",
+		bytes.NewReader(bodyBytes),
+	)
+	if err != nil {
+		return "", false, fmt.Errorf("build aider http request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Workflow-ID", req.WorkflowID.String())
+	httpReq.Header.Set("X-Expert-ID", req.Expert.ID.String())
+
+	httpResp, err := a.httpClient.Do(httpReq)
+	if err != nil {
+		a.logger.Error("aider service call failed",
+			zap.Error(err),
+			zap.String("url", a.aiderServiceURL),
+		)
+		return "", false, fmt.Errorf("aider service: %w", err)
+	}
+	defer httpResp.Body.Close()
+
+	var aiderResp aiderServiceResponse
+	if err := json.NewDecoder(httpResp.Body).Decode(&aiderResp); err != nil {
+		return "", false, fmt.Errorf("decode aider response: %w", err)
+	}
+
+	if !aiderResp.Success {
+		a.logger.Error("aider iteration failed",
+			zap.String("error", aiderResp.Error),
+			zap.Int("iteration", iteration),
+		)
+		return "", false, fmt.Errorf("aider: %s", aiderResp.Error)
+	}
+
+	a.logger.Debug("aider service response",
+		zap.String("commit_sha", aiderResp.CommitSHA),
+		zap.Strings("files_changed", aiderResp.FilesChanged),
 	)
 
 	// Extract commit SHA
