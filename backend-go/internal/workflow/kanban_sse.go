@@ -71,6 +71,14 @@ func (h *Handler) StreamKanban(c *gin.Context) {
 	eventCh, errCh := sub.Subscribe(c.Request.Context(), workflowID, uuid.Nil, 0)
 
 	c.Stream(func(w io.Writer) bool {
+		// ✅ FIX: Write initial ping immediately to flush HTTP headers.
+		// WHY: Go/Gin doesn't send 200 OK until first write.
+		// Without this, browser stays in CONNECTING state forever if no events exist.
+		// SSE comment format: lines starting with ':' are ignored by EventSource.
+		fmt.Fprintf(w, ": connected\n\n")
+		if flusher, ok := w.(interface{ Flush() }); ok {
+			flusher.Flush()
+		}
 		select {
 		case event, ok := <-eventCh:
 			if !ok {
