@@ -365,9 +365,26 @@ func (a *AgentLoop) act(ctx context.Context, req AgentLoopRequest, llmContent st
 			ToExpertID string          `json:"to_expert_id"`
 			Question   string          `json:"question"`
 		}
-		if err := json.Unmarshal([]byte(block), &call); err != nil {
-			a.logger.Warn("agent loop: malformed tool call",
+		// Take the first balanced {...} object inside the block instead of
+		// requiring the block to be exactly one JSON value.
+		//
+		// WHY: LLM tool-call output is not deterministic. Observed in
+		// production: a block whose object was followed by a stray ']',
+		// which made json.Unmarshal fail with
+		// "invalid character ']' after top-level value" and silently
+		// dropped the expert's artifact. The same tolerance also handles a
+		// block wrapped in an array ("[{...}]") and a block with trailing
+		// prose after the object.
+		jsonBlock := extractFirstJSONObject(block)
+		if jsonBlock == "" {
+			a.logger.Warn("agent loop: tool call has no JSON object",
 				zap.String("block", truncate(block, 100)),
+			)
+			continue
+		}
+		if err := json.Unmarshal([]byte(jsonBlock), &call); err != nil {
+			a.logger.Warn("agent loop: malformed tool call",
+				zap.String("block", truncate(jsonBlock, 100)),
 				zap.Error(err),
 			)
 			continue
@@ -421,6 +438,7 @@ func buildAgentSystemPrompt(req AgentLoopRequest) string {
 	sb.WriteString(fmt.Sprintf("You are %s, a domain expert in %s.\n\n", req.Expert.Name, req.Expert.Domain))
 	sb.WriteString(fmt.Sprintf("REASONING CHARTER:\n%s\n\n", req.Expert.ReasoningCharter))
 	sb.WriteString(fmt.Sprintf("YOUR TASK:\n%s\n\n", req.TaskDescription))
+	sb.WriteString(phaseFocus(req.WorkflowPhase))
 	sb.WriteString("HOW TO USE YOUR CONTEXT:\n")
 	sb.WriteString("1. TRAINING MATERIAL: Principles from your training. Apply them to the new problem.\n")
 	sb.WriteString("   You do NOT need an exact match. 'consistent hashing' training applies to 'URL shortener'.\n")
@@ -437,6 +455,47 @@ func buildAgentSystemPrompt(req AgentLoopRequest) string {
 	sb.WriteString("<tool_call>{\"tool\": \"AskExpert\", \"to_expert_id\": \"<uuid>\", \"question\": \"<text>\"}</tool_call>\n\n")
 	sb.WriteString("WHEN DONE: Output TASK_COMPLETE as the last line after posting your artifact.\n")
 	return sb.String()
+}
+
+// phaseFocus returns the phase-specific section of the system prompt.
+// Returns "" for phases that need no extra constraint.
+//
+// WHY this exists: runner.go deliberately executes the SAME planned task
+// list once per phase (see its Step 8 comment — "each design phase runs the
+// full wave set"). But WorkflowPhase was only used to decide which gates
+// run; it never reached the prompt. So an expert received a byte-identical
+// system prompt in high_level_design and in detailed_design, produced
+// near-identical output, and because blackboard dedup_key is a hash of
+// (event_type + poster + content), that second artifact was silently
+// dropped as a duplicate. The phase's LLM call was paid for and produced
+// nothing. Telling the expert which phase it is in is what makes the
+// re-run purposeful instead of duplicate work.
+//
+// The per-phase artifact focus mirrors the workflow state machine in
+// DOMAIN_EXPERT_COLLABORATION_DESIGN.md §9.
+//
+// Only design phases appear here: runner.go routes implementation and qa to
+// AiderRunner (which builds its own prompt), so AgentLoop never sees them.
+func phaseFocus(phase string) string {
+	switch phase {
+	case PhaseHighLevelDesign:
+		return "CURRENT PHASE: high_level_design\n" +
+			"Stay at the HIGH-LEVEL view: component boundaries, major technology\n" +
+			"choices with their trade-offs, and how a request flows through the system.\n" +
+			"Expected artifacts: architecture_decision, requirement_captured.\n" +
+			"Do NOT write concrete schemas, endpoint signatures or code in this phase.\n\n"
+	case PhaseDetailedDesign:
+		return "CURRENT PHASE: detailed_design\n" +
+			"The high-level architecture is already on the blackboard. Read it and go\n" +
+			"one level deeper — do NOT restate it.\n" +
+			"Expected artifacts: data_model_proposed, api_contract_proposed,\n" +
+			"module_design_proposed, test_case_proposed.\n" +
+			"Be concrete: table/field definitions, endpoint signatures with request and\n" +
+			"response shapes, per-module responsibilities.\n\n"
+	default:
+		// intake / handoff / unset: no phase-specific constraint.
+		return ""
+	}
 }
 
 // buildAgentUserPrompt builds the user prompt for each OTA iteration.
@@ -471,6 +530,56 @@ func extractToolCallBlocks(text string) []string {
 		text = text[start+end+len(close):]
 	}
 	return blocks
+}
+
+// extractFirstJSONObject returns the first balanced {...} object found in s,
+// or "" if there is none / it never closes.
+//
+// Brace counting is string-aware: braces inside JSON string literals are
+// ignored (a code artifact's "code" field legitimately contains { and }),
+// and a backslash escape does not terminate the string.
+//
+// Mental execution:
+//   `{"a":1}]`              -> `{"a":1}`   (stray trailing bracket dropped)
+//   `[{"a":1}]`             -> `{"a":1}`   (array wrapper skipped)
+//   `{"code":"func(){}"}`   -> whole object (braces inside string ignored)
+//   `{"s":"a\"}b"}`         -> whole object (escaped quote handled)
+//   `{"a":1`                -> ""          (never balances)
+//   `no json here`          -> ""
+func extractFirstJSONObject(s string) string {
+	start := strings.Index(s, "{")
+	if start == -1 {
+		return ""
+	}
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case ch == '\\':
+				escaped = true
+			case ch == '"':
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return ""
 }
 
 // loopTemperature returns LLM temperature based on loop pattern.

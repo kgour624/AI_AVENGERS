@@ -27,6 +27,13 @@ function ApprovalGate({
   const [notes, setNotes] = useState('')
   const [loading, setLoading] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // sent: this gate has been responded to successfully.
+  // WHY: the gate stays mounted until the 10s workflow poll reports a status
+  // other than paused_for_approval. Re-enabling the buttons in that window
+  // let the user fire the same approval several times (6 duplicate POSTs were
+  // seen in one 3-second window). The backend now rejects repeats with 409,
+  // but the UI should not send them in the first place.
+  const [sent, setSent] = useState(false)
 
   const respond = async (decision: 'approve' | 'request_changes') => {
     if (!approvalId) {
@@ -37,6 +44,7 @@ function ApprovalGate({
     setError(null)
     try {
       await respondToApproval(workflowId, approvalId, decision, notes || undefined)
+      setSent(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Request failed')
     } finally {
@@ -64,17 +72,20 @@ function ApprovalGate({
       {error && (
         <p className="mt-1 text-xs text-mode-refuse">{error}</p>
       )}
+      {sent && !error && (
+        <p className="mt-1 text-xs text-mode-advise">Response sent. Resuming workflow...</p>
+      )}
       <div className="mt-3 flex gap-2">
         <button
           onClick={() => respond('approve')}
-          disabled={!!loading}
+          disabled={!!loading || sent}
           className="rounded bg-mode-advise px-4 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
         >
           {loading === 'approve' ? 'Approving...' : '\u2713 Approve'}
         </button>
         <button
           onClick={() => respond('request_changes')}
-          disabled={!!loading}
+          disabled={!!loading || sent}
           className="rounded border border-glow-amber/60 px-4 py-1.5 text-xs font-semibold text-glow-amber hover:bg-glow-amber/10 disabled:opacity-50"
         >
           {loading === 'request_changes' ? 'Sending...' : '\u21ba Request Changes'}

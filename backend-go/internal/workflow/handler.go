@@ -372,7 +372,7 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 		"decision": req.Decision,
 		"notes":    req.Notes,
 	})
-	_, err = h.engine.db.Exec(ctx,
+	tag, err := h.engine.db.Exec(ctx,
 		`UPDATE approval_requests SET
 			status = $1,
 			client_response = $2,
@@ -383,6 +383,30 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 	if err != nil {
 		h.logger.Error("update approval failed", zap.Error(err))
 		response.InternalError(c)
+		return
+	}
+
+	// No row updated means this approval is not pending: either it was
+	// already responded to, or the id does not belong to this workflow.
+	// Stop here — do NOT post client_response or resume.
+	//
+	// WHY this guard matters (observed in production): the UPDATE's
+	// "AND status = 'pending'" makes a repeat response a no-op, but the
+	// old code ignored the result and still returned 200 AND called
+	// Resume(). The approval gate stays on screen until the 10s workflow
+	// poll refreshes, so a user clicking Approve a few times produced
+	// several 200s and several Resume() calls for one approval (6 were
+	// seen in one 3-second window). A late duplicate is worse than noise:
+	// if the workflow has meanwhile paused at the NEXT gate, that stray
+	// Resume() un-pauses it and the client never gets to approve that
+	// gate — a human-in-the-loop checkpoint is skipped.
+	if tag.RowsAffected() == 0 {
+		h.logger.Info("approval already responded or not pending",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("approval_id", approvalID.String()),
+			zap.String("decision", req.Decision),
+		)
+		response.Conflict(c, "this approval has already been responded to")
 		return
 	}
 
