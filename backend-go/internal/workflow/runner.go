@@ -539,11 +539,15 @@ func (r *WorkflowRunner) executeWaves(
 func listMergedFiles(mainPath string) []string {
 	var files []string
 	_ = filepath.Walk(mainPath, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info == nil || info.IsDir() {
+		if err != nil {
 			return nil
 		}
-		if strings.Contains(path, string(filepath.Separator)+".git"+string(filepath.Separator)) ||
-			strings.HasSuffix(path, string(filepath.Separator)+".git") {
+		if info.IsDir() {
+			return nil
+		}
+		// Skip .git/ directory — same check as publishCodeArtifacts()
+		// in aider_runner.go (kept identical on purpose).
+		if strings.Contains(path, ".git/") || strings.Contains(path, ".git\\") {
 			return nil
 		}
 		rel, relErr := filepath.Rel(mainPath, path)
