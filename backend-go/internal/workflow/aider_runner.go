@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -375,7 +376,9 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 		return nil, fmt.Errorf("load design artifacts: %w", err)
 	}
 
-	var designFiles []string
+	// Non-nil for the same reason as listEditableFiles: this list is sent as
+	// JSON and a nil slice becomes null, which AiderService rejects.
+	designFiles := []string{}
 	for _, ev := range events {
 		filename := artifactFilename(ev)
 		filePath := filepath.Join(workspacePath, filename)
@@ -993,7 +996,7 @@ func (a *AiderRunner) runAiderIteration(
 	genericApproved, genericTopics := a.checkGenericApproval(ctx, req.WorkflowID, req.Expert.ID)
 
 	// Step 2: Load expert training (charter + RAG chunks)
-	training, err := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
+	training, trainingChunks, err := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
 	if err != nil {
 		a.logger.Warn("failed to load expert training",
 			zap.Error(err),
@@ -1030,7 +1033,7 @@ func (a *AiderRunner) runAiderIteration(
 	//   A: Yes, Aider respects system-level instructions in the message.
 	//      The instructions are clear and specific.
 	//      Aider is designed to follow user instructions precisely.
-	message += a.build7030EnforcementInstructions(genericApproved, genericTopics, training != "", len(designFiles) > 0)
+	message += a.build7030EnforcementInstructions(genericApproved, genericTopics, trainingChunks > 0, len(designFiles) > 0)
 
 	// Files Aider is allowed to edit: everything git tracks except the seeded
 	// design docs. On the first wave of a new project this is empty, which is
@@ -1041,6 +1044,7 @@ func (a *AiderRunner) runAiderIteration(
 			zap.String("workspace", workspacePath),
 			zap.Error(listErr),
 		)
+		editFiles = []string{}
 	}
 
 	// Call AiderService HTTP API
@@ -1082,7 +1086,7 @@ func (a *AiderRunner) runAiderIteration(
 		zap.Int("iteration", iteration),
 		zap.Int("edit_files", len(editFiles)),
 		zap.Int("read_only_design_files", len(designFiles)),
-		zap.Bool("has_training", training != ""),
+		zap.Int("training_chunks", trainingChunks),
 		zap.Int("message_chars", len(message)),
 	)
 	bodyBytes, err := json.Marshal(reqBody)
@@ -1111,17 +1115,55 @@ func (a *AiderRunner) runAiderIteration(
 	}
 	defer httpResp.Body.Close()
 
+	respBody, readErr := io.ReadAll(httpResp.Body)
+	if readErr != nil {
+		return "", false, fmt.Errorf("read aider response: %w", readErr)
+	}
+
+	// Check the status BEFORE decoding.
+	//
+	// WHY this has to come first: an error body from AiderService shares no
+	// field names with aiderServiceResponse, so Decode succeeds and leaves the
+	// struct at its zero value — Success=false, Error="". The caller then
+	// reported `aider: ` with nothing after the colon and every explanation
+	// thrown away. That is how a FastAPI 422 ("edit_files: Input should be a
+	// valid list") surfaced as five identical blank failures per expert and a
+	// dead implementation phase. The body is logged because it is the only
+	// place the real reason exists.
+	//
+	// Same shape as every other outbound HTTP call in this codebase
+	// (ml/sidecar_client.go, gateway/providers/common.go).
+	if httpResp.StatusCode != http.StatusOK {
+		snippet := string(respBody)
+		if len(snippet) > 1000 {
+			snippet = snippet[:1000] + "...(truncated)"
+		}
+		a.logger.Error("aider service returned non-200",
+			zap.Int("status", httpResp.StatusCode),
+			zap.String("url", a.aiderServiceURL+"/iterate"),
+			zap.Int("iteration", iteration),
+			zap.String("body", snippet),
+		)
+		return "", false, fmt.Errorf("aider service status %d: %s", httpResp.StatusCode, snippet)
+	}
+
 	var aiderResp aiderServiceResponse
-	if err := json.NewDecoder(httpResp.Body).Decode(&aiderResp); err != nil {
-		return "", false, fmt.Errorf("decode aider response: %w", err)
+	if err := json.Unmarshal(respBody, &aiderResp); err != nil {
+		return "", false, fmt.Errorf("decode aider response: %w (body: %s)", err, string(respBody))
 	}
 
 	if !aiderResp.Success {
+		// A 200 with success=false and no error text means AiderService itself
+		// is not telling us why. Say so instead of emitting a bare "aider: ".
+		reason := aiderResp.Error
+		if reason == "" {
+			reason = fmt.Sprintf("no reason reported by aider-service (body: %s)", string(respBody))
+		}
 		a.logger.Error("aider iteration failed",
-			zap.String("error", aiderResp.Error),
+			zap.String("error", reason),
 			zap.Int("iteration", iteration),
 		)
-		return "", false, fmt.Errorf("aider: %s", aiderResp.Error)
+		return "", false, fmt.Errorf("aider: %s", reason)
 	}
 
 	a.logger.Debug("aider service response",
@@ -1415,7 +1457,12 @@ func (a *AiderRunner) listEditableFiles(ctx context.Context, workspacePath strin
 		return nil, fmt.Errorf("git ls-files: %w", err)
 	}
 
-	var files []string
+	// Non-nil even when nothing matches. A nil slice marshals to JSON null,
+	// and null is not a list: AiderService rejected the whole request with 422
+	// and Aider never ran. Every greenfield task hits that path, because the
+	// only files a fresh workspace has are the design docs this function
+	// filters out.
+	files := []string{}
 	for _, line := range strings.Split(string(output), "\n") {
 		name := strings.TrimSpace(line)
 		if name == "" {
@@ -1564,7 +1611,7 @@ func (a *AiderRunner) loadExpertTraining(
 	ctx context.Context,
 	expertID uuid.UUID,
 	taskDescription string,
-) (string, error) {
+) (string, int, error) {
 	// Step 1: Load reasoning_charter (rules)
 	var charter string
 	err := a.db.QueryRow(ctx,
@@ -1572,7 +1619,7 @@ func (a *AiderRunner) loadExpertTraining(
 		expertID,
 	).Scan(&charter)
 	if err != nil {
-		return "", fmt.Errorf("query expert charter: %w", err)
+		return "", 0, fmt.Errorf("query expert charter: %w", err)
 	}
 
 	// Step 2: RAG on course_chunks — embed task, find relevant chunks
@@ -1671,7 +1718,15 @@ func (a *AiderRunner) loadExpertTraining(
 		)
 	}
 
-	return sb.String(), nil
+	// The chunk count is returned separately, not inferred from the string.
+	//
+	// WHY: the returned string is non-empty whenever the expert has a
+	// reasoning_charter, even with zero chunks retrieved. Callers that tested
+	// `training != ""` therefore concluded the expert was trained and told the
+	// model "your training knowledge is your source of truth" when no training
+	// knowledge had been sent at all — the logs showed
+	// "no training chunks found" and has_training=true on the same task.
+	return sb.String(), len(chunks), nil
 }
 
 // publishCodeArtifacts walks the workspace and posts all code files to blackboard.

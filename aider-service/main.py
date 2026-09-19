@@ -9,6 +9,7 @@ switching stay in one place.
 
 import os
 import subprocess
+from typing import Optional
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -83,7 +84,13 @@ class IterateRequest(BaseModel):
     # Files added to Aider's chat as editable, relative to workspace_path.
     # Empty is normal on a greenfield task — the edit format lets the model
     # create new files without asking.
-    edit_files: list[str] = []
+    #
+    # Optional, not `list[str] = []`: a caller written in Go sends an empty list
+    # as JSON null unless it is careful, and a bare `list[str]` rejects null
+    # with a 422 before the request reaches Aider. Rejecting the whole
+    # implementation phase over an empty list is not a trade worth making, so
+    # null is accepted and normalised in the handler.
+    edit_files: Optional[list[str]] = None
     # Files added as reference material the model may read but must not change
     # (the approved design documents).
     #
@@ -91,7 +98,7 @@ class IterateRequest(BaseModel):
     # Writing them into the workspace leaves them closed, and the repo map shows
     # little more than an .md file's headings — so the model was asked to
     # implement a design it could not actually see.
-    read_only_files: list[str] = []
+    read_only_files: Optional[list[str]] = None
 
 
 class IterateResponse(BaseModel):
@@ -106,7 +113,7 @@ def health():
     return {"status": "ok"}
 
 
-def _existing_paths(workspace_path: str, names: list[str]) -> list[str]:
+def _existing_paths(workspace_path: str, names: Optional[list[str]]) -> list[str]:
     """Turn workspace-relative names into absolute paths, skipping missing ones.
 
     Missing entries are skipped rather than passed through: for a name that does
@@ -115,7 +122,7 @@ def _existing_paths(workspace_path: str, names: list[str]) -> list[str]:
     from what is actually on disk.
     """
     resolved = []
-    for name in names:
+    for name in names or []:
         path = os.path.join(workspace_path, name)
         if os.path.isfile(path):
             resolved.append(path)
