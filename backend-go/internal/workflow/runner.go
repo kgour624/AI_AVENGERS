@@ -225,10 +225,27 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	}
 
 	// --- Gate: Ask client to approve implementation start ---
+	//
+	// GateName MUST be one of approval_requests_gate_check (migration 006):
+	//   'intake','high_level_design','detailed_design','handoff',
+	//   'budget_exceeded','ad_hoc'
+	//
+	// BUG FIX: this passed "implementation_approval", which is not in that
+	// list, so the INSERT inside AskClient's createApprovalRequest() failed
+	// the CHECK constraint -> AskClient returned an error -> the workflow was
+	// failed with "implementation AskClient failed", right after the design
+	// phases completed.
+	//
+	// 'detailed_design' is the correct gate: this call sits immediately after
+	// the Detailed Design phase and gates the start of implementation, which
+	// is exactly "Client approval gate 3" in the workflow state machine of
+	// DOMAIN_EXPERT_COLLABORATION_DESIGN.md §9 (gates: intake ->
+	// high_level_design -> detailed_design -> handoff). The schema and the
+	// design doc agree; the invented name was the outlier.
 	_, err = r.tools.AskClient(ctx, AskClientRequest{
 		WorkflowID:   workflowID,
 		FromExpertID: uuid.Nil,
-		GateName:     "implementation_approval",
+		GateName:     "detailed_design",
 		Summary:      "Design phases complete. Approve to start implementation (Aider will write code).",
 	})
 	if err != nil {

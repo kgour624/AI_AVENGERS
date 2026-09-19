@@ -328,26 +328,44 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 		return
 	}
 
-	validDecisions := map[string]bool{
-		"approve":                  true,
-		"approve_with_notes":       true,
-		"request_changes":          true,
-		"reject_and_restart_phase": true,
-		"cancel_workflow":          true,
+	// decisionToStatus maps the client's decision (API vocabulary) to the
+	// approval_requests.status value (DB vocabulary). These two vocabularies
+	// are NOT the same and must be translated explicitly.
+	//
+	// The DB values are fixed by approval_requests_status_check (migration 006):
+	//   'pending','approved','approved_with_notes','changes_requested',
+	//   'rejected','cancelled'
+	//
+	// BUG FIX: this used to be a map[string]bool for validation plus a
+	// separate `approvalStatus := req.Decision` with an if-statement that
+	// only remapped reject_and_restart_phase and cancel_workflow. The other
+	// three decisions were written to the DB verbatim:
+	//   "approve"            -> invalid (DB wants 'approved')
+	//   "approve_with_notes" -> invalid (DB wants 'approved_with_notes')
+	//   "request_changes"    -> invalid (DB wants 'changes_requested')
+	// so the UPDATE violated the CHECK constraint and the handler returned
+	// HTTP 500. Clicking "Approve" in the Kanban approval gate could never
+	// succeed — 3 of the 5 decisions were permanently broken.
+	//
+	// WHY one map instead of two lists: the root cause was two parallel
+	// lists of decisions that had to be kept in sync and weren't. A single
+	// map makes the valid set and the DB translation the same source of
+	// truth, so adding a decision cannot silently produce an invalid status.
+	decisionToStatus := map[string]string{
+		"approve":                  "approved",
+		"approve_with_notes":       "approved_with_notes",
+		"request_changes":          "changes_requested",
+		"reject_and_restart_phase": "rejected",
+		"cancel_workflow":          "cancelled",
 	}
-	if !validDecisions[req.Decision] {
+	approvalStatus, ok := decisionToStatus[req.Decision]
+	if !ok {
 		response.BadRequest(c, "INVALID_DECISION",
 			"decision must be: approve, approve_with_notes, request_changes, reject_and_restart_phase, cancel_workflow")
 		return
 	}
 
 	ctx := c.Request.Context()
-
-	// Map decision to approval_requests.status
-	approvalStatus := req.Decision
-	if req.Decision == "reject_and_restart_phase" || req.Decision == "cancel_workflow" {
-		approvalStatus = "rejected"
-	}
 
 	// Update approval_request row
 	clientResponseJSON, _ := json.Marshal(map[string]string{
