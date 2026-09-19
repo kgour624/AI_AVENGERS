@@ -16,6 +16,10 @@ ALTER TABLE ingestion_jobs DROP CONSTRAINT IF EXISTS job_status_check;
 ALTER TABLE ingestion_jobs ADD CONSTRAINT job_status_check
     CHECK (status IN ('pending', 'running', 'complete', 'failed', 'paused'));
 
+ALTER TABLE ingestion_jobs DROP CONSTRAINT IF EXISTS ingestion_jobs_stage_check;
+ALTER TABLE ingestion_jobs ADD CONSTRAINT ingestion_jobs_stage_check
+    CHECK (current_stage IN ('pending', 'chunking', 'topic_extraction', 'charter_extraction', 'embedding', 'storing', 'smoke_test', 'complete', 'failed', 'paused'));
+
 -- Step 3: Add paused_at column.
 -- Set when status transitions to 'paused'.
 -- NULL for all non-paused jobs.

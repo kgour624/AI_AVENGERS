@@ -32,7 +32,8 @@ BEGIN
                 'storing',
                 'smoke_test',
                 'complete',
-                'failed'
+                'failed',
+                'paused'
             ));
     END IF;
 END $$;
