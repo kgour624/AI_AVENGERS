@@ -173,7 +173,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 			if isDesignPhase {
 				// Design phase: full 3-gate system
 				gr, gateErr := a.gateSystem.RunGates(
-					ctx, req.Expert, req.TaskDescription, req.AllExperts,
+					ctx, req.WorkflowID, req.Expert, req.TaskDescription, req.AllExperts,
 				)
 				if gateErr != nil {
 					a.logger.Warn("agent loop: gate system failed (continuing)",
@@ -208,7 +208,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		if gateResult != nil {
 			// Gate system ran: use gate-controlled context
 			gateCtx := FormatGateContext(gateResult)
-			blackboardCtx, bErr := a.buildBlackboardContext(ctx, allArtifacts)
+			blackboardCtx, bErr := a.buildBlackboardContext(ctx, req.WorkflowID, allArtifacts)
 			if bErr != nil {
 				blackboardCtx = formatArtifacts(allArtifacts)
 			}
@@ -216,7 +216,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		} else {
 			// No gate system (assembler nil): fallback to blackboard only
 			var bErr error
-			contextText, bErr = a.buildBlackboardContext(ctx, allArtifacts)
+			contextText, bErr = a.buildBlackboardContext(ctx, req.WorkflowID, allArtifacts)
 			if bErr != nil {
 				contextText = formatArtifacts(allArtifacts)
 			}
@@ -230,6 +230,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 
 		llmResp, err := a.gateway.Call(ctx, gateway.LLMRequest{
 			Model:        gateway.ModelStrong,
+			WorkflowID:   &req.WorkflowID,
 			SystemPrompt: systemPrompt,
 			UserPrompt:   userPrompt,
 			MaxTokens:    4000,
@@ -299,7 +300,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 // buildBlackboardContext builds context from blackboard artifacts only.
 // Summarizes old artifacts if count exceeds threshold.
 // Renamed from buildContext — gate context is now handled by FormatGateContext.
-func (a *AgentLoop) buildBlackboardContext(ctx context.Context, artifacts []blackboard.Event) (string, error) {
+func (a *AgentLoop) buildBlackboardContext(ctx context.Context, workflowID uuid.UUID, artifacts []blackboard.Event) (string, error) {
 	if len(artifacts) == 0 {
 		return "No prior artifacts from peers.", nil
 	}
@@ -315,6 +316,7 @@ func (a *AgentLoop) buildBlackboardContext(ctx context.Context, artifacts []blac
 	oldText := formatArtifacts(old)
 	summaryResp, err := a.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelCheap,
+		WorkflowID:   &workflowID,
 		SystemPrompt: "Summarize these expert artifacts concisely. Preserve key decisions, data models, API contracts. Max 500 words.",
 		UserPrompt:   oldText,
 		MaxTokens:    700,

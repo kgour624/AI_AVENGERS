@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -26,6 +27,18 @@ type LLMRequest struct {
 	MaxTokens    int
 	Temperature  float64
 	UseCache     bool
+	// WorkflowID attributes this call's cost to a workflow.
+	//
+	// nil (the default) = not part of a workflow — e.g. the chat flow,
+	// which already records its cost on the messages row. Behaviour for
+	// those callers is unchanged.
+	//
+	// When set, Call() adds the call's cost to workflows.cost_spent_usd.
+	// WHY here and not at every call site: this is the single place where
+	// cost is computed, so attribution cannot be forgotten by a new caller.
+	// WHY it does not affect caching: cacheKey() is built from
+	// Model + SystemPrompt + UserPrompt only.
+	WorkflowID *uuid.UUID
 }
 
 // LLMResponse is the output from the model gateway.
@@ -288,6 +301,11 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			g.totalCost.Store(currentCost + cost)
 			g.callCount.Add(1)
 
+			// Attribute the spend to the workflow, if this call belongs to one.
+			// Only reached on a real provider call — the cache hit above
+			// returns early, so a cached answer is never charged twice.
+			g.addWorkflowCost(ctx, req.WorkflowID, cost)
+
 			result := &LLMResponse{
 				Content:      provResp.Content,
 				InputTokens:  provResp.InputTokens,
@@ -519,4 +537,38 @@ func (g *ModelGateway) getModelName(ctx context.Context, settingKey, fallback st
 // cacheKey generates a stable cache key for a request.
 func (g *ModelGateway) cacheKey(req LLMRequest) string {
 	return fmt.Sprintf("%s:%s:%s", req.Model, req.SystemPrompt, req.UserPrompt)
+}
+
+// addWorkflowCost adds cost to workflows.cost_spent_usd for one workflow.
+//
+// No-op when workflowID is nil (non-workflow call) or the DB is not wired.
+// Non-fatal on error: a monitoring write must never fail an LLM response
+// the caller already paid for — matches how cost checks are treated in
+// WorkflowRunner.executeWaves (logged, execution continues).
+//
+// WHY the column has to be maintained here: nothing wrote it before, so it
+// stayed 0.0 forever. Two things depended on it —
+//   1. the Kanban header, which showed "$0.0000 / $10.00" no matter what
+//      was actually spent;
+//   2. CostMonitor.CheckWorkflowLimits, which reads this exact column as
+//      its "fast path" and therefore never saw a limit as reached, so the
+//      per-workflow soft/hard cost caps could not fire at all.
+func (g *ModelGateway) addWorkflowCost(ctx context.Context, workflowID *uuid.UUID, cost float64) {
+	if workflowID == nil || g.db == nil || cost <= 0 {
+		return
+	}
+	// context.WithoutCancel: the spend already happened. If the caller's
+	// context is cancelled right after the provider replied, the money is
+	// still gone and must still be recorded.
+	if _, err := g.db.Exec(context.WithoutCancel(ctx),
+		`UPDATE workflows SET cost_spent_usd = cost_spent_usd + $1, updated_at = NOW()
+		 WHERE id = $2`,
+		cost, *workflowID,
+	); err != nil {
+		g.logger.Warn("failed to attribute LLM cost to workflow",
+			zap.String("workflow_id", workflowID.String()),
+			zap.Float64("cost_usd", cost),
+			zap.Error(err),
+		)
+	}
 }

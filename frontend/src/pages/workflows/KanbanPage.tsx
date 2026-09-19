@@ -1,11 +1,11 @@
 import { useParams } from 'react-router-dom'
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { getWorkflow, respondToApproval } from '@/api/workflows'
+import { getBlackboard, getWorkflow, respondToApproval } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
 import { useFileStream } from '@/hooks/useFileStream'
 import type { FileEntry } from '@/hooks/useFileStream'
-import type { KanbanTask } from '@/api/workflows'
+import type { BlackboardEvent, KanbanTask } from '@/api/workflows'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
@@ -104,15 +104,155 @@ const COLUMNS: { key: KanbanTask['status']; label: string; color: string }[] = [
   { key: 'done',         label: 'Done',         color: 'text-mode-advise' },
 ]
 
-function TaskCard({ task }: { task: KanbanTask }) {
+function TaskCard({ task, onSelect }: { task: KanbanTask; onSelect: () => void }) {
   return (
-    <Card className="mb-2 p-3">
+    <Card
+      onClick={onSelect}
+      className="mb-2 cursor-pointer p-3 hover:border-glow-purple/40"
+      title="Show this expert's deliverables"
+    >
       <p className="text-sm font-medium text-text-primary">{task.title}</p>
       <p className="mt-1 text-xs text-text-secondary">{task.expertName}</p>
       {task.costUsd > 0 && (
         <p className="mt-1 text-xs text-text-disabled">${task.costUsd.toFixed(4)}</p>
       )}
     </Card>
+  )
+}
+
+// Blackboard event types that represent an expert deliverable worth reading.
+// Same set the backend forwards as kanban_artifact (see kanban_sse.go).
+const ARTIFACT_TYPES = new Set([
+  'architecture_decision',
+  'data_model_proposed',
+  'api_contract_proposed',
+  'module_design_proposed',
+  'code_artifact_produced',
+  'test_case_proposed',
+  'requirement_captured',
+])
+
+// renderContentValue turns one artifact content field into readable text.
+// Strings are shown as-is (they are usually prose or code); anything else is
+// pretty-printed JSON rather than "[object Object]".
+function renderContentValue(value: unknown): string {
+  if (typeof value === 'string') return value
+  return JSON.stringify(value, null, 2)
+}
+
+// ArtifactsPanel — reads what the experts actually produced.
+//
+// WHY this exists: the Kanban board only ever showed a task's title and
+// expert name. The deliverable itself (the PRD, the architecture decision,
+// the API contract) lives in blackboard_events and had no screen at all —
+// getBlackboard() existed in the API client but no page called it. So a
+// finished workflow looked empty even though the work was done.
+function ArtifactsPanel({
+  events,
+  expertNames,
+  filterExpertId,
+  onClearFilter,
+}: {
+  events: BlackboardEvent[]
+  expertNames: Map<string, string>
+  filterExpertId: string | null
+  onClearFilter: () => void
+}) {
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+
+  const artifacts = events.filter(
+    (e) =>
+      ARTIFACT_TYPES.has(e.eventType) &&
+      (!filterExpertId || e.postedByExpertId === filterExpertId)
+  )
+
+  if (events.length === 0) return null
+
+  const selected = selectedId
+    ? artifacts.find((a) => a.id === selectedId)
+    : artifacts[artifacts.length - 1] // default to the newest
+
+  return (
+    <div className="mt-6">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
+          Deliverables ({artifacts.length})
+        </span>
+        {filterExpertId && (
+          <button
+            onClick={onClearFilter}
+            className="text-[10px] font-medium uppercase tracking-wider text-brand hover:underline"
+          >
+            Showing {expertNames.get(filterExpertId) ?? 'one expert'} — show all
+          </button>
+        )}
+      </div>
+
+      {artifacts.length === 0 ? (
+        <Card className="p-4">
+          <p className="text-center text-xs text-text-disabled">
+            No deliverables yet for this selection.
+          </p>
+        </Card>
+      ) : (
+        <div className="grid grid-cols-3 gap-4">
+          <Card className="col-span-1 max-h-96 overflow-y-auto p-2">
+            {artifacts.map((a) => (
+              <button
+                key={a.id}
+                onClick={() => setSelectedId(a.id)}
+                className={cn(
+                  'mb-1 w-full rounded px-2 py-1.5 text-left text-xs',
+                  selected?.id === a.id
+                    ? 'bg-surface-overlay text-text-primary'
+                    : 'text-text-secondary hover:bg-surface-overlay/60'
+                )}
+              >
+                <span className="block truncate font-medium">
+                  {a.eventType.replace(/_/g, ' ')}
+                </span>
+                <span className="block truncate text-[10px] text-text-disabled">
+                  {(a.postedByExpertId && expertNames.get(a.postedByExpertId)) || 'system'}
+                </span>
+              </button>
+            ))}
+          </Card>
+
+          <Card className="col-span-2 max-h-96 overflow-y-auto p-3">
+            {selected ? (
+              <>
+                <div className="mb-2 flex items-center justify-between">
+                  <p className="text-xs font-medium text-text-primary">
+                    {selected.eventType.replace(/_/g, ' ')}
+                  </p>
+                  <span className="text-xs text-text-disabled">
+                    {(selected.postedByExpertId && expertNames.get(selected.postedByExpertId)) ||
+                      'system'}
+                  </span>
+                </div>
+                {Object.entries(selected.content ?? {}).map(([key, value]) => (
+                  <div key={key} className="mb-3">
+                    {/* baseAPI's response interceptor camelizes every key, so a
+                        field posted as "file_path" arrives as "filePath" —
+                        split on capitals as well as underscores. */}
+                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
+                      {key.replace(/_/g, ' ').replace(/([A-Z])/g, ' $1')}
+                    </p>
+                    <pre className="overflow-x-auto whitespace-pre-wrap text-xs text-text-secondary">
+                      {renderContentValue(value)}
+                    </pre>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <p className="py-4 text-center text-xs text-text-disabled">
+                Select a deliverable to read it
+              </p>
+            )}
+          </Card>
+        </div>
+      )}
+    </div>
   )
 }
 
@@ -211,6 +351,25 @@ function KanbanPage() {
   // and wave_completed events only (see useFileStream).
   const fileStream = useFileStream(id ?? null)
 
+  // Deliverables (blackboard artifacts). Polled on the same 10s interval as
+  // the workflow metadata above — the SSE stream reports that an artifact was
+  // posted but drops its content, and this panel needs the content itself.
+  const { data: blackboard } = useQuery({
+    queryKey: ['blackboard', id],
+    queryFn: () => getBlackboard(id!),
+    enabled: !!id,
+    refetchInterval: 10000,
+  })
+
+  // Clicking a task card narrows the deliverables panel to that expert.
+  const [filterExpertId, setFilterExpertId] = useState<string | null>(null)
+
+  // Explicit tuple type: .map() with an array literal infers string[], not
+  // [string, string], which does not satisfy the Map constructor.
+  const expertNames = new Map<string, string>(
+    tasks.map((t) => [t.assignedExpertId, t.expertName] as [string, string])
+  )
+
   return (
     <div className="p-6">
       {/* Header */}
@@ -268,7 +427,11 @@ function KanbanPage() {
                 </div>
                 <div className="min-h-24 rounded-lg bg-surface-overlay p-2">
                   {colTasks.map((task) => (
-                    <TaskCard key={task.id} task={task} />
+                    <TaskCard
+                      key={task.id}
+                      task={task}
+                      onSelect={() => setFilterExpertId(task.assignedExpertId)}
+                    />
                   ))}
                   {colTasks.length === 0 && (
                     <p className="py-4 text-center text-xs text-text-disabled">Empty</p>
@@ -289,6 +452,14 @@ function KanbanPage() {
           summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
         />
       )}
+
+      {/* Deliverables — what the experts actually produced (PRD, architecture, contracts) */}
+      <ArtifactsPanel
+        events={blackboard?.events ?? []}
+        expertNames={expertNames}
+        filterExpertId={filterExpertId}
+        onClearFilter={() => setFilterExpertId(null)}
+      />
 
       {/* Live file browser — populated once experts start producing code */}
       <FilesPanel files={fileStream.files} isConnected={fileStream.isConnected} />

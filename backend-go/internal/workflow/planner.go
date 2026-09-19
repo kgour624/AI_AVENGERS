@@ -58,7 +58,7 @@ type workflowExpert struct {
 //   Attempt 1 fail: LLM hallucinated UUID -> 0 valid tasks -> retry
 //   Attempt 2: LLM -> JSON -> validate -> return
 //   Attempt 3 fail: return error
-func (p *Planner) Plan(ctx context.Context, requirementText string, experts []workflowExpert) ([]TaskSpec, error) {
+func (p *Planner) Plan(ctx context.Context, workflowID uuid.UUID, requirementText string, experts []workflowExpert) ([]TaskSpec, error) {
 	if len(experts) == 0 {
 		return nil, fmt.Errorf("planner: no experts provided")
 	}
@@ -83,7 +83,7 @@ func (p *Planner) Plan(ctx context.Context, requirementText string, experts []wo
 
 	var lastErr error
 	for attempt := 1; attempt <= plannerMaxRetries; attempt++ {
-		tasks, err := p.planOnce(ctx, userPrompt, expertIndex)
+		tasks, err := p.planOnce(ctx, workflowID, userPrompt, expertIndex)
 		if err != nil {
 			lastErr = err
 			p.logger.Warn("planner: attempt failed",
@@ -102,9 +102,10 @@ func (p *Planner) Plan(ctx context.Context, requirementText string, experts []wo
 }
 
 // planOnce makes one LLM call and validates the result.
-func (p *Planner) planOnce(ctx context.Context, userPrompt string, expertIndex map[string]workflowExpert) ([]TaskSpec, error) {
+func (p *Planner) planOnce(ctx context.Context, workflowID uuid.UUID, userPrompt string, expertIndex map[string]workflowExpert) ([]TaskSpec, error) {
 	resp, err := p.gateway.Call(ctx, gateway.LLMRequest{
-		Model: gateway.ModelStrong,
+		Model:      gateway.ModelStrong,
+		WorkflowID: &workflowID,
 		SystemPrompt: `You are a workflow planner for a multi-agent software development system.
 
 Given a list of domain experts and a requirement, create exactly one task per expert.

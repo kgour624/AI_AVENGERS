@@ -717,7 +717,16 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 
 	reranked, err := a.sidecar.Rerank(ctx, question, texts, limit)
 	if err != nil {
-		// Fallback: return top K without reranking
+		// Fallback: return top K without reranking.
+		//
+		// This was silent before. It must not be: the flat 0.5 score below
+		// is under workflow Gate 1's 0.70 threshold, so while the sidecar is
+		// unreachable every expert silently drops to "generic allowed" mode
+		// even with perfect training data — and no error surfaced anywhere.
+		a.logger.Warn("reranker unavailable — falling back to flat 0.5 scores",
+			zap.Int("candidates", len(candidates)),
+			zap.Error(err),
+		)
 		var chunks []chinawall.CourseChunk
 		for i, c := range candidates {
 			if i >= limit {

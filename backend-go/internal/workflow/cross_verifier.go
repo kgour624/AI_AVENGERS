@@ -518,7 +518,9 @@ func (cv *CrossVerifier) runReview(
 	)
 
 	resp, callErr := cv.gateway.Call(ctx, gateway.LLMRequest{
-		Model:        gateway.ModelCheap, // Reviews use cheap model (fast, low cost)
+		Model: gateway.ModelCheap, // Reviews use cheap model (fast, low cost)
+		// artifact carries its own workflow id — no extra parameter needed.
+		WorkflowID:   &artifact.WorkflowID,
 		SystemPrompt: systemPrompt,
 		UserPrompt:   userPrompt,
 		MaxTokens:    500,

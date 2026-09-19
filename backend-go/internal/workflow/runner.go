@@ -142,7 +142,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 
 	// Step 4: Plan.
 	log.Info("runner: planning", zap.Int("experts", len(experts)))
-	tasks, err := r.planner.Plan(ctx, requirementText, experts)
+	tasks, err := r.planner.Plan(ctx, workflowID, requirementText, experts)
 	if err != nil {
 		log.Error("runner: planning failed", zap.Error(err))
 		_ = r.engine.Fail(ctx, workflowID, "planning failed: "+err.Error())

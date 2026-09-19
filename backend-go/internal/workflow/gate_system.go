@@ -117,6 +117,7 @@ func NewGateSystem(assembler *appcontext.Assembler, gw *gateway.ModelGateway, lo
 //       -> Gate 3 enabled, CoverageGap = "distributed rate limiting"
 func (g *GateSystem) RunGates(
 	ctx context.Context,
+	workflowID uuid.UUID,
 	expert workflowExpert,
 	taskDescription string,
 	allExperts []workflowExpert,
@@ -161,10 +162,33 @@ func (g *GateSystem) RunGates(
 		return result, nil
 	}
 
+	// Diagnostics for "chunks were found but none qualified".
+	//
+	// WHY: total_chunks alone cannot tell these two cases apart, and they
+	// need opposite fixes:
+	//   a) the reranker (ml-sidecar) is unreachable — getCourseChunks falls
+	//      back to a hardcoded RerankScore of 0.5 for every chunk, which is
+	//      below this threshold, so Gate 1 can NEVER pass no matter how good
+	//      the training data is. Signature: every score is exactly 0.5.
+	//   b) the reranker ran and the best chunk genuinely scored below the
+	//      threshold. Signature: varied scores; top_score shows how close.
+	topScore := 0.0
+	allExactlyHalf := len(ownChunks) > 0
+	for _, c := range ownChunks {
+		s := float64(c.RerankScore)
+		if s > topScore {
+			topScore = s
+		}
+		if s != 0.5 {
+			allExactlyHalf = false
+		}
+	}
 	g.logger.Info("gate system: Gate 1 FAIL — proceeding to Gate 2",
 		zap.String("expert", expert.Name),
 		zap.Int("total_chunks", len(ownChunks)),
 		zap.Float64("threshold", gate1SimilarityThreshold),
+		zap.Float64("top_score", topScore),
+		zap.Bool("rerank_fallback_suspected", allExactlyHalf),
 	)
 
 	// ============================================================
@@ -174,7 +198,7 @@ func (g *GateSystem) RunGates(
 	result.PeerContributions = peerContribs
 
 	// Coverage check: do combined peer chunks cover the task?
-	coverage, gap := g.checkCoverage(ctx, taskDescription, peerContribs)
+	coverage, gap := g.checkCoverage(ctx, workflowID, taskDescription, peerContribs)
 	result.Gate2Coverage = coverage
 
 	switch coverage {
@@ -305,6 +329,7 @@ func (g *GateSystem) pollPeers(
 //   return: "PARTIAL", "distributed rate limiting across nodes"
 func (g *GateSystem) checkCoverage(
 	ctx context.Context,
+	workflowID uuid.UUID,
 	taskDescription string,
 	peerContribs []PeerContribution,
 ) (coverage string, gap string) {
@@ -332,7 +357,8 @@ func (g *GateSystem) checkCoverage(
 	}
 
 	resp, err := g.gateway.Call(ctx, gateway.LLMRequest{
-		Model: gateway.ModelCheap,
+		Model:      gateway.ModelCheap,
+		WorkflowID: &workflowID,
 		SystemPrompt: `You are a coverage checker. Given a task and peer knowledge, determine if the knowledge covers the task.
 
 Output EXACTLY one of:
