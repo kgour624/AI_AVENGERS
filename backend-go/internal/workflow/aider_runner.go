@@ -26,53 +26,55 @@ import (
 // AiderRunner executes implementation/qa tasks using Aider.
 //
 // PATTERN: RALF Loop (Ralph Loop from Arpit Bhiyani AI Masterclass)
-//   File system is context (not JSON blobs)
-//   Git history is memory (meaningful commits)
-//   Fresh read every iteration (no stale context)
-//   Patch-based changes (unified diff format)
+//
+//	File system is context (not JSON blobs)
+//	Git history is memory (meaningful commits)
+//	Fresh read every iteration (no stale context)
+//	Patch-based changes (unified diff format)
 //
 // FLOW:
-//   1. Initialize workspace: /workspaces/{workflow_id}/
-//   2. Git init + initial commit
-//   3. Load design artifacts from blackboard → seed files
-//   4. Run Aider loop:
-//      - Observe: git status, test results, build errors
-//      - Think: Aider LLM call with expert's training (Gate 1 only)
-//      - Act: Apply patches, commit changes
-//      - Repeat until TASK_COMPLETE or max iterations
-//   5. Post final code artifacts to blackboard
-//   6. Cleanup workspace (optional, keep for debugging)
+//  1. Initialize workspace: /workspaces/{workflow_id}/
+//  2. Git init + initial commit
+//  3. Load design artifacts from blackboard → seed files
+//  4. Run Aider loop:
+//     - Observe: git status, test results, build errors
+//     - Think: Aider LLM call with expert's training (Gate 1 only)
+//     - Act: Apply patches, commit changes
+//     - Repeat until TASK_COMPLETE or max iterations
+//  5. Post final code artifacts to blackboard
+//  6. Cleanup workspace (optional, keep for debugging)
 //
 // MENTAL MODEL:
-//   Expert: Backend Engineer, Task: "Implement user authentication"
-//   
-//   Iteration 1:
-//     Observe: Empty workspace, design artifacts in blackboard
-//     Think:   Aider reads expert's training (Gate 1: auth patterns)
-//     Act:     Generate auth.go, commit "feat: add user authentication"
-//   
-//   Iteration 2:
-//     Observe: go build fails (missing import)
-//     Think:   Aider analyzes error, checks training
-//     Act:     Fix import, commit "fix: add missing crypto import"
-//   
-//   Iteration 3:
-//     Observe: go test fails (password hash test)
-//     Think:   Aider reads test output, checks training
-//     Act:     Fix hash logic, commit "fix: use bcrypt cost 12"
-//   
-//   Iteration 4:
-//     Observe: All tests pass, build succeeds
-//     Think:   Task complete
-//     Act:     Post code_artifact_produced to blackboard, exit
+//
+//	Expert: Backend Engineer, Task: "Implement user authentication"
+//
+//	Iteration 1:
+//	  Observe: Empty workspace, design artifacts in blackboard
+//	  Think:   Aider reads expert's training (Gate 1: auth patterns)
+//	  Act:     Generate auth.go, commit "feat: add user authentication"
+//
+//	Iteration 2:
+//	  Observe: go build fails (missing import)
+//	  Think:   Aider analyzes error, checks training
+//	  Act:     Fix import, commit "fix: add missing crypto import"
+//
+//	Iteration 3:
+//	  Observe: go test fails (password hash test)
+//	  Think:   Aider reads test output, checks training
+//	  Act:     Fix hash logic, commit "fix: use bcrypt cost 12"
+//
+//	Iteration 4:
+//	  Observe: All tests pass, build succeeds
+//	  Think:   Task complete
+//	  Act:     Post code_artifact_produced to blackboard, exit
 type AiderRunner struct {
 	db                 *pgxpool.Pool
 	store              *blackboard.Store
 	gateway            *gateway.ModelGateway
-	mlClient           *ml.SidecarClient        // For embedding task descriptions -> RAG on course_chunks
-	validationPipeline *validation.Pipeline     // Validates code before publishing to blackboard
-	workspaceDir       string                   // Base directory: /workspaces/
-	aiderServiceURL    string                   // AiderService HTTP API URL
+	mlClient           *ml.SidecarClient    // For embedding task descriptions -> RAG on course_chunks
+	validationPipeline *validation.Pipeline // Validates code before publishing to blackboard
+	workspaceDir       string               // Base directory: /workspaces/
+	aiderServiceURL    string               // AiderService HTTP API URL
 	httpClient         *http.Client
 	logger             *zap.Logger
 }
@@ -126,39 +128,42 @@ type AiderRunResult struct {
 // PHASE 5: Production Hardening - Error Recovery
 //
 // MENTAL MODEL:
-//   Pod crashes during iteration 3 of 5
-//   On restart:
-//     1. Load checkpoint from DB
-//     2. Resume from iteration 4
-//     3. Continue OTA loop
+//
+//	Pod crashes during iteration 3 of 5
+//	On restart:
+//	  1. Load checkpoint from DB
+//	  2. Resume from iteration 4
+//	  3. Continue OTA loop
 //
 // CROSS-QUESTIONS:
-//   Q: What state needs to be saved?
-//   A: Iteration number, commits, observations, completion status
 //
-//   Q: Where to save?
-//   A: Database table: aider_checkpoints
-//      Key: (workflow_id, expert_id, task_id)
+//	Q: What state needs to be saved?
+//	A: Iteration number, commits, observations, completion status
 //
-//   Q: When to save?
-//   A: After each successful iteration (before next iteration starts)
+//	Q: Where to save?
+//	A: Database table: aider_checkpoints
+//	   Key: (workflow_id, expert_id, task_id)
 //
-//   Q: How to resume?
-//   A: Load checkpoint, skip completed iterations, continue from last+1
+//	Q: When to save?
+//	A: After each successful iteration (before next iteration starts)
 //
-//   Q: What if no checkpoint?
-//   A: Start from iteration 1 (normal flow, first run)
+//	Q: How to resume?
+//	A: Load checkpoint, skip completed iterations, continue from last+1
 //
-//   Q: When to delete checkpoint?
-//   A: After task completes successfully (cleanup)
+//	Q: What if no checkpoint?
+//	A: Start from iteration 1 (normal flow, first run)
+//
+//	Q: When to delete checkpoint?
+//	A: After task completes successfully (cleanup)
 //
 // EXAMPLE:
-//   Iteration 1: Create auth.go → Save checkpoint (iteration=1, commits=[abc123])
-//   Iteration 2: Fix import → Save checkpoint (iteration=2, commits=[abc123, def456])
-//   [POD CRASH]
-//   On restart: Load checkpoint → Resume from iteration 3
-//   Iteration 3: Add tests → Save checkpoint (iteration=3, commits=[abc123, def456, ghi789])
-//   Task complete → Delete checkpoint
+//
+//	Iteration 1: Create auth.go → Save checkpoint (iteration=1, commits=[abc123])
+//	Iteration 2: Fix import → Save checkpoint (iteration=2, commits=[abc123, def456])
+//	[POD CRASH]
+//	On restart: Load checkpoint → Resume from iteration 3
+//	Iteration 3: Add tests → Save checkpoint (iteration=3, commits=[abc123, def456, ghi789])
+//	Task complete → Delete checkpoint
 type AiderCheckpoint struct {
 	WorkflowID       uuid.UUID `json:"workflow_id"`
 	ExpertID         uuid.UUID `json:"expert_id"`
@@ -177,10 +182,10 @@ type AiderCheckpoint struct {
 // Phase 2 will add runAiderIteration() with real Aider integration.
 //
 // Current implementation:
-//   1. Initialize workspace
-//   2. Seed with design artifacts
-//   3. TODO: Run Aider loop (Phase 2)
-//   4. TODO: Post code artifacts (Phase 3)
+//  1. Initialize workspace
+//  2. Seed with design artifacts
+//  3. TODO: Run Aider loop (Phase 2)
+//  4. TODO: Post code artifacts (Phase 3)
 func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunResult, error) {
 	// PHASE 5: Track start time for duration metrics
 	startTime := time.Now()
@@ -265,12 +270,13 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 // initWorkspace creates workspace directory and initializes git repo.
 //
 // MENTAL MODEL:
-//   Input: /workspaces/abc-123/
-//   Actions:
-//     1. mkdir -p /workspaces/abc-123/
-//     2. cd /workspaces/abc-123/ && git init
-//     3. git commit --allow-empty -m "chore: initialize workspace"
-//   Output: Empty git repo with initial commit
+//
+//	Input: /workspaces/abc-123/
+//	Actions:
+//	  1. mkdir -p /workspaces/abc-123/
+//	  2. cd /workspaces/abc-123/ && git init
+//	  3. git commit --allow-empty -m "chore: initialize workspace"
+//	Output: Empty git repo with initial commit
 //
 // WHY initial commit?
 //   - Provides base for git diff (HEAD~1)
@@ -321,25 +327,27 @@ func (a *AiderRunner) initWorkspace(ctx context.Context, workspacePath string) e
 //
 // MENTAL MODEL — two seed sources:
 //
-//   Source 1: Blackboard design events
-//     architecture_decision  → ARCHITECTURE.md
-//     data_model_proposed    → DATA_MODEL.md
-//     api_contract_proposed  → API_CONTRACT.yaml
-//     module_design_proposed → MODULE_DESIGN.md
+//	Source 1: Blackboard design events
+//	  architecture_decision  → ARCHITECTURE.md
+//	  data_model_proposed    → DATA_MODEL.md
+//	  api_contract_proposed  → API_CONTRACT.yaml
+//	  module_design_proposed → MODULE_DESIGN.md
 //
-//   Source 2: main/ workspace (prior wave code files)
-//     /workspaces/{workflow_id}/main/auth.go
-//     /workspaces/{workflow_id}/main/handler.go
-//     ... → rsync'd into this expert's workspace
+//	Source 2: main/ workspace (prior wave code files)
+//	  /workspaces/{workflow_id}/main/auth.go
+//	  /workspaces/{workflow_id}/main/handler.go
+//	  ... → rsync'd into this expert's workspace
 //
 // WHY Source 2 is critical (Bug #2 fix):
-//   WorkspaceMerger.MergeWave() merges Wave 1 experts' code into main/.
-//   Without copying main/ here, Wave 2 experts start with empty workspaces.
-//   They see design docs but NOT the actual code Wave 1 wrote.
-//   With this fix: Wave 2 experts see all prior code files in their workspace.
+//
+//	WorkspaceMerger.MergeWave() merges Wave 1 experts' code into main/.
+//	Without copying main/ here, Wave 2 experts start with empty workspaces.
+//	They see design docs but NOT the actual code Wave 1 wrote.
+//	With this fix: Wave 2 experts see all prior code files in their workspace.
 //
 // ORDER: blackboard first, then main/ overlay.
-//   main/ files take precedence (they are the latest merged state).
+//
+//	main/ files take precedence (they are the latest merged state).
 func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, workspacePath string) error {
 	// --- Source 1: Blackboard design artifacts ---
 	events, err := a.store.GetByType(ctx, workflowID, []string{
@@ -391,7 +399,7 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 			} else {
 				a.logger.Info("seedWorkspace: copied prior wave files from main/",
 					zap.String("workflow_id", workflowID.String()),
-			)
+				)
 			}
 		}
 	}
@@ -422,12 +430,13 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 // artifactToFilename maps blackboard event types to filenames.
 //
 // MENTAL MODEL:
-//   Event Type                → Filename
-//   architecture_decision     → ARCHITECTURE.md
-//   data_model_proposed       → DATA_MODEL.md
-//   api_contract_proposed     → API_CONTRACT.yaml
-//   module_design_proposed    → MODULE_DESIGN.md
-//   (default)                 → DESIGN.md
+//
+//	Event Type                → Filename
+//	architecture_decision     → ARCHITECTURE.md
+//	data_model_proposed       → DATA_MODEL.md
+//	api_contract_proposed     → API_CONTRACT.yaml
+//	module_design_proposed    → MODULE_DESIGN.md
+//	(default)                 → DESIGN.md
 func (a *AiderRunner) artifactToFilename(eventType string) string {
 	switch eventType {
 	case "architecture_decision":
@@ -446,36 +455,39 @@ func (a *AiderRunner) artifactToFilename(eventType string) string {
 // runAiderLoop executes the OTA loop: Observe → Think → Act.
 //
 // MENTAL MODEL:
-//   Max 5 iterations (balance between thoroughness and cost)
-//   Each iteration:
-//     1. Observe: git status, build errors, test failures
-//     2. Think: Aider CLI call with task + observations
-//     3. Act: Aider applies patches, commits changes
-//   Exit when: TASK_COMPLETE or max iterations reached
+//
+//	Max 5 iterations (balance between thoroughness and cost)
+//	Each iteration:
+//	  1. Observe: git status, build errors, test failures
+//	  2. Think: Aider CLI call with task + observations
+//	  3. Act: Aider applies patches, commits changes
+//	Exit when: TASK_COMPLETE or max iterations reached
 //
 // PHASE 4 ADDITION:
-//   QA Phase Support:
-//     - Different prompt (focus on test generation)
-//     - Load implementation artifacts from previous phase
-//     - Track test coverage (>80% target)
-//     - Validate test quality (naming, edge cases, error paths)
+//
+//	QA Phase Support:
+//	  - Different prompt (focus on test generation)
+//	  - Load implementation artifacts from previous phase
+//	  - Track test coverage (>80% target)
+//	  - Validate test quality (naming, edge cases, error paths)
 //
 // CROSS-QUESTIONS:
-//   Q: Why max 5 iterations?
-//   A: Balance between fixing issues and preventing infinite loops
-//      Most tasks complete in 2-3 iterations (initial + 1-2 fixes)
 //
-//   Q: Why observe before think?
-//   A: Provide context (build errors, test failures) to Aider
-//      Without observations, Aider can't fix errors
+//	Q: Why max 5 iterations?
+//	A: Balance between fixing issues and preventing infinite loops
+//	   Most tasks complete in 2-3 iterations (initial + 1-2 fixes)
 //
-//   Q: What if max iterations reached?
-//   A: Return partial completion (Completed=false)
-//      Caller can decide: retry, escalate, or accept partial
+//	Q: Why observe before think?
+//	A: Provide context (build errors, test failures) to Aider
+//	   Without observations, Aider can't fix errors
 //
-//   Q: How does QA phase differ?
-//   A: Implementation creates source code, QA creates test files
-//      QA validates coverage and test quality
+//	Q: What if max iterations reached?
+//	A: Return partial completion (Completed=false)
+//	   Caller can decide: retry, escalate, or accept partial
+//
+//	Q: How does QA phase differ?
+//	A: Implementation creates source code, QA creates test files
+//	   QA validates coverage and test quality
 func (a *AiderRunner) runAiderLoop(
 	ctx context.Context,
 	req AiderRunRequest,
@@ -634,33 +646,36 @@ func (a *AiderRunner) runAiderLoop(
 // observeWorkspace gathers current workspace state for Aider.
 //
 // MENTAL MODEL:
-//   Observations = context for Aider's next iteration
-//   Includes:
-//     - Git status (what files changed)
-//     - Build errors (compile failures)
-//     - Test failures (test output)
-//     - Coverage (QA phase only)
+//
+//	Observations = context for Aider's next iteration
+//	Includes:
+//	  - Git status (what files changed)
+//	  - Build errors (compile failures)
+//	  - Test failures (test output)
+//	  - Coverage (QA phase only)
 //
 // PHASE 4 ADDITION:
-//   QA Phase: Include test coverage in observations
-//   Example: "Coverage: 45.2% (target: 80.0%)"
+//
+//	QA Phase: Include test coverage in observations
+//	Example: "Coverage: 45.2% (target: 80.0%)"
 //
 // CROSS-QUESTIONS:
-//   Q: Why git status?
-//   A: Shows what files Aider created/modified
-//      Helps Aider understand current state
 //
-//   Q: Why build errors?
-//   A: Aider needs to see compile errors to fix them
-//      Without errors, Aider doesn't know what's wrong
+//	Q: Why git status?
+//	A: Shows what files Aider created/modified
+//	   Helps Aider understand current state
 //
-//   Q: Why test failures?
-//   A: Aider needs test output to fix failing tests
-//      Test output shows expected vs actual behavior
+//	Q: Why build errors?
+//	A: Aider needs to see compile errors to fix them
+//	   Without errors, Aider doesn't know what's wrong
 //
-//   Q: Why coverage in QA only?
-//   A: Implementation doesn't need coverage (no tests yet)
-//      QA needs to know current coverage to improve it
+//	Q: Why test failures?
+//	A: Aider needs test output to fix failing tests
+//	   Test output shows expected vs actual behavior
+//
+//	Q: Why coverage in QA only?
+//	A: Implementation doesn't need coverage (no tests yet)
+//	   QA needs to know current coverage to improve it
 func (a *AiderRunner) observeWorkspace(
 	ctx context.Context,
 	phase string,
@@ -721,19 +736,21 @@ func (a *AiderRunner) observeWorkspace(
 // runBuild executes go build and captures output.
 //
 // MENTAL MODEL:
-//   go build ./... compiles all packages
-//   Returns: (output, error)
-//     - error != nil: build failed (compile errors)
-//     - error == nil: build succeeded
+//
+//	go build ./... compiles all packages
+//	Returns: (output, error)
+//	  - error != nil: build failed (compile errors)
+//	  - error == nil: build succeeded
 //
 // CROSS-QUESTIONS:
-//   Q: Why go build ./...?
-//   A: Builds all packages in workspace (not just main)
-//      Catches compile errors in all files
 //
-//   Q: Why capture output?
-//   A: Output contains error messages for Aider
-//      Aider needs to see errors to fix them
+//	Q: Why go build ./...?
+//	A: Builds all packages in workspace (not just main)
+//	   Catches compile errors in all files
+//
+//	Q: Why capture output?
+//	A: Output contains error messages for Aider
+//	   Aider needs to see errors to fix them
 func (a *AiderRunner) runBuild(
 	ctx context.Context,
 	workspacePath string,
@@ -747,19 +764,21 @@ func (a *AiderRunner) runBuild(
 // runTests executes go test and captures output.
 //
 // MENTAL MODEL:
-//   go test ./... runs all tests
-//   Returns: (output, error)
-//     - error != nil: tests failed
-//     - error == nil: tests passed
+//
+//	go test ./... runs all tests
+//	Returns: (output, error)
+//	  - error != nil: tests failed
+//	  - error == nil: tests passed
 //
 // CROSS-QUESTIONS:
-//   Q: Why go test ./...?
-//   A: Runs all tests in workspace
-//      Catches test failures in all packages
 //
-//   Q: Why capture output?
-//   A: Output contains test failure details
-//      Aider needs to see failures to fix them
+//	Q: Why go test ./...?
+//	A: Runs all tests in workspace
+//	   Catches test failures in all packages
+//
+//	Q: Why capture output?
+//	A: Output contains test failure details
+//	   Aider needs to see failures to fix them
 func (a *AiderRunner) runTests(
 	ctx context.Context,
 	workspacePath string,
@@ -775,26 +794,29 @@ func (a *AiderRunner) runTests(
 // PHASE 4: QA Phase Support
 //
 // MENTAL MODEL:
-//   go test -cover ./... outputs:
-//     ok      package1    0.123s  coverage: 85.7% of statements
-//     ok      package2    0.456s  coverage: 92.3% of statements
 //
-//   Parse output to extract coverage percentage
+//	go test -cover ./... outputs:
+//	  ok      package1    0.123s  coverage: 85.7% of statements
+//	  ok      package2    0.456s  coverage: 92.3% of statements
+//
+//	Parse output to extract coverage percentage
 //
 // CROSS-QUESTIONS:
-//   Q: Why separate method?
-//   A: runTests() doesn't capture coverage, need -cover flag
 //
-//   Q: What if no tests?
-//   A: Coverage = 0%, not an error (first iteration)
+//	Q: Why separate method?
+//	A: runTests() doesn't capture coverage, need -cover flag
 //
-//   Q: What if multiple packages?
-//   A: Average coverage across all packages
+//	Q: What if no tests?
+//	A: Coverage = 0%, not an error (first iteration)
+//
+//	Q: What if multiple packages?
+//	A: Average coverage across all packages
 //
 // RETURNS:
-//   output: Full test output (for debugging)
-//   coverage: Average coverage percentage (0-100)
-//   error: Non-nil if tests failed to run (not if tests failed)
+//
+//	output: Full test output (for debugging)
+//	coverage: Average coverage percentage (0-100)
+//	error: Non-nil if tests failed to run (not if tests failed)
 func (a *AiderRunner) runTestsWithCoverage(
 	ctx context.Context,
 	workspacePath string,
@@ -816,25 +838,28 @@ func (a *AiderRunner) runTestsWithCoverage(
 // PHASE 4: QA Phase Support
 //
 // MENTAL MODEL:
-//   Input:
-//     ok      package1    0.123s  coverage: 85.7% of statements
-//     ok      package2    0.456s  coverage: 92.3% of statements
-//   Output: 89.0 (average of 85.7 and 92.3)
+//
+//	Input:
+//	  ok      package1    0.123s  coverage: 85.7% of statements
+//	  ok      package2    0.456s  coverage: 92.3% of statements
+//	Output: 89.0 (average of 85.7 and 92.3)
 //
 // CROSS-QUESTIONS:
-//   Q: Why average?
-//   A: Single metric for overall coverage
-//      Alternative: weighted by package size (future)
 //
-//   Q: What if no coverage lines?
-//   A: Return 0.0 (no tests yet)
+//	Q: Why average?
+//	A: Single metric for overall coverage
+//	   Alternative: weighted by package size (future)
 //
-//   Q: What if parse fails?
-//   A: Return 0.0 (graceful degradation)
+//	Q: What if no coverage lines?
+//	A: Return 0.0 (no tests yet)
+//
+//	Q: What if parse fails?
+//	A: Return 0.0 (graceful degradation)
 //
 // REGEX:
-//   coverage: (\d+\.\d+)% of statements
-//   Captures: 85.7, 92.3, etc.
+//
+//	coverage: (\d+\.\d+)% of statements
+//	Captures: 85.7, 92.3, etc.
 func (a *AiderRunner) parseCoverage(output string) float64 {
 	// Regex to match: coverage: 85.7% of statements
 	// Note: Using simple string parsing instead of regex for clarity
@@ -876,21 +901,23 @@ func (a *AiderRunner) parseCoverage(output string) float64 {
 // runAiderIteration executes one Aider iteration.
 //
 // MENTAL MODEL:
-//   Full flow per iteration:
-//   1. Check if generic knowledge is approved on blackboard (30% rule)
-//   2. Load expert training: charter (rules) + RAG chunks (knowledge)
-//   3. Build prompt with 70/30 enforcement instructions
-//   4. Call AiderService HTTP API
-//   5. Extract commit SHA
-//   6. Check task completion criteria (build+tests for impl, coverage for QA)
+//
+//	Full flow per iteration:
+//	1. Check if generic knowledge is approved on blackboard (30% rule)
+//	2. Load expert training: charter (rules) + RAG chunks (knowledge)
+//	3. Build prompt with 70/30 enforcement instructions
+//	4. Call AiderService HTTP API
+//	5. Extract commit SHA
+//	6. Check task completion criteria (build+tests for impl, coverage for QA)
 //
 // 70/30 RULE ENFORCEMENT:
-//   Expert MUST use its own training knowledge (70%).
-//   Generic LLM knowledge is BLOCKED by default.
-//   Generic is only allowed if blackboard has generic_knowledge_approved
-//   event posted by ALL other experts in the workflow.
-//   If expert needs something not in training, it must post
-//   generic_knowledge_request to blackboard and stop.
+//
+//	Expert MUST use its own training knowledge (70%).
+//	Generic LLM knowledge is BLOCKED by default.
+//	Generic is only allowed if blackboard has generic_knowledge_approved
+//	event posted by ALL other experts in the workflow.
+//	If expert needs something not in training, it must post
+//	generic_knowledge_request to blackboard and stop.
 func (a *AiderRunner) runAiderIteration(
 	ctx context.Context,
 	req AiderRunRequest,
@@ -1068,8 +1095,9 @@ func (a *AiderRunner) runAiderIteration(
 // extractCommitSHA gets the latest commit SHA.
 //
 // MENTAL MODEL:
-//   git rev-parse HEAD returns current commit SHA
-//   Used to track which commits Aider created
+//
+//	git rev-parse HEAD returns current commit SHA
+//	Used to track which commits Aider created
 func (a *AiderRunner) extractCommitSHA(
 	ctx context.Context,
 	workspacePath string,
@@ -1086,23 +1114,25 @@ func (a *AiderRunner) extractCommitSHA(
 // checkGenericApproval checks if generic knowledge is approved for this expert's task.
 //
 // MENTAL MODEL:
-//   Blackboard event: generic_knowledge_approved
-//   Content: { "approved_for_expert_id": "uuid", "topics": ["JWT", "OAuth"] }
 //
-//   If this event exists on blackboard for this expert:
-//   -> Generic knowledge is approved for those topics
-//   -> Expert can use generic LLM knowledge for those topics only
+//	Blackboard event: generic_knowledge_approved
+//	Content: { "approved_for_expert_id": "uuid", "topics": ["JWT", "OAuth"] }
+//
+//	If this event exists on blackboard for this expert:
+//	-> Generic knowledge is approved for those topics
+//	-> Expert can use generic LLM knowledge for those topics only
 //
 // CROSS-QUESTIONS:
-//   Q: Who posts generic_knowledge_approved?
-//   A: Other experts in the workflow (via cross-verification, Step 3)
-//      All experts must approve for generic to be allowed.
 //
-//   Q: What if only some experts approved?
-//   A: Not enough. ALL must approve. (Implemented in Step 3)
+//	Q: Who posts generic_knowledge_approved?
+//	A: Other experts in the workflow (via cross-verification, Step 3)
+//	   All experts must approve for generic to be allowed.
 //
-//   Q: What if no approval events exist?
-//   A: Generic is blocked. Expert must use training only.
+//	Q: What if only some experts approved?
+//	A: Not enough. ALL must approve. (Implemented in Step 3)
+//
+//	Q: What if no approval events exist?
+//	A: Generic is blocked. Expert must use training only.
 func (a *AiderRunner) checkGenericApproval(
 	ctx context.Context,
 	workflowID uuid.UUID,
@@ -1141,21 +1171,23 @@ func (a *AiderRunner) checkGenericApproval(
 // build7030EnforcementInstructions builds the 70/30 rule enforcement text.
 //
 // MENTAL MODEL:
-//   This text is appended to every Aider message.
-//   It explicitly tells Aider:
-//   - Use ONLY training knowledge (70% rule)
-//   - Generic knowledge is BLOCKED unless approved (30% rule)
-//   - If something is missing, post generic_knowledge_request
+//
+//	This text is appended to every Aider message.
+//	It explicitly tells Aider:
+//	- Use ONLY training knowledge (70% rule)
+//	- Generic knowledge is BLOCKED unless approved (30% rule)
+//	- If something is missing, post generic_knowledge_request
 //
 // CROSS-QUESTIONS:
-//   Q: Why append to message instead of system prompt?
-//   A: Aider doesn't have a separate system prompt field.
-//      Message is the only input. Appending ensures it's always present.
 //
-//   Q: What if genericApproved is true?
-//   A: We tell Aider which topics are approved for generic knowledge.
-//      Only those topics can use generic knowledge.
-//      Everything else still requires training knowledge.
+//	Q: Why append to message instead of system prompt?
+//	A: Aider doesn't have a separate system prompt field.
+//	   Message is the only input. Appending ensures it's always present.
+//
+//	Q: What if genericApproved is true?
+//	A: We tell Aider which topics are approved for generic knowledge.
+//	   Only those topics can use generic knowledge.
+//	   Everything else still requires training knowledge.
 func (a *AiderRunner) build7030EnforcementInstructions(
 	genericApproved bool,
 	genericTopics []string,
@@ -1203,43 +1235,46 @@ func (a *AiderRunner) build7030EnforcementInstructions(
 // PHASE 4: QA Phase Support
 //
 // MENTAL MODEL:
-//   QA prompt structure:
-//     1. Task description (from planner)
-//     2. Test requirements (coverage, quality)
-//     3. Observations (test failures, coverage)
-//     4. Best practices (naming, table-driven tests)
+//
+//	QA prompt structure:
+//	  1. Task description (from planner)
+//	  2. Test requirements (coverage, quality)
+//	  3. Observations (test failures, coverage)
+//	  4. Best practices (naming, table-driven tests)
 //
 // CROSS-QUESTIONS:
-//   Q: What makes a good test?
-//   A: - Tests all public functions
-//      - Covers edge cases (empty input, nil, invalid)
-//      - Tests error paths
-//      - Clear naming: TestFunctionName_Scenario_ExpectedResult
 //
-//   Q: Why >80% coverage?
-//   A: Industry standard, balances thoroughness vs cost
+//	Q: What makes a good test?
+//	A: - Tests all public functions
+//	   - Covers edge cases (empty input, nil, invalid)
+//	   - Tests error paths
+//	   - Clear naming: TestFunctionName_Scenario_ExpectedResult
 //
-//   Q: Should we enforce table-driven tests?
-//   A: Recommend in prompt, not enforce (some tests don't fit)
+//	Q: Why >80% coverage?
+//	A: Industry standard, balances thoroughness vs cost
+//
+//	Q: Should we enforce table-driven tests?
+//	A: Recommend in prompt, not enforce (some tests don't fit)
 //
 // EXAMPLE OUTPUT:
-//   "Generate comprehensive tests for auth.go
 //
-//    Requirements:
-//    - Test all public functions (Authenticate, ValidateToken)
-//    - Cover edge cases: empty username, invalid password, expired token
-//    - Test error paths: database errors, network failures
-//    - Achieve >80% code coverage
-//    - Use table-driven tests where appropriate
+//	"Generate comprehensive tests for auth.go
 //
-//    Naming convention:
-//    - TestFunctionName_Scenario_ExpectedResult
-//    - Example: TestAuthenticate_EmptyUsername_ReturnsError
+//	 Requirements:
+//	 - Test all public functions (Authenticate, ValidateToken)
+//	 - Cover edge cases: empty username, invalid password, expired token
+//	 - Test error paths: database errors, network failures
+//	 - Achieve >80% code coverage
+//	 - Use table-driven tests where appropriate
 //
-//    Observations from previous iteration:
-//    Test Failures:
-//    TestAuthenticate_ValidCredentials failed: expected nil error, got 'db connection failed'
-//    Coverage: 45.2%"
+//	 Naming convention:
+//	 - TestFunctionName_Scenario_ExpectedResult
+//	 - Example: TestAuthenticate_EmptyUsername_ReturnsError
+//
+//	 Observations from previous iteration:
+//	 Test Failures:
+//	 TestAuthenticate_ValidCredentials failed: expected nil error, got 'db connection failed'
+//	 Coverage: 45.2%"
 func (a *AiderRunner) buildQAPrompt(taskDescription string, observations string) string {
 	var prompt strings.Builder
 
@@ -1284,42 +1319,45 @@ func (a *AiderRunner) buildQAPrompt(taskDescription string, observations string)
 // loadExpertTraining loads expert's actual training knowledge via RAG.
 //
 // MENTAL MODEL:
-//   Two parts returned as one string:
 //
-//   Part 1 — RULES (reasoning_charter):
-//     "Never use microservices for team < 10"
-//     "Always use bcrypt cost 12 for passwords"
-//     These are hard rules the expert MUST follow.
+//	Two parts returned as one string:
 //
-//   Part 2 — KNOWLEDGE (course_chunks via vector search):
-//     Embed the task description -> find top-10 most relevant chunks
-//     from this expert's training corpus (course_chunks WHERE expert_id=X).
-//     These are the actual patterns, examples, code snippets from transcripts.
+//	Part 1 — RULES (reasoning_charter):
+//	  "Never use microservices for team < 10"
+//	  "Always use bcrypt cost 12 for passwords"
+//	  These are hard rules the expert MUST follow.
+//
+//	Part 2 — KNOWLEDGE (course_chunks via vector search):
+//	  Embed the task description -> find top-10 most relevant chunks
+//	  from this expert's training corpus (course_chunks WHERE expert_id=X).
+//	  These are the actual patterns, examples, code snippets from transcripts.
 //
 // WHY RAG not just charter:
-//   Charter = rules (what to do/not do).
-//   Chunks = knowledge (HOW to do it, with examples).
-//   Without chunks, expert has rules but no knowledge of HOW.
-//   With chunks, expert codes from its own training, not generic LLM knowledge.
+//
+//	Charter = rules (what to do/not do).
+//	Chunks = knowledge (HOW to do it, with examples).
+//	Without chunks, expert has rules but no knowledge of HOW.
+//	With chunks, expert codes from its own training, not generic LLM knowledge.
 //
 // CROSS-QUESTIONS:
-//   Q: Why embed task description for retrieval?
-//   A: We want chunks most relevant to THIS task.
-//      "Implement JWT auth" -> retrieves auth chunks, not caching chunks.
 //
-//   Q: Why top-10 chunks?
-//   A: ~500 tokens/chunk * 10 = ~5000 tokens. Fits in Aider's budget.
-//      More chunks = better coverage but higher cost.
+//	Q: Why embed task description for retrieval?
+//	A: We want chunks most relevant to THIS task.
+//	   "Implement JWT auth" -> retrieves auth chunks, not caching chunks.
 //
-//   Q: What if expert has no chunks (not trained yet)?
-//   A: Return charter only. Log warning. Workflow continues.
-//      Admin must upload transcripts before expert is useful.
+//	Q: Why top-10 chunks?
+//	A: ~500 tokens/chunk * 10 = ~5000 tokens. Fits in Aider's budget.
+//	   More chunks = better coverage but higher cost.
 //
-//   Q: What if ML sidecar is down?
-//   A: Fall back to charter only. Non-fatal. Log error.
+//	Q: What if expert has no chunks (not trained yet)?
+//	A: Return charter only. Log warning. Workflow continues.
+//	   Admin must upload transcripts before expert is useful.
 //
-//   Q: What if task description is empty?
-//   A: Skip RAG, return charter only.
+//	Q: What if ML sidecar is down?
+//	A: Fall back to charter only. Non-fatal. Log error.
+//
+//	Q: What if task description is empty?
+//	A: Skip RAG, return charter only.
 func (a *AiderRunner) loadExpertTraining(
 	ctx context.Context,
 	expertID uuid.UUID,
@@ -1437,38 +1475,41 @@ func (a *AiderRunner) loadExpertTraining(
 // publishCodeArtifacts walks the workspace and posts all code files to blackboard.
 //
 // MENTAL MODEL:
-//   Input: workspace path, expert ID, commit SHAs
-//   Actions:
-//     1. Walk workspace recursively
-//     2. Skip: .git/, design artifacts (ARCHITECTURE.md, etc.)
-//     3. For each code file:
-//        - Read content
-//        - Detect language from extension
-//        - Count lines of code
-//        - Post code_artifact_produced event to blackboard
-//   Output: N events posted (one per code file)
+//
+//	Input: workspace path, expert ID, commit SHAs
+//	Actions:
+//	  1. Walk workspace recursively
+//	  2. Skip: .git/, design artifacts (ARCHITECTURE.md, etc.)
+//	  3. For each code file:
+//	     - Read content
+//	     - Detect language from extension
+//	     - Count lines of code
+//	     - Post code_artifact_produced event to blackboard
+//	Output: N events posted (one per code file)
 //
 // CROSS-QUESTIONS:
-//   Q: Why walk recursively?
-//   A: Aider may create subdirectories (internal/auth/handler.go)
 //
-//   Q: Why skip design artifacts?
-//   A: Already in blackboard from design phase, not code
+//	Q: Why walk recursively?
+//	A: Aider may create subdirectories (internal/auth/handler.go)
 //
-//   Q: Why detect language?
-//   A: Frontend syntax highlighting, validation
+//	Q: Why skip design artifacts?
+//	A: Already in blackboard from design phase, not code
 //
-//   Q: What if no code files?
-//   A: Not an error, just post no events (task may have failed)
+//	Q: Why detect language?
+//	A: Frontend syntax highlighting, validation
+//
+//	Q: What if no code files?
+//	A: Not an error, just post no events (task may have failed)
 //
 // EXAMPLE:
-//   Workspace: /workspaces/abc-123/backend-expert-id/
-//   Files:
-//     - ARCHITECTURE.md (skip)
-//     - shortener.go (post)
-//     - shortener_test.go (post)
-//     - internal/db/schema.sql (post)
-//   Result: 3 events posted
+//
+//	Workspace: /workspaces/abc-123/backend-expert-id/
+//	Files:
+//	  - ARCHITECTURE.md (skip)
+//	  - shortener.go (post)
+//	  - shortener_test.go (post)
+//	  - internal/db/schema.sql (post)
+//	Result: 3 events posted
 func (a *AiderRunner) publishCodeArtifacts(
 	ctx context.Context,
 	req AiderRunRequest,
@@ -1751,11 +1792,12 @@ func (a *AiderRunner) publishCodeArtifacts(
 // expert started (i.e. what seedWorkspace() copied in from prior waves).
 //
 // WHY compare against main/ and not os.Stat on the expert's own workspace:
-//   Every file in the expert's workspace "exists" by the time
-//   publishCodeArtifacts() walks it (that's the whole point of the walk).
-//   The question is whether it existed BEFORE this expert's Aider run,
-//   which is exactly what main/ (pre-merge state) represents. Files not
-//   present in main/ were newly authored by Aider this run.
+//
+//	Every file in the expert's workspace "exists" by the time
+//	publishCodeArtifacts() walks it (that's the whole point of the walk).
+//	The question is whether it existed BEFORE this expert's Aider run,
+//	which is exactly what main/ (pre-merge state) represents. Files not
+//	present in main/ were newly authored by Aider this run.
 //
 // Non-fatal: if main/ can't be inspected (e.g. wave 1, no main/ yet), every
 // file is reported as "create", which is correct (nothing existed before).
@@ -1832,37 +1874,40 @@ func countLines(content []byte) int {
 // PHASE 4: QA Phase Support
 //
 // MENTAL MODEL:
-//   After QA phase completes, post coverage metrics for:
-//     - Frontend display (show coverage badge)
-//     - Audit trail (compliance requirements)
-//     - Other experts (know test quality)
+//
+//	After QA phase completes, post coverage metrics for:
+//	  - Frontend display (show coverage badge)
+//	  - Audit trail (compliance requirements)
+//	  - Other experts (know test quality)
 //
 // CROSS-QUESTIONS:
-//   Q: When to call this?
-//   A: After QA phase completes successfully (result.Completed == true)
 //
-//   Q: What if coverage < 80%?
-//   A: This shouldn't happen (task wouldn't complete)
-//      But if called, still post (passed: false)
+//	Q: When to call this?
+//	A: After QA phase completes successfully (result.Completed == true)
 //
-//   Q: How to count tests?
-//   A: Parse test output for "PASS" or "ok" lines
+//	Q: What if coverage < 80%?
+//	A: This shouldn't happen (task wouldn't complete)
+//	   But if called, still post (passed: false)
 //
-//   Q: What about package-level coverage?
-//   A: Future enhancement. For now, post average.
+//	Q: How to count tests?
+//	A: Parse test output for "PASS" or "ok" lines
+//
+//	Q: What about package-level coverage?
+//	A: Future enhancement. For now, post average.
 //
 // EVENT STRUCTURE:
-//   {
-//     "event_type": "test_coverage_achieved",
-//     "posted_by_expert_id": "expert-uuid",
-//     "content": {
-//       "coverage_percent": 85.7,
-//       "target_percent": 80.0,
-//       "passed": true,
-//       "test_count": 42,
-//       "package_count": 3
-//     }
-//   }
+//
+//	{
+//	  "event_type": "test_coverage_achieved",
+//	  "posted_by_expert_id": "expert-uuid",
+//	  "content": {
+//	    "coverage_percent": 85.7,
+//	    "target_percent": 80.0,
+//	    "passed": true,
+//	    "test_count": 42,
+//	    "package_count": 3
+//	  }
+//	}
 func (a *AiderRunner) postCoverageMetrics(
 	ctx context.Context,
 	req AiderRunRequest,
@@ -1912,24 +1957,26 @@ func (a *AiderRunner) postCoverageMetrics(
 // PHASE 4: QA Phase Support
 //
 // MENTAL MODEL:
-//   Test output contains lines like:
-//     ok      package1    0.123s
-//     ok      package2    0.456s
-//   Each "ok" line represents one or more tests in that package.
 //
-//   More accurate: count "PASS: TestName" lines
-//   But "ok" lines are simpler and good enough.
+//	Test output contains lines like:
+//	  ok      package1    0.123s
+//	  ok      package2    0.456s
+//	Each "ok" line represents one or more tests in that package.
+//
+//	More accurate: count "PASS: TestName" lines
+//	But "ok" lines are simpler and good enough.
 //
 // CROSS-QUESTIONS:
-//   Q: Why count "ok" lines?
-//   A: Simple heuristic, one line per package with tests
 //
-//   Q: What about individual test count?
-//   A: Would need to parse "=== RUN TestName" lines
-//      Future enhancement if needed
+//	Q: Why count "ok" lines?
+//	A: Simple heuristic, one line per package with tests
 //
-//   Q: What if no tests?
-//   A: Return 0 (valid case for first iteration)
+//	Q: What about individual test count?
+//	A: Would need to parse "=== RUN TestName" lines
+//	   Future enhancement if needed
+//
+//	Q: What if no tests?
+//	A: Return 0 (valid case for first iteration)
 func (a *AiderRunner) countTests(output string) int {
 	lines := strings.Split(output, "\n")
 	count := 0
@@ -1947,15 +1994,17 @@ func (a *AiderRunner) countTests(output string) int {
 // PHASE 4: QA Phase Support
 //
 // MENTAL MODEL:
-//   Same as countTests() - each "ok" line is one package
-//   This is a duplicate for clarity (may diverge in future)
+//
+//	Same as countTests() - each "ok" line is one package
+//	This is a duplicate for clarity (may diverge in future)
 //
 // CROSS-QUESTIONS:
-//   Q: Why separate method?
-//   A: Semantic clarity, may count differently in future
 //
-//   Q: What about failed packages?
-//   A: Count "FAIL" lines too
+//	Q: Why separate method?
+//	A: Semantic clarity, may count differently in future
+//
+//	Q: What about failed packages?
+//	A: Count "FAIL" lines too
 func (a *AiderRunner) countPackages(output string) int {
 	lines := strings.Split(output, "\n")
 	count := 0
@@ -1974,37 +2023,40 @@ func (a *AiderRunner) countPackages(output string) int {
 // PHASE 5: Production Hardening - Error Recovery
 //
 // MENTAL MODEL:
-//   After each successful iteration, save state:
-//     INSERT INTO aider_checkpoints (...)
-//     ON CONFLICT (workflow_id, expert_id, task_id)
-//     DO UPDATE SET current_iteration = ..., updated_at = NOW()
+//
+//	After each successful iteration, save state:
+//	  INSERT INTO aider_checkpoints (...)
+//	  ON CONFLICT (workflow_id, expert_id, task_id)
+//	  DO UPDATE SET current_iteration = ..., updated_at = NOW()
 //
 // CROSS-QUESTIONS:
-//   Q: What if save fails?
-//   A: Log error but don't fail iteration (non-fatal)
-//      Worst case: restart from beginning (acceptable)
 //
-//   Q: Should we use transaction?
-//   A: No, checkpoint is independent of main workflow
-//      Failure to save checkpoint shouldn't rollback iteration
+//	Q: What if save fails?
+//	A: Log error but don't fail iteration (non-fatal)
+//	   Worst case: restart from beginning (acceptable)
 //
-//   Q: What about concurrent saves?
-//   A: ON CONFLICT handles race conditions
-//      Last write wins (acceptable for checkpoints)
+//	Q: Should we use transaction?
+//	A: No, checkpoint is independent of main workflow
+//	   Failure to save checkpoint shouldn't rollback iteration
+//
+//	Q: What about concurrent saves?
+//	A: ON CONFLICT handles race conditions
+//	   Last write wins (acceptable for checkpoints)
 //
 // SQL:
-//   CREATE TABLE aider_checkpoints (
-//     workflow_id UUID NOT NULL,
-//     expert_id UUID NOT NULL,
-//     task_id UUID NOT NULL,
-//     current_iteration INT NOT NULL,
-//     commit_shas JSONB NOT NULL,
-//     last_observation TEXT,
-//     completed BOOLEAN DEFAULT FALSE,
-//     created_at TIMESTAMPTZ DEFAULT NOW(),
-//     updated_at TIMESTAMPTZ DEFAULT NOW(),
-//     PRIMARY KEY (workflow_id, expert_id, task_id)
-//   );
+//
+//	CREATE TABLE aider_checkpoints (
+//	  workflow_id UUID NOT NULL,
+//	  expert_id UUID NOT NULL,
+//	  task_id UUID NOT NULL,
+//	  current_iteration INT NOT NULL,
+//	  commit_shas JSONB NOT NULL,
+//	  last_observation TEXT,
+//	  completed BOOLEAN DEFAULT FALSE,
+//	  created_at TIMESTAMPTZ DEFAULT NOW(),
+//	  updated_at TIMESTAMPTZ DEFAULT NOW(),
+//	  PRIMARY KEY (workflow_id, expert_id, task_id)
+//	);
 func (a *AiderRunner) saveCheckpoint(
 	ctx context.Context,
 	checkpoint *AiderCheckpoint,
@@ -2064,23 +2116,25 @@ func (a *AiderRunner) saveCheckpoint(
 // PHASE 5: Production Hardening - Error Recovery
 //
 // MENTAL MODEL:
-//   On pod restart, check if checkpoint exists:
-//     SELECT * FROM aider_checkpoints
-//     WHERE workflow_id = ? AND expert_id = ? AND task_id = ?
 //
-//   If exists: Resume from checkpoint.CurrentIteration + 1
-//   If not exists: Start from iteration 1 (normal flow)
+//	On pod restart, check if checkpoint exists:
+//	  SELECT * FROM aider_checkpoints
+//	  WHERE workflow_id = ? AND expert_id = ? AND task_id = ?
+//
+//	If exists: Resume from checkpoint.CurrentIteration + 1
+//	If not exists: Start from iteration 1 (normal flow)
 //
 // CROSS-QUESTIONS:
-//   Q: What if checkpoint doesn't exist?
-//   A: Return nil, nil (not an error, just no checkpoint)
 //
-//   Q: What if query fails?
-//   A: Return error (caller decides: fail or start fresh)
+//	Q: What if checkpoint doesn't exist?
+//	A: Return nil, nil (not an error, just no checkpoint)
 //
-//   Q: Should we validate checkpoint?
-//   A: Yes, check if completed=true (shouldn't happen)
-//      If completed, delete checkpoint and start fresh
+//	Q: What if query fails?
+//	A: Return error (caller decides: fail or start fresh)
+//
+//	Q: Should we validate checkpoint?
+//	A: Yes, check if completed=true (shouldn't happen)
+//	   If completed, delete checkpoint and start fresh
 func (a *AiderRunner) loadCheckpoint(
 	ctx context.Context,
 	workflowID, expertID, taskID uuid.UUID,
@@ -2159,30 +2213,33 @@ func (a *AiderRunner) loadCheckpoint(
 // PHASE 5: Production Hardening - Resource Limits
 //
 // MENTAL MODEL:
-//   Walk workspace recursively, sum file sizes:
-//     filepath.Walk(workspacePath, func(path, info, err) {
-//       if !info.IsDir() {
-//         totalSize += info.Size()
-//       }
-//     })
+//
+//	Walk workspace recursively, sum file sizes:
+//	  filepath.Walk(workspacePath, func(path, info, err) {
+//	    if !info.IsDir() {
+//	      totalSize += info.Size()
+//	    }
+//	  })
 //
 // CROSS-QUESTIONS:
-//   Q: Should we include .git/?
-//   A: Yes, git history counts toward disk usage
-//      Large repos can have big .git/ directories
 //
-//   Q: What if walk fails?
-//   A: Return error (caller decides: fail or continue)
+//	Q: Should we include .git/?
+//	A: Yes, git history counts toward disk usage
+//	   Large repos can have big .git/ directories
 //
-//   Q: Should we cache size?
-//   A: No, recalculate each iteration (size changes)
-//      Caching would give stale data
+//	Q: What if walk fails?
+//	A: Return error (caller decides: fail or continue)
 //
-//   Q: What about symlinks?
-//   A: Count symlink size, not target (standard behavior)
+//	Q: Should we cache size?
+//	A: No, recalculate each iteration (size changes)
+//	   Caching would give stale data
+//
+//	Q: What about symlinks?
+//	A: Count symlink size, not target (standard behavior)
 //
 // RETURNS:
-//   Total size in bytes (includes all files and .git/)
+//
+//	Total size in bytes (includes all files and .git/)
 func (a *AiderRunner) getWorkspaceSize(workspacePath string) (int64, error) {
 	var totalSize int64
 
@@ -2216,22 +2273,24 @@ func (a *AiderRunner) getWorkspaceSize(workspacePath string) (int64, error) {
 // PHASE 5: Production Hardening - Error Recovery
 //
 // MENTAL MODEL:
-//   After task completes successfully, cleanup:
-//     DELETE FROM aider_checkpoints
-//     WHERE workflow_id = ? AND expert_id = ? AND task_id = ?
+//
+//	After task completes successfully, cleanup:
+//	  DELETE FROM aider_checkpoints
+//	  WHERE workflow_id = ? AND expert_id = ? AND task_id = ?
 //
 // CROSS-QUESTIONS:
-//   Q: When to delete?
-//   A: After task completes (Completed=true)
-//      Also after loading completed checkpoint (cleanup)
 //
-//   Q: What if delete fails?
-//   A: Log error but don't fail task (non-fatal)
-//      Checkpoint will be cleaned up by TTL job
+//	Q: When to delete?
+//	A: After task completes (Completed=true)
+//	   Also after loading completed checkpoint (cleanup)
 //
-//   Q: Should we delete on failure?
-//   A: No, keep checkpoint for debugging
-//      TTL job will clean up old checkpoints (>7 days)
+//	Q: What if delete fails?
+//	A: Log error but don't fail task (non-fatal)
+//	   Checkpoint will be cleaned up by TTL job
+//
+//	Q: Should we delete on failure?
+//	A: No, keep checkpoint for debugging
+//	   TTL job will clean up old checkpoints (>7 days)
 func (a *AiderRunner) deleteCheckpoint(
 	ctx context.Context,
 	workflowID, expertID, taskID uuid.UUID,
