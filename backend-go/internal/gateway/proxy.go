@@ -182,9 +182,15 @@ func (g *ModelGateway) ProxyHandler(c *gin.Context) {
 		return
 	}
 
+	// Aider does not set max_tokens, so this default is what every code
+	// generation request gets. 4000 was too small to hold a first pass at a
+	// backend package: the reply would be cut off mid SEARCH/REPLACE block and
+	// discarded as malformed. The gateway clamps this down to whatever the
+	// active provider actually allows (ModelGateway.Call), so asking for more
+	// than a provider supports is safe.
 	maxTokens := req.MaxTokens
 	if maxTokens == 0 {
-		maxTokens = 4000
+		maxTokens = 8000
 	}
 
 	// Cost attribution: parse the header into the gateway's WorkflowID so

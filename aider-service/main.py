@@ -80,6 +80,18 @@ class IterateRequest(BaseModel):
     message: str
     expert_id: str
     workflow_id: str
+    # Files added to Aider's chat as editable, relative to workspace_path.
+    # Empty is normal on a greenfield task — the edit format lets the model
+    # create new files without asking.
+    edit_files: list[str] = []
+    # Files added as reference material the model may read but must not change
+    # (the approved design documents).
+    #
+    # WHY they must be listed: Aider only reads files that are in the chat.
+    # Writing them into the workspace leaves them closed, and the repo map shows
+    # little more than an .md file's headings — so the model was asked to
+    # implement a design it could not actually see.
+    read_only_files: list[str] = []
 
 
 class IterateResponse(BaseModel):
@@ -92,6 +104,22 @@ class IterateResponse(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+def _existing_paths(workspace_path: str, names: list[str]) -> list[str]:
+    """Turn workspace-relative names into absolute paths, skipping missing ones.
+
+    Missing entries are skipped rather than passed through: for a name that does
+    not exist, Aider's Coder creates an empty file and adds it to the chat, which
+    would litter the repository with empty files whenever the caller's list drifts
+    from what is actually on disk.
+    """
+    resolved = []
+    for name in names:
+        path = os.path.join(workspace_path, name)
+        if os.path.isfile(path):
+            resolved.append(path)
+    return resolved
 
 
 def _git(workspace_path: str, *args: str) -> str:
@@ -153,12 +181,18 @@ def iterate(req: IterateRequest) -> IterateResponse:
 
         head_before = _git(req.workspace_path, "rev-parse", "HEAD")
 
+        # Resolve against the workspace: Aider stores absolute paths, and a
+        # relative name would resolve against this process's cwd (/app).
+        edit_paths = _existing_paths(req.workspace_path, req.edit_files)
+        read_only_paths = _existing_paths(req.workspace_path, req.read_only_files)
+
         coder = Coder.create(
             main_model=model,
             edit_format=AIDER_EDIT_FORMAT,
             io=io,
             repo=repo,
-            fnames=[],  # start empty; the repo map lets Aider ask for files
+            fnames=edit_paths,
+            read_only_fnames=read_only_paths,
             auto_commits=True,
             dirty_commits=False,
             # stream=False: Coder defaults to streaming, and the proxy returns

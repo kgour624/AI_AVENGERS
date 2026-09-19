@@ -209,12 +209,13 @@ func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunRe
 	}
 
 	// Step 2: Load design artifacts from blackboard → seed files
-	if err := a.seedWorkspace(ctx, req.WorkflowID, workspacePath); err != nil {
+	designFiles, err := a.seedWorkspace(ctx, req.WorkflowID, workspacePath)
+	if err != nil {
 		return nil, fmt.Errorf("seed workspace: %w", err)
 	}
 
 	// Step 3: Run Aider loop (OTA: Observe → Think → Act)
-	result, err := a.runAiderLoop(ctx, req, workspacePath)
+	result, err := a.runAiderLoop(ctx, req, workspacePath, designFiles)
 	if err != nil {
 		return nil, fmt.Errorf("aider loop: %w", err)
 	}
@@ -325,13 +326,27 @@ func (a *AiderRunner) initWorkspace(ctx context.Context, workspacePath string) e
 // seedWorkspace loads design artifacts from blackboard AND copies files from
 // the shared main/ workspace (populated by WorkspaceMerger after prior waves).
 //
+// Returns the relative paths of the design files it wrote, so the caller can
+// hand them to Aider as read-only context. Without that list the docs sit in
+// the workspace unopened: Aider only reads files that are in the chat, and the
+// repo map shows an .md file as little more than its headings.
+//
 // MENTAL MODEL — two seed sources:
 //
 //	Source 1: Blackboard design events
-//	  architecture_decision  → ARCHITECTURE.md
-//	  data_model_proposed    → DATA_MODEL.md
-//	  api_contract_proposed  → API_CONTRACT.yaml
-//	  module_design_proposed → MODULE_DESIGN.md
+//	  architecture_decision  → design/0007_architecture_decision.md
+//	  data_model_proposed    → design/0009_data_model_proposed.md
+//	  api_contract_proposed  → design/0011_api_contract_proposed.yaml
+//	  module_design_proposed → design/0014_module_design_proposed.md
+//
+//	One file per event, prefixed with the blackboard sequence number.
+//	WHY not one file per event TYPE: a workflow produces many artifacts of
+//	the same type — three experts each posting two architecture_decision
+//	events is six. Mapping type → fixed filename made every one of them
+//	overwrite the last, so Aider received only the final artifact of each
+//	type and the rest of the approved design was silently thrown away before
+//	the implementation phase ever started. The sequence number is already
+//	unique per workflow and keeps the files in the order they were decided.
 //
 //	Source 2: main/ workspace (prior wave code files)
 //	  /workspaces/{workflow_id}/main/auth.go
@@ -348,7 +363,7 @@ func (a *AiderRunner) initWorkspace(ctx context.Context, workspacePath string) e
 // ORDER: blackboard first, then main/ overlay.
 //
 //	main/ files take precedence (they are the latest merged state).
-func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, workspacePath string) error {
+func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, workspacePath string) ([]string, error) {
 	// --- Source 1: Blackboard design artifacts ---
 	events, err := a.store.GetByType(ctx, workflowID, []string{
 		"architecture_decision",
@@ -357,18 +372,24 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 		"module_design_proposed",
 	}, 0)
 	if err != nil {
-		return fmt.Errorf("load design artifacts: %w", err)
+		return nil, fmt.Errorf("load design artifacts: %w", err)
 	}
 
+	var designFiles []string
 	for _, ev := range events {
-		filename := a.artifactToFilename(ev.EventType)
+		filename := artifactFilename(ev)
 		filePath := filepath.Join(workspacePath, filename)
-		if err := os.WriteFile(filePath, ev.Content, 0644); err != nil {
-			return fmt.Errorf("write %s: %w", filename, err)
+		if err := os.MkdirAll(filepath.Dir(filePath), 0755); err != nil {
+			return nil, fmt.Errorf("make dir for %s: %w", filename, err)
 		}
+		if err := os.WriteFile(filePath, ev.Content, 0644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", filename, err)
+		}
+		designFiles = append(designFiles, filename)
 		a.logger.Debug("seed file created from blackboard",
 			zap.String("file", filename),
 			zap.String("event_type", ev.EventType),
+			zap.Int64("seq", ev.SequenceNumber),
 		)
 	}
 
@@ -415,41 +436,41 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 	cmd.Dir = workspacePath
 	if output, err := cmd.CombinedOutput(); err != nil {
 		if !strings.Contains(string(output), "nothing to commit") {
-			return fmt.Errorf("git commit: %w (output: %s)", err, string(output))
+			return nil, fmt.Errorf("git commit: %w (output: %s)", err, string(output))
 		}
 	}
 
 	a.logger.Info("workspace seeded",
 		zap.String("workflow_id", workflowID.String()),
 		zap.Int("blackboard_artifacts", len(events)),
+		zap.Int("design_files_written", len(designFiles)),
 	)
 
-	return nil
+	return designFiles, nil
 }
 
-// artifactToFilename maps blackboard event types to filenames.
+// artifactFilename builds a unique, stable path for one design artifact.
 //
-// MENTAL MODEL:
+//	design/{sequence}_{event_type}.{ext}
 //
-//	Event Type                → Filename
-//	architecture_decision     → ARCHITECTURE.md
-//	data_model_proposed       → DATA_MODEL.md
-//	api_contract_proposed     → API_CONTRACT.yaml
-//	module_design_proposed    → MODULE_DESIGN.md
-//	(default)                 → DESIGN.md
-func (a *AiderRunner) artifactToFilename(eventType string) string {
-	switch eventType {
-	case "architecture_decision":
-		return "ARCHITECTURE.md"
-	case "data_model_proposed":
-		return "DATA_MODEL.md"
-	case "api_contract_proposed":
-		return "API_CONTRACT.yaml"
-	case "module_design_proposed":
-		return "MODULE_DESIGN.md"
-	default:
-		return "DESIGN.md"
+// The sequence number is the blackboard sequence, unique per workflow and
+// already ordered by when the decision was made. api_contract_proposed gets
+// .yaml, everything else .md.
+//
+// They live under design/ rather than the workspace root so the generated code
+// and the reference material never sit in the same directory — the merger and
+// the code-artifact publisher both work on the root, and a design doc there
+// reads as project output.
+func artifactFilename(ev blackboard.Event) string {
+	ext := ".md"
+	if ev.EventType == "api_contract_proposed" {
+		ext = ".yaml"
 	}
+	eventType := ev.EventType
+	if eventType == "" {
+		eventType = "design"
+	}
+	return fmt.Sprintf("design/%04d_%s%s", ev.SequenceNumber, eventType, ext)
 }
 
 // runAiderLoop executes the OTA loop: Observe → Think → Act.
@@ -492,9 +513,13 @@ func (a *AiderRunner) runAiderLoop(
 	ctx context.Context,
 	req AiderRunRequest,
 	workspacePath string,
+	designFiles []string,
 ) (*AiderRunResult, error) {
 	const maxIterations = 5
 	var commitSHAs []string
+	// Reason the last iteration produced nothing. Reported if every iteration
+	// comes back empty, so the caller learns why instead of just "failed".
+	var lastIterationErr error
 
 	// PHASE 5: Load checkpoint for recovery
 	// Try to resume from previous run (pod restart)
@@ -568,11 +593,13 @@ func (a *AiderRunner) runAiderLoop(
 			workspacePath,
 			observations,
 			iteration,
+			designFiles,
 		)
 		cancel() // Always cancel to release resources
 
 		if err != nil {
-			// Check if timeout
+			// A timeout is still fatal: the 5-minute budget is per iteration,
+			// and a run that blew through it will blow through the next one.
 			if iterationCtx.Err() == context.DeadlineExceeded {
 				a.logger.Error("aider iteration timeout",
 					zap.Int("iteration", iteration),
@@ -580,7 +607,24 @@ func (a *AiderRunner) runAiderLoop(
 				)
 				return nil, fmt.Errorf("aider iteration %d timeout after 5 minutes", iteration)
 			}
-			return nil, fmt.Errorf("aider iteration %d: %w", iteration, err)
+
+			// Everything else is a retry signal, not the end of the task.
+			//
+			// WHY: this loop exists so that iteration N+1 can act on what
+			// iteration N observed — build errors, test failures, a model that
+			// asked a question instead of writing code. Returning on the first
+			// error made maxIterations a lie: iteration 2 never ran, and one
+			// unproductive first response killed the whole task. The honest
+			// failure condition is "five iterations and still no commit",
+			// which is checked after the loop.
+			lastIterationErr = err
+			a.logger.Warn("aider iteration produced nothing, continuing to next iteration",
+				zap.Int("iteration", iteration),
+				zap.Int("max", maxIterations),
+				zap.Int("commits_so_far", len(commitSHAs)),
+				zap.Error(err),
+			)
+			continue
 		}
 
 		if commitSHA != "" {
@@ -631,9 +675,20 @@ func (a *AiderRunner) runAiderLoop(
 		}
 	}
 
-	// Max iterations reached
+	// Every iteration ran and not one of them committed anything. Only now is
+	// the task a failure, and the reason is the last iteration's own error
+	// rather than a generic "all tasks failed".
+	if len(commitSHAs) == 0 {
+		if lastIterationErr != nil {
+			return nil, fmt.Errorf("no commit after %d iterations: %w", maxIterations, lastIterationErr)
+		}
+		return nil, fmt.Errorf("no commit after %d iterations", maxIterations)
+	}
+
+	// Max iterations reached with partial work committed.
 	a.logger.Warn("max iterations reached",
 		zap.Int("iterations", maxIterations),
+		zap.Int("commits", len(commitSHAs)),
 	)
 
 	return &AiderRunResult{
@@ -924,6 +979,7 @@ func (a *AiderRunner) runAiderIteration(
 	workspacePath string,
 	observations string,
 	iteration int,
+	designFiles []string,
 ) (commitSHA string, taskComplete bool, err error) {
 	// Step 1: Check if generic knowledge is approved for this task.
 	//
@@ -951,11 +1007,7 @@ func (a *AiderRunner) runAiderIteration(
 	if req.WorkflowPhase == "qa" {
 		message = a.buildQAPrompt(req.TaskDescription, observations)
 	} else {
-		// Implementation phase
-		message = req.TaskDescription
-		if observations != "" {
-			message += "\n\nObservations from previous iteration:\n" + observations
-		}
+		message = a.buildImplementationPrompt(req, observations, designFiles)
 	}
 
 	// Step 4: Add training knowledge
@@ -978,7 +1030,18 @@ func (a *AiderRunner) runAiderIteration(
 	//   A: Yes, Aider respects system-level instructions in the message.
 	//      The instructions are clear and specific.
 	//      Aider is designed to follow user instructions precisely.
-	message += a.build7030EnforcementInstructions(genericApproved, genericTopics)
+	message += a.build7030EnforcementInstructions(genericApproved, genericTopics, training != "", len(designFiles) > 0)
+
+	// Files Aider is allowed to edit: everything git tracks except the seeded
+	// design docs. On the first wave of a new project this is empty, which is
+	// fine — Aider's edit format lets it create new files without asking.
+	editFiles, listErr := a.listEditableFiles(ctx, workspacePath)
+	if listErr != nil {
+		a.logger.Warn("could not list editable files, Aider will start with none",
+			zap.String("workspace", workspacePath),
+			zap.Error(listErr),
+		)
+	}
 
 	// Call AiderService HTTP API
 	// WHY HTTP not CLI: AiderService routes LLM calls through ModelGateway
@@ -988,6 +1051,16 @@ func (a *AiderRunner) runAiderIteration(
 		Message       string `json:"message"`
 		ExpertID      string `json:"expert_id"`
 		WorkflowID    string `json:"workflow_id"`
+		// EditFiles are added to Aider's chat as editable.
+		EditFiles []string `json:"edit_files"`
+		// ReadOnlyFiles are added as reference material Aider may read but
+		// must not modify — the approved design documents.
+		//
+		// WHY they have to be listed at all: Aider only reads files that are
+		// in the chat. Seeding them into the workspace put them on disk but
+		// left them closed, so the model was asked to implement a design it
+		// could not see and answered with questions instead of code.
+		ReadOnlyFiles []string `json:"read_only_files"`
 	}
 	type aiderServiceResponse struct {
 		CommitSHA    string   `json:"commit_sha"`
@@ -1001,7 +1074,17 @@ func (a *AiderRunner) runAiderIteration(
 		Message:       message,
 		ExpertID:      req.Expert.ID.String(),
 		WorkflowID:    req.WorkflowID.String(),
+		EditFiles:     editFiles,
+		ReadOnlyFiles: designFiles,
 	}
+
+	a.logger.Info("aider iteration request",
+		zap.Int("iteration", iteration),
+		zap.Int("edit_files", len(editFiles)),
+		zap.Int("read_only_design_files", len(designFiles)),
+		zap.Bool("has_training", training != ""),
+		zap.Int("message_chars", len(message)),
+	)
 	bodyBytes, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", false, fmt.Errorf("marshal aider request: %w", err)
@@ -1188,19 +1271,51 @@ func (a *AiderRunner) checkGenericApproval(
 //	A: We tell Aider which topics are approved for generic knowledge.
 //	   Only those topics can use generic knowledge.
 //	   Everything else still requires training knowledge.
+//
+// hasTraining reports whether any training chunks were actually retrieved for
+// this expert. designFilesPresent reports whether the approved design documents
+// were seeded into the workspace and opened for reading.
+//
+// WHY those two flags: with no training chunks, "your training is your ONLY
+// source of truth" instructs the model to build from nothing, and the only
+// obedient answer is to write no code. That is exactly what happened on the
+// first real run — two of three experts retrieved zero chunks and all three
+// produced no edits. The approved design documents are a legitimate source in
+// that case: they are this workflow's own output, already passed through the
+// gate system and approved by the client, so naming them does not open the door
+// to generic invention.
 func (a *AiderRunner) build7030EnforcementInstructions(
 	genericApproved bool,
 	genericTopics []string,
+	hasTraining bool,
+	designFilesPresent bool,
 ) string {
 	var sb strings.Builder
 
 	sb.WriteString("\n\n=== KNOWLEDGE USAGE RULES (MANDATORY, NO EXCEPTIONS) ===\n")
 	sb.WriteString("You are a domain expert with specific training. Follow these rules strictly:\n\n")
 
-	sb.WriteString("RULE 1 — USE YOUR TRAINING ONLY:\n")
-	sb.WriteString("  Code and design ONLY from the training knowledge provided above.\n")
-	sb.WriteString("  Your training chunks are your ONLY source of truth.\n")
-	sb.WriteString("  Do NOT use generic LLM knowledge, internet knowledge, or assumptions.\n\n")
+	switch {
+	case hasTraining:
+		sb.WriteString("RULE 1 — USE YOUR TRAINING AND THE APPROVED DESIGN:\n")
+		sb.WriteString("  Build ONLY from the training knowledge provided above and the\n")
+		sb.WriteString("  approved design documents opened for reading in this chat.\n")
+		sb.WriteString("  Those two are your ONLY sources of truth.\n")
+		sb.WriteString("  Do NOT use generic LLM knowledge, internet knowledge, or assumptions.\n\n")
+	case designFilesPresent:
+		sb.WriteString("RULE 1 — BUILD FROM THE APPROVED DESIGN:\n")
+		sb.WriteString("  No training excerpt was retrieved for this task.\n")
+		sb.WriteString("  Build ONLY from the approved design documents opened for reading in\n")
+		sb.WriteString("  this chat. They are this project's agreed design and your ONLY source\n")
+		sb.WriteString("  of truth here.\n")
+		sb.WriteString("  Do NOT use generic LLM knowledge, internet knowledge, or assumptions.\n")
+		sb.WriteString("  Implement exactly what the design specifies — nothing beyond it.\n\n")
+	default:
+		sb.WriteString("RULE 1 — NO APPROVED SOURCE IS AVAILABLE:\n")
+		sb.WriteString("  Neither training knowledge nor design documents were provided.\n")
+		sb.WriteString("  Do NOT invent an implementation. Reply with a short list of exactly\n")
+		sb.WriteString("  what is missing and write no code.\n\n")
+	}
 
 	if genericApproved && len(genericTopics) > 0 {
 		sb.WriteString("RULE 2 — GENERIC KNOWLEDGE (APPROVED FOR SPECIFIC TOPICS):\n")
@@ -1215,19 +1330,106 @@ func (a *AiderRunner) build7030EnforcementInstructions(
 		sb.WriteString("  No expert consensus has been reached to allow generic knowledge.\n\n")
 	}
 
-	sb.WriteString("RULE 3 — IF TRAINING IS INSUFFICIENT:\n")
-	sb.WriteString("  If your training knowledge does not cover what you need:\n")
-	sb.WriteString("  1. Do NOT guess or use generic knowledge.\n")
+	sb.WriteString("RULE 3 — IF YOUR SOURCES ARE INSUFFICIENT:\n")
+	sb.WriteString("  If the approved sources do not cover part of what you need:\n")
+	sb.WriteString("  1. Do NOT guess or use generic knowledge for that part.\n")
 	sb.WriteString("  2. Write a comment in the code: // TRAINING_GAP: [what is missing]\n")
-	sb.WriteString("  3. Implement what you CAN from training.\n")
-	sb.WriteString("  4. Leave TODO comments for gaps.\n\n")
+	sb.WriteString("  3. Still implement every part that IS covered — a gap in one area is\n")
+	sb.WriteString("     never a reason to write no code at all.\n")
+	sb.WriteString("  4. Leave TODO comments for the gaps.\n\n")
 
 	sb.WriteString("RULE 4 — CITATION:\n")
 	sb.WriteString("  For every significant design decision, add a comment:\n")
-	sb.WriteString("  // SOURCE: [Training N] - [brief reason]\n")
-	sb.WriteString("  This proves your code comes from training, not generic knowledge.\n")
+	sb.WriteString("  // SOURCE: [Training N | design/<file>] - [brief reason]\n")
+	sb.WriteString("  This proves your code comes from an approved source, not generic knowledge.\n")
 
 	return sb.String()
+}
+
+// buildImplementationPrompt builds the implementation-phase instruction.
+//
+// WHY this exists at all: the implementation phase used to send the planner's
+// task description verbatim. That description was written for the design phase
+// — "System design for real-time Kanban with WebSocket broadcast" — so the model
+// was literally asked to do system design and answered with prose. Nothing in
+// the message said "write source files into this repository". The QA phase
+// already had buildQAPrompt for exactly this reason; implementation had nothing.
+func (a *AiderRunner) buildImplementationPrompt(
+	req AiderRunRequest,
+	observations string,
+	designFiles []string,
+) string {
+	var sb strings.Builder
+
+	sb.WriteString("IMPLEMENTATION TASK — write working source code into this repository.\n\n")
+	sb.WriteString("Your assignment: ")
+	sb.WriteString(req.TaskTitle)
+	sb.WriteString("\n\n")
+	if req.TaskDescription != "" && req.TaskDescription != req.TaskTitle {
+		sb.WriteString("Scope:\n")
+		sb.WriteString(req.TaskDescription)
+		sb.WriteString("\n\n")
+	}
+
+	sb.WriteString("WHAT TO PRODUCE:\n")
+	sb.WriteString("  - Real, compiling source files — not prose, not pseudocode, not a plan.\n")
+	sb.WriteString("  - Create whatever new files the task needs. You do not need permission\n")
+	sb.WriteString("    to create a file: use a SEARCH/REPLACE block with the new path and an\n")
+	sb.WriteString("    empty SEARCH section.\n")
+	sb.WriteString("  - Only the part of the system assigned to you above. Another expert owns\n")
+	sb.WriteString("    each of the other parts; do not implement theirs.\n")
+	sb.WriteString("  - Every reply that changes anything MUST contain SEARCH/REPLACE blocks.\n")
+	sb.WriteString("    If you have a question, make your best decision from the approved\n")
+	sb.WriteString("    sources and write the code — there is no human in this loop to answer.\n\n")
+
+	if len(designFiles) > 0 {
+		sb.WriteString("APPROVED DESIGN (read-only, already open in this chat):\n")
+		for _, f := range designFiles {
+			sb.WriteString("  - ")
+			sb.WriteString(f)
+			sb.WriteString("\n")
+		}
+		sb.WriteString("  These are the decisions the client approved. Implement them as written.\n")
+		sb.WriteString("  Do not edit these files.\n\n")
+	}
+
+	if observations != "" {
+		sb.WriteString("OBSERVATIONS FROM THE PREVIOUS ITERATION (fix these first):\n")
+		sb.WriteString(observations)
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
+}
+
+// listEditableFiles returns the git-tracked files Aider may edit: everything in
+// the workspace except the seeded design documents under design/.
+//
+// git ls-files rather than a filesystem walk: it already honours .gitignore and
+// never returns anything inside .git.
+func (a *AiderRunner) listEditableFiles(ctx context.Context, workspacePath string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "ls-files")
+	cmd.Dir = workspacePath
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git ls-files: %w", err)
+	}
+
+	var files []string
+	for _, line := range strings.Split(string(output), "\n") {
+		name := strings.TrimSpace(line)
+		if name == "" {
+			continue
+		}
+		// design/ holds the approved design documents. They go to Aider as
+		// read-only context; listing them here would let the model "implement"
+		// the task by rewriting its own specification.
+		if strings.HasPrefix(name, "design/") {
+			continue
+		}
+		files = append(files, name)
+	}
+	return files, nil
 }
 
 // buildQAPrompt constructs a QA-specific prompt for test generation.
@@ -1661,13 +1863,22 @@ func (a *AiderRunner) publishCodeArtifacts(
 			return nil
 		}
 
-		// Skip design artifacts (already in blackboard from design phase)
+		// Skip the seeded design artifacts. They came FROM the blackboard in
+		// seedWorkspace; re-publishing them would duplicate the design phase's
+		// own output as this expert's code.
+		//
+		// Matched by the design/ prefix, not by filename: artifactFilename()
+		// writes design/{seq}_{event_type}.{md|yaml}, and one of those
+		// extensions is .yaml — which detectLanguage() recognises, so a name
+		// check alone would let the API contract through and hand a
+		// specification document to the code validator.
+		relFromRoot, relErr := filepath.Rel(workspacePath, path)
+		if relErr == nil && strings.HasPrefix(filepath.ToSlash(relFromRoot), "design/") {
+			return nil
+		}
+
 		filename := filepath.Base(path)
-		if filename == "ARCHITECTURE.md" ||
-			filename == "DATA_MODEL.md" ||
-			filename == "API_CONTRACTS.md" ||
-			filename == ".gitignore" ||
-			filename == "README.md" {
+		if filename == ".gitignore" || filename == "README.md" {
 			return nil
 		}
 
