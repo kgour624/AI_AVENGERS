@@ -313,11 +313,41 @@ func (t *Tools) AskClient(ctx context.Context, req AskClientRequest) (uuid.UUID,
 	// Step 2: Post question_to_client event on blackboard.
 	// Include approval_id so the SSE stream carries it to the frontend.
 	// camelizeKeys in useKanbanStream.ts converts approval_id → approvalId.
-	fromExpertID := req.FromExpertID
+	//
+	// BUG FIX: blackboard_events has CHECK constraint
+	// blackboard_events_poster_check (migration 006):
+	//   (posted_by_expert_id IS NOT NULL AND posted_by_client = FALSE) OR
+	//   (posted_by_expert_id IS NULL     AND posted_by_client = TRUE)
+	// plus an FK: posted_by_expert_id REFERENCES experts(id).
+	//
+	// Every call site in runner.go passes FromExpertID: uuid.Nil (these are
+	// system/workflow-triggered gates — intake plan approval, implementation
+	// approval, handoff — not posted by any specific expert). The old code
+	// always did `&fromExpertID` and left PostedByClient at its zero value
+	// (false). For FromExpertID == uuid.Nil that produced a non-nil pointer
+	// to the zero UUID: postgres saw posted_by_expert_id =
+	// '00000000-0000-0000-0000-000000000000', which fails the FK (no such
+	// expert row) AND would have failed the CHECK too (expert_id set but
+	// posted_by_client also false is fine for the CHECK, but there is no
+	// row with that id, so FK fires first). Every AskClient call in the
+	// codebase hit this on the very first gate ("intake"), which is why
+	// workflows failed immediately after DAG build with no wave ever
+	// starting.
+	//
+	// Fix: mirror the exact pattern already used for task_plan_ready above
+	// in runner.go — nil expert ID means client/system posted it.
+	var postedByExpertID *uuid.UUID
+	postedByClient := true
+	if req.FromExpertID != uuid.Nil {
+		id := req.FromExpertID
+		postedByExpertID = &id
+		postedByClient = false
+	}
 	_, err = t.store.Post(ctx, blackboard.PostRequest{
 		WorkflowID:       req.WorkflowID,
 		EventType:        "question_to_client",
-		PostedByExpertID: &fromExpertID,
+		PostedByExpertID: postedByExpertID,
+		PostedByClient:   postedByClient,
 		Content: map[string]interface{}{
 			"gate_name":   req.GateName,
 			"summary":     req.Summary,
