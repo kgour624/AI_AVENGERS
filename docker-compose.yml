@@ -60,6 +60,10 @@ services:
       - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001}
       - AIDER_SERVICE_URL=http://aider-service:8082
       - AIDER_WORKSPACE_ROOT=/workspaces
+      # Shared secret aider-service uses to reach POST /api/v1/llm/proxy.
+      # Both services must read the same value. Empty = the proxy answers 503
+      # and Aider phases cannot run.
+      - AIDER_PROXY_TOKEN=${AIDER_PROXY_TOKEN:-dev_aider_proxy_token}
       - CAVOTI_API_KEY=${CAVOTI_API_KEY:-}
       - CAVOTI_BASE_URL=${CAVOTI_BASE_URL:-https://cavoti.com/v1}
     depends_on:
@@ -92,7 +96,19 @@ services:
     ports:
       - "8082:8082"
     environment:
+      # litellm's OpenAI transport appends /chat/completions to this base URL.
       - MODEL_GATEWAY_URL=http://api:8080/api/v1/llm/proxy
+      # Must match the api service's AIDER_PROXY_TOKEN.
+      - AIDER_PROXY_TOKEN=${AIDER_PROXY_TOKEN:-dev_aider_proxy_token}
+      # Label only — the proxy picks the real model from admin settings.
+      # The openai/ prefix selects the transport that honours the base URL.
+      - AIDER_MODEL=${AIDER_MODEL:-openai/deepseek-chat}
+      - AIDER_EDIT_FORMAT=${AIDER_EDIT_FORMAT:-diff}
+      - AIDER_MAX_INPUT_TOKENS=${AIDER_MAX_INPUT_TOKENS:-64000}
+      - AIDER_MAX_OUTPUT_TOKENS=${AIDER_MAX_OUTPUT_TOKENS:-8000}
+    depends_on:
+      api:
+        condition: service_started
     volumes:
       - workspaces:/workspaces
     restart: unless-stopped

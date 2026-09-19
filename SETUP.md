@@ -35,6 +35,12 @@ Required:
 - `JWT_SECRET` — minimum 32 characters
 - `OPENROUTER_API_KEY` — from openrouter.ai
 - `ENCRYPTION_KEY` — exactly 32 characters (for OAuth token encryption)
+- `AIDER_PROXY_TOKEN` — long random string, shared by the `api` and
+  `aider-service` containers. `aider-service` sends it as a Bearer token to
+  `POST /api/v1/llm/proxy`; it is a process with no user login, so it cannot
+  present a JWT. If it is empty the proxy replies **503** and the
+  implementation/qa phases cannot run. `docker-compose.yml` falls back to
+  `dev_aider_proxy_token` for local development — change it for anything real.
 
 ### 2. Start Services
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"time"
 )
@@ -46,11 +47,12 @@ type RunResult struct {
 // env: additional environment variables (merged with minimal safe env).
 //
 // Mental execution:
-//   Run(["gofmt", "-l", "main.go"], "/tmp/artifact_abc", nil)
-//   → exec.CommandContext(5s, "gofmt", "-l", "main.go")
-//   → cmd.Dir = /tmp/artifact_abc
-//   → cmd.Run() → stdout="main.go\n" (file needs formatting)
-//   → RunResult{Stdout: "main.go\n", ExitCode: 0}
+//
+//	Run(["gofmt", "-l", "main.go"], "/tmp/artifact_abc", nil)
+//	→ exec.CommandContext(5s, "gofmt", "-l", "main.go")
+//	→ cmd.Dir = /tmp/artifact_abc
+//	→ cmd.Run() → stdout="main.go\n" (file needs formatting)
+//	→ RunResult{Stdout: "main.go\n", ExitCode: 0}
 func Run(ctx context.Context, cfg SandboxConfig, workDir string, command []string, env []string) (*RunResult, error) {
 	if len(command) == 0 {
 		return nil, fmt.Errorf("sandbox: command is empty")
@@ -119,8 +121,18 @@ func Run(ctx context.Context, cfg SandboxConfig, workDir string, command []strin
 
 // WriteTempFile writes content to a temp file in dir and returns the path.
 // Caller is responsible for cleanup (defer os.Remove(path)).
+//
+// filename may contain directory separators. Artifacts carry their real
+// path inside the project ("foundational/logger/logger.go"), not a bare
+// base name. os.WriteFile does not create intermediate directories, so
+// every artifact in a subdirectory failed with ENOENT and the pipeline
+// reported it as "validation failed" — the generated code was fine, the
+// sandbox was. MkdirAll on the parent removes that whole false-failure class.
 func WriteTempFile(dir, filename, content string) (string, error) {
-	path := dir + "/" + filename
+	path := filepath.Join(dir, filename)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return "", fmt.Errorf("sandbox: make temp subdir: %w", err)
+	}
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		return "", fmt.Errorf("sandbox: write temp file: %w", err)
 	}

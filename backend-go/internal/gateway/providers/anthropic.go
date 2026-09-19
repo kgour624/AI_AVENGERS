@@ -29,15 +29,21 @@ func NewAnthropicProvider(apiKey string, client *http.Client) *AnthropicProvider
 
 func (p *AnthropicProvider) Name() string { return "anthropic" }
 func (p *AnthropicProvider) ModelName(tier gtypes.ModelType) string {
-	if tier == gtypes.ModelStrong { return "claude-3-5-sonnet-20241022" }
+	if tier == gtypes.ModelStrong {
+		return "claude-3-5-sonnet-20241022"
+	}
 	return "claude-3-haiku-20240307"
 }
 func (p *AnthropicProvider) CostPer1K(tier gtypes.ModelType) (float64, float64) {
-	if tier == gtypes.ModelStrong { return 0.003, 0.015 }
+	if tier == gtypes.ModelStrong {
+		return 0.003, 0.015
+	}
 	return 0.00025, 0.00125
 }
 func (p *AnthropicProvider) MaxTokens(tier gtypes.ModelType) int {
-	if tier == gtypes.ModelStrong { return 8192 }
+	if tier == gtypes.ModelStrong {
+		return 8192
+	}
 	return 4096
 }
 
@@ -51,6 +57,7 @@ type claudeContentBlock struct {
 // ExtractContent handles Claude's two content formats:
 //   - Plain string (standard Claude models)
 //   - Typed array (Claude thinking/extended models)
+//
 // Joins all "text" blocks; ignores "thinking" blocks.
 func (p *AnthropicProvider) ExtractContent(raw json.RawMessage, _ string) string {
 	if len(raw) == 0 {
@@ -81,27 +88,47 @@ func (p *AnthropicProvider) ExtractStreamToken(content, _ string) string {
 	return content
 }
 
-func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
-	type msg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
-	type areq struct {
-		Model     string `json:"model"`
-		MaxTokens int    `json:"max_tokens"`
-		System    string `json:"system,omitempty"`
-		Messages  []msg  `json:"messages"`
-		Stream    bool   `json:"stream"`
-	}
-	var sys string
-	var msgs []msg
-	for _, m := range req.Messages {
+// anthropicMsg is one turn in the Anthropic messages array.
+// Shared by Call and StreamCall so splitAnthropicSystem can build it once.
+type anthropicMsg struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// splitAnthropicSystem separates system turns from conversation turns.
+//
+// Anthropic takes the system prompt as a top-level "system" string, not as a
+// message with role "system", so the two have to be pulled apart.
+//
+// Every system turn is joined, not just the last one. A conversation can carry
+// more than one: Aider sends the main instructions as the first system message
+// and appends a short format reminder as a trailing system message. Assigning
+// instead of appending kept only the reminder and silently discarded the
+// instructions the whole request depended on.
+func splitAnthropicSystem(in []gtypes.ProviderMessage) (string, []anthropicMsg) {
+	var sysParts []string
+	var msgs []anthropicMsg
+	for _, m := range in {
 		if m.Role == "system" {
-			sys = m.Content
-		} else {
-			msgs = append(msgs, msg{Role: m.Role, Content: m.Content})
+			if m.Content != "" {
+				sysParts = append(sysParts, m.Content)
+			}
+			continue
 		}
+		msgs = append(msgs, anthropicMsg{Role: m.Role, Content: m.Content})
 	}
+	return strings.Join(sysParts, "\n\n"), msgs
+}
+
+func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderRequest) (<-chan string, <-chan *gtypes.ProviderResponse, error) {
+	type areq struct {
+		Model     string         `json:"model"`
+		MaxTokens int            `json:"max_tokens"`
+		System    string         `json:"system,omitempty"`
+		Messages  []anthropicMsg `json:"messages"`
+		Stream    bool           `json:"stream"`
+	}
+	sys, msgs := splitAnthropicSystem(req.Messages)
 	body, _ := json.Marshal(areq{Model: p.ModelName(req.ModelTier), MaxTokens: req.MaxTokens, System: sys, Messages: msgs, Stream: true})
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
@@ -139,8 +166,8 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 				continue
 			}
 			var ev struct {
-				Type    string `json:"type"`
-				Delta   struct{ Type, Text string } `json:"delta"`
+				Type    string                                  `json:"type"`
+				Delta   struct{ Type, Text string }             `json:"delta"`
 				Usage   struct{ InputTokens, OutputTokens int } `json:"usage"`
 				Message struct {
 					Model string
@@ -152,7 +179,9 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 			}
 			switch ev.Type {
 			case "message_start":
-				if ev.Message.Model != "" { model = ev.Message.Model }
+				if ev.Message.Model != "" {
+					model = ev.Message.Model
+				}
 				in = ev.Message.Usage.InputTokens
 			case "content_block_delta":
 				if ev.Delta.Type == "text_delta" && ev.Delta.Text != "" {
@@ -173,25 +202,13 @@ func (p *AnthropicProvider) StreamCall(ctx context.Context, req gtypes.ProviderR
 }
 
 func (p *AnthropicProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
-	type msg struct {
-		Role    string `json:"role"`
-		Content string `json:"content"`
-	}
 	type areq struct {
-		Model     string `json:"model"`
-		MaxTokens int    `json:"max_tokens"`
-		System    string `json:"system,omitempty"`
-		Messages  []msg  `json:"messages"`
+		Model     string         `json:"model"`
+		MaxTokens int            `json:"max_tokens"`
+		System    string         `json:"system,omitempty"`
+		Messages  []anthropicMsg `json:"messages"`
 	}
-	var sys string
-	var msgs []msg
-	for _, m := range req.Messages {
-		if m.Role == "system" {
-			sys = m.Content
-		} else {
-			msgs = append(msgs, msg{Role: m.Role, Content: m.Content})
-		}
-	}
+	sys, msgs := splitAnthropicSystem(req.Messages)
 	body, _ := json.Marshal(areq{Model: p.ModelName(req.ModelTier), MaxTokens: req.MaxTokens, System: sys, Messages: msgs})
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
@@ -209,9 +226,9 @@ func (p *AnthropicProvider) Call(ctx context.Context, req gtypes.ProviderRequest
 		return nil, fmt.Errorf("anthropic: status %d", resp.StatusCode)
 	}
 	var r struct {
-		Content []struct{ Type, Text string } `json:"content"`
+		Content []struct{ Type, Text string }           `json:"content"`
 		Usage   struct{ InputTokens, OutputTokens int } `json:"usage"`
-		Model   string `json:"model"`
+		Model   string                                  `json:"model"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
 		return nil, fmt.Errorf("anthropic: decode: %w", err)

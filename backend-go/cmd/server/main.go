@@ -475,6 +475,33 @@ func buildRouter(
 	v1.GET("/repo/callback/:provider", repoHandler.OAuthCallback)
 
 	// ============================================================
+	// Service-to-service routes — shared secret, NOT a user JWT
+	// ============================================================
+	// LLM proxy for AiderService: routes Aider's LLM calls through
+	// ModelGateway so cost, retry and provider selection stay centralized.
+	//
+	// WHY not on the JWT-protected group (where it used to live):
+	// AiderService is a process, not a logged-in user. It cannot obtain an
+	// access token, so every Aider LLM call was rejected with 401 before it
+	// reached the gateway. A shared secret is the credential a service can
+	// actually hold.
+	//
+	// Two paths, one handler: Aider's OPENAI_API_BASE points at /llm/proxy,
+	// and the OpenAI client library inside litellm appends
+	// "/chat/completions" to its base URL. The plain path stays for direct
+	// callers and for probing the endpoint by hand.
+	aiderProxyToken := os.Getenv("AIDER_PROXY_TOKEN")
+	if aiderProxyToken == "" {
+		logger.Warn("AIDER_PROXY_TOKEN is not set — /llm/proxy will reject all calls with 503, Aider phases cannot run")
+	}
+	llmProxy := v1.Group("/llm")
+	llmProxy.Use(middleware.ServiceTokenMiddleware(aiderProxyToken, logger))
+	{
+		llmProxy.POST("/proxy", modelGateway.ProxyHandler)
+		llmProxy.POST("/proxy/chat/completions", modelGateway.ProxyHandler)
+	}
+
+	// ============================================================
 	// Protected routes — JWT required
 	// ============================================================
 	protected := v1.Group("")
@@ -486,10 +513,6 @@ func buildRouter(
 		// lets it restore fullName + email + role from the server
 		// using the refresh token cookie.
 		protected.GET("/auth/me", handleGetMe(authService))
-
-		// LLM proxy for AiderService — routes Aider LLM calls through ModelGateway
-		// WHY protected: cost attribution requires knowing which workflow/expert
-		protected.POST("/llm/proxy", modelGateway.ProxyHandler)
 
 		// Expert routes (read-only for clients)
 		experts := protected.Group("/experts")
@@ -587,9 +610,9 @@ func buildRouter(
 		adminGroup.POST("/llm-settings", adminHandler.UpdateLLMSettings)
 		// CodeCraftAPI model catalog proxy + embedding settings
 		// WHY proxy: API key must never leave the server.
-		adminGroup.GET("/codecraftapi/models",  adminHandler.GetCodeCraftModels)
-		adminGroup.GET("/embedding-settings",   adminHandler.GetEmbeddingSettings)
-		adminGroup.POST("/embedding-settings",  adminHandler.UpdateEmbeddingSettings)
+		adminGroup.GET("/codecraftapi/models", adminHandler.GetCodeCraftModels)
+		adminGroup.GET("/embedding-settings", adminHandler.GetEmbeddingSettings)
+		adminGroup.POST("/embedding-settings", adminHandler.UpdateEmbeddingSettings)
 		// Expert categories (migration 010, CT-A3) — admin-owned template layer.
 		adminGroup.GET("/expert-categories", adminHandler.ListExpertCategories)
 		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)

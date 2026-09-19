@@ -1,6 +1,27 @@
 # Aider Integration Architecture Design
 
-**Status:** Draft  
+> **⚠️ The Python snippets in this document do not match Aider's real API.**
+> They were written against an imagined interface and the first Aider run
+> failed on the very first line of them. Do not copy code from here.
+>
+> Specifically, every `Model(...)` / `Coder.create(...)` example below is wrong:
+> * `Model(name=..., api_base=..., api_key=...)` — `Model.__init__` takes the
+>   model name **positionally** and accepts none of those keywords
+>   (`aider/models.py`). Credentials come from environment variables.
+> * `Coder.create(..., git_dname=...)` — `Coder.__init__` has no `git_dname`
+>   and no `**kwargs`; the workspace is passed as a `GitRepo` via `repo=`.
+> * `coder.main_model.extra_headers = {...}` — nothing reads that attribute.
+>   Per-request headers go in `model.extra_params["extra_headers"]`, which is
+>   what `Model.send_completion` merges into the litellm call.
+> * The examples use `gpt-4`. The proxy ignores the requested model entirely
+>   and uses the admin-configured provider and tier.
+>
+> **The working integration is `aider-service/main.py` and
+> `backend-go/internal/gateway/proxy.go`.** Read those. The proxy contract is
+> documented in `docs/CURRENT_ARCHITECTURE.md`. Treat the rest of this
+> document as intent and rationale only.
+
+**Status:** Draft (code samples superseded — see banner above)  
 **Created:** 2026-09-17  
 **Author:** AI Avengers Team  
 **Purpose:** Integrate Aider for implementation/qa phases while preserving existing AgentLoop for design phases

@@ -1,15 +1,78 @@
+"""FastAPI wrapper that runs one Aider iteration inside a workspace.
+
+Every LLM call Aider makes is routed to the Go backend's /llm/proxy endpoint,
+which is OpenAI chat-completions compatible. The proxy decides which real
+model runs (the admin's configured provider and "strong" tier) — this service
+never talks to a model vendor directly, so cost tracking, retries and provider
+switching stay in one place.
+"""
+
 import os
 import subprocess
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 # Aider source is in aider-main/ (installed via pip install -e /aider-main)
+from aider import models as aider_models
 from aider.coders import Coder
+from aider.io import InputOutput
 from aider.models import Model
+from aider.repo import GitRepo
 
 app = FastAPI()
 
+# The base URL Aider's HTTP client is pointed at. The OpenAI client library
+# inside litellm appends "/chat/completions" to it, so the backend registers
+# both /llm/proxy and /llm/proxy/chat/completions.
 MODEL_GATEWAY_URL = os.getenv("MODEL_GATEWAY_URL", "http://localhost:8080/api/v1/llm/proxy")
+
+# Shared secret for the proxy. It is sent as the OpenAI api_key, which means it
+# arrives as "Authorization: Bearer <token>" — the only header the OpenAI
+# client library lets us control on that path. Must match the backend's
+# AIDER_PROXY_TOKEN.
+PROXY_TOKEN = os.getenv("AIDER_PROXY_TOKEN", "")
+
+# Model name handed to litellm.
+#
+# The "openai/" prefix is load-bearing: it selects litellm's OpenAI-compatible
+# transport, which is the one that honours OPENAI_API_BASE. Without the prefix
+# litellm picks a vendor transport with a hardcoded endpoint and the proxy is
+# bypassed. The part after the prefix is only a label — the proxy ignores the
+# requested model and uses the admin-configured provider.
+AIDER_MODEL = os.getenv("AIDER_MODEL", "openai/deepseek-chat")
+
+# "diff" (search/replace blocks) instead of Aider's "whole" default. "whole"
+# makes the model re-emit every edited file in full, which on a real repo burns
+# output tokens and truncates against the output cap.
+AIDER_EDIT_FORMAT = os.getenv("AIDER_EDIT_FORMAT", "diff")
+
+# Context window Aider should assume. Aider normally reads this from litellm's
+# model database, but "openai/<label>" is not in that database, so it would
+# assume 0 and mis-size the repo map and history summarisation.
+AIDER_MAX_INPUT_TOKENS = int(os.getenv("AIDER_MAX_INPUT_TOKENS", "64000"))
+AIDER_MAX_OUTPUT_TOKENS = int(os.getenv("AIDER_MAX_OUTPUT_TOKENS", "8000"))
+
+# litellm reads credentials from the environment, not from constructor
+# arguments. Setting them here covers every Model this process builds —
+# including the weak model Aider uses for commit messages and history
+# summarisation, which we never construct by hand.
+os.environ["OPENAI_API_BASE"] = MODEL_GATEWAY_URL
+os.environ["OPENAI_API_KEY"] = PROXY_TOKEN or "unset"
+
+# Teach Aider the model's limits and that it costs nothing to call. Cost is
+# recorded server-side against the workflow, so a second figure here would
+# double-count. This is the same dict Aider's --model-metadata-file option
+# populates.
+aider_models.model_info_manager.local_model_metadata[AIDER_MODEL] = {
+    "max_input_tokens": AIDER_MAX_INPUT_TOKENS,
+    "max_output_tokens": AIDER_MAX_OUTPUT_TOKENS,
+    "max_tokens": AIDER_MAX_INPUT_TOKENS,
+    "input_cost_per_token": 0.0,
+    "output_cost_per_token": 0.0,
+    "litellm_provider": "openai",
+    "mode": "chat",
+}
 
 
 class IterateRequest(BaseModel):
@@ -31,63 +94,144 @@ def health():
     return {"status": "ok"}
 
 
+def _git(workspace_path: str, *args: str) -> str:
+    return (
+        subprocess.check_output(["git", *args], cwd=workspace_path)
+        .decode(errors="replace")
+        .strip()
+    )
+
+
+def _build_model(workflow_id: str, expert_id: str) -> Model:
+    """Build a Model whose requests carry workflow/expert attribution headers.
+
+    extra_params is the only injection point Aider offers: Model.send_completion
+    merges it straight into the litellm.completion(**kwargs) call. Assigning
+    model.extra_headers instead just sets an attribute nobody reads, so the
+    backend saw no attribution headers at all.
+    """
+    model = Model(AIDER_MODEL, weak_model=AIDER_MODEL, editor_model=AIDER_MODEL)
+
+    model.extra_params = dict(model.extra_params or {})
+    model.extra_params["extra_headers"] = {
+        "X-Workflow-ID": workflow_id,
+        "X-Expert-ID": expert_id,
+    }
+
+    # The proxy answers with a single complete body, never an SSE stream.
+    model.streaming = False
+    model.use_repo_map = True
+    return model
+
+
 @app.post("/iterate", response_model=IterateResponse)
 def iterate(req: IterateRequest) -> IterateResponse:
     try:
-        # Configure Aider to route LLM calls through ModelGateway proxy
-        # WHY: Centralized cost tracking, retry, provider switching
-        model = Model(
-            name="gpt-4",
-            api_base=MODEL_GATEWAY_URL,
-            api_key="proxy",  # Not used — ModelGateway handles auth
+        model = _build_model(req.workflow_id, req.expert_id)
+
+        # yes=True auto-confirms every prompt (adding files, creating files,
+        # committing). pretty/fancy_input off because there is no terminal:
+        # prompt_toolkit's interactive input needs a tty and would raise here.
+        io = InputOutput(
+            pretty=False,
+            yes=True,
+            fancy_input=False,
+            root=req.workspace_path,
         )
+
+        # The repo has to be built explicitly with git_dname. Left to itself,
+        # Coder builds a GitRepo with git_dname=None, which resolves to the
+        # process working directory (/app) — not this workflow's workspace.
+        # chdir is not an option: FastAPI serves sync endpoints on a thread
+        # pool, so a process-global cwd would race between concurrent tasks.
+        repo = GitRepo(
+            io,
+            fnames=[],
+            git_dname=req.workspace_path,
+            models=model.commit_message_models(),
+        )
+
+        head_before = _git(req.workspace_path, "rev-parse", "HEAD")
 
         coder = Coder.create(
             main_model=model,
-            fnames=[],  # Aider auto-detects files in workspace
+            edit_format=AIDER_EDIT_FORMAT,
+            io=io,
+            repo=repo,
+            fnames=[],  # start empty; the repo map lets Aider ask for files
             auto_commits=True,
             dirty_commits=False,
-            git_dname=req.workspace_path,
+            # stream=False: Coder defaults to streaming, and the proxy returns
+            # one complete JSON body. A streaming client would wait for SSE
+            # frames that never come and fail as an unexplained timeout.
+            stream=False,
+            # Off because nothing here can service them: there is no user to
+            # approve a shell command, no linter configured in the workspace,
+            # and no reason to fetch URLs mentioned in a task description.
+            suggest_shell_commands=False,
+            detect_urls=False,
+            auto_lint=False,
+            auto_test=False,
         )
 
-        # Set cost attribution headers on every LLM call
-        if hasattr(coder.main_model, "extra_headers"):
-            coder.main_model.extra_headers = {
-                "X-Workflow-ID": req.workflow_id,
-                "X-Expert-ID": req.expert_id,
-            }
-
-        # Run one Aider iteration
         coder.run(req.message)
 
-        # Extract latest commit SHA
-        commit_sha = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"],
-            cwd=req.workspace_path,
-        ).decode().strip()
+        head_after = _git(req.workspace_path, "rev-parse", "HEAD")
 
-        # Get files changed in last commit
-        files_output = subprocess.check_output(
-            ["git", "diff", "--name-only", "HEAD~1", "HEAD"],
-            cwd=req.workspace_path,
-        ).decode().strip()
+        if head_after == head_before:
+            # Aider reports LLM and parsing failures through its console and
+            # then returns normally. Without this check the caller was told the
+            # iteration succeeded while nothing had changed. Report the reason
+            # Aider recorded instead of a bare "no changes".
+            reasons = []
+            if coder.num_exhausted_context_windows:
+                reasons.append(
+                    f"context window exhausted x{coder.num_exhausted_context_windows}"
+                )
+            if coder.num_malformed_responses:
+                reasons.append(
+                    f"malformed edit blocks x{coder.num_malformed_responses}"
+                )
+            detail = "; ".join(reasons) if reasons else "model proposed no edits"
+            return IterateResponse(
+                commit_sha=head_before,
+                files_changed=[],
+                success=False,
+                error=f"aider made no commit ({detail})",
+            )
+
+        # Diff against the pre-run HEAD, not HEAD~1. Aider may produce more
+        # than one commit in an iteration, and HEAD~1 does not exist when the
+        # workspace's seed commit is the only one.
+        files_output = _git(
+            req.workspace_path, "diff", "--name-only", head_before, head_after
+        )
         files_changed = [f for f in files_output.split("\n") if f]
 
         return IterateResponse(
-            commit_sha=commit_sha,
+            commit_sha=coder.last_aider_commit_hash or head_after,
             files_changed=files_changed,
             success=True,
         )
 
+    except subprocess.CalledProcessError as e:
+        output = (e.output or b"").decode(errors="replace").strip()
+        return IterateResponse(
+            commit_sha="",
+            files_changed=[],
+            success=False,
+            error=f"git {' '.join(e.cmd[1:])} failed (exit {e.returncode}): {output}",
+        )
     except Exception as e:
         return IterateResponse(
             commit_sha="",
             files_changed=[],
             success=False,
-            error=str(e),
+            error=f"{type(e).__name__}: {e}",
         )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8082)

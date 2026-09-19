@@ -138,6 +138,21 @@ func InternalError(c *gin.Context) {
 	})
 }
 
+// ServiceUnavailable sends a 503 response.
+// Use when the endpoint exists but a required dependency or config is missing,
+// so the caller can tell "not wired up" apart from "rejected" (401) and
+// "crashed" (500).
+func ServiceUnavailable(c *gin.Context, message string) {
+	c.JSON(http.StatusServiceUnavailable, APIResponse{
+		Success: false,
+		Error: &APIError{
+			Code:    "SERVICE_UNAVAILABLE",
+			Message: message,
+		},
+		Meta: buildMeta(c),
+	})
+}
+
 // TooManyRequests sends a 429 rate limit response.
 func TooManyRequests(c *gin.Context) {
 	c.JSON(http.StatusTooManyRequests, APIResponse{

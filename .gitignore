@@ -25,6 +25,7 @@ frontend/dist/
 
 # Python
 ml-sidecar/__pycache__/
+aider-service/__pycache__/
 ml-sidecar/*.pyc
 ml-sidecar/.venv/
 

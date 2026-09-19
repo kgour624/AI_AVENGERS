@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -53,6 +54,50 @@ func AuthMiddleware(jwtService *auth.JWTService, logger *zap.Logger) gin.Handler
 		c.Set("user_id", claims.UserID)
 		c.Set("email", claims.Email)
 		c.Set("role", claims.Role)
+
+		c.Next()
+	}
+}
+
+// ServiceTokenMiddleware authenticates a backend service by shared secret.
+//
+// WHY not AuthMiddleware: AuthMiddleware validates a user's JWT access token.
+// AiderService is a process, not a user — it has no login, no refresh cookie
+// and no way to mint an access token. Putting /llm/proxy behind
+// AuthMiddleware meant every Aider LLM call was answered with 401.
+//
+// The token travels as "Authorization: Bearer <token>" because that is what
+// the OpenAI client library inside Aider sends for its api_key. No custom
+// header is possible on that path.
+//
+// An empty configured token rejects every request with 503 rather than
+// letting the route through. A blank shared secret must never mean
+// "authentication disabled" on an endpoint that spends money.
+func ServiceTokenMiddleware(expectedToken string, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if expectedToken == "" {
+			logger.Error("service token route called but AIDER_PROXY_TOKEN is not set")
+			response.ServiceUnavailable(c, "Service token not configured")
+			c.Abort()
+			return
+		}
+
+		authHeader := c.GetHeader("Authorization")
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
+			response.Unauthorized(c, "Invalid authorization format. Use: Bearer <token>")
+			c.Abort()
+			return
+		}
+
+		// Constant-time compare: a shared secret checked with == leaks its
+		// prefix length through response timing.
+		if subtle.ConstantTimeCompare([]byte(parts[1]), []byte(expectedToken)) != 1 {
+			logger.Warn("service token mismatch", zap.String("path", c.Request.URL.Path))
+			response.Unauthorized(c, "Invalid service token")
+			c.Abort()
+			return
+		}
 
 		c.Next()
 	}

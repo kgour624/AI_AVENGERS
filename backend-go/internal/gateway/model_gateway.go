@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -39,6 +40,22 @@ type LLMRequest struct {
 	// WHY it does not affect caching: cacheKey() is built from
 	// Model + SystemPrompt + UserPrompt only.
 	WorkflowID *uuid.UUID
+
+	// Messages carries a full multi-turn conversation.
+	//
+	// nil (the default) = use SystemPrompt + UserPrompt. Every existing
+	// caller is a single-shot prompt, so their behaviour is unchanged.
+	//
+	// When set, it replaces SystemPrompt/UserPrompt and is passed to the
+	// provider verbatim, assistant turns included.
+	// WHY this exists: the /llm/proxy endpoint serves Aider, which sends a
+	// real conversation (system, few-shot user/assistant pairs, chat
+	// history, reminder). Squeezing that into two strings dropped every
+	// assistant turn and every message except the last of each role — the
+	// model was being asked to edit code it had never been shown writing.
+	// ProviderRequest already took []ProviderMessage; only this struct
+	// could not express it.
+	Messages []ProviderMessage
 }
 
 // LLMResponse is the output from the model gateway.
@@ -56,10 +73,10 @@ type LLMResponse struct {
 // Delegates all provider-specific concerns to LLMProvider interface.
 //
 // To add a new provider:
-//   1. Create internal/gateway/providers/myprovider.go
-//   2. Implement gateway/types.LLMProvider interface
-//   3. Add a case in buildProvider() below
-//   Nothing else changes.
+//  1. Create internal/gateway/providers/myprovider.go
+//  2. Implement gateway/types.LLMProvider interface
+//  3. Add a case in buildProvider() below
+//     Nothing else changes.
 type ModelGateway struct {
 	cfg        config.LLMConfig
 	db         *pgxpool.Pool // nil = env config only, no DB override
@@ -227,11 +244,12 @@ func (g *ModelGateway) getProvider(ctx context.Context) LLMProvider {
 // takes effect on the next Call() with no restart needed.
 //
 // Fallback behavior:
-//   If all 3 attempts on the primary provider fail (any error), and
-//   'llm_fallback_provider' is configured in system_settings AND is
-//   different from the primary, Call() retries 3 more times on the
-//   fallback provider. This is per-Call() — global provider is never
-//   mutated. If fallback also fails, the original error is returned.
+//
+//	If all 3 attempts on the primary provider fail (any error), and
+//	'llm_fallback_provider' is configured in system_settings AND is
+//	different from the primary, Call() retries 3 more times on the
+//	fallback provider. This is per-Call() — global provider is never
+//	mutated. If fallback also fails, the original error is returned.
 func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, error) {
 	if req.UseCache {
 		if cached, ok := g.cache.Load(g.cacheKey(req)); ok {
@@ -256,10 +274,14 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 		}
 
 		var messages []ProviderMessage
-		if req.SystemPrompt != "" {
-			messages = append(messages, ProviderMessage{Role: "system", Content: req.SystemPrompt})
+		if len(req.Messages) > 0 {
+			messages = req.Messages
+		} else {
+			if req.SystemPrompt != "" {
+				messages = append(messages, ProviderMessage{Role: "system", Content: req.SystemPrompt})
+			}
+			messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
 		}
-		messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
 
 		provReq := ProviderRequest{
 			ModelTier:   req.Model,
@@ -385,9 +407,10 @@ func (g *ModelGateway) GetStats() map[string]interface{} {
 // Used by chinawall/enforcer.go generateFlatText for Gate 5 generation.
 //
 // WHY streaming only for Gate 5:
-//   Gates 1-4 are fast (keyword check, vector search, charter check, necessity).
-//   Only Gate 5 (LLM generation) takes 30-67s. Streaming Gate 5 means
-//   the user sees the first token in 2-3s instead of waiting 67s.
+//
+//	Gates 1-4 are fast (keyword check, vector search, charter check, necessity).
+//	Only Gate 5 (LLM generation) takes 30-67s. Streaming Gate 5 means
+//	the user sees the first token in 2-3s instead of waiting 67s.
 //
 // Fallback: if StreamCall fails, caller should fall back to Call().
 func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan string, <-chan *LLMResponse, error) {
@@ -511,10 +534,11 @@ func (g *ModelGateway) getAPIKey(ctx context.Context, provider config.LLMProvide
 // Falls back to the provided default if the key is missing or empty.
 //
 // WHY this method exists:
-//   CodeCraftAPI exposes a live model catalog. Admin selects which model
-//   to use per tier from the admin panel. Model names are stored in
-//   system_settings (e.g. key="codecraftapi_model_strong").
-//   Same pattern as getActiveProvider() and getAPIKey().
+//
+//	CodeCraftAPI exposes a live model catalog. Admin selects which model
+//	to use per tier from the admin panel. Model names are stored in
+//	system_settings (e.g. key="codecraftapi_model_strong").
+//	Same pattern as getActiveProvider() and getAPIKey().
 func (g *ModelGateway) getModelName(ctx context.Context, settingKey, fallback string) string {
 	if g.db == nil {
 		return fallback
@@ -535,7 +559,22 @@ func (g *ModelGateway) getModelName(ctx context.Context, settingKey, fallback st
 }
 
 // cacheKey generates a stable cache key for a request.
+//
+// Multi-turn requests key on the whole conversation. Without this, two
+// different conversations would collide: both leave SystemPrompt and
+// UserPrompt empty, so the key would reduce to the model tier alone.
 func (g *ModelGateway) cacheKey(req LLMRequest) string {
+	if len(req.Messages) > 0 {
+		var b strings.Builder
+		b.WriteString(string(req.Model))
+		for _, m := range req.Messages {
+			b.WriteString("\x00")
+			b.WriteString(m.Role)
+			b.WriteString("\x00")
+			b.WriteString(m.Content)
+		}
+		return b.String()
+	}
 	return fmt.Sprintf("%s:%s:%s", req.Model, req.SystemPrompt, req.UserPrompt)
 }
 
@@ -548,11 +587,11 @@ func (g *ModelGateway) cacheKey(req LLMRequest) string {
 //
 // WHY the column has to be maintained here: nothing wrote it before, so it
 // stayed 0.0 forever. Two things depended on it —
-//   1. the Kanban header, which showed "$0.0000 / $10.00" no matter what
-//      was actually spent;
-//   2. CostMonitor.CheckWorkflowLimits, which reads this exact column as
-//      its "fast path" and therefore never saw a limit as reached, so the
-//      per-workflow soft/hard cost caps could not fire at all.
+//  1. the Kanban header, which showed "$0.0000 / $10.00" no matter what
+//     was actually spent;
+//  2. CostMonitor.CheckWorkflowLimits, which reads this exact column as
+//     its "fast path" and therefore never saw a limit as reached, so the
+//     per-workflow soft/hard cost caps could not fire at all.
 func (g *ModelGateway) addWorkflowCost(ctx context.Context, workflowID *uuid.UUID, cost float64) {
 	if workflowID == nil || g.db == nil || cost <= 0 {
 		return

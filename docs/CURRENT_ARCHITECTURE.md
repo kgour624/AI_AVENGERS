@@ -296,10 +296,69 @@ Resume-safe (`checkpoint.go` — interrupted ingestion resume kar sakta hai).
 
 ---
 
+## 10a. Aider ↔ ModelGateway Proxy Contract
+
+`aider-service` kisi bhi model vendor se seedha baat nahi karta. Uske saare LLM
+calls Go backend pe wapas aate hain, OpenAI chat-completions format mein.
+
+**Routes** (dono ek hi handler — `internal/gateway/proxy.go`):
+
+```
+POST /api/v1/llm/proxy
+POST /api/v1/llm/proxy/chat/completions
+```
+
+Doosra path zaroori hai kyunki litellm ke andar ka OpenAI client apne base URL
+ke aage khud `/chat/completions` jodta hai. Aider ka `OPENAI_API_BASE` pehla
+path hai, request doosre pe land karti hai.
+
+**Auth:** shared secret (`AIDER_PROXY_TOKEN`), user JWT nahi —
+`middleware.ServiceTokenMiddleware`. `aider-service` ek process hai, logged-in
+user nahi; uske paas access token lene ka koi raasta nahi hai. Token
+`Authorization: Bearer <token>` ke roop mein aata hai kyunki OpenAI client
+library us path pe sirf `api_key` ko control karne deti hai. Token blank ho toh
+route har call ko **503** deta hai — khaali secret ka matlab "auth off" nahi ho
+sakta ek aise endpoint pe jo paisa kharch karta hai.
+
+**Request:** poori conversation forward hoti hai (`LLMRequest.Messages`),
+sirf last system + last user nahi. `model` field **ignore** hota hai — kaun sa
+asli model chalega ye admin ki setting hai, aur gateway ka `strong` tier hamesha
+use hota hai. `stream: true` aur `tools` explicit **400** dete hain (SSE aur
+tool-calling provider contract mein nahi hain — chup-chaap galat jawab dene se
+behtar hai saaf mana karna).
+
+**Response:** poora OpenAI envelope — `id`, `object`, `created`, `model`,
+`choices[].finish_reason`, aur `usage`. litellm isko OpenAI SDK ke
+`ChatCompletion` model mein parse karta hai, jo in fields ke bina fail hota hai;
+`usage` ke bina Aider ki har iteration free dikhti thi.
+
+**Cost attribution:** `X-Workflow-ID` header ko UUID mein parse karke
+`LLMRequest.WorkflowID` set hota hai, jisse gateway `workflows.cost_spent_usd`
+badhata hai. Pehle ye header sirf log hota tha.
+
+**Aider side** (`aider-service/main.py`) ke teen non-obvious points:
+
+| Cheez | Kyun |
+|---|---|
+| Model name mein `openai/` prefix | Yehi litellm transport `OPENAI_API_BASE` maanta hai. Prefix hataya toh litellm vendor endpoint hardcode kar deta hai aur proxy bypass ho jaata hai. Prefix ke baad ka naam sirf label hai. |
+| `OPENAI_API_BASE`/`OPENAI_API_KEY` env vars, constructor args nahi | litellm credentials sirf environment se padhta hai. Env var se weak model (commit message + history summary) bhi cover ho jaata hai, jo hum haath se banate hi nahi. |
+| `GitRepo(io, fnames=[], git_dname=workspace)` explicitly | Coder khud banata hai toh `git_dname=None` deta hai, jo process ki cwd (`/app`) ban jaati hai — workflow ka workspace nahi. `chdir` option nahi hai: FastAPI sync endpoints thread-pool pe chalte hain, cwd global hai, concurrent tasks race karenge. |
+| `stream=False` Coder pe | Coder default streaming hai, proxy ek complete JSON body deta hai. |
+| `model.extra_params["extra_headers"]` | `send_completion` sirf `extra_params` ko litellm call mein merge karta hai. `model.extra_headers` set karna ek aisi attribute likhna hai jise koi padhta nahi. |
+| HEAD before/after compare | Aider LLM/parse failures apne console pe likh ke normally return karta hai. Compare ke bina caller ko "success" milta tha jabki kuch commit hua hi nahi; ab `num_exhausted_context_windows` / `num_malformed_responses` se asli wajah report hoti hai. |
+
+---
+
 ## 11. Recently Fixed Bugs (Is Session, Verified Against Code)
 
 | Bug | File | Fix |
 |---|---|---|
+| Aider `Model(name="gpt-4", api_base=..., api_key=...)` | `aider-service/main.py` | Teen aise keyword args jo `Model.__init__` mein exist hi nahi karte — pehla Aider run turant crash hua. Positional model name + env-var credentials. |
+| Aider `Coder.create(git_dname=...)` | `aider-service/main.py` | `Coder.__init__` mein `git_dname` nahi hai aur `**kwargs` bhi nahi — workspace `repo=GitRepo(...)` se jaata hai |
+| `/llm/proxy` JWT-protected tha | `cmd/server/main.go` | `aider-service` JWT le hi nahi sakta → har Aider LLM call 401. Ab shared-secret middleware. |
+| Proxy conversation collapse | `internal/gateway/proxy.go` | Sirf last system + last user bachte the, saare assistant turns gir jaate the. Ab poori conversation pass hoti hai (`LLMRequest.Messages`). |
+| Anthropic multi-system overwrite | `providers/anthropic.go` | `sys = m.Content` assign tha — do system messages mein pehla (asli instructions) chup-chaap gir jaata tha, sirf trailing reminder bachta tha. Ab join hota hai. |
+| Validation sandbox nested path | `internal/validation/sandbox.go` | `os.WriteFile` intermediate dirs nahi banata, toh `foundational/logger/logger.go` jaise har artifact ENOENT pe "validation failed" hota tha. `MkdirAll` add kiya. |
 | DAG false-cycle detection | `dag.go` | In-degree calculation reversed thi — har normal 2-task plan (ek task no-deps, doosra usi pe depend) false-cycle error deta tha |
 | Self-dependency case-mismatch | `planner.go` | String-compare se UUID-compare mein badla (LLM case-mismatch UUID return karta tha) |
 | Missing `operation` field | `aider_runner.go` | `code_artifact_produced` event mein create/modify tag add kiya |
