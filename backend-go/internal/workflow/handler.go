@@ -45,6 +45,7 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 		        phase_started_at, phase_completed_at,
 		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		        cost_soft_limit_pct, cost_hard_limit_pct,
+		        generic_allowance_pct,
 		        created_at, updated_at
 		 FROM workflows
 		 WHERE client_id = $1
@@ -68,6 +69,7 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 			&w.PhaseStartedAt, &w.PhaseCompletedAt,
 			&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 			&w.CostSoftLimitPct, &w.CostHardLimitPct,
+		&w.GenericAllowancePct,
 			&w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
 			continue
@@ -322,10 +324,27 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 	var req struct {
 		Decision string `json:"decision" binding:"required"`
 		Notes    string `json:"notes"`
+		// GenericAllowancePct: optional. Sent with "request_changes" when the
+		// client is not satisfied with a trained-knowledge-only design and
+		// wants the design produced again with a bounded generic allowance.
+		// Pointer so "not sent" is distinguishable from an explicit 0.
+		GenericAllowancePct *float64 `json:"generic_allowance_pct"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
 		return
+	}
+
+	// Validate the dial before anything else. The DB has the same 0-30 CHECK
+	// (workflows_generic_allowance_pct_check, migration 017); this gives the
+	// client a clear 400 instead of a 500 from a constraint violation.
+	if req.GenericAllowancePct != nil {
+		pct := *req.GenericAllowancePct
+		if pct < 0 || pct > MaxGenericAllowancePct {
+			response.BadRequest(c, "INVALID_GENERIC_ALLOWANCE",
+				fmt.Sprintf("generic_allowance_pct must be between 0 and %.0f", MaxGenericAllowancePct))
+			return
+		}
 	}
 
 	// decisionToStatus maps the client's decision (API vocabulary) to the
@@ -422,6 +441,23 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 		},
 	})
 
+	// Persist the generic dial BEFORE resuming, so the runner's next phase
+	// attempt reads the new value (it re-reads the column per attempt).
+	if req.GenericAllowancePct != nil {
+		if _, err := h.engine.db.Exec(ctx,
+			`UPDATE workflows SET generic_allowance_pct = $1, updated_at = NOW() WHERE id = $2`,
+			*req.GenericAllowancePct, workflowID,
+		); err != nil {
+			h.logger.Error("update generic_allowance_pct failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+		h.logger.Info("generic allowance set by client",
+			zap.String("workflow_id", workflowID.String()),
+			zap.Float64("generic_allowance_pct", *req.GenericAllowancePct),
+		)
+	}
+
 	// Act on decision
 	switch req.Decision {
 	case "approve", "approve_with_notes":
@@ -430,13 +466,28 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 			response.InternalError(c)
 			return
 		}
+	case "request_changes":
+		// Resume so the runner wakes up and re-runs the design phases with the
+		// dial the client just set.
+		//
+		// WHY this changed: previously request_changes left the workflow
+		// paused forever with a comment saying "experts read the
+		// client_response event and revise" — nothing did that, so the
+		// workflow was simply stuck. The runner now owns the re-run
+		// (see WorkflowRunner.Run's design loop), and it can only act once
+		// the workflow is running again.
+		if err := h.engine.Resume(ctx, workflowID); err != nil {
+			h.logger.Error("resume for re-run failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
 	case "cancel_workflow":
 		if err := h.engine.Fail(ctx, workflowID, "cancelled by client"); err != nil {
 			h.logger.Error("cancel workflow failed", zap.Error(err))
 		}
-		// request_changes and reject_and_restart_phase:
-		// workflow stays paused; experts read the client_response event
-		// from the blackboard and revise their artifacts.
+		// reject_and_restart_phase: workflow stays paused. Unlike
+		// request_changes there is no implemented restart semantic for it yet,
+		// and resuming without one would silently move the workflow forward.
 	}
 
 	h.logger.Info("approval responded",

@@ -60,7 +60,7 @@ func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *g
 	var gs *GateSystem
 	var eb *ExperienceBank
 	if assembler != nil {
-		gs = NewGateSystem(assembler, gw, logger)
+		gs = NewGateSystem(assembler, logger)
 		eb = NewExperienceBank(db, logger)
 	}
 	return &AgentLoop{
@@ -83,6 +83,11 @@ type AgentLoopRequest struct {
 	// AllExperts: all experts in this workflow.
 	// Used by Gate 2 to poll peers for knowledge.
 	AllExperts []workflowExpert
+	// GenericAllowancePct: the client's generic ceiling (0-30) read from
+	// workflows.generic_allowance_pct by the runner. 0 = trained + peer
+	// knowledge only. Re-read by the runner on every phase attempt, so a
+	// client raising it and re-running takes effect immediately.
+	GenericAllowancePct float64
 }
 
 type AgentLoopResult struct {
@@ -174,6 +179,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 				// Design phase: full 3-gate system
 				gr, gateErr := a.gateSystem.RunGates(
 					ctx, req.WorkflowID, req.Expert, req.TaskDescription, req.AllExperts,
+					req.GenericAllowancePct,
 				)
 				if gateErr != nil {
 					a.logger.Warn("agent loop: gate system failed (continuing)",
@@ -261,6 +267,33 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 		if artifactID != nil {
 			result.ArtifactEventID = artifactID
+		}
+
+		// Measure sourcing on every iteration's output.
+		//
+		// WHY measured and not assumed: "every claim must cite its source" is
+		// only a prompt instruction — nothing enforces it. Counting the
+		// markers is the only way to know whether the trained material was
+		// actually used, instead of eyeballing an artifact in the UI. A zero
+		// count while generic is blocked is a real problem, so it is logged
+		// at WARN.
+		chunkCites := strings.Count(llmResp.Content, "[CHUNK_")
+		peerCites := strings.Count(llmResp.Content, "[PEER:")
+		genericTags := strings.Count(llmResp.Content, "[GENERIC]")
+		notCovered := strings.Count(llmResp.Content, "[NOT_COVERED")
+		sourcingFields := []zap.Field{
+			zap.String("expert", req.Expert.Name),
+			zap.Int("iteration", iter),
+			zap.Int("chunk_citations", chunkCites),
+			zap.Int("peer_citations", peerCites),
+			zap.Int("generic_tags", genericTags),
+			zap.Int("not_covered_tags", notCovered),
+			zap.Float64("generic_allowance_pct", req.GenericAllowancePct),
+		}
+		if chunkCites == 0 && peerCites == 0 && req.GenericAllowancePct == 0 {
+			a.logger.Warn("agent loop: output cites no trained or peer source", sourcingFields...)
+		} else {
+			a.logger.Info("agent loop: output sourcing", sourcingFields...)
 		}
 
 		if strings.Contains(llmResp.Content, doneMarker) {

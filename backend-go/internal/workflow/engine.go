@@ -60,9 +60,18 @@ type Workflow struct {
 	CostSpentUSD       float64         `json:"cost_spent_usd"`
 	CostSoftLimitPct   float64         `json:"cost_soft_limit_pct"`
 	CostHardLimitPct   float64         `json:"cost_hard_limit_pct"`
+	// GenericAllowancePct: client-set ceiling (0-30) on how much of an
+	// expert's answer may be generic knowledge. 0 (default) means trained
+	// knowledge + peer experts only. See migration 017.
+	GenericAllowancePct float64        `json:"generic_allowance_pct"`
 	CreatedAt          time.Time       `json:"created_at"`
 	UpdatedAt          time.Time       `json:"updated_at"`
 }
+
+// MaxGenericAllowancePct is the product ceiling on generic knowledge.
+// Trained knowledge must always remain the majority contributor; the same
+// bound is enforced in the DB by workflows_generic_allowance_pct_check.
+const MaxGenericAllowancePct = 30.0
 
 // CreateRequest is the input to Engine.Create.
 type CreateRequest struct {
@@ -127,6 +136,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*Workflow, erro
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
+		           generic_allowance_pct,
 		           created_at, updated_at`,
 		req.ClientID, req.ProjectID, req.Title,
 		StatusDraft, PhaseIntake,
@@ -136,6 +146,7 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*Workflow, erro
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
+		&w.GenericAllowancePct,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
@@ -169,6 +180,7 @@ func (e *Engine) Start(ctx context.Context, workflowID uuid.UUID) (*Workflow, er
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
+		           generic_allowance_pct,
 		           created_at, updated_at`,
 		StatusRunning, PhaseIntake, now,
 		workflowID, StatusDraft,
@@ -177,6 +189,7 @@ func (e *Engine) Start(ctx context.Context, workflowID uuid.UUID) (*Workflow, er
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
+		&w.GenericAllowancePct,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
@@ -248,6 +261,7 @@ func (e *Engine) TransitionPhase(
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
+		           generic_allowance_pct,
 		           created_at, updated_at`,
 		nextPhase, now, StatusRunning, workflowID,
 	).Scan(
@@ -256,6 +270,7 @@ func (e *Engine) TransitionPhase(
 		&updated.PhaseStartedAt, &updated.PhaseCompletedAt,
 		&expertIDsRaw, &updated.CostBudgetUSD, &updated.CostSpentUSD,
 		&updated.CostSoftLimitPct, &updated.CostHardLimitPct,
+		&updated.GenericAllowancePct,
 		&updated.CreatedAt, &updated.UpdatedAt,
 	)
 	if err != nil {
@@ -271,6 +286,37 @@ func (e *Engine) TransitionPhase(
 		zap.String("to", nextPhase),
 	)
 	return &updated, nil
+}
+
+// RestartPhase sets current_phase WITHOUT the forward-only validation that
+// TransitionPhase applies, and puts the workflow back to running.
+//
+// WHY a separate method instead of relaxing TransitionPhase: a workflow must
+// never drift backwards on its own — that validation is what keeps the state
+// machine honest. But a client who reads the deliverables, is not satisfied,
+// and asks for the design to be produced again (optionally with a generic
+// allowance) IS a legitimate backwards move, and it is driven by an explicit
+// human action. Giving it its own named method keeps the two cases
+// distinguishable in the code and in the logs.
+func (e *Engine) RestartPhase(ctx context.Context, workflowID uuid.UUID, phase string) error {
+	_, err := e.db.Exec(ctx,
+		`UPDATE workflows SET
+			current_phase = $1,
+			phase_started_at = NOW(),
+			phase_completed_at = NULL,
+			status = $2,
+			updated_at = NOW()
+		 WHERE id = $3`,
+		phase, StatusRunning, workflowID,
+	)
+	if err != nil {
+		return fmt.Errorf("workflow restart phase: %w", err)
+	}
+	e.logger.Info("workflow phase restarted by client request",
+		zap.String("workflow_id", workflowID.String()),
+		zap.String("phase", phase),
+	)
+	return nil
 }
 
 // PauseForApproval pauses the workflow at a client approval gate.
@@ -347,6 +393,7 @@ func (e *Engine) GetByID(ctx context.Context, workflowID uuid.UUID) (*Workflow, 
 		        phase_started_at, phase_completed_at,
 		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		        cost_soft_limit_pct, cost_hard_limit_pct,
+		        generic_allowance_pct,
 		        created_at, updated_at
 		 FROM workflows WHERE id = $1`,
 		workflowID,
@@ -355,6 +402,7 @@ func (e *Engine) GetByID(ctx context.Context, workflowID uuid.UUID) (*Workflow, 
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
+		&w.GenericAllowancePct,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {

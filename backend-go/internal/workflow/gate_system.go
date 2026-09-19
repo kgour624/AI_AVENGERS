@@ -12,7 +12,6 @@ import (
 
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/chinawall"
-	"ai_avengers/backend/internal/gateway"
 )
 
 // Gate 1 works in two relevance bands instead of one pass/fail line.
@@ -66,16 +65,16 @@ type GateResult struct {
 	// gate1StrongThreshold. Gate 3 is only enabled when this is true.
 	GenericAllowed bool
 
-	// CoverageGap: what's missing after Gate 1 + Gate 2.
-	// Used as Gate 3 prompt: "Fill ONLY this gap: [CoverageGap]"
+	// CoverageGap: the task text the generic allowance applies to.
 	// Empty when GenericAllowed=false.
 	CoverageGap string
 
-	// Gate1Passed: true when expert's own training covered the task.
+	// Gate1Passed: true when the expert's own training produced usable chunks.
 	Gate1Passed bool
 
-	// Gate2Coverage: "YES" | "PARTIAL" | "NO" from coverage check.
-	Gate2Coverage string
+	// GenericAllowancePct: the client's ceiling (0-30), copied from the
+	// workflow so the prompt can state the exact limit.
+	GenericAllowancePct float64
 }
 
 // PeerContribution is one expert's knowledge contribution in Gate 2.
@@ -116,15 +115,18 @@ type PeerContribution struct {
 //   SRP: GateSystem only decides knowledge access, doesn't generate answers.
 //   OCP: New gates can be added without changing AgentLoop.
 //   DIP: AgentLoop depends on GateResult (interface), not gate internals.
+// No ModelGateway field: GateSystem no longer makes any LLM call. The only
+// one it had was the coverage check, and that decision now belongs to the
+// client (workflows.generic_allowance_pct). Keeping an unused LLM dependency
+// here would misrepresent what this type does.
 type GateSystem struct {
 	assembler *appcontext.Assembler
-	gateway   *gateway.ModelGateway
 	logger    *zap.Logger
 }
 
 // NewGateSystem creates a new GateSystem.
-func NewGateSystem(assembler *appcontext.Assembler, gw *gateway.ModelGateway, logger *zap.Logger) *GateSystem {
-	return &GateSystem{assembler: assembler, gateway: gw, logger: logger}
+func NewGateSystem(assembler *appcontext.Assembler, logger *zap.Logger) *GateSystem {
+	return &GateSystem{assembler: assembler, logger: logger}
 }
 
 // RunGates executes Gate 1 → Gate 2 → Gate 3 decision.
@@ -152,6 +154,7 @@ func (g *GateSystem) RunGates(
 	expert workflowExpert,
 	taskDescription string,
 	allExperts []workflowExpert,
+	genericAllowancePct float64,
 ) (*GateResult, error) {
 	result := &GateResult{}
 
@@ -229,50 +232,41 @@ func (g *GateSystem) RunGates(
 	peerContribs := g.pollPeers(ctx, expert.ID, taskDescription, allExperts)
 	result.PeerContributions = peerContribs
 
-	// Own training is strong: block generic outright and skip the coverage
-	// LLM call — there is nothing to decide.
-	if len(strongChunks) > 0 {
-		result.GenericAllowed = false
-		result.Gate2Coverage = "YES"
-		g.logger.Info("gate system: strong own training — generic blocked",
-			zap.String("expert", expert.Name),
-			zap.Int("strong_chunks", len(strongChunks)),
-			zap.Int("peer_contributions", len(peerContribs)),
-		)
-		return result, nil
-	}
-
-	// Coverage is judged over BOTH own usable training and peer knowledge,
-	// so generic is permitted only for what neither of them covers.
-	coverage, gap := g.checkCoverage(ctx, workflowID, taskDescription, result.TrainingChunks, peerContribs)
-	result.Gate2Coverage = coverage
-
-	switch coverage {
-	case "YES":
-		// Training + peers cover the task fully.
-		result.GenericAllowed = false
-		g.logger.Info("gate system: training + peers cover task — generic blocked",
-			zap.String("expert", expert.Name),
-			zap.Int("training_chunks", len(result.TrainingChunks)),
-			zap.Int("peer_contributions", len(peerContribs)),
-		)
-	case "PARTIAL":
-		// Generic allowed for the named gap only, tagged [GENERIC].
-		result.GenericAllowed = true
-		result.CoverageGap = gap
-		g.logger.Info("gate system: partial coverage — generic allowed for gap only",
-			zap.String("expert", expert.Name),
-			zap.Int("training_chunks", len(result.TrainingChunks)),
-			zap.String("gap", gap),
-		)
-	default: // "NO"
-		// Neither training nor peers cover it: generic for the full task.
-		result.GenericAllowed = true
+	// ============================================================
+	// GATE 3: Generic knowledge — the CLIENT decides, not a model
+	// ============================================================
+	// genericAllowancePct comes from workflows.generic_allowance_pct, which
+	// the client sets from the approval gate after reading the deliverables.
+	//   0 (default) -> generic BLOCKED. Trained + peer knowledge only.
+	//   >0          -> at most that share of the answer may be generic, and
+	//                  every such claim must be tagged [GENERIC].
+	//
+	// WHY this replaced the LLM coverage check: that check asked a cheap
+	// model "does this knowledge cover the task?". For any broad task the
+	// answer was "NO", which set CoverageGap to the ENTIRE task and told the
+	// expert generic was fine for everything — so the trained material was
+	// retrieved, put in the prompt, and then effectively thrown away. The
+	// experts are trained on specific industry course material; whether to
+	// dilute that with generic knowledge is a product decision for the
+	// client, not an inference a model should make per task. Removing it
+	// also drops one LLM call per expert per phase.
+	result.GenericAllowancePct = genericAllowancePct
+	result.GenericAllowed = genericAllowancePct > 0
+	if result.GenericAllowed {
+		// The gap is not model-decided any more. The expert is told how much
+		// generic is permitted and must still cite everything else.
 		result.CoverageGap = taskDescription
-		g.logger.Info("gate system: no coverage — generic allowed for full task",
-			zap.String("expert", expert.Name),
-		)
 	}
+
+	g.logger.Info("gate system: generic policy",
+		zap.String("workflow_id", workflowID.String()),
+		zap.String("expert", expert.Name),
+		zap.Float64("generic_allowance_pct", genericAllowancePct),
+		zap.Bool("generic_allowed", result.GenericAllowed),
+		zap.Int("training_chunks", len(result.TrainingChunks)),
+		zap.Int("strong_chunks", len(strongChunks)),
+		zap.Int("peer_contributions", len(peerContribs)),
+	)
 
 	return result, nil
 }
@@ -363,103 +357,6 @@ func (g *GateSystem) pollPeers(
 	}
 }
 
-// checkCoverage asks LLM: do these peer chunks cover the task?
-// Returns: coverage ("YES"|"PARTIAL"|"NO") + gap description.
-//
-// WHY cheap LLM (ModelCheap):
-//   This is a binary classification, not generation.
-//   ModelCheap is sufficient and costs 10x less.
-//
-// Mental execution:
-//   task: "Design rate limiter"
-//   peerChunks: [api_design, rate_limiter_pattern]
-//   LLM: "PARTIAL\nMISSING: distributed rate limiting across nodes"
-//   return: "PARTIAL", "distributed rate limiting across nodes"
-func (g *GateSystem) checkCoverage(
-	ctx context.Context,
-	workflowID uuid.UUID,
-	taskDescription string,
-	ownChunks []chinawall.CourseChunk,
-	peerContribs []PeerContribution,
-) (coverage string, gap string) {
-	if len(ownChunks) == 0 && len(peerContribs) == 0 {
-		return "NO", taskDescription
-	}
-
-	// Build the available-knowledge summary from BOTH sources.
-	//
-	// WHY own training is included: this used to judge peer chunks only, so
-	// an expert whose own training partly covered the task was still told
-	// "NO coverage — generic allowed for the full task". The gap has to be
-	// measured against everything the expert actually has in front of it.
-	var sb strings.Builder
-	for _, c := range ownChunks {
-		if sb.Len() == 0 {
-			sb.WriteString("[Your own training]\n")
-		}
-		sb.WriteString(c.Text)
-		sb.WriteString("\n")
-	}
-	if sb.Len() > 0 {
-		sb.WriteString("\n")
-	}
-	for _, contrib := range peerContribs {
-		if len(contrib.Chunks) == 0 {
-			continue
-		}
-		sb.WriteString(fmt.Sprintf("[Expert: %s]\n", contrib.ExpertName))
-		for _, c := range contrib.Chunks {
-			sb.WriteString(c.Text)
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-	}
-
-	peerText := sb.String()
-	if strings.TrimSpace(peerText) == "" {
-		return "NO", taskDescription
-	}
-
-	resp, err := g.gateway.Call(ctx, gateway.LLMRequest{
-		Model:      gateway.ModelCheap,
-		WorkflowID: &workflowID,
-		SystemPrompt: `You are a coverage checker. Given a task and peer knowledge, determine if the knowledge covers the task.
-
-Output EXACTLY one of:
-YES
-PARTIAL\nMISSING: <what is missing, max 50 words>
-NO
-
-No other output.`,
-		UserPrompt: fmt.Sprintf("TASK: %s\n\nAVAILABLE KNOWLEDGE:\n%s", taskDescription, peerText),
-		MaxTokens:  100,
-		Temperature: 0.0,
-	})
-	if err != nil {
-		g.logger.Warn("gate system: coverage check LLM failed", zap.Error(err))
-		// Fail safe: allow generic
-		return "NO", taskDescription
-	}
-
-	raw := strings.TrimSpace(resp.Content)
-	if strings.HasPrefix(raw, "YES") {
-		return "YES", ""
-	}
-	if strings.HasPrefix(raw, "PARTIAL") {
-		lines := strings.SplitN(raw, "\n", 2)
-		missing := ""
-		if len(lines) > 1 {
-			missing = strings.TrimPrefix(strings.TrimSpace(lines[1]), "MISSING:")
-			missing = strings.TrimSpace(missing)
-		}
-		if missing == "" {
-			missing = taskDescription
-		}
-		return "PARTIAL", missing
-	}
-	return "NO", taskDescription
-}
-
 // FormatGateContext builds the context string from GateResult.
 // Called by AgentLoop.buildContext() to replace the old training-only context.
 //
@@ -524,23 +421,35 @@ func FormatGateContext(result *GateResult) string {
 
 	switch {
 	case result.GenericAllowed:
-		sb.WriteString("[GATE 3: GAP FILLING ALLOWED]\n")
-		sb.WriteString(fmt.Sprintf("ONLY fill this specific gap: %s\n", result.CoverageGap))
+		// The client has opened a bounded generic allowance.
+		sb.WriteString("[GENERIC ALLOWANCE OPENED BY THE CLIENT]\n")
+		sb.WriteString(fmt.Sprintf(
+			"At most %.0f%% of your output may come from generic knowledge.\n",
+			result.GenericAllowancePct))
 		sb.WriteString("Rules:\n")
-		sb.WriteString("- Use minimal generic knowledge\n")
-		sb.WriteString("- Mark every generic claim with [GENERIC]\n")
-		sb.WriteString("- Do NOT rewrite what your training or your peers already covered\n")
-		sb.WriteString("- Generic knowledge will be reviewed by admin for future training\n\n")
+		sb.WriteString("- The trained and peer material above stays the primary source.\n")
+		sb.WriteString("- Tag EVERY generic sentence with [GENERIC]. Untagged generic content is a violation.\n")
+		sb.WriteString("- Everything not tagged [GENERIC] MUST carry [CHUNK_id] or [PEER:ExpertName].\n")
+		sb.WriteString("- Do NOT restate what your training or your peers already cover.\n")
+		sb.WriteString("- Generic claims are reviewed by the admin as future training material.\n\n")
 
 	case hasTraining || hasPeers:
-		// Something was found and coverage was judged sufficient.
-		sb.WriteString("RULE: Generic knowledge is BLOCKED. Build your answer only from\n")
-		sb.WriteString("the material above.\n\n")
+		// Default posture: trained + peer knowledge only.
+		sb.WriteString("[GENERIC KNOWLEDGE IS BLOCKED]\n")
+		sb.WriteString("Build the answer ONLY from the material above.\n")
+		sb.WriteString("- EVERY claim must carry its source: [CHUNK_id] for your training,\n")
+		sb.WriteString("  [PEER:ExpertName] for a peer's. A claim with no source is not allowed.\n")
+		sb.WriteString("- If something the task asks for is genuinely not in the material above,\n")
+		sb.WriteString("  do NOT invent it. Write [NOT_COVERED: <what is missing>] instead.\n")
+		sb.WriteString("  Saying it is missing is correct behaviour; guessing is not.\n\n")
 
 	default:
-		// Nothing at all was found — the honest fallback.
+		// Nothing at all was found. Say so rather than silently guessing.
 		sb.WriteString("[NO TRAINING OR PEER KNOWLEDGE FOUND]\n")
-		sb.WriteString("Use your general domain expertise. Mark all claims with [GENERIC].\n\n")
+		sb.WriteString("You have no trained material for this task and no peer supplied any.\n")
+		sb.WriteString("State this plainly as [NOT_COVERED: <what you would need>] rather than\n")
+		sb.WriteString("answering from generic knowledge, unless the client has opened a\n")
+		sb.WriteString("generic allowance.\n\n")
 	}
 
 	return sb.String()

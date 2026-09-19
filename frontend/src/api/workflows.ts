@@ -17,6 +17,8 @@ export interface Workflow {
   costSpentUsd: number
   costSoftLimitPct: number
   costHardLimitPct: number
+  // genericAllowancePct: 0-30. 0 = experts use trained + peer knowledge only.
+  genericAllowancePct: number
   createdAt: string
   updatedAt: string
 }
@@ -119,11 +121,15 @@ export const respondToApproval = (
   workflowId: string,
   approvalId: string,
   decision: 'approve' | 'approve_with_notes' | 'request_changes' | 'reject_and_restart_phase' | 'cancel_workflow',
-  notes?: string
+  notes?: string,
+  // genericAllowancePct: 0-30. Sent with 'request_changes' to re-run the
+  // design with a bounded generic-knowledge allowance. Omit to leave the
+  // workflow's current setting untouched.
+  genericAllowancePct?: number
 ) =>
   baseAPI
     .post<ApiResponse<{ status: string; decision: string }>>(
       `/api/v1/workflows/${workflowId}/approvals/${approvalId}/respond`,
-      { decision, notes }
+      { decision, notes, genericAllowancePct }
     )
     .then((res) => res.data.data!)

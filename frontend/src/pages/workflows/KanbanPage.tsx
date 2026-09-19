@@ -13,16 +13,24 @@ import { cn } from '@/utils/cn'
 
 // ApprovalGate component — renders Approve/Request Changes buttons.
 // Shown when workflow.status === 'paused_for_approval'.
+// GENERIC_OPTIONS: the allowance values the client can pick.
+// Capped at 30 to match MaxGenericAllowancePct in the backend and the
+// workflows_generic_allowance_pct_check constraint (migration 017) — trained
+// knowledge must always remain the majority contributor.
+const GENERIC_OPTIONS = [0, 5, 10, 20, 30]
+
 function ApprovalGate({
   workflowId,
   approvalId,
   gateName,
   summary,
+  currentGenericPct,
 }: {
   workflowId: string
   approvalId: string
   gateName: string
   summary: string
+  currentGenericPct: number
 }) {
   const [notes, setNotes] = useState('')
   const [loading, setLoading] = useState<string | null>(null)
@@ -35,6 +43,10 @@ function ApprovalGate({
   // but the UI should not send them in the first place.
   const [sent, setSent] = useState(false)
 
+  // genericPct: only sent with 'request_changes'. Approving never changes the
+  // dial — approval means "this output is acceptable as it stands".
+  const [genericPct, setGenericPct] = useState(currentGenericPct)
+
   const respond = async (decision: 'approve' | 'request_changes') => {
     if (!approvalId) {
       setError('Approval ID not yet received from server. Please wait a moment and try again.')
@@ -43,7 +55,13 @@ function ApprovalGate({
     setLoading(decision)
     setError(null)
     try {
-      await respondToApproval(workflowId, approvalId, decision, notes || undefined)
+      await respondToApproval(
+        workflowId,
+        approvalId,
+        decision,
+        notes || undefined,
+        decision === 'request_changes' ? genericPct : undefined
+      )
       setSent(true)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Request failed')
@@ -75,6 +93,44 @@ function ApprovalGate({
       {sent && !error && (
         <p className="mt-1 text-xs text-mode-advise">Response sent. Resuming workflow...</p>
       )}
+
+      {/* Generic-knowledge dial. Applies only to "Request Changes": the design
+          is produced again with this ceiling. 0 keeps experts on trained +
+          peer knowledge only, which is the default posture. */}
+      <div className="mt-3 rounded border border-surface-overlay bg-surface-base/60 p-3">
+        <p className="text-xs font-medium text-text-primary">
+          Not satisfied? Allow some generic knowledge and re-run the design
+        </p>
+        <p className="mt-1 text-[11px] text-text-disabled">
+          Experts currently use ONLY their trained material and each other's work.
+          Raising this lets them fill gaps with general knowledge, tagged [GENERIC].
+          Capped at 30% so trained knowledge stays the majority.
+        </p>
+        <div className="mt-2 flex items-center gap-2">
+          <label htmlFor="generic-pct" className="text-[11px] text-text-secondary">
+            Generic allowance
+          </label>
+          <select
+            id="generic-pct"
+            value={genericPct}
+            onChange={(e) => setGenericPct(Number(e.target.value))}
+            disabled={!!loading || sent}
+            className="rounded border border-surface-overlay bg-surface-base px-2 py-1 text-xs text-text-primary disabled:opacity-50"
+          >
+            {GENERIC_OPTIONS.map((pct) => (
+              <option key={pct} value={pct}>
+                {pct === 0 ? '0% — trained knowledge only' : `${pct}%`}
+              </option>
+            ))}
+          </select>
+          {currentGenericPct > 0 && (
+            <span className="text-[11px] text-glow-amber">
+              currently {currentGenericPct}%
+            </span>
+          )}
+        </div>
+      </div>
+
       <div className="mt-3 flex gap-2">
         <button
           onClick={() => respond('approve')}
@@ -88,7 +144,9 @@ function ApprovalGate({
           disabled={!!loading || sent}
           className="rounded border border-glow-amber/60 px-4 py-1.5 text-xs font-semibold text-glow-amber hover:bg-glow-amber/10 disabled:opacity-50"
         >
-          {loading === 'request_changes' ? 'Sending...' : '\u21ba Request Changes'}
+          {loading === 'request_changes'
+            ? 'Sending...'
+            : `\u21ba Request Changes & Re-run (${genericPct}% generic)`}
         </button>
       </div>
     </div>
@@ -450,6 +508,7 @@ function KanbanPage() {
           approvalId={stream.approvalGate?.approvalId ?? ''}
           gateName={stream.approvalGate?.gateName ?? 'approval'}
           summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
+          currentGenericPct={workflow?.genericAllowancePct ?? 0}
         />
       )}
 

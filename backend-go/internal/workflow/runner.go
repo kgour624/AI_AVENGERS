@@ -19,6 +19,16 @@ import (
 	"ai_avengers/backend/internal/monitoring"
 )
 
+// maxDesignAttempts bounds how many times the design phases may be produced
+// again at the client's request. Each attempt blocks on a human response at
+// the approval gate, so this cannot spin on its own — it is a runaway-cost
+// guard, not a policy limit.
+const maxDesignAttempts = 10
+
+// decisionChangesRequested is the approval_requests.status value written when
+// the client presses "Request Changes" (see handler.decisionToStatus).
+const decisionChangesRequested = "changes_requested"
+
 // runnerState is the checkpoint saved after each task completes.
 // Written to workflows.runner_state for pod-restart recovery.
 type runnerState struct {
@@ -202,61 +212,80 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// After design phases, AskClient gates implementation start.
 	// Implementation and QA use AiderRunner (file system + git).
 
-	// --- Phase: High Level Design ---
-	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
-	state := &runnerState{Phase: PhaseHighLevelDesign}
-	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-		log.Error("runner: HLD waves failed", zap.Error(err))
-		if len(state.CompletedExpertIDs) == 0 {
-			_ = r.engine.Fail(ctx, workflowID, "HLD phase: all tasks failed")
+	// --- Design phases, repeatable on client request ---
+	//
+	// The two design phases plus their approval gate run inside a loop. If the
+	// client responds "request_changes" at the gate, the design is produced
+	// again — picking up whatever generic allowance the client set with that
+	// response (executeWaves re-reads workflows.generic_allowance_pct on every
+	// attempt). Approving breaks the loop and implementation starts.
+	//
+	// WHY a loop and not "experts revise in place": the client's dial changes
+	// what the experts are ALLOWED to use as source material, which is an
+	// input to the gate system, not something an expert can patch afterwards.
+	// The design has to be produced again under the new rule.
+	//
+	// The loop cannot spin on its own — every iteration blocks on a human
+	// response at the gate. maxDesignAttempts is only a runaway-cost guard.
+	var state *runnerState
+	for attempt := 1; attempt <= maxDesignAttempts; attempt++ {
+		if attempt == 1 {
+			_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
+		} else {
+			// Backwards move, so TransitionPhase's forward-only validation
+			// does not apply. See Engine.RestartPhase.
+			if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseHighLevelDesign); rErr != nil {
+				log.Error("runner: restart HLD failed", zap.Error(rErr))
+				return
+			}
+			log.Info("runner: re-running design phases on client request",
+				zap.Int("attempt", attempt),
+			)
+		}
+
+		state = &runnerState{Phase: PhaseHighLevelDesign}
+		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+			log.Error("runner: HLD waves failed", zap.Error(err))
+			if len(state.CompletedExpertIDs) == 0 {
+				_ = r.engine.Fail(ctx, workflowID, "HLD phase: all tasks failed")
+				return
+			}
+		}
+
+		if attempt == 1 {
+			_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseDetailedDesign, nil, 0)
+		} else if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseDetailedDesign); rErr != nil {
+			log.Error("runner: restart detailed design failed", zap.Error(rErr))
 			return
+		}
+
+		state = &runnerState{Phase: PhaseDetailedDesign}
+		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+			log.Error("runner: DetailedDesign waves failed", zap.Error(err))
+			if len(state.CompletedExpertIDs) == 0 {
+				_ = r.engine.Fail(ctx, workflowID, "DetailedDesign phase: all tasks failed")
+				return
+			}
+		}
+
+		// Gate: client reads the deliverables and decides.
+		decision, gateErr := r.askDesignGate(ctx, workflowID, attempt)
+		if gateErr != nil {
+			log.Error("runner: design gate failed", zap.Error(gateErr))
+			return
+		}
+		if decision != decisionChangesRequested {
+			break
+		}
+		if attempt == maxDesignAttempts {
+			log.Warn("runner: design re-run limit reached, proceeding",
+				zap.Int("max_attempts", maxDesignAttempts),
+			)
 		}
 	}
 
-	// --- Phase: Detailed Design ---
-	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseDetailedDesign, nil, 0)
-	state = &runnerState{Phase: PhaseDetailedDesign}
-	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-		log.Error("runner: DetailedDesign waves failed", zap.Error(err))
-		if len(state.CompletedExpertIDs) == 0 {
-			_ = r.engine.Fail(ctx, workflowID, "DetailedDesign phase: all tasks failed")
-			return
-		}
-	}
-
-	// --- Gate: Ask client to approve implementation start ---
-	//
-	// GateName MUST be one of approval_requests_gate_check (migration 006):
-	//   'intake','high_level_design','detailed_design','handoff',
-	//   'budget_exceeded','ad_hoc'
-	//
-	// BUG FIX: this passed "implementation_approval", which is not in that
-	// list, so the INSERT inside AskClient's createApprovalRequest() failed
-	// the CHECK constraint -> AskClient returned an error -> the workflow was
-	// failed with "implementation AskClient failed", right after the design
-	// phases completed.
-	//
-	// 'detailed_design' is the correct gate: this call sits immediately after
-	// the Detailed Design phase and gates the start of implementation, which
-	// is exactly "Client approval gate 3" in the workflow state machine of
-	// DOMAIN_EXPERT_COLLABORATION_DESIGN.md §9 (gates: intake ->
-	// high_level_design -> detailed_design -> handoff). The schema and the
-	// design doc agree; the invented name was the outlier.
-	_, err = r.tools.AskClient(ctx, AskClientRequest{
-		WorkflowID:   workflowID,
-		FromExpertID: uuid.Nil,
-		GateName:     "detailed_design",
-		Summary:      "Design phases complete. Approve to start implementation (Aider will write code).",
-	})
-	if err != nil {
-		log.Error("runner: implementation AskClient failed", zap.Error(err))
-		_ = r.engine.Fail(ctx, workflowID, "implementation AskClient failed")
-		return
-	}
-	if err := r.waitForResume(ctx, workflowID); err != nil {
-		log.Warn("runner: wait for implementation approval failed", zap.Error(err))
-		return
-	}
+	// The design gate lives inside the loop above (askDesignGate), so by the
+	// time we get here the client has approved the design.
 
 	// --- Phase: Implementation (Aider) ---
 	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseImplementation, nil, 0)
@@ -348,6 +377,11 @@ func (r *WorkflowRunner) executeWaves(
 	// Design phases (high_level_design, detailed_design, handoff) use AgentLoop.
 	// Implementation/QA phases use AiderRunner (file system + git).
 	useAider := state.Phase == PhaseImplementation || state.Phase == PhaseQA
+
+	// Client's generic ceiling, read fresh for this phase attempt so a re-run
+	// picks up a dial the client just changed. Only the design phases use it
+	// (AiderRunner builds its own prompt and never allows generic).
+	genericAllowancePct := r.loadGenericAllowancePct(ctx, workflowID)
 
 	// workflowWorkspace is the base dir for all expert workspaces in this workflow.
 	// Structure: /workspaces/{workflow_id}/{expert_id}/
@@ -463,6 +497,8 @@ func (r *WorkflowRunner) executeWaves(
 						WorkflowPhase: state.Phase,
 						// AllExperts: all workflow experts for Gate 2 peer poll.
 						AllExperts: experts,
+						// GenericAllowancePct: 0 means trained + peer only.
+						GenericAllowancePct: genericAllowancePct,
 					})
 					if err != nil {
 						r.logger.Error("runner: task failed",
@@ -656,6 +692,94 @@ func (r *WorkflowRunner) loadRequirement(ctx context.Context, workflowID uuid.UU
 		return content.Text
 	}
 	return string(latest.Content)
+}
+
+// askDesignGate posts the design approval gate, waits for the client, and
+// returns the decision recorded on the approval row.
+//
+// GateName must be one of approval_requests_gate_check (migration 006):
+//   'intake','high_level_design','detailed_design','handoff',
+//   'budget_exceeded','ad_hoc'
+// 'detailed_design' is correct here: this gate sits immediately after the
+// Detailed Design phase and gates the start of implementation — "Client
+// approval gate 3" in DOMAIN_EXPERT_COLLABORATION_DESIGN.md §9.
+func (r *WorkflowRunner) askDesignGate(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	attempt int,
+) (string, error) {
+	summary := "Design phases complete. Read the deliverables, then Approve to start " +
+		"implementation — or Request Changes to have the design produced again " +
+		"(optionally allowing some generic knowledge)."
+	if attempt > 1 {
+		summary = fmt.Sprintf("Design re-run #%d complete. %s", attempt, summary)
+	}
+
+	if _, err := r.tools.AskClient(ctx, AskClientRequest{
+		WorkflowID:   workflowID,
+		FromExpertID: uuid.Nil,
+		GateName:     "detailed_design",
+		Summary:      summary,
+	}); err != nil {
+		_ = r.engine.Fail(ctx, workflowID, "design AskClient failed")
+		return "", fmt.Errorf("design gate: %w", err)
+	}
+
+	if err := r.waitForResume(ctx, workflowID); err != nil {
+		return "", fmt.Errorf("design gate wait: %w", err)
+	}
+
+	decision := r.lastApprovalStatus(ctx, workflowID)
+	r.logger.Info("runner: design gate answered",
+		zap.String("workflow_id", workflowID.String()),
+		zap.Int("attempt", attempt),
+		zap.String("decision", decision),
+	)
+	return decision, nil
+}
+
+// lastApprovalStatus returns the status of the most recent approval row for a
+// workflow, e.g. "approved" | "changes_requested" | "rejected".
+//
+// Returns "" on error, which the caller treats as "not a re-run request" —
+// failing to read the decision must not trap the workflow in the design loop.
+func (r *WorkflowRunner) lastApprovalStatus(ctx context.Context, workflowID uuid.UUID) string {
+	var status string
+	err := r.db.QueryRow(ctx,
+		`SELECT status FROM approval_requests
+		 WHERE workflow_id = $1
+		 ORDER BY requested_at DESC
+		 LIMIT 1`,
+		workflowID,
+	).Scan(&status)
+	if err != nil {
+		r.logger.Warn("runner: could not read approval decision", zap.Error(err))
+		return ""
+	}
+	return status
+}
+
+// loadGenericAllowancePct reads the client's generic ceiling for a workflow.
+//
+// Read fresh on every phase attempt (not cached from the workflow loaded at
+// Run start) precisely so that a client raising the dial at the gate and
+// asking for a re-run takes effect on the next attempt.
+//
+// Returns 0 on error — the safe default is "trained knowledge only".
+func (r *WorkflowRunner) loadGenericAllowancePct(ctx context.Context, workflowID uuid.UUID) float64 {
+	var pct float64
+	err := r.db.QueryRow(ctx,
+		`SELECT generic_allowance_pct FROM workflows WHERE id = $1`,
+		workflowID,
+	).Scan(&pct)
+	if err != nil {
+		r.logger.Warn("runner: could not read generic_allowance_pct, defaulting to 0",
+			zap.String("workflow_id", workflowID.String()),
+			zap.Error(err),
+		)
+		return 0
+	}
+	return pct
 }
 
 // waitForResume polls workflow status until it transitions to 'running'.
