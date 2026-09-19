@@ -64,12 +64,18 @@ func BuildDAG(tasks []TaskSpec) ([]ExecutionWave, error) {
 
 	// Compute in-degree for each task.
 	// in-degree[i] = number of tasks that must complete before task i.
+	//
+	// BUG FIX: this used to do `idx := taskIndex[depID.String()]; inDegree[idx]++`,
+	// which incremented the in-degree of the DEPENDENCY (depID) instead of the
+	// DEPENDENT (t). That's backwards: a task with zero dependencies would get
+	// its in-degree bumped by every task that depends on it, so it would never
+	// reach in-degree 0 and would be misreported as part of a cycle — exactly
+	// the "cycle detected among 1 tasks: [expertID]" failure seen in production
+	// for a task that had no dependencies at all. in-degree[i] is simply the
+	// number of dependencies task i itself declares.
 	inDegree := make([]int, len(tasks))
-	for _, t := range tasks {
-		for _, depID := range t.DependsOnExpertIDs {
-			idx := taskIndex[depID.String()]
-			inDegree[idx]++
-		}
+	for i, t := range tasks {
+		inDegree[i] = len(t.DependsOnExpertIDs)
 	}
 
 	// Build adjacency list: task i → tasks that depend on i.
