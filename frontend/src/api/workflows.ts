@@ -36,6 +36,19 @@ export interface KanbanTask {
   updatedAt: string
 }
 
+export interface FileArtifact {
+  filename: string
+  filePath: string
+  content: string
+  language: string
+  commitSha: string
+  linesOfCode: number
+  phase: string
+  validationPassed: boolean
+  validationError: string
+  operation: 'create' | 'modify'
+}
+
 export interface BlackboardEvent {
   id: string
   workflowId: string

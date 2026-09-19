@@ -3,6 +3,8 @@ import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getWorkflow, respondToApproval } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
+import { useFileStream } from '@/hooks/useFileStream'
+import type { FileEntry } from '@/hooks/useFileStream'
 import type { KanbanTask } from '@/api/workflows'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
@@ -103,6 +105,79 @@ function TaskCard({ task }: { task: KanbanTask }) {
   )
 }
 
+// FilesPanel — live file browser fed by useFileStream.
+// Shown once implementation/QA phases start producing code files.
+// WHY separate section (not a tab): KanbanPage had no tab pattern to
+// reuse; a stacked section below the board matches how ApprovalGate and
+// the completion banner are already appended below the board.
+function FilesPanel({ files, isConnected }: { files: FileEntry[]; isConnected: boolean }) {
+  const [selectedPath, setSelectedPath] = useState<string | null>(null)
+
+  if (files.length === 0) return null
+
+  const selected = selectedPath ? files.find((f) => f.filePath === selectedPath) : undefined
+
+  return (
+    <div className="mt-6">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
+          Files
+        </span>
+        <div className="flex items-center gap-1.5">
+          <span className={cn(
+            'h-2 w-2 rounded-full',
+            isConnected ? 'bg-mode-advise animate-pulse' : 'bg-glow-amber animate-pulse'
+          )} />
+          <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
+            {isConnected ? 'Live' : 'Connecting...'}
+          </span>
+        </div>
+      </div>
+      <div className="grid grid-cols-3 gap-4">
+        <Card className="col-span-1 max-h-96 overflow-y-auto p-2">
+          {files.map((file) => (
+            <button
+              key={file.filePath}
+              onClick={() => setSelectedPath(file.filePath)}
+              className={cn(
+                'flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs',
+                selectedPath === file.filePath
+                  ? 'bg-surface-overlay text-text-primary'
+                  : 'text-text-secondary hover:bg-surface-overlay/60'
+              )}
+            >
+              <span className="truncate">{file.filePath}</span>
+              <Badge variant={file.operation === 'create' ? 'success' : 'warn'}>
+                {file.operation}
+              </Badge>
+            </button>
+          ))}
+        </Card>
+        <Card className="col-span-2 max-h-96 overflow-y-auto p-3">
+          {selected ? (
+            <>
+              <div className="mb-2 flex items-center justify-between">
+                <p className="text-xs font-medium text-text-primary">{selected.filePath}</p>
+                <span className="text-xs text-text-disabled">{selected.linesOfCode} lines</span>
+              </div>
+              {!selected.validationPassed && selected.validationError && (
+                <p className="mb-2 text-xs text-mode-refuse">{selected.validationError}</p>
+              )}
+              <pre className="overflow-x-auto whitespace-pre text-xs text-text-secondary">
+                {selected.content}
+              </pre>
+            </>
+          ) : (
+            <p className="py-4 text-center text-xs text-text-disabled">
+              Select a file to view its content
+            </p>
+          )}
+        </Card>
+      </div>
+    </div>
+  )
+}
+
 function KanbanPage() {
   const { id } = useParams<{ id: string }>()
 
@@ -120,6 +195,10 @@ function KanbanPage() {
   const stream = useKanbanStream(id ?? null)
   const tasks = stream.tasks
   const isLoading = !stream.isConnected && tasks.length === 0 && !stream.isDone
+
+  // Live file browser — separate SSE stream, scoped to code_artifact_produced
+  // and wave_completed events only (see useFileStream).
+  const fileStream = useFileStream(id ?? null)
 
   return (
     <div className="p-6">
@@ -199,6 +278,9 @@ function KanbanPage() {
           summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
         />
       )}
+
+      {/* Live file browser — populated once experts start producing code */}
+      <FilesPanel files={fileStream.files} isConnected={fileStream.isConnected} />
 
       {/* Completion notice */}
       {stream.isDone && (

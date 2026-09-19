@@ -554,6 +554,7 @@ func buildRouter(
 			workflows.GET("/:id/kanban", wfHandler.GetKanban)
 			workflows.POST("/:id/run", wfHandler.RunWorkflow(wfRunner))
 			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
+			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
 		}
 	}
