@@ -429,7 +429,7 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 	cmd := exec.CommandContext(ctx, "git", "add", ".")
 	cmd.Dir = workspacePath
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git add: %w", err)
+		return nil, fmt.Errorf("git add: %w", err)
 	}
 
 	cmd = exec.CommandContext(ctx, "git", "commit", "-m", "chore: seed workspace with design artifacts and prior wave output")
