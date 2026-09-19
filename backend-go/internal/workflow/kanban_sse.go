@@ -70,6 +70,13 @@ func (h *Handler) StreamKanban(c *gin.Context) {
 	// Frontend deduplicates by sequence_number if needed.
 	eventCh, errCh := sub.Subscribe(c.Request.Context(), workflowID, uuid.Nil, 0)
 
+	// ✅ FIX: Write initial ping BEFORE entering stream loop.
+	// WHY: Go/Gin doesn't send 200 OK headers until first write.
+	// Without this, browser stays in CONNECTING state if no events exist.
+	// SSE comment format: lines starting with ':' are ignored by EventSource.
+	c.Writer.Write([]byte(": connected\n\n"))
+	c.Writer.Flush()
+
 	c.Stream(func(w io.Writer) bool {
 		select {
 		case event, ok := <-eventCh:
