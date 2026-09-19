@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -484,6 +487,25 @@ func (r *WorkflowRunner) executeWaves(
 					zap.Int("wave", waveIdx),
 					zap.Int("experts_merged", len(waveExpertIDs)),
 				)
+
+				// Post wave_completed so the frontend (and any other listener)
+				// knows main/ was just updated with this wave's merged code.
+				// Non-fatal: logged and ignored on failure, matches the
+				// pattern used for every other blackboard.Post call in this
+				// function (e.g. task_plan_ready, cost_limit_exceeded above).
+				mainPath := fmt.Sprintf("%s/main", workflowWorkspace)
+				mergedFiles := listMergedFiles(mainPath)
+				_, _ = r.store.Post(ctx, blackboard.PostRequest{
+					WorkflowID:     workflowID,
+					EventType:      "wave_completed",
+					PostedByClient: false,
+					Content: map[string]interface{}{
+						"wave_index":   waveIdx,
+						"phase":        state.Phase,
+						"expert_ids":   waveExpertIDs,
+						"merged_files": mergedFiles,
+					},
+				})
 			}
 		}
 
@@ -505,6 +527,33 @@ func (r *WorkflowRunner) executeWaves(
 	errMu.Lock()
 	defer errMu.Unlock()
 	return firstErr
+}
+
+// listMergedFiles returns the relative paths of all files currently in
+// mainPath (the shared main/ workspace), excluding .git/. Used to populate
+// the wave_completed event so listeners (e.g. a live file browser) know
+// what's in main/ without doing their own filesystem walk.
+//
+// Non-fatal: returns nil (not an error) if mainPath can't be read, e.g. the
+// merge itself failed or produced nothing.
+func listMergedFiles(mainPath string) []string {
+	var files []string
+	_ = filepath.Walk(mainPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil || info.IsDir() {
+			return nil
+		}
+		if strings.Contains(path, string(filepath.Separator)+".git"+string(filepath.Separator)) ||
+			strings.HasSuffix(path, string(filepath.Separator)+".git") {
+			return nil
+		}
+		rel, relErr := filepath.Rel(mainPath, path)
+		if relErr != nil {
+			return nil
+		}
+		files = append(files, rel)
+		return nil
+	})
+	return files
 }
 
 // getLastBlackboardSeq returns the current max sequence_number on the blackboard.

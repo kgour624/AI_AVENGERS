@@ -1690,6 +1690,12 @@ func (a *AiderRunner) publishCodeArtifacts(
 		// Count lines of code (use final validated code)
 		linesOfCode := countLines([]byte(finalCode))
 
+		// Determine operation: "create" vs "modify".
+		// Compares against main/ (the merged state from prior waves, see
+		// seedWorkspace()'s Source 2). If the file already existed in main/
+		// before this expert started, it's a modify; otherwise it's new.
+		operation := a.detectFileOperation(req.WorkflowID, relPath)
+
 		// Post to blackboard
 		_, postErr := a.store.Post(ctx, blackboard.PostRequest{
 			WorkflowID:       req.WorkflowID,
@@ -1705,6 +1711,7 @@ func (a *AiderRunner) publishCodeArtifacts(
 				"phase":             req.WorkflowPhase,
 				"validation_passed": validationPassed,
 				"validation_error":  validationError,
+				"operation":         operation,
 			},
 		})
 
@@ -1737,6 +1744,27 @@ func (a *AiderRunner) publishCodeArtifacts(
 	)
 
 	return nil
+}
+
+// detectFileOperation reports whether relPath is new ("create") or already
+// existed ("modify") relative to the shared main/ workspace at the time this
+// expert started (i.e. what seedWorkspace() copied in from prior waves).
+//
+// WHY compare against main/ and not os.Stat on the expert's own workspace:
+//   Every file in the expert's workspace "exists" by the time
+//   publishCodeArtifacts() walks it (that's the whole point of the walk).
+//   The question is whether it existed BEFORE this expert's Aider run,
+//   which is exactly what main/ (pre-merge state) represents. Files not
+//   present in main/ were newly authored by Aider this run.
+//
+// Non-fatal: if main/ can't be inspected (e.g. wave 1, no main/ yet), every
+// file is reported as "create", which is correct (nothing existed before).
+func (a *AiderRunner) detectFileOperation(workflowID uuid.UUID, relPath string) string {
+	mainPath := filepath.Join(a.workspaceDir, workflowID.String(), "main", relPath)
+	if _, err := os.Stat(mainPath); err == nil {
+		return "modify"
+	}
+	return "create"
 }
 
 // detectLanguage returns the language name based on file extension.
