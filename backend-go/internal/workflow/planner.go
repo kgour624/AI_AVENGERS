@@ -176,18 +176,32 @@ Format:
 			continue
 		}
 		expertUUID, _ := uuid.Parse(rt.ExpertID)
-		seen := make(map[string]bool)
+		seen := make(map[uuid.UUID]bool)
 		var deps []uuid.UUID
 		for _, depStr := range rt.DependsOnExpertIDs {
-			if depStr == rt.ExpertID || seen[depStr] {
+			// Parse dependency UUID first to handle case-insensitive comparison
+			depUUID, err := uuid.Parse(depStr)
+			if err != nil {
+				p.logger.Warn("planner: invalid dep UUID skipped", zap.String("dep", depStr))
+				continue
+			}
+			// Check self-dependency using parsed UUIDs (case-insensitive)
+			if depUUID == expertUUID {
+				p.logger.Warn("planner: self-dependency removed",
+					zap.String("expert_id", expertUUID.String()),
+					zap.String("dep_id", depStr),
+				)
+				continue
+			}
+			// Check duplicate using parsed UUID
+			if seen[depUUID] {
 				continue
 			}
 			if _, ok := expertIndex[depStr]; !ok {
 				p.logger.Warn("planner: unknown dep removed", zap.String("dep", depStr))
 				continue
 			}
-			seen[depStr] = true
-			depUUID, _ := uuid.Parse(depStr)
+			seen[depUUID] = true
 			deps = append(deps, depUUID)
 		}
 		tasks = append(tasks, TaskSpec{
