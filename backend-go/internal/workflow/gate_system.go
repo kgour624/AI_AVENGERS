@@ -15,12 +15,33 @@ import (
 	"ai_avengers/backend/internal/gateway"
 )
 
-// gate1SimilarityThreshold: minimum rerank score for Gate 1 to pass.
-// WHY 0.70 (not 0.75): 0.75 is too strict for APPLY_PRINCIPLES mode.
-// Principles transfer at lower similarity ("consistent hashing" applies
-// to "URL shortener" at ~0.68-0.72 similarity).
-// 0.70 is the middle of the suggested 0.68-0.72 range.
-const gate1SimilarityThreshold = 0.70
+// Gate 1 works in two relevance bands instead of one pass/fail line.
+//
+// WHY the band exists: with a single 0.70 cutoff, real runs on correctly
+// trained experts scored 0.504 and 0.668 as their BEST chunk. Everything was
+// therefore discarded and the answer fell through to fully generic — the
+// trained material was retrieved from the DB and then thrown away, which is
+// the opposite of what a domain-expert platform is for.
+//
+// gate1StrongThreshold: own training covers the task well enough that
+// generic knowledge is blocked outright and no coverage check is needed.
+const gate1StrongThreshold = 0.70
+
+// gate1UsableThreshold: own training is relevant enough to apply as
+// principles. It enters the prompt, peers are still consulted, and generic
+// knowledge is permitted ONLY for what neither covers — tagged [GENERIC] so
+// the gap is visible to the admin instead of silently invented.
+//
+// WHY 0.40: the observed real scores for on-topic trained material sat in
+// the 0.50-0.67 range, and a cross-encoder score below ~0.4 is weak enough
+// that forcing the expert to build on it produces worse answers than letting
+// it reason. Tune with the measured top_score in the Gate 1 log.
+const gate1UsableThreshold = 0.40
+
+// gate1MaxChunks caps how many own-training chunks reach the prompt, so that
+// weak-but-passing chunks cannot crowd out the strongest ones. Chunks arrive
+// sorted best-first, so this keeps the top N.
+const gate1MaxChunks = 5
 
 // gate2PollTimeout: how long Gate 2 waits for peer responses.
 // WHY 10s: enough for parallel DB queries, not so long it blocks workflow.
@@ -32,15 +53,17 @@ const gate2PollTimeout = 10 * time.Second
 // AgentLoop uses this to build the LLM context.
 type GateResult struct {
 	// TrainingChunks: expert's own training chunks (Gate 1 result).
-	// Non-empty when Gate 1 passes (similarity >= 0.70).
+	// Non-empty when at least one chunk scored >= gate1UsableThreshold,
+	// capped at gate1MaxChunks and ordered best-first.
 	TrainingChunks []chinawall.CourseChunk
 
 	// PeerContributions: knowledge from other experts (Gate 2 result).
 	// Non-empty when Gate 1 fails but peers have relevant knowledge.
 	PeerContributions []PeerContribution
 
-	// GenericAllowed: true only when Gate 1 AND Gate 2 both fail to
-	// cover the task. Gate 3 is only enabled when this is true.
+	// GenericAllowed: true when own training + peer knowledge together do
+	// NOT cover the task. Always false when any chunk reached
+	// gate1StrongThreshold. Gate 3 is only enabled when this is true.
 	GenericAllowed bool
 
 	// CoverageGap: what's missing after Gate 1 + Gate 2.
@@ -66,20 +89,28 @@ type PeerContribution struct {
 //
 // DESIGN: "Pehle Ghar mein Dhoondo, Fir Dost se Pucho, Fir Google Karo"
 //
-// Gate 1 — Own training (Vector DB):
-//   Expert's course_chunks searched for task.
-//   If similarity >= 0.70 -> PASS -> Generic BLOCKED.
-//   Expert uses only their training. Citations: [CHUNK_uuid].
+// Gate 1 — Own training (Vector DB), two bands:
+//   >= gate1StrongThreshold (0.70): training covers the task -> Generic
+//     BLOCKED outright, no coverage check needed.
+//   >= gate1UsableThreshold (0.40): training is relevant as principles ->
+//     it goes into the prompt (top gate1MaxChunks) and the coverage check
+//     decides whether any generic filling is permitted.
+//   Below both: no own training in the prompt.
+//   Citations: [CHUNK_uuid].
 //
-// Gate 2 — Peer knowledge (Blackboard Poll):
+// Gate 2 — Peer knowledge (Blackboard Poll) — ALWAYS runs:
 //   All other workflow experts' chunks searched in parallel (10s timeout).
-//   Coverage check: do combined chunks cover the task?
-//   YES -> Generic BLOCKED. PARTIAL/NO -> Gate 3 enabled.
+//   Runs even when Gate 1 found strong training, because cross-expert
+//   collaboration is mandatory: an expert must see what its peers were
+//   trained on for the same task, not just its own material.
+//   Coverage check (own training + peers): does the combined knowledge
+//   cover the task? YES -> Generic BLOCKED. PARTIAL/NO -> Gate 3 enabled.
 //
 // Gate 3 — Gap filling (Generic, restricted):
-//   Only enabled when Gate 1 AND Gate 2 fail.
+//   Only enabled when own training AND peers together leave a gap.
 //   Prompt: "Fill ONLY this gap: [gap]. Minimal generic knowledge."
-//   Generic claims saved to pending_experience for admin review.
+//   Generic claims saved to pending_experience for admin review, so an
+//   uncovered area becomes visible training debt instead of a silent guess.
 //
 // SOLID:
 //   SRP: GateSystem only decides knowledge access, doesn't generate answers.
@@ -142,36 +173,9 @@ func (g *GateSystem) RunGates(
 		// Non-fatal: treat as Gate 1 fail, proceed to Gate 2
 	}
 
-	// Filter by similarity threshold
-	var qualifiedChunks []chinawall.CourseChunk
-	for _, c := range ownChunks {
-		if float64(c.RerankScore) >= gate1SimilarityThreshold {
-			qualifiedChunks = append(qualifiedChunks, c)
-		}
-	}
-
-	if len(qualifiedChunks) > 0 {
-		// Gate 1 PASS: expert has sufficient training knowledge
-		result.TrainingChunks = qualifiedChunks
-		result.Gate1Passed = true
-		result.GenericAllowed = false
-		g.logger.Info("gate system: Gate 1 PASS — generic blocked",
-			zap.String("expert", expert.Name),
-			zap.Int("qualified_chunks", len(qualifiedChunks)),
-		)
-		return result, nil
-	}
-
-	// Diagnostics for "chunks were found but none qualified".
-	//
-	// WHY: total_chunks alone cannot tell these two cases apart, and they
-	// need opposite fixes:
-	//   a) the reranker (ml-sidecar) is unreachable — getCourseChunks falls
-	//      back to a hardcoded RerankScore of 0.5 for every chunk, which is
-	//      below this threshold, so Gate 1 can NEVER pass no matter how good
-	//      the training data is. Signature: every score is exactly 0.5.
-	//   b) the reranker ran and the best chunk genuinely scored below the
-	//      threshold. Signature: varied scores; top_score shows how close.
+	// Split own training into the two bands. ownChunks arrive sorted by
+	// rerank score, best first.
+	var strongChunks, usableChunks []chinawall.CourseChunk
 	topScore := 0.0
 	allExactlyHalf := len(ownChunks) > 0
 	for _, c := range ownChunks {
@@ -182,46 +186,90 @@ func (g *GateSystem) RunGates(
 		if s != 0.5 {
 			allExactlyHalf = false
 		}
+		if s >= gate1StrongThreshold {
+			strongChunks = append(strongChunks, c)
+		}
+		if s >= gate1UsableThreshold {
+			usableChunks = append(usableChunks, c)
+		}
 	}
-	g.logger.Info("gate system: Gate 1 FAIL — proceeding to Gate 2",
+	if len(usableChunks) > gate1MaxChunks {
+		usableChunks = usableChunks[:gate1MaxChunks]
+	}
+	result.TrainingChunks = usableChunks
+	result.Gate1Passed = len(usableChunks) > 0
+
+	// rerank_fallback_suspected: every score being exactly 0.5 is the
+	// signature of getCourseChunks' fallback when ml-sidecar's reranker is
+	// unreachable — real reranker output is never uniformly 0.5. Without
+	// this flag, "sidecar down" and "scores genuinely low" look identical
+	// in the logs and need opposite fixes.
+	g.logger.Info("gate system: Gate 1 result",
 		zap.String("expert", expert.Name),
 		zap.Int("total_chunks", len(ownChunks)),
-		zap.Float64("threshold", gate1SimilarityThreshold),
+		zap.Int("usable_chunks", len(usableChunks)),
+		zap.Int("strong_chunks", len(strongChunks)),
 		zap.Float64("top_score", topScore),
+		zap.Float64("usable_threshold", gate1UsableThreshold),
+		zap.Float64("strong_threshold", gate1StrongThreshold),
 		zap.Bool("rerank_fallback_suspected", allExactlyHalf),
 	)
 
 	// ============================================================
-	// GATE 2: Peer knowledge poll (parallel, 10s timeout)
+	// GATE 2: Peer knowledge poll — ALWAYS runs
 	// ============================================================
+	// Peers are polled on every task now, not only when Gate 1 fails.
+	// Cross-expert collaboration is the whole point of the workflow: the
+	// System Design expert's architecture has to reach the PMO's task and
+	// vice versa. Previously a Gate 1 pass returned early and the peer's
+	// material never entered the prompt at all.
+	//
+	// Cost note: pollPeers only does embed + vector search + rerank per
+	// peer (no LLM call), is parallel, and is bounded by gate2PollTimeout.
 	peerContribs := g.pollPeers(ctx, expert.ID, taskDescription, allExperts)
 	result.PeerContributions = peerContribs
 
-	// Coverage check: do combined peer chunks cover the task?
-	coverage, gap := g.checkCoverage(ctx, workflowID, taskDescription, peerContribs)
+	// Own training is strong: block generic outright and skip the coverage
+	// LLM call — there is nothing to decide.
+	if len(strongChunks) > 0 {
+		result.GenericAllowed = false
+		result.Gate2Coverage = "YES"
+		g.logger.Info("gate system: strong own training — generic blocked",
+			zap.String("expert", expert.Name),
+			zap.Int("strong_chunks", len(strongChunks)),
+			zap.Int("peer_contributions", len(peerContribs)),
+		)
+		return result, nil
+	}
+
+	// Coverage is judged over BOTH own usable training and peer knowledge,
+	// so generic is permitted only for what neither of them covers.
+	coverage, gap := g.checkCoverage(ctx, workflowID, taskDescription, result.TrainingChunks, peerContribs)
 	result.Gate2Coverage = coverage
 
 	switch coverage {
 	case "YES":
-		// Gate 2 PASS: peers cover the task fully
+		// Training + peers cover the task fully.
 		result.GenericAllowed = false
-		g.logger.Info("gate system: Gate 2 PASS — peer knowledge sufficient",
+		g.logger.Info("gate system: training + peers cover task — generic blocked",
 			zap.String("expert", expert.Name),
+			zap.Int("training_chunks", len(result.TrainingChunks)),
 			zap.Int("peer_contributions", len(peerContribs)),
 		)
 	case "PARTIAL":
-		// Gate 2 PARTIAL: peers cover some, generic allowed for gap only
+		// Generic allowed for the named gap only, tagged [GENERIC].
 		result.GenericAllowed = true
 		result.CoverageGap = gap
-		g.logger.Info("gate system: Gate 2 PARTIAL — generic allowed for gap",
+		g.logger.Info("gate system: partial coverage — generic allowed for gap only",
 			zap.String("expert", expert.Name),
+			zap.Int("training_chunks", len(result.TrainingChunks)),
 			zap.String("gap", gap),
 		)
 	default: // "NO"
-		// Gate 2 FAIL: no peer knowledge, generic allowed for full task
+		// Neither training nor peers cover it: generic for the full task.
 		result.GenericAllowed = true
 		result.CoverageGap = taskDescription
-		g.logger.Info("gate system: Gate 2 FAIL — generic allowed for full task",
+		g.logger.Info("gate system: no coverage — generic allowed for full task",
 			zap.String("expert", expert.Name),
 		)
 	}
@@ -331,14 +379,30 @@ func (g *GateSystem) checkCoverage(
 	ctx context.Context,
 	workflowID uuid.UUID,
 	taskDescription string,
+	ownChunks []chinawall.CourseChunk,
 	peerContribs []PeerContribution,
 ) (coverage string, gap string) {
-	if len(peerContribs) == 0 {
+	if len(ownChunks) == 0 && len(peerContribs) == 0 {
 		return "NO", taskDescription
 	}
 
-	// Build peer knowledge summary
+	// Build the available-knowledge summary from BOTH sources.
+	//
+	// WHY own training is included: this used to judge peer chunks only, so
+	// an expert whose own training partly covered the task was still told
+	// "NO coverage — generic allowed for the full task". The gap has to be
+	// measured against everything the expert actually has in front of it.
 	var sb strings.Builder
+	for _, c := range ownChunks {
+		if sb.Len() == 0 {
+			sb.WriteString("[Your own training]\n")
+		}
+		sb.WriteString(c.Text)
+		sb.WriteString("\n")
+	}
+	if sb.Len() > 0 {
+		sb.WriteString("\n")
+	}
 	for _, contrib := range peerContribs {
 		if len(contrib.Chunks) == 0 {
 			continue
@@ -367,7 +431,7 @@ PARTIAL\nMISSING: <what is missing, max 50 words>
 NO
 
 No other output.`,
-		UserPrompt: fmt.Sprintf("TASK: %s\n\nPEER KNOWLEDGE:\n%s", taskDescription, peerText),
+		UserPrompt: fmt.Sprintf("TASK: %s\n\nAVAILABLE KNOWLEDGE:\n%s", taskDescription, peerText),
 		MaxTokens:  100,
 		Temperature: 0.0,
 	})
@@ -406,9 +470,19 @@ No other output.`,
 func FormatGateContext(result *GateResult) string {
 	var sb strings.Builder
 
-	if result.Gate1Passed && len(result.TrainingChunks) > 0 {
-		sb.WriteString(fmt.Sprintf("[GATE 1 PASS: YOUR TRAINING — %d chunks]\n", len(result.TrainingChunks)))
-		sb.WriteString("These are YOUR principles. Use them. Cite each with [CHUNK_uuid].\n\n")
+	hasTraining := len(result.TrainingChunks) > 0
+	hasPeers := len(result.PeerContributions) > 0
+
+	// Own training first.
+	//
+	// WHY no early return here any more: this block used to end with
+	// `return sb.String()`, so the moment an expert's own training
+	// qualified, the peer section below was never rendered — the other
+	// experts' work silently never reached the prompt. Both sources are
+	// required input now.
+	if hasTraining {
+		sb.WriteString(fmt.Sprintf("[GATE 1: YOUR TRAINING — %d chunks]\n", len(result.TrainingChunks)))
+		sb.WriteString("These are YOUR principles. Apply them first. Cite each with [CHUNK_uuid].\n\n")
 		for _, c := range result.TrainingChunks {
 			if c.Topic != "" {
 				sb.WriteString(fmt.Sprintf("[CHUNK_%s | Topic: %s | Score: %.2f]\n",
@@ -417,13 +491,15 @@ func FormatGateContext(result *GateResult) string {
 			sb.WriteString(c.Text)
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString("RULE: Generic knowledge is BLOCKED. Use only the above training material.\n\n")
-		return sb.String()
 	}
 
-	if len(result.PeerContributions) > 0 {
+	if hasPeers {
 		sb.WriteString("[GATE 2: PEER KNOWLEDGE]\n")
-		sb.WriteString("Your training didn't cover this. Your peers contributed the following.\n")
+		if hasTraining {
+			sb.WriteString("What your peers were trained on for this same task.\n")
+		} else {
+			sb.WriteString("Your training didn't cover this. Your peers contributed the following.\n")
+		}
 		sb.WriteString("Cite peer knowledge as [PEER:ExpertName].\n\n")
 		for _, contrib := range result.PeerContributions {
 			if len(contrib.Chunks) == 0 {
@@ -438,17 +514,31 @@ func FormatGateContext(result *GateResult) string {
 		}
 	}
 
-	if result.GenericAllowed {
+	// Both sources present: say explicitly that neither may be dropped.
+	// Without this the model tends to answer from whichever block it read
+	// last and quietly ignore the other.
+	if hasTraining && hasPeers {
+		sb.WriteString("REQUIRED: your own training AND your peers' knowledge above are both\n")
+		sb.WriteString("input to this task. Reconcile them. Do not ignore either one.\n\n")
+	}
+
+	switch {
+	case result.GenericAllowed:
 		sb.WriteString("[GATE 3: GAP FILLING ALLOWED]\n")
 		sb.WriteString(fmt.Sprintf("ONLY fill this specific gap: %s\n", result.CoverageGap))
 		sb.WriteString("Rules:\n")
 		sb.WriteString("- Use minimal generic knowledge\n")
 		sb.WriteString("- Mark every generic claim with [GENERIC]\n")
-		sb.WriteString("- Do NOT rewrite what peers already covered\n")
+		sb.WriteString("- Do NOT rewrite what your training or your peers already covered\n")
 		sb.WriteString("- Generic knowledge will be reviewed by admin for future training\n\n")
-	} else if len(result.PeerContributions) > 0 {
-		sb.WriteString("RULE: Generic knowledge is BLOCKED. Use only peer knowledge above.\n\n")
-	} else {
+
+	case hasTraining || hasPeers:
+		// Something was found and coverage was judged sufficient.
+		sb.WriteString("RULE: Generic knowledge is BLOCKED. Build your answer only from\n")
+		sb.WriteString("the material above.\n\n")
+
+	default:
+		// Nothing at all was found — the honest fallback.
 		sb.WriteString("[NO TRAINING OR PEER KNOWLEDGE FOUND]\n")
 		sb.WriteString("Use your general domain expertise. Mark all claims with [GENERIC].\n\n")
 	}
