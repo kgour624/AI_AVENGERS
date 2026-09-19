@@ -141,3 +141,26 @@ Must be minimum 32 characters.
 
 **ENCRYPTION_KEY wrong length:**
 Must be exactly 32 characters for AES-256.
+
+
+**Implementation phase fails with `mkdir /workspaces/<id>: permission denied`:**
+
+The `api` container runs as a non-root user and writes the Aider workspaces
+into the shared `workspaces` Docker volume. The image now declares
+`/workspaces` with that user as owner, but Docker only applies an image
+directory's ownership when it creates a **new** empty named volume. A volume
+created before this change is still root-owned, so it has to be removed once:
+
+```bash
+docker-compose down
+docker volume rm ai_avengers_workspaces   # name = <project>_workspaces
+docker-compose up -d --build api aider-service
+```
+
+This deletes generated workspaces only — Postgres and Redis data live in
+separate volumes and are untouched.
+
+Both `api` and `aider-service` deliberately run as UID 1000 because they share
+this volume: the Go side creates the workspace and runs `git` in it, and
+aider-service edits and commits files in the same directory. If you change the
+user in one Dockerfile, change it in the other too.
