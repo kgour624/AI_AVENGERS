@@ -39,7 +39,43 @@ FROM alpine:3.19
 #   rsync           — seedWorkspace copies main/ into an expert workspace and
 #                     WorkspaceMerger merges expert workspaces back into main/,
 #                     both via rsync.
-RUN apk --no-cache add ca-certificates tzdata git rsync
+#   go              — the implementation and QA phases verify generated code by
+#                     building and testing it (internal/workflow/verify.go), and
+#                     the validation pipeline runs "go vet" and "gofmt"
+#                     (internal/validation/go_validator.go). Without the Go
+#                     toolchain every one of those calls failed with
+#                     "executable file not found", which the old code could not
+#                     tell apart from a compile error: taskComplete could never
+#                     become true, so every task burned all 5 iterations, and
+#                     publishCodeArtifacts returned early on the "build failure"
+#                     so no generated code ever reached the blackboard.
+#   nodejs, npm     — same story for the frontend expert. tsc/npm are what
+#                     verify a React workspace; "go build" in one is meaningless.
+#
+# COST: these two add roughly 300 MB to the image. Removing them does not break
+# the build — verification degrades to "could not be verified", which is
+# reported honestly and no longer blocks publishing — but then nothing the
+# experts write is ever actually compiled or tested.
+#
+# RISK, stated plainly: "go test" and "npm run test" execute model-generated
+# code inside this container as the non-root user. The validation sandbox
+# (internal/validation/sandbox.go) applies ulimits and timeouts; verify.go
+# currently relies only on the caller's context timeout. Moving these runs into
+# a dedicated sandboxed service is the right long-term shape.
+RUN apk --no-cache add ca-certificates tzdata git rsync go nodejs npm
+
+# Caches for a non-root user.
+#
+# The Go toolchain refuses to run without a writable build cache and would fail
+# with "failed to initialize build cache ... permission denied", because the
+# default ($HOME/.cache/go-build) is not writable for the user below. npm has
+# the same problem with its cache directory. /tmp is writable by everyone and a
+# cache is meant to be throwaway, so it is the right home for both.
+ENV GOCACHE=/tmp/gocache \
+    GOPATH=/tmp/go \
+    GOTMPDIR=/tmp \
+    GOFLAGS=-mod=mod \
+    npm_config_cache=/tmp/npm
 
 WORKDIR /app
 

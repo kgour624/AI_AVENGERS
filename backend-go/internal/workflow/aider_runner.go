@@ -524,6 +524,20 @@ func (a *AiderRunner) runAiderLoop(
 	// comes back empty, so the caller learns why instead of just "failed".
 	var lastIterationErr error
 
+	// Expert training, loaded once for the whole task.
+	//
+	// The task description is the retrieval key and it does not change between
+	// iterations, so the result cannot change either. Loading it inside the loop
+	// meant five identical embedding calls to the ML sidecar and five identical
+	// pgvector queries per expert, for one task.
+	training, trainingChunks, trainErr := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
+	if trainErr != nil {
+		a.logger.Warn("failed to load expert training, continuing without it",
+			zap.Error(trainErr),
+			zap.String("expert_id", req.Expert.ID.String()),
+		)
+	}
+
 	// PHASE 5: Load checkpoint for recovery
 	// Try to resume from previous run (pod restart)
 	checkpoint, err := a.loadCheckpoint(ctx, req.WorkflowID, req.Expert.ID, req.TaskID)
@@ -597,6 +611,8 @@ func (a *AiderRunner) runAiderLoop(
 			observations,
 			iteration,
 			designFiles,
+			training,
+			trainingChunks,
 		)
 		cancel() // Always cancel to release resources
 
@@ -741,7 +757,30 @@ func (a *AiderRunner) observeWorkspace(
 ) (string, error) {
 	var observations strings.Builder
 
-	// Git status
+	// What the workspace currently holds.
+	//
+	// WHY this had to be added: the only state the model used to receive was
+	// "git status --short", and auto_commits means Aider commits its own edits —
+	// so git status is empty almost every time. The model could not see the files
+	// it had produced in the previous iteration. It was being asked to continue
+	// work it could not observe.
+	files, listErr := a.listEditableFiles(ctx, workspacePath)
+	if listErr != nil {
+		a.logger.Warn("observeWorkspace: could not list files", zap.Error(listErr))
+	}
+	if len(files) == 0 {
+		observations.WriteString("FILES IN THE WORKSPACE: none yet — no source file has been created.\n\n")
+	} else {
+		observations.WriteString("FILES IN THE WORKSPACE (excluding the read-only design/ documents):\n")
+		for _, f := range files {
+			observations.WriteString("  ")
+			observations.WriteString(f)
+			observations.WriteString("\n")
+		}
+		observations.WriteString("\n")
+	}
+
+	// Uncommitted changes, when there are any.
 	cmd := exec.CommandContext(ctx, "git", "status", "--short")
 	cmd.Dir = workspacePath
 	output, err := cmd.CombinedOutput()
@@ -749,103 +788,32 @@ func (a *AiderRunner) observeWorkspace(
 		// Non-fatal: continue without git status
 		a.logger.Warn("git status failed", zap.Error(err))
 	} else if len(output) > 0 {
-		observations.WriteString("Git Status:\n")
+		observations.WriteString("UNCOMMITTED CHANGES:\n")
 		observations.Write(output)
 		observations.WriteString("\n")
 	}
 
-	// Build errors
-	buildOutput, buildErr := a.runBuild(ctx, workspacePath)
-	if buildErr != nil {
-		observations.WriteString("Build Errors:\n")
-		observations.WriteString(buildOutput)
-		observations.WriteString("\n")
-	}
+	// Build and test state, per project actually present in the workspace.
+	// See verify.go: a missing toolchain is reported as "not verified", never as
+	// a build error, and a React workspace is no longer told to fix Go.
+	verification := a.verifyWorkspace(ctx, workspacePath)
+	observations.WriteString(verification.Report())
 
-	// Test failures and coverage (phase-specific)
 	if phase == "qa" {
-		// QA phase: run tests with coverage
-		testOutput, coverage, testErr := a.runTestsWithCoverage(ctx, workspacePath)
-		if testErr != nil {
-			observations.WriteString("Test Failures:\n")
-			observations.WriteString(testOutput)
-			observations.WriteString("\n")
+		if coverage, ok := a.goCoverage(ctx, workspacePath); ok {
+			observations.WriteString(fmt.Sprintf("\nCurrent Go coverage: %.1f%% (target: 80.0%%)\n", coverage))
+		} else {
+			observations.WriteString("\nGo coverage could not be measured in this workspace.\n")
 		}
-		// Always show coverage (even if 0%)
-		observations.WriteString(fmt.Sprintf("Current Coverage: %.1f%% (target: 80.0%%)\n\n", coverage))
-	} else {
-		// Implementation phase: run tests without coverage
-		testOutput, testErr := a.runTests(ctx, workspacePath)
-		if testErr != nil {
-			observations.WriteString("Test Failures:\n")
-			observations.WriteString(testOutput)
-			observations.WriteString("\n")
-		}
-	}
-
-	// If no observations, return empty (first iteration)
-	if observations.Len() == 0 {
-		return "", nil
 	}
 
 	return observations.String(), nil
 }
 
-// runBuild executes go build and captures output.
-//
-// MENTAL MODEL:
-//
-//	go build ./... compiles all packages
-//	Returns: (output, error)
-//	  - error != nil: build failed (compile errors)
-//	  - error == nil: build succeeded
-//
-// CROSS-QUESTIONS:
-//
-//	Q: Why go build ./...?
-//	A: Builds all packages in workspace (not just main)
-//	   Catches compile errors in all files
-//
-//	Q: Why capture output?
-//	A: Output contains error messages for Aider
-//	   Aider needs to see errors to fix them
-func (a *AiderRunner) runBuild(
-	ctx context.Context,
-	workspacePath string,
-) (string, error) {
-	cmd := exec.CommandContext(ctx, "go", "build", "./...")
-	cmd.Dir = workspacePath
-	output, err := cmd.CombinedOutput()
-	return string(output), err
-}
-
-// runTests executes go test and captures output.
-//
-// MENTAL MODEL:
-//
-//	go test ./... runs all tests
-//	Returns: (output, error)
-//	  - error != nil: tests failed
-//	  - error == nil: tests passed
-//
-// CROSS-QUESTIONS:
-//
-//	Q: Why go test ./...?
-//	A: Runs all tests in workspace
-//	   Catches test failures in all packages
-//
-//	Q: Why capture output?
-//	A: Output contains test failure details
-//	   Aider needs to see failures to fix them
-func (a *AiderRunner) runTests(
-	ctx context.Context,
-	workspacePath string,
-) (string, error) {
-	cmd := exec.CommandContext(ctx, "go", "test", "./...")
-	cmd.Dir = workspacePath
-	output, err := cmd.CombinedOutput()
-	return string(output), err
-}
+// Go-only runBuild and runTests used to live here. They were removed, not
+// moved: they hardcoded "go build ./..." and "go test ./..." for every expert,
+// including the React one, and returned exec's not-found error as if the code
+// were broken. Per-project verification is in verify.go.
 
 // runTestsWithCoverage executes go test with coverage and captures output.
 //
@@ -983,6 +951,14 @@ func (a *AiderRunner) runAiderIteration(
 	observations string,
 	iteration int,
 	designFiles []string,
+	// training and trainingChunks are loaded once per task by runAiderLoop, not
+	// per iteration: loadExpertTraining embeds the task description and runs a
+	// pgvector search, and the task description does not change between
+	// iterations. The old code repeated that identical embed + query on all five
+	// iterations — the logs showed "loadExpertTraining: RAG complete" five times
+	// per expert for one task.
+	training string,
+	trainingChunks int,
 ) (commitSHA string, taskComplete bool, err error) {
 	// Step 1: Check if generic knowledge is approved for this task.
 	//
@@ -994,16 +970,6 @@ func (a *AiderRunner) runAiderIteration(
 	//   This implements the design doc rule:
 	//   "30% generic ONLY when ALL experts agree"
 	genericApproved, genericTopics := a.checkGenericApproval(ctx, req.WorkflowID, req.Expert.ID)
-
-	// Step 2: Load expert training (charter + RAG chunks)
-	training, trainingChunks, err := a.loadExpertTraining(ctx, req.Expert.ID, req.TaskDescription)
-	if err != nil {
-		a.logger.Warn("failed to load expert training",
-			zap.Error(err),
-			zap.String("expert_id", req.Expert.ID.String()),
-		)
-		// Non-fatal: continue without training
-	}
 
 	// Step 3: Build Aider message (phase-specific)
 	var message string
@@ -1177,42 +1143,50 @@ func (a *AiderRunner) runAiderIteration(
 		return "", false, fmt.Errorf("extract commit SHA: %w", err)
 	}
 
-	// Check if task complete (phase-specific criteria)
-	if req.WorkflowPhase == "qa" {
-		// QA phase: tests pass + coverage >80%
-		testOutput, coverage, testErr := a.runTestsWithCoverage(ctx, workspacePath)
-		taskComplete = (testErr == nil && coverage >= 80.0)
+	// Is the task done?
+	//
+	// The old test was (buildErr == nil && testErr == nil) with build and test
+	// hardcoded to Go. In an image with no Go toolchain both errors were always
+	// non-nil, so this could never be true: every task ran all five iterations
+	// and reported Completed=false no matter what Aider produced. For a frontend
+	// expert it was doubly wrong — "go build" in a React workspace is meaningless.
+	//
+	// AllPassed() requires that something was actually checked AND that it
+	// passed. A workspace nobody could verify is not complete, but it is not
+	// reported as broken code either. See verify.go.
+	verification := a.verifyWorkspace(ctx, workspacePath)
+	taskComplete = verification.AllPassed()
 
-		a.logger.Info("aider iteration completed (QA phase)",
-			zap.Int("iteration", iteration),
-			zap.String("commit", commitSHA),
-			zap.Float64("coverage", coverage),
-			zap.Bool("tests_pass", testErr == nil),
-			zap.Bool("task_complete", taskComplete),
-		)
-
-		// Log warning if coverage is close but not enough
-		if testErr == nil && coverage >= 75.0 && coverage < 80.0 {
-			a.logger.Warn("coverage close to target but not sufficient",
-				zap.Float64("coverage", coverage),
-				zap.Float64("target", 80.0),
-				zap.String("test_output", testOutput),
-			)
-		}
-	} else {
-		// Implementation phase: build + tests pass
-		_, buildErr := a.runBuild(ctx, workspacePath)
-		_, testErr := a.runTests(ctx, workspacePath)
-		taskComplete = (buildErr == nil && testErr == nil)
-
-		a.logger.Info("aider iteration completed (implementation phase)",
-			zap.Int("iteration", iteration),
-			zap.String("commit", commitSHA),
-			zap.Bool("build_pass", buildErr == nil),
-			zap.Bool("tests_pass", testErr == nil),
-			zap.Bool("task_complete", taskComplete),
-		)
+	fields := []zap.Field{
+		zap.Int("iteration", iteration),
+		zap.String("commit", commitSHA),
+		zap.String("phase", req.WorkflowPhase),
+		zap.Bool("verified", verification.Verified()),
 	}
+	for _, r := range verification.Results {
+		fields = append(fields, zap.String("check_"+r.Project, string(r.Status)))
+	}
+
+	if req.WorkflowPhase == "qa" {
+		// QA additionally demands coverage, but only where coverage can be read.
+		// An unmeasurable 0.0 must not be mistaken for untested code.
+		coverage, haveCoverage := a.goCoverage(ctx, workspacePath)
+		if haveCoverage {
+			taskComplete = taskComplete && coverage >= 80.0
+			fields = append(fields, zap.Float64("coverage", coverage))
+			if coverage >= 75.0 && coverage < 80.0 {
+				a.logger.Warn("coverage close to target but not sufficient",
+					zap.Float64("coverage", coverage),
+					zap.Float64("target", 80.0),
+				)
+			}
+		} else {
+			fields = append(fields, zap.String("coverage", "not measurable"))
+		}
+	}
+
+	fields = append(fields, zap.Bool("task_complete", taskComplete))
+	a.logger.Info("aider iteration completed", fields...)
 
 	return commitSHA, taskComplete, nil
 }
@@ -1839,53 +1813,49 @@ func (a *AiderRunner) publishCodeArtifacts(
 	validationCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
 	defer cancel()
 
-	// Validate build
-	buildOutput, buildErr := a.runBuild(validationCtx, workspacePath)
-	if buildErr != nil {
-		// Check if timeout
-		if validationCtx.Err() == context.DeadlineExceeded {
-			a.logger.Error("build validation timeout",
-				zap.String("workflow_id", req.WorkflowID.String()),
-				zap.String("expert", req.Expert.Name),
-				zap.Duration("timeout", 15*time.Minute),
-			)
-			return fmt.Errorf("build validation timeout (15 minutes)")
+	// Verify every project the workspace actually contains.
+	//
+	// WHY this replaced a hardcoded go build + go test: those two returned
+	// "executable file not found" in this image, and the old code treated that
+	// as a build failure and returned early. The result was that NO
+	// code_artifact_produced event ever reached the blackboard — the Deliverables
+	// panel stayed empty even when Aider had written working code. A tool that
+	// is not installed must not delete the expert's output.
+	verification := a.verifyWorkspace(validationCtx, workspacePath)
+
+	if failures := verification.Failures(); len(failures) > 0 {
+		var detail strings.Builder
+		for _, f := range failures {
+			detail.WriteString(f.Project)
+			detail.WriteString(": ")
+			detail.WriteString(f.Output)
+			detail.WriteString("\n")
 		}
-		a.logger.Error("build validation failed",
+		a.logger.Error("validation failed, not publishing",
 			zap.String("workflow_id", req.WorkflowID.String()),
 			zap.String("expert", req.Expert.Name),
-			zap.String("output", buildOutput),
-			zap.Error(buildErr),
+			zap.String("detail", detail.String()),
 		)
-		return fmt.Errorf("build validation failed: %w\nOutput: %s", buildErr, buildOutput)
+		return fmt.Errorf("validation failed:\n%s", detail.String())
 	}
 
-	// Validate tests
-	testOutput, testErr := a.runTests(validationCtx, workspacePath)
-	if testErr != nil {
-		// Check if timeout
-		if validationCtx.Err() == context.DeadlineExceeded {
-			a.logger.Error("test validation timeout",
-				zap.String("workflow_id", req.WorkflowID.String()),
-				zap.String("expert", req.Expert.Name),
-				zap.Duration("timeout", 15*time.Minute),
-			)
-			return fmt.Errorf("test validation timeout (15 minutes)")
-		}
-		a.logger.Error("test validation failed",
+	if !verification.Verified() {
+		// Nothing could be checked. Publish anyway and say so: the reviewer in
+		// cross-verification is the next gate, and silently discarding the work
+		// leaves the client with nothing to review at all.
+		a.logger.Warn("publishing unverified code — no project could be built in this environment",
 			zap.String("workflow_id", req.WorkflowID.String()),
 			zap.String("expert", req.Expert.Name),
-			zap.String("output", testOutput),
-			zap.Error(testErr),
+			zap.String("report", verification.Report()),
 		)
-		return fmt.Errorf("test validation failed: %w\nOutput: %s", testErr, testOutput)
 	}
 
 	// Log validation success with duration
 	validationDuration := time.Since(validationStart)
-	a.logger.Info("validation passed, proceeding to publish",
+	a.logger.Info("validation complete, proceeding to publish",
 		zap.String("workflow_id", req.WorkflowID.String()),
 		zap.String("expert", req.Expert.Name),
+		zap.Bool("verified", verification.Verified()),
 		zap.Duration("validation_duration", validationDuration),
 	)
 
