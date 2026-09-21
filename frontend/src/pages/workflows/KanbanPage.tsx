@@ -10,6 +10,9 @@ import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { cn } from '@/utils/cn'
+import { WorkflowChatPanel } from '@/components/workflow/WorkflowChatPanel'
+import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
+import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 
 // ApprovalGate component — renders Approve/Request Changes buttons.
 // Shown when workflow.status === 'paused_for_approval'.
@@ -428,6 +431,14 @@ function KanbanPage() {
     tasks.map((t) => [t.assignedExpertId, t.expertName] as [string, string])
   )
 
+  // The set of experts this workflow actually has, for the chat's participant
+  // picker (WorkflowChatPanel) — derived from the Kanban task list rather
+  // than a second fetch of the global expert catalogue, and de-duplicated
+  // because the same expert can own more than one task across waves.
+  const availableExperts = Array.from(
+    new Map(tasks.map((t) => [t.assignedExpertId, { id: t.assignedExpertId, name: t.expertName }])).values()
+  )
+
   return (
     <div className="p-6">
       {/* Header */}
@@ -522,6 +533,20 @@ function KanbanPage() {
 
       {/* Live file browser — populated once experts start producing code */}
       <FilesPanel files={fileStream.files} isConnected={fileStream.isConnected} />
+
+      {/* Deliverable chat (§6) — separate from the product chat, own tables,
+          own tool loop. Available once the workflow has produced at least
+          one task/expert to talk to. */}
+      {id && availableExperts.length > 0 && (
+        <WorkflowChatPanel workflowId={id} availableExperts={availableExperts} />
+      )}
+
+      {/* Amendments (§7.5) — proposals from the chat's mutating tools and from
+          code-feedback findings, waiting on this client's approve/edit/reject. */}
+      {id && <AmendmentsPanel workflowId={id} />}
+
+      {/* Delivery (§17, §18) — push the harness out, or check what got built. */}
+      {id && <DeliveryPanel workflowId={id} />}
 
       {/* Completion notice */}
       {stream.isDone && (
