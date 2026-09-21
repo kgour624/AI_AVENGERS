@@ -431,8 +431,11 @@ func buildRouter(
 		0.8,    // alert_threshold (80%)
 		logger,
 	)
+	wfQARunner := workflow.NewQARunner(
+		bbStore, wfGateSystem, modelGateway, wfSections, workspaceRoot, logger,
+	)
 	wfRunner := workflow.NewWorkflowRunner(
-		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfAuthoringRunner, wfWorkspaceMerger, wfCrossVerifier,
+		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfAuthoringRunner, wfQARunner, wfWorkspaceMerger, wfCrossVerifier,
 		wfCostMonitor, wfTools, bbStore, modelGateway, logger,
 	)
 	// Projector: blackboard events -> workflow_tasks projection (single write path).

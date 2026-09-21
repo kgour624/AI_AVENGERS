@@ -69,8 +69,9 @@ type WorkflowRunner struct {
 	engine          *Engine
 	planner         *Planner
 	agentLoop       *AgentLoop
-	aiderRunner     *AiderRunner            // Aider integration for the QA phase (application code)
-	authoringRunner *AuthoringRunner        // §9: implementation phase now authors design sections, not code
+	aiderRunner     *AiderRunner            // kept for cross-verifier and any future code-gen path
+	authoringRunner *AuthoringRunner        // §9: implementation phase authors design sections
+	qaRunner        *QARunner               // §19: QA phase — testing experts propose test cases
 	workspaceMerger *WorkspaceMerger        // Merges per-expert workspaces after each Aider wave
 	crossVerifier   *CrossVerifier          // Cross-verification protocol (§8)
 	costMonitor     *monitoring.CostMonitor // Per-workflow budget cap enforcement
@@ -87,6 +88,7 @@ func NewWorkflowRunner(
 	agentLoop *AgentLoop,
 	aiderRunner *AiderRunner,
 	authoringRunner *AuthoringRunner,
+	qaRunner *QARunner,
 	workspaceMerger *WorkspaceMerger,
 	crossVerifier *CrossVerifier,
 	costMonitor *monitoring.CostMonitor,
@@ -102,6 +104,7 @@ func NewWorkflowRunner(
 		agentLoop:       agentLoop,
 		aiderRunner:     aiderRunner,
 		authoringRunner: authoringRunner,
+		qaRunner:        qaRunner,
 		workspaceMerger: workspaceMerger,
 		crossVerifier:   crossVerifier,
 		costMonitor:     costMonitor,
@@ -517,8 +520,11 @@ func (r *WorkflowRunner) executeWaves(
 						return
 					}
 
-					// QA (unchanged): Use AiderRunner (file system + git).
-					_, err := r.aiderRunner.Run(ctx, AiderRunRequest{
+					// QA phase: testing experts (java-tester, react-tester, etc.)
+					// read the completed design and propose test cases as
+					// acceptance criteria. No Aider, no go build, no git workspace.
+					// See qa_runner.go and §19 of COLLABORATIVE_DESIGN_ARCHITECTURE.md.
+					qaResult, err := r.qaRunner.Run(ctx, AiderRunRequest{
 						WorkflowID:      workflowID,
 						Expert:          expert,
 						TaskID:          uuid.Nil,
@@ -527,7 +533,7 @@ func (r *WorkflowRunner) executeWaves(
 						WorkflowPhase:   state.Phase,
 					})
 					if err != nil {
-						r.logger.Error("runner: aider task failed",
+						r.logger.Error("runner: qa task failed",
 							zap.String("expert", expert.Name),
 							zap.Error(err),
 						)
@@ -538,13 +544,20 @@ func (r *WorkflowRunner) executeWaves(
 						state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
 						errMu.Unlock()
 					} else {
+						r.logger.Info("runner: qa task completed",
+							zap.String("expert", expert.Name),
+							zap.Int("proposed", qaResult.ProposedCount),
+							zap.Int("gaps", qaResult.GapCount),
+							zap.Bool("completed", qaResult.Completed),
+						)
 						errMu.Lock()
 						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
 						errMu.Unlock()
-						// Track for post-wave merge (only successful experts).
-						waveMu.Lock()
-						waveExpertIDs = append(waveExpertIDs, expert.ID.String())
-						waveMu.Unlock()
+						// QA does not produce per-expert workspaces, so there
+						// is nothing to merge. waveExpertIDs is intentionally
+						// NOT appended here — the post-wave merge below is
+						// gated on len(waveExpertIDs) > 0 and is a no-op when
+						// the slice is empty.
 					}
 				} else {
 					// Design phases: Use AgentLoop (blackboard-based, existing code).
