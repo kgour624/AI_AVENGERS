@@ -28,8 +28,13 @@ const (
 //
 // DESIGN:
 //   Subscribes to the same workflow blackboard Redis channel as Kanban.
-//   Only translates the two event types relevant to a file browser:
-//     code_artifact_produced -> SSE file_artifact (includes "operation": create|modify)
+//   Only translates the event types relevant to a file browser:
+//     code_artifact_produced  -> SSE file_artifact (includes "operation": create|modify)
+//     design_section_written  -> SSE file_artifact (same shape — §9/§10 of
+//                                 docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md;
+//                                 the authoring phase's equivalent of a code
+//                                 file, posted by
+//                                 AuthoringRunner.publishDesignArtifact)
 //     wave_completed          -> SSE file_wave (main/ was just updated)
 //   Everything else is ignored — a file browser doesn't care about task
 //   status or approval gates, that's StreamKanban's job.
@@ -130,7 +135,10 @@ func (h *Handler) handleFileEvent(w io.Writer, event blackboard.Event) {
 	}
 
 	switch event.EventType {
-	case "code_artifact_produced":
+	case "code_artifact_produced", "design_section_written":
+		// Same SSE type for both: FilesPanel/useFileStream.ts render by content
+		// shape (filename/filePath/content/...), not by which phase produced
+		// the file, so one case here is enough — no new frontend branch needed.
 		sendKanbanSSE(w, SSEFileArtifact, payload)
 	case "wave_completed":
 		sendKanbanSSE(w, SSEFileWave, payload)
