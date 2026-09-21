@@ -426,6 +426,24 @@ func buildRouter(
 	wfProjector := workflow.NewProjector(postgres.Pool, bbStore, bbSubscriber, logger)
 	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, wfProjector, logger)
 
+	// Workflow chat (docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md §6).
+	//
+	// Entirely separate from the product chat (chatHandler / messageHandler
+	// above): its own tables, its own handler, no shared code path. It reuses the
+	// workflow engine's own pieces instead — GateSystem so an answer about a
+	// deliverable obeys the same knowledge rules that produced it, and
+	// DesignSectionStore so the design file list it shows is always the real one.
+	//
+	// A second GateSystem instance is constructed here rather than reaching into
+	// AgentLoop's: GateSystem holds no mutable state (assembler + logger only),
+	// and AgentLoop keeps its own private one (agent_loop.go:63).
+	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
+	wfSections := workflow.NewDesignSectionStore(postgres.Pool, logger)
+	wfChatSvc := workflow.NewWorkflowChatService(
+		postgres.Pool, wfGateSystem, modelGateway, wfSections, logger,
+	)
+	wfChatHandler := workflow.NewChatHandler(wfChatSvc, logger)
+
 	// Resume any workflows that were running before pod restart.
 	// WHY background context: must outlive the HTTP server startup.
 	go wfRunner.ResumeOrphanWorkflows(context.Background())
@@ -580,6 +598,16 @@ func buildRouter(
 			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
 		}
+
+		// Workflow chat (§6). Registered on `protected`, so these inherit
+		// AuthMiddleware like every route above — the handlers read
+		// c.MustGet("user_id") and every one of them checks chat ownership
+		// against it.
+		//
+		// Mounts /workflows/:id/chats and /workflow-chats/:cid/*. The workflow
+		// paths reuse the `:id` parameter name the group above already uses, so
+		// gin's tree merges them instead of reporting a wildcard conflict.
+		wfChatHandler.RegisterRoutes(protected)
 	}
 
 	// ============================================================
