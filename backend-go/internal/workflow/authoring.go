@@ -53,6 +53,8 @@ import (
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/blackboard"
 )
 
 // finalMD, acceptanceMD, decisionsMD are the four protocol filenames (§2.2 —
