@@ -439,8 +439,14 @@ func buildRouter(
 	// and AgentLoop keeps its own private one (agent_loop.go:63).
 	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
 	wfSections := workflow.NewDesignSectionStore(postgres.Pool, logger)
+	// wfToolRegistry: the §7 tool loop's catalogue. workspaceRoot matches
+	// AiderRunner's below exactly — read_design/search_design read the same
+	// {workspaceRoot}/{workflowID}/main/ tree AiderRunner's own workspace
+	// convention already defines.
+	wfToolRegistry := workflow.NewToolRegistry(workspaceRoot, logger)
 	wfChatSvc := workflow.NewWorkflowChatService(
-		postgres.Pool, wfGateSystem, modelGateway, wfSections, logger,
+		postgres.Pool, bbStore, wfGateSystem, modelGateway, wfSections,
+		wfToolRegistry, workspaceRoot, logger,
 	)
 	wfChatHandler := workflow.NewChatHandler(wfChatSvc, logger)
 

@@ -48,6 +48,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
 )
 
@@ -126,27 +127,48 @@ type ChatParticipant struct {
 // Carrying an unused dependency would suggest a coupling that does not exist.
 // The two reads live in deliverableContext and citedEvents.
 type WorkflowChatService struct {
-	db       *pgxpool.Pool
-	gates    *GateSystem
-	gw       *gateway.ModelGateway
-	sections *DesignSectionStore
-	logger   *zap.Logger
+	db            *pgxpool.Pool
+	store         *blackboard.Store
+	gates         *GateSystem
+	gw            *gateway.ModelGateway
+	sections      *DesignSectionStore
+	tools         *ToolRegistry
+	workspaceRoot string
+	logger        *zap.Logger
 }
 
 // NewWorkflowChatService wires the service.
+//
+// store is the SAME blackboard.Store instance main.go already constructed with
+// a real Redis client (bbStore), passed in rather than rebuilt here.
+// Store.Post unconditionally calls publishNotification, which calls
+// s.redis.Publish with no nil check (store.go:194, 328) — a Store built with a
+// nil Redis client would panic the first time a mutating tool in the loop
+// posts an event.
+//
+// workspaceRoot is the same AIDER_WORKSPACE_ROOT main.go already reads for
+// AiderRunner — the tool loop's read_design/search_design tools read the
+// identical {workspaceRoot}/{workflowID}/main/ layout that
+// seedWorkspace/WorkspaceMerger already produce. One convention, not two.
 func NewWorkflowChatService(
 	db *pgxpool.Pool,
+	store *blackboard.Store,
 	gates *GateSystem,
 	gw *gateway.ModelGateway,
 	sections *DesignSectionStore,
+	tools *ToolRegistry,
+	workspaceRoot string,
 	logger *zap.Logger,
 ) *WorkflowChatService {
 	return &WorkflowChatService{
-		db:       db,
-		gates:    gates,
-		gw:       gw,
-		sections: sections,
-		logger:   logger,
+		db:            db,
+		store:         store,
+		gates:         gates,
+		gw:            gw,
+		sections:      sections,
+		tools:         tools,
+		workspaceRoot: workspaceRoot,
+		logger:        logger,
 	}
 }
 
@@ -527,18 +549,8 @@ func (s *WorkflowChatService) Send(
 	}
 
 	systemPrompt := s.buildSystemPrompt(expert, gateResult, genericPct)
+	toolCatalogue := promptCatalogue(s.tools.ForExpert(expert))
 	userPrompt := s.buildUserPrompt(deliverable, sectionList, history, question)
-
-	resp, err := s.gw.Call(ctx, gateway.LLMRequest{
-		Model:        gateway.ModelStrong,
-		WorkflowID:   &ch.WorkflowID, // chat spend lands on the workflow budget
-		SystemPrompt: systemPrompt,
-		UserPrompt:   userPrompt,
-		MaxTokens:    4000,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("send: llm: %w", err)
-	}
 
 	// Audit record: which knowledge rules produced this answer (§6.4).
 	// GenericAllowed is true when training + peers together do NOT cover the
@@ -554,6 +566,123 @@ func (s *WorkflowChatService) Send(
 		"coverage_gap":          gateResult.CoverageGap,
 	})
 
+	// The tool loop (§7.3): gather -> act -> verify. Every step — including
+	// every intermediate tool call — is persisted as its own row before the
+	// loop continues, so a client can see what the expert read before it
+	// answered (§7.6 "shows its work"), and so a crash mid-loop loses at most
+	// the step in flight, not the ones already done.
+	loopCtx := &toolLoopContext{
+		db:            s.db,
+		store:         s.store, // the real Store — see NewWorkflowChatService's comment
+		sections:      s.sections,
+		gates:         s.gates,
+		gw:            s.gw,
+		workflowID:    ch.WorkflowID,
+		expert:        expert,
+		chatID:        chatID,
+		workspaceRoot: s.workspaceRoot,
+	}
+
+	maxSteps := s.toolLoopMaxSteps(ctx)
+	stepNo := 0
+	convo := userPrompt + "\n\n" + toolCatalogue
+	var finalContent string
+	var totalTokens int
+	var totalCost float64
+
+	for {
+		stepNo++
+		resp, err := s.gw.Call(ctx, gateway.LLMRequest{
+			Model:        gateway.ModelStrong,
+			WorkflowID:   &ch.WorkflowID, // chat spend lands on the workflow budget
+			SystemPrompt: systemPrompt,
+			UserPrompt:   convo,
+			MaxTokens:    4000,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("send: llm (step %d): %w", stepNo, err)
+		}
+		totalTokens += resp.InputTokens + resp.OutputTokens
+		totalCost += resp.CostUSD
+
+		calls := parseToolCalls(resp.Content)
+		if len(calls) == 0 {
+			// No tool call: this is the final answer.
+			finalContent = resp.Content
+			break
+		}
+
+		// Persist the assistant's tool-call turn itself (content minus the
+		// tool_call blocks, which may be empty — the model sometimes emits
+		// nothing but the call).
+		reasoning := stripToolCallBlocks(resp.Content)
+		if reasoning != "" {
+			if _, err := s.db.Exec(ctx,
+				`INSERT INTO workflow_chat_messages (chat_id, role, expert_id, content, turn_number, step_number)
+				 VALUES ($1, 'assistant', $2, $3, $4, $5)`,
+				chatID, expert.ID, reasoning, turn, stepNo,
+			); err != nil {
+				s.logger.Warn("workflow chat: could not persist reasoning step",
+					zap.String("chat_id", chatID.String()), zap.Error(err))
+			}
+		}
+
+		var toolResultsText strings.Builder
+		for _, call := range calls {
+			tool, known := s.tools.lookup(call.Tool, expert)
+			var resultJSON json.RawMessage
+			var resultErr error
+			if !known {
+				resultErr = fmt.Errorf("tool %q is not available to this expert", call.Tool)
+			} else {
+				var out any
+				out, resultErr = tool.Handler(ctx, loopCtx, call.Input)
+				if resultErr == nil {
+					resultJSON, _ = json.Marshal(out)
+				}
+			}
+
+			var resultForPrompt string
+			if resultErr != nil {
+				resultForPrompt = fmt.Sprintf("ERROR: %s", resultErr.Error())
+				resultJSON, _ = json.Marshal(map[string]string{"error": resultErr.Error()})
+			} else {
+				resultForPrompt = string(resultJSON)
+			}
+			toolResultsText.WriteString(fmt.Sprintf("[%s result]\n%s\n\n", call.Tool, resultForPrompt))
+
+			inputJSON := call.Input
+			if len(inputJSON) == 0 {
+				inputJSON = json.RawMessage("{}")
+			}
+			if _, err := s.db.Exec(ctx,
+				`INSERT INTO workflow_chat_messages
+				     (chat_id, role, tool_name, tool_input, tool_result, turn_number, step_number)
+				 VALUES ($1, 'tool', $2, $3, $4, $5, $6)`,
+				chatID, call.Tool, inputJSON, resultJSON, turn, stepNo,
+			); err != nil {
+				s.logger.Warn("workflow chat: could not persist tool step",
+					zap.String("chat_id", chatID.String()), zap.String("tool", call.Tool),
+					zap.Error(err))
+			}
+		}
+
+		if stepNo >= maxSteps {
+			// The cap exists so a confused model cannot loop until the
+			// workflow's budget is gone (§7.3). Ending here — rather than
+			// erroring — still gives the client an answer, built from
+			// whatever the loop already gathered.
+			s.logger.Warn("workflow chat: tool loop hit max steps",
+				zap.String("chat_id", chatID.String()), zap.Int("max_steps", maxSteps))
+			finalContent = "I gathered the following before reaching my step limit:\n\n" + toolResultsText.String()
+			break
+		}
+
+		// Feed the tool results back in and let the model continue.
+		convo = convo + "\n\n=== YOUR PREVIOUS TOOL CALLS ===\n" + resp.Content +
+			"\n\n=== TOOL RESULTS ===\n" + toolResultsText.String()
+	}
+
 	var out WorkflowChatMessage
 	err = s.db.QueryRow(ctx,
 		`INSERT INTO workflow_chat_messages
@@ -562,8 +691,8 @@ func (s *WorkflowChatService) Send(
 		 VALUES ($1, 'assistant', $2, $3, $4, $5, $6, $7)
 		 RETURNING id, chat_id, role, expert_id, content, turn_number,
 		           gate_result, tokens_used, cost_usd, created_at`,
-		chatID, expert.ID, resp.Content, turn, gateJSON,
-		resp.InputTokens+resp.OutputTokens, resp.CostUSD,
+		chatID, expert.ID, finalContent, turn, gateJSON,
+		totalTokens, totalCost,
 	).Scan(&out.ID, &out.ChatID, &out.Role, &out.ExpertID, &out.Content,
 		&out.TurnNumber, &out.GateResult, &out.TokensUsed, &out.CostUSD,
 		&out.CreatedAt)
@@ -590,7 +719,8 @@ func (s *WorkflowChatService) Send(
 		zap.Int("training_chunks", len(gateResult.TrainingChunks)),
 		zap.Int("peers", len(gateResult.PeerContributions)),
 		zap.Float64("generic_pct", genericPct),
-		zap.Float64("cost_usd", resp.CostUSD),
+		zap.Int("tool_steps", stepNo),
+		zap.Float64("cost_usd", totalCost),
 	)
 	return &out, nil
 }
@@ -742,6 +872,23 @@ func (s *WorkflowChatService) effectiveGenericPct(ctx context.Context, ch *Workf
 		return 0
 	}
 	return pct
+}
+
+// toolLoopMaxSteps reads the step cap from system_settings (§11, §7.3).
+// Falls back to toolLoopMaxStepsDefault (tool_loop.go) on any read failure —
+// a missing settings row must bound the loop, never leave it unbounded.
+func (s *WorkflowChatService) toolLoopMaxSteps(ctx context.Context) int {
+	var raw []byte
+	if err := s.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'tool_loop_max_steps'`,
+	).Scan(&raw); err != nil {
+		return toolLoopMaxStepsDefault
+	}
+	var v int
+	if err := json.Unmarshal(raw, &v); err != nil || v <= 0 {
+		return toolLoopMaxStepsDefault
+	}
+	return v
 }
 
 // genericCeiling reads the business ceiling from system_settings (§11).
