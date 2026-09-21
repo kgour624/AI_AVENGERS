@@ -466,6 +466,24 @@ func buildRouter(
 	)
 	wfChatHandler := workflow.NewChatHandler(wfChatSvc, logger)
 
+	// Delivery: harness git-push export (§18) and the code-feedback loop (§17).
+	//
+	// Both take repoSvc as their credential source, through the one-method
+	// RepoTokenSource interface rather than as a *repo.Service — so the
+	// encryption key and the decrypt routine stay private to internal/repo,
+	// which is the property migration 001 stored the token encrypted to
+	// protect. See internal/workflow/client_repo.go for the credential rules
+	// these two features are bound by.
+	//
+	// workspaceRoot is the same value AiderRunner and the tool registry get:
+	// all three read {workspaceRoot}/{workflowID}/main/, and the export pushes
+	// exactly the tree the chat's read_design shows.
+	wfGitExporter := workflow.NewGitExporter(postgres.Pool, bbStore, repoSvc, workspaceRoot, logger)
+	wfCodeFeedback := workflow.NewCodeFeedbackService(
+		postgres.Pool, bbStore, wfSections, repoSvc, workspaceRoot, logger,
+	)
+	wfDeliveryHandler := workflow.NewDeliveryHandler(wfGitExporter, wfCodeFeedback, logger)
+
 	// Resume any workflows that were running before pod restart.
 	// WHY background context: must outlive the HTTP server startup.
 	go wfRunner.ResumeOrphanWorkflows(context.Background())
@@ -630,6 +648,12 @@ func buildRouter(
 		// paths reuse the `:id` parameter name the group above already uses, so
 		// gin's tree merges them instead of reporting a wildcard conflict.
 		wfChatHandler.RegisterRoutes(protected)
+
+		// Delivery (§17, §18). Same `protected` group and the same `:id`
+		// parameter name for the same two reasons: both handlers check workflow
+		// ownership against c.MustGet("user_id"), and a different wildcard name
+		// at this path position would conflict with the workflow routes above.
+		wfDeliveryHandler.RegisterRoutes(protected)
 	}
 
 	// ============================================================

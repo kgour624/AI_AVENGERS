@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	"github.com/redis/go-redis/v9"
@@ -634,6 +636,72 @@ func (s *Service) updateSyncStatus(ctx context.Context, connectionID uuid.UUID, 
 		 WHERE id=$4`,
 		status, totalChunks, lastSync, connectionID,
 	)
+}
+
+// ErrNoRepoConnection means the project has no git provider connected, so
+// there is no token to act with. A distinct error because the caller's answer
+// to the client is a specific instruction ("connect a repo first"), not a
+// generic failure.
+var ErrNoRepoConnection = errors.New("no repo connection for this project")
+
+// ErrProviderMismatch means a token exists, but for a different provider than
+// the caller asked for. Returning the wrong provider's token would send a
+// GitHub token to GitLab (or the reverse) — a credential leak to a third
+// party, not merely a failed request.
+var ErrProviderMismatch = errors.New("the connected provider does not match the requested one")
+
+// AccessTokenForProject returns the DECRYPTED access token stored for a
+// project's git connection.
+//
+// Why this exists as an exported method:
+//
+// Two features outside this package need to act on a client's git remote with
+// the client's own credentials: the harness git-push export (§18 of
+// docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md) and the code-feedback ingest,
+// which clones the repo the client built (§17). Both need exactly one thing
+// from here — the token — and neither should own a second copy of the
+// encryption key or of the decrypt routine. Exporting the narrowest possible
+// accessor keeps encrypt/decrypt and s.encryptionKey private to this package,
+// which is the property migration 001 stored the token encrypted to protect.
+//
+// The returned token is for immediate in-memory use. Callers must never write
+// it to disk, into a git config, or into a log line.
+func (s *Service) AccessTokenForProject(ctx context.Context, projectID uuid.UUID, provider string) (string, error) {
+	var encrypted, storedProvider string
+	err := s.db.QueryRow(ctx,
+		`SELECT COALESCE(access_token, ''), provider
+		   FROM repo_connections
+		  WHERE project_id = $1
+		  ORDER BY created_at DESC
+		  LIMIT 1`,
+		projectID,
+	).Scan(&encrypted, &storedProvider)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoRepoConnection
+	}
+	if err != nil {
+		return "", fmt.Errorf("load repo connection: %w", err)
+	}
+	if encrypted == "" {
+		// A row can exist with a NULL token: access_token is nullable and
+		// ConnectRepo is not the only way a row is created.
+		return "", ErrNoRepoConnection
+	}
+	if storedProvider != provider {
+		return "", fmt.Errorf("%w: connected %s, asked for %s", ErrProviderMismatch, storedProvider, provider)
+	}
+
+	token, err := s.decrypt(encrypted)
+	if err != nil {
+		// Deliberately does not wrap the decrypt error's text into something
+		// that could carry ciphertext into a log. The cause is almost always a
+		// changed ENCRYPTION_KEY, and that is what the message should say.
+		return "", fmt.Errorf("stored token could not be decrypted — was ENCRYPTION_KEY changed after the repo was connected?")
+	}
+	if strings.TrimSpace(token) == "" {
+		return "", ErrNoRepoConnection
+	}
+	return token, nil
 }
 
 // encrypt encrypts a string using AES-256-GCM.

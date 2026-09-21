@@ -3,7 +3,6 @@ package workflow
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -96,8 +95,14 @@ func (m *WorkspaceMerger) MergeWave(
 
 	// No conflicts: rsync each expert workspace into main/
 	mainPath := filepath.Join(workflowWorkspace, "main")
-	if err := os.MkdirAll(mainPath, 0755); err != nil {
-		return fmt.Errorf("mkdir main workspace: %w", err)
+	// ensureGitRepo (client_repo.go), not a bare MkdirAll. commitMerge below
+	// starts with `git add .`, and nothing in this file — or anywhere else —
+	// ever ran `git init` in main/: rsync copies with `--exclude .git`, so the
+	// directory was a plain folder. `git add` in a non-repository fails, so
+	// every multi-expert wave merge was failing at this step. Found while
+	// implementing the §18 export, which needs main/ to have history.
+	if err := ensureGitRepo(ctx, mainPath); err != nil {
+		return fmt.Errorf("prepare main workspace: %w", err)
 	}
 
 	for _, expertID := range expertIDs {
@@ -149,14 +154,23 @@ func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath 
 	return nil
 }
 
-// copyToMain handles the single-expert case: just rsync to main.
+// copyToMain handles the single-expert case: rsync to main, then commit.
+//
+// The commit is new. Before it, a single-expert wave left main/ as an
+// uncommitted pile of files while a multi-expert wave committed — so whether
+// the harness had any history at all depended on how many experts happened to
+// be in the wave. The §18 export pushes main/'s history; "depends on the
+// roster" is not an acceptable answer to "is there history".
 func (m *WorkspaceMerger) copyToMain(ctx context.Context, workflowWorkspace, expertID string) error {
 	expertPath := filepath.Join(workflowWorkspace, expertID)
 	mainPath := filepath.Join(workflowWorkspace, "main")
-	if err := os.MkdirAll(mainPath, 0755); err != nil {
-		return fmt.Errorf("mkdir main workspace: %w", err)
+	if err := ensureGitRepo(ctx, mainPath); err != nil {
+		return fmt.Errorf("prepare main workspace: %w", err)
 	}
-	return m.rsyncToMain(ctx, expertPath, mainPath)
+	if err := m.rsyncToMain(ctx, expertPath, mainPath); err != nil {
+		return err
+	}
+	return m.commitMerge(ctx, mainPath, 1)
 }
 
 // commitMerge stages and commits all changes in the main workspace.
