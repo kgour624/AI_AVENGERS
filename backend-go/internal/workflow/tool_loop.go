@@ -802,11 +802,42 @@ func toolProposeAcceptance(ctx context.Context, l *toolLoopContext, input json.R
 	}, nil
 }
 
+// toolRaiseConflict handles a disagreement between two experts.
+//
+// FLOW (doc §16.2):
+//
+//  1. Post design_conflict_raised so the event is always on the blackboard.
+//
+//  2. Classify the conflict:
+//     - Spine statement (C-NNN in final.md's statement table) → architectural
+//       decision → always goes to the client. Rank cannot override a product
+//       decision.
+//     - Section detail (anything else) → try rank-based auto-resolve.
+//
+//  3. Auto-resolve: walk expert_categories.authoring_rank ascending (lower
+//     number = higher authority). For each candidate:
+//     a. Skip the two conflicting experts themselves — they already disagree.
+//     b. Check HasKnowledge: does this expert's RAG have relevant chunks
+//        (score >= gate1UsableThreshold = 0.40)? If not, skip with a log.
+//     c. First candidate that passes → ask it via one LLM call (same as
+//        toolAskExpert). Its answer is the resolution.
+//     d. Post design_conflict_resolved with the winner's answer.
+//
+//  4. If no candidate has knowledge → escalate to client with a message
+//     explaining why no expert could auto-resolve.
+//
+// WHY the two conflicting experts are skipped in step 3: they already stated
+// their positions. Asking one of them to "resolve" the conflict they raised
+// would just return their own position — not a resolution.
 func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMessage) (any, error) {
 	var args struct {
 		StatementID string `json:"statement_id"`
 		Position    string `json:"position"`
 		Reason      string `json:"reason"`
+		// OtherExpertID is the expert this one disagrees with.
+		// Optional — if absent, auto-resolve still runs but skips only the
+		// calling expert.
+		OtherExpertID string `json:"other_expert_id"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return nil, fmt.Errorf("raise_conflict: invalid input: %w", err)
@@ -815,21 +846,214 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		return nil, fmt.Errorf("raise_conflict: statement_id and position are required")
 	}
 
+	// Step 1: always post the conflict event first.
 	ev, err := l.store.Post(ctx, blackboard.PostRequest{
 		WorkflowID:       l.workflowID,
 		EventType:        "design_conflict_raised",
 		PostedByExpertID: &l.expert.ID,
 		Content: map[string]any{
-			"chat_id":      l.chatID,
-			"statement_id": args.StatementID,
-			"my_position":  args.Position,
-			"reason":       args.Reason,
+			"chat_id":        l.chatID,
+			"statement_id":   args.StatementID,
+			"my_position":    args.Position,
+			"reason":         args.Reason,
+			"other_expert_id": args.OtherExpertID,
 		},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("raise_conflict: %w", err)
+		return nil, fmt.Errorf("raise_conflict: post event: %w", err)
 	}
-	return map[string]any{"raised": true, "event_id": ev.ID}, nil
+
+	// Step 2: classify — spine statement or section detail?
+	// A spine statement ID starts with "C-" (e.g. C-014). Everything else
+	// is a section-level detail. This is the deterministic classifier from
+	// §16.2: location, not an LLM judgement.
+	isSpineStatement := strings.HasPrefix(strings.TrimSpace(args.StatementID), "C-")
+	if isSpineStatement {
+		// Architectural decision — always goes to the client.
+		_, _ = l.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     l.workflowID,
+			EventType:      "design_conflict_escalated",
+			PostedByClient: false,
+			Content: map[string]any{
+				"conflict_event_id": ev.ID,
+				"statement_id":      args.StatementID,
+				"reason":            "spine statement — architectural decision requires client approval",
+			},
+		})
+		return map[string]any{
+			"raised":    true,
+			"event_id":  ev.ID,
+			"escalated": true,
+			"note":      "This is a spine-level architectural statement (C-NNN). It requires client approval — rank cannot override a product decision.",
+		}, nil
+	}
+
+	// Step 3: section detail — try rank-based auto-resolve.
+	// Build the skip set: the two conflicting experts.
+	skipIDs := map[uuid.UUID]bool{l.expert.ID: true}
+	if args.OtherExpertID != "" {
+		if otherID, parseErr := uuid.Parse(args.OtherExpertID); parseErr == nil {
+			skipIDs[otherID] = true
+		}
+	}
+
+	// Load all workflow experts with their category rank, ordered by rank ASC
+	// (lower number = higher authority). NULL rank comes last.
+	type rankedExpert struct {
+		expert workflowExpert
+		rank   *int // nil when authoring_rank IS NULL
+	}
+	rows, queryErr := l.db.Query(ctx,
+		`SELECT e.id, e.name, e.domain,
+		        COALESCE(e.reasoning_charter, ''),
+		        COALESCE(e.loop_pattern, 'ota'),
+		        COALESCE(e.max_loop_iterations, 5),
+		        COALESCE(e.allowed_tools, '[]'::jsonb),
+		        ec.authoring_rank
+		 FROM workflow_experts we
+		 JOIN experts e ON e.id = we.expert_id
+		 LEFT JOIN expert_categories ec ON ec.id = e.category_id
+		 WHERE we.workflow_id = $1
+		   AND e.is_active = TRUE AND e.deleted_at IS NULL
+		 ORDER BY ec.authoring_rank ASC NULLS LAST`,
+		l.workflowID,
+	)
+	if queryErr != nil {
+		// DB error — fall back to client escalation rather than failing the tool.
+		return map[string]any{
+			"raised":    true,
+			"event_id":  ev.ID,
+			"escalated": true,
+			"note":      fmt.Sprintf("Could not load ranked experts (db error: %s) — escalated to client.", queryErr.Error()),
+		}, nil
+	}
+	defer rows.Close()
+
+	var candidates []rankedExpert
+	for rows.Next() {
+		var re rankedExpert
+		var toolsJSON []byte
+		if scanErr := rows.Scan(
+			&re.expert.ID, &re.expert.Name, &re.expert.Domain,
+			&re.expert.ReasoningCharter, &re.expert.LoopPattern,
+			&re.expert.MaxLoopIterations, &toolsJSON, &re.rank,
+		); scanErr != nil {
+			continue
+		}
+		if len(toolsJSON) > 0 {
+			_ = json.Unmarshal(toolsJSON, &re.expert.AllowedTools)
+		}
+		candidates = append(candidates, re)
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		return map[string]any{
+			"raised":    true,
+			"event_id":  ev.ID,
+			"escalated": true,
+			"note":      fmt.Sprintf("Could not read ranked experts (rows error: %s) — escalated to client.", rowsErr.Error()),
+		}, nil
+	}
+
+	// Walk candidates in rank order. Skip conflicting experts. Check knowledge.
+	conflictTopic := fmt.Sprintf("%s: %s", args.StatementID, args.Reason)
+	var skippedMessages []string
+
+	for _, candidate := range candidates {
+		if skipIDs[candidate.expert.ID] {
+			continue // one of the two conflicting experts — skip
+		}
+
+		// Knowledge check: does this expert have relevant training?
+		if !l.gates.HasKnowledge(ctx, candidate.expert.ID, conflictTopic) {
+			msg := fmt.Sprintf("%s (rank %v): skipped — no relevant training chunks for this topic",
+				candidate.expert.Name, rankStr(candidate.rank))
+			skippedMessages = append(skippedMessages, msg)
+			continue
+		}
+
+		// This expert has knowledge — ask it to resolve the conflict.
+		resolutionPrompt := fmt.Sprintf(
+			"Two experts disagree on: %s\n\nStatement ID: %s\nReason for conflict: %s\n\n"+
+				"Based on your training, which position is correct and why? Be concise.",
+			args.StatementID, args.StatementID, args.Reason,
+		)
+
+		gr, gateErr := l.gates.RunGates(ctx, l.workflowID, candidate.expert,
+			conflictTopic, []workflowExpert{candidate.expert}, 0)
+		if gateErr != nil {
+			skippedMessages = append(skippedMessages, fmt.Sprintf(
+				"%s: skipped — gate system error: %s", candidate.expert.Name, gateErr.Error()))
+			continue
+		}
+
+		resp, llmErr := l.gw.Call(ctx, gateway.LLMRequest{
+			Model:        gateway.ModelFast,
+			WorkflowID:   &l.workflowID,
+			SystemPrompt: fmt.Sprintf("You are %s, a domain expert in %s. %s\n\n%s",
+				candidate.expert.Name, candidate.expert.Domain,
+				candidate.expert.ReasoningCharter,
+				FormatGateContext(gr)),
+			UserPrompt: resolutionPrompt,
+			MaxTokens:  500,
+		})
+		if llmErr != nil {
+			skippedMessages = append(skippedMessages, fmt.Sprintf(
+				"%s: skipped — LLM error: %s", candidate.expert.Name, llmErr.Error()))
+			continue
+		}
+
+		// Resolution found — post the event and return.
+		_, _ = l.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:       l.workflowID,
+			EventType:        "design_conflict_resolved",
+			PostedByExpertID: &candidate.expert.ID,
+			Content: map[string]any{
+				"conflict_event_id": ev.ID,
+				"statement_id":      args.StatementID,
+				"resolver":          candidate.expert.Name,
+				"resolver_rank":     rankStr(candidate.rank),
+				"resolution":        resp.Content,
+				"skipped_experts":   skippedMessages,
+			},
+		})
+		return map[string]any{
+			"raised":           true,
+			"event_id":         ev.ID,
+			"auto_resolved":    true,
+			"resolved_by":      candidate.expert.Name,
+			"resolution":       resp.Content,
+			"skipped_experts":  skippedMessages,
+			"note":             "Auto-resolved by rank. Client will see this in DECISIONS.md.",
+		}, nil
+	}
+
+	// Step 4: no candidate had knowledge — escalate to client.
+	_, _ = l.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:     l.workflowID,
+		EventType:      "design_conflict_escalated",
+		PostedByClient: false,
+		Content: map[string]any{
+			"conflict_event_id": ev.ID,
+			"statement_id":      args.StatementID,
+			"reason":            "no expert with sufficient training found to auto-resolve",
+			"skipped_experts":   skippedMessages,
+		},
+	})
+	return map[string]any{
+		"raised":          true,
+		"event_id":        ev.ID,
+		"escalated":       true,
+		"skipped_experts": skippedMessages,
+		"note":            "No expert with relevant training could auto-resolve this conflict. Escalated to client for manual decision.",
+	}, nil
+}
+
+// rankStr formats a nullable rank for log messages.
+func rankStr(r *int) string {
+	if r == nil {
+		return "unranked"
+	}
+	return fmt.Sprintf("%d", *r)
 }
 
 // toolAskExpert deliberately does NOT call Tools.AskExpert.

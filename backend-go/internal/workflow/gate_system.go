@@ -357,6 +357,25 @@ func (g *GateSystem) pollPeers(
 	}
 }
 
+// HasKnowledge returns true when the expert has at least one training chunk
+// for the given topic that scores at or above gate1UsableThreshold (0.40).
+//
+// Used by the conflict auto-resolver (tool_loop.go toolRaiseConflict) to
+// check whether a higher-rank expert actually knows the topic before letting
+// it decide. Rank gives authority; knowledge gives legitimacy.
+//
+// WHY reuse gate1UsableThreshold: it is the same bar Gate 1 uses to decide
+// "this training is relevant enough to apply as principles". A score below
+// it means the expert's training is too weak to reason from — the same
+// conclusion applies here.
+func (g *GateSystem) HasKnowledge(ctx context.Context, expertID uuid.UUID, topic string) bool {
+	chunks, err := g.assembler.GetCourseChunksForWorkflow(ctx, expertID, topic, 1)
+	if err != nil || len(chunks) == 0 {
+		return false
+	}
+	return float64(chunks[0].RerankScore) >= gate1UsableThreshold
+}
+
 // FormatGateContext builds the context string from GateResult.
 // Called by AgentLoop.buildContext() to replace the old training-only context.
 //
