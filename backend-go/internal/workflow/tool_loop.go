@@ -282,11 +282,158 @@ type toolCall struct {
 	Input json.RawMessage `json:"input"`
 }
 
+// normalizeDeepSeekToolTokens rewrites DeepSeek's native reserved-token
+// tool-call format into our canonical <tool_call>{...}</tool_call> blocks.
+//
+// WHY this exists:
+// DeepSeek-chat is trained with reserved tokens for tool calling:
+//   <｜tool▁calls▁begin｜>
+//   <｜tool▁call▁begin｜>function_name<｜tool▁separator｜>{"arg":"val"}
+//   <｜tool▁call▁end｜>
+//   <｜tool▁calls▁end｜>
+// When the model drifts from our custom <tool_call>{...}</tool_call>
+// prompt instruction (non-deterministic — happens especially on
+// tool-heavy queries like list_sections / search_design), it emits
+// these reserved tokens instead. extractToolCallBlocks only looks for
+// <tool_call>, so the native format produced zero parsed calls and the
+// raw garbled text was returned to the client as the final answer.
+//
+// This function is called BEFORE extractToolCallBlocks so the rest of
+// the parse pipeline is unchanged.
+//
+// Other providers (Anthropic, Gemini, Cavoti, CodeCraftAPI, OpenRouter)
+// use OpenAI-compatible text completion and never emit these tokens —
+// the function is a no-op for them (the marker strings are absent).
+//
+// Mental execution:
+//   input:  "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>list_sections<｜tool▁separator｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+//   output: "<tool_call>{\"tool\":\"list_sections\",\"input\":{}}</tool_call>"
+//
+//   input:  "Here is my answer."   (any non-DeepSeek provider)
+//   output: "Here is my answer."   (unchanged — no markers present)
+func normalizeDeepSeekToolTokens(content string) string {
+	// Fast path: if none of the DeepSeek reserved markers are present,
+	// return immediately without allocating. This is the common case for
+	// every provider that is not DeepSeek.
+	const callsBegin = "<｜tool▁calls▁begin｜>"
+	if !strings.Contains(content, callsBegin) {
+		return content
+	}
+
+	const (
+		callsEnd   = "<｜tool▁calls▁end｜>"
+		callBegin  = "<｜tool▁call▁begin｜>"
+		callEnd    = "<｜tool▁call▁end｜>"
+		separator  = "<｜tool▁separator｜>"
+	)
+
+	var out strings.Builder
+	remaining := content
+
+	for {
+		// Find the outer wrapper start.
+		wrapStart := strings.Index(remaining, callsBegin)
+		if wrapStart == -1 {
+			// No more DeepSeek blocks — write the rest as-is.
+			out.WriteString(remaining)
+			break
+		}
+		// Write any prose before the block.
+		out.WriteString(remaining[:wrapStart])
+
+		// Find the outer wrapper end.
+		wrapEnd := strings.Index(remaining[wrapStart:], callsEnd)
+		var blockContent string
+		if wrapEnd == -1 {
+			// Malformed: no closing wrapper. Treat everything from here as
+			// the block content and stop after this iteration.
+			blockContent = remaining[wrapStart+len(callsBegin):]
+			remaining = ""
+		} else {
+			blockContent = remaining[wrapStart+len(callsBegin) : wrapStart+wrapEnd]
+			remaining = remaining[wrapStart+wrapEnd+len(callsEnd):]
+		}
+
+		// Each individual call is delimited by callBegin / callEnd.
+		for {
+			cStart := strings.Index(blockContent, callBegin)
+			if cStart == -1 {
+				break
+			}
+			blockContent = blockContent[cStart+len(callBegin):]
+
+			cEnd := strings.Index(blockContent, callEnd)
+			var oneCall string
+			if cEnd == -1 {
+				oneCall = blockContent
+				blockContent = ""
+			} else {
+				oneCall = blockContent[:cEnd]
+				blockContent = blockContent[cEnd+len(callEnd):]
+			}
+
+			// oneCall is: "tool_name<｜tool▁separator｜>{...json...}"
+			// Split on the separator to get name and args.
+			sepIdx := strings.Index(oneCall, separator)
+			var toolName, argsRaw string
+			if sepIdx == -1 {
+				// No separator — the whole thing might be a JSON object
+				// already (some DeepSeek variants omit the name prefix).
+				toolName = ""
+				argsRaw = strings.TrimSpace(oneCall)
+			} else {
+				toolName = strings.TrimSpace(oneCall[:sepIdx])
+				argsRaw = strings.TrimSpace(oneCall[sepIdx+len(separator):])
+			}
+
+			// argsRaw should be a JSON object. If it is not, skip this call
+			// rather than emitting malformed JSON into the pipeline.
+			if !strings.HasPrefix(argsRaw, "{") {
+				continue
+			}
+
+			// Rewrite into our canonical format.
+			// {"tool":"<name>","input":<args>}
+			// If toolName is empty (no separator variant), the JSON object
+			// itself may already contain a "tool" key — pass it through as
+			// the input and let extractFirstJSONObject + json.Unmarshal
+			// handle it; the toolCall struct will pick up the "tool" field.
+			var canonical string
+			if toolName != "" {
+				// Escape the tool name for safe JSON embedding.
+				nameBytes, err := json.Marshal(toolName)
+				if err != nil {
+					continue
+				}
+				canonical = fmt.Sprintf(`{"tool":%s,"input":%s}`, string(nameBytes), argsRaw)
+			} else {
+				// No name prefix — pass the raw JSON through; it may already
+				// be in {"tool":"...","input":{...}} shape.
+				canonical = argsRaw
+			}
+			out.WriteString("<tool_call>")
+			out.WriteString(canonical)
+			out.WriteString("</tool_call>")
+
+			if cEnd == -1 {
+				break
+			}
+		}
+	}
+	return out.String()
+}
+
 // parseToolCalls extracts every tool call from a model response, using the same
 // two-stage tolerant parse agent_loop.go uses (extractToolCallBlocks then
 // extractFirstJSONObject) for the same reason: tool-call output is not
 // guaranteed to be clean JSON.
+//
+// normalizeDeepSeekToolTokens is called first so that DeepSeek's native
+// reserved-token format is rewritten into our canonical <tool_call>{...}</tool_call>
+// blocks before extractToolCallBlocks runs. For all other providers the
+// normalizer is a no-op (fast path: no reserved-token markers present).
 func parseToolCalls(content string) []toolCall {
+	content = normalizeDeepSeekToolTokens(content)
 	blocks := extractToolCallBlocks(content)
 	var calls []toolCall
 	for _, block := range blocks {
@@ -311,7 +458,13 @@ func parseToolCalls(content string) []toolCall {
 // with commentary — the commentary is not the final answer (there IS a tool
 // call, so the loop continues), but it also should not be silently discarded
 // from what gets persisted as this step's content.
+//
+// normalizeDeepSeekToolTokens is called first for the same reason as in
+// parseToolCalls: DeepSeek's native tokens must be rewritten before the
+// <tool_call> stripper runs, otherwise they pass through as prose and appear
+// in the persisted reasoning step.
 func stripToolCallBlocks(content string) string {
+	content = normalizeDeepSeekToolTokens(content)
 	const open, close = "<tool_call>", "</tool_call>"
 	var sb strings.Builder
 	for {
