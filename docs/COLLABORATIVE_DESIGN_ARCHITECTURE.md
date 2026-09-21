@@ -942,21 +942,219 @@ Every row is a bug from the last week. This design can reproduce all of them.
 
 ---
 
-## 16. Open questions for the team
+## 16. Decisions (resolved with the team, 2026-09-19)
 
-1. **Who writes acceptance criteria?** Each expert for its own section, or the
-   testing expert for all? Per-expert gives ownership; central gives consistency.
-   This design assumes per-expert plus a testing review pass.
-2. **Two experts trained on the same domain.** Their training will sometimes
-   disagree. Client decision (§5), or does seniority settle it?
-3. **How does built code report back?** The loop currently ends at handoff. If
-   Claude Code's output should feed the next increment, that path is undesigned.
-4. **Untrained experts.** Two of three experts in recent runs retrieved zero
-   chunks. Should an expert with no training be blocked from authoring into the
-   single source of truth?
-5. **Harness export.** Zip, a git remote we push to, or a generated repository?
-6. **Who is the integrator?** §4.3 computes "most upstream participant". Is that
-   right, or should it be an explicit per-workflow choice?
-7. **Tool permissions.** `AllowedTools` is empty for every expert today, which
-   this design reads as read-only. Who grants mutating tools, and per expert or
-   per category?
+These were open questions in the first draft. They are now decided. Each records
+the choice and the reason, so nobody re-opens them without knowing why.
+
+1. **Who writes acceptance criteria — DECIDED: each expert for its own section,
+   then a testing-expert review pass.** Ownership sits with the author, who best
+   knows what can break; the testing expert makes a second pass to catch gaps and
+   inconsistency. This is §3.4 plus a review step at the end of the DAG.
+
+2. **Two experts trained on the same domain disagree — DECIDED: split by scope.**
+   An architecture-level disagreement (something in the spine's statement table)
+   goes to the client as a conflict (§5). A small, same-domain detail is settled
+   automatically by rank — `expert_categories.authoring_rank`, the same column
+   §4.2 adds. The higher rank wins, silently, and the decision is logged in
+   `DECISIONS.md` so it is visible without stopping the client. Rationale: the
+   client must own product-shaping choices, but must not be pulled into every
+   small technical difference.
+
+   Mechanically: when `raise_conflict` (§7.4) fires, the handler checks whether
+   the two statements are in the spine's **statement table** (architecture-level →
+   client gate) or inside a single section's detail (same-domain → rank auto).
+   The classifier is the statement's location, not an LLM judgement — location is
+   deterministic; a judgement is not.
+
+3. **Does built code report back — DECIDED: not now (Option A). The full plan for
+   later (Option B) is written in §17 so it never has to be reverse-engineered
+   from transcripts.** The loop ends at handoff for now. §17 is a complete,
+   self-contained plan for the feedback loop, to be implemented only when the
+   basic flow (design → chat → amend → handoff) is proven in production.
+
+4. **Untrained experts — DECIDED: not a policy question, it was a data accident.**
+   The zero-chunk experts in recent runs were a human error (a SQL query run
+   against the training data), not experts intended to work untrained. Going
+   forward no untrained expert enters a workflow — that is guaranteed by process,
+   at expert-selection time, not by a block in the authoring path. One safety net
+   remains: if an expert with `total_chunks = 0` ever reaches an authoring turn,
+   the turn fails loudly with "expert has no training loaded" rather than
+   authoring from nothing. This is a guard against the accident recurring, not a
+   feature.
+
+5. **Harness export — DECIDED: ZIP now (Option A). Git push (Option B) full plan
+   in §18.** A download button that zips the harness folder ships first. §18 is
+   the complete plan for pushing to a client's git remote, reusing the existing
+   repo-connect/OAuth feature, to be implemented when a client actually asks for
+   it.
+
+6. **Integrator — DECIDED: automatic by default, with a manual override toggle.**
+   By default the integrator is the most-upstream participant, computed as in
+   §4.3 (fewest declared dependencies — typically System Design or Product
+   Manager). But some workflows will not have those roles at all, so a per-workflow
+   setting can (a) turn the auto choice off and (b) name a specific integrator.
+   Stored on the workflow; auto is the default and needs no configuration.
+
+7. **Tool permissions — DECIDED: per expert (Option A).** `AllowedTools` is
+   already a per-expert column (`workflowExpert.AllowedTools`), so mutating-tool
+   permission is granted per expert, not per category. Default remains empty =
+   read-only, which is safe and is what every expert has today. An admin grants a
+   mutating tool to a specific expert deliberately.
+
+---
+
+## 17. Option B — the code-feedback loop (deferred; full plan)
+
+**Not implemented now.** This section exists so that when the team decides to
+build it, the plan is here — no transcript, no re-discovery. It follows the same
+control-plane / content-plane split as the rest of this document.
+
+### 17.1 What it is
+
+Today the workflow ends when the client downloads the harness. Option B closes
+the loop: the code Claude Code produces comes back, the experts see what was
+actually built, and the next design increment is informed by it — build errors,
+deviations from the contract, decisions the coding agent had to make that the
+design left open.
+
+### 17.2 The shape
+
+```
+client builds with Claude Code in their own repo
+        │
+        ▼
+1. INGEST   client points the workflow at the built repo (the repo-connect
+            feature from §18 already knows how to read a repo). We do NOT
+            re-run the design; we read the result.
+2. DIFF     compare the built code against ACCEPTANCE.md:
+              - which acceptance criteria have matching code / passing tests
+              - which endpoints/tables exist that the contract never defined
+                (the coding agent invented them → a gap in our design)
+              - which contract items have no implementation (unbuilt)
+3. REPORT   post code_feedback_ingested to the blackboard with the findings.
+            This is content the experts read on the next turn — exactly like
+            observeWorkspace feeds the Aider loop today (verify.go pattern).
+4. AMEND    each finding becomes a proposed design amendment (§7.5) routed to
+            the owning expert: "the coding agent added POST /x that the contract
+            does not define — accept into the contract, or is this a defect?"
+5. GATE     client approves the amendments, exactly as §7.5.
+6. INCREMENT the design now reflects reality; DECISIONS.md records the round;
+            the next Claude Code run reads the delta since the last decision.
+```
+
+### 17.3 What it reuses (nothing new invented)
+
+| Need | Existing piece |
+|---|---|
+| Read a client repo | Repo-connect / OAuth (§18, and `internal/repo`) |
+| Compare code to expectation | `verify.go` per-project build/test, run against the client repo |
+| "Findings the experts read" | The observations pattern in `observeWorkspace` |
+| Turn a finding into a design change | `propose_amendment` + approval (§7.5) |
+| Record the round | `DECISIONS.md` + a new `code_feedback_ingested` event |
+
+### 17.4 New pieces required
+
+- One event type: `code_feedback_ingested` (no migration — `event_type` has no
+  CHECK, §10).
+- A comparator that maps acceptance criteria to code presence. This is the only
+  genuinely new logic, and it is bounded: for each `AC-*` with a `Verify` command,
+  run it against the client repo and record pass/fail; for each contract endpoint
+  and table, grep the repo for its presence.
+- An ingest endpoint: `POST /workflows/{id}/code-feedback` taking a repo
+  reference.
+
+### 17.5 The mental model, end to end
+
+```
+design v1 shipped (DEC-011 the latest decision)
+client builds, comes back with repo R
+INGEST R
+DIFF against ACCEPTANCE.md:
+   AC-20-03 (batch-move endpoint)  -> test passes            ✓
+   AC-50-01 (WebSocket reconnect)  -> no matching code       ✗ unbuilt
+   POST /boards/{id}/archive       -> in repo, not in contract  ← invented
+REPORT code_feedback_ingested { built: [...], unbuilt: [AC-50-01],
+                                invented: [POST /boards/{id}/archive] }
+AMEND:
+   unbuilt AC-50-01   -> routed to the frontend expert: "still required? or drop?"
+   invented archive   -> routed to system-design: "fold into contract, or defect?"
+client approves: keep AC-50-01, adopt archive into the contract as C-030
+Aider commits both amendments -> design v2
+DECISIONS.md: DEC-012 "reconciled with build R; C-030 added, AC-50-01 reaffirmed"
+next build reads: since DEC-011, C-030 added
+```
+
+### 17.6 Why deferred
+
+It depends on §18 (reading a client repo) and on the basic loop being proven.
+Building it before the design→chat→amend loop works would be building on unproven
+ground — the same mistake as wiring the whole Aider pipeline before a single LLM
+call had ever succeeded.
+
+---
+
+## 18. Option B — git-push export (deferred; full plan)
+
+**Not implemented now.** ZIP ships first (§16.5). This is the plan for pushing the
+harness to a client's git remote when asked.
+
+### 18.1 What exists to build on
+
+`internal/repo` already handles GitHub/GitLab connection: OAuth flow, token
+storage (encrypted, per `ENCRYPTION_KEY`), and PAT-based connect. The workflow
+already produces the harness as a git repository under `/workspaces/{workflow_id}`.
+So export is mostly wiring two things that already exist.
+
+### 18.2 The shape
+
+```
+1. CONNECT   client connects a git provider (exists: OAuth or PAT, internal/repo)
+2. CHOOSE    a target: an existing empty repo, or a new repo to create
+3. PUSH      the harness workspace's main/ branch is pushed to the target:
+               git remote add client <url-with-token>
+               git push client main
+             The workspace is already a git repo with real commit history —
+             per-expert authorship and every amendment — so the client receives
+             not just files but the full decision trail in git log.
+4. RECORD    harness_exported event { provider, repo_url, commit_sha }
+```
+
+### 18.3 New pieces required
+
+- An export endpoint: `POST /workflows/{id}/export/git` taking a provider +
+  target repo reference.
+- Create-repo call (optional path): the provider APIs both support it; only
+  needed for "new repo" rather than "existing empty repo".
+- Token injection into the push URL, then scrubbed from logs. The token is never
+  written to disk in the workspace — it goes into the remote URL for one push and
+  the remote is removed after.
+
+### 18.4 The one risk, named
+
+Pushing carries a token. It must be injected into the remote URL in memory for
+the single push and the remote removed immediately after, never committed, never
+logged. `internal/repo` already stores tokens encrypted; this path must not
+undo that by writing the token into `.git/config` and leaving it there. The
+mental check before shipping: after a push, `git remote -v` in the workspace
+must show no client remote and no token anywhere on disk.
+
+### 18.5 Why deferred
+
+ZIP delivers the same artifact with none of the token risk and none of the
+provider-API surface. Git push is a convenience worth building only when a client
+asks to skip the download-and-upload step — not before.
+
+---
+
+## 19. Still open — genuinely undecided
+
+Only these remain for the team; everything in §16 is settled.
+
+- **`authoring_rank` seeding.** §4.2 and §16.2 both use it. Who sets the initial
+  ranks per category, and by what criteria? Until set, all ranks are NULL, which
+  means: no ordering hint (planner decides order) and same-domain conflicts fall
+  back to the client instead of auto-resolving. Safe default; just less automatic.
+- **Testing-review depth (§16.1).** Does the testing expert only *review*
+  acceptance criteria, or may it *add* its own? This design allows adding; confirm
+  that is wanted.
