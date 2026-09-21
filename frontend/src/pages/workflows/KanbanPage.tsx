@@ -439,8 +439,22 @@ function KanbanPage() {
     new Map(tasks.map((t) => [t.assignedExpertId, { id: t.assignedExpertId, name: t.expertName }])).values()
   )
 
+  // Root scroll container. AppShell's <main> (frontend/src/components/
+  // layout/AppShell.tsx) is `overflow-hidden` by contract — every page it
+  // renders must provide its OWN scroll box, exactly as ChatPage.tsx already
+  // does with its `overflow-y-auto` message list. This page never had one:
+  // the Kanban board + ApprovalGate + Deliverables + Files + (now) the
+  // Chat/Amendments/Delivery panels made the page taller than the viewport,
+  // and main's overflow-hidden silently clipped everything past the fold —
+  // Deliverables onward in one screenshot, the chat's textarea/send button in
+  // another. The content was always in the DOM; it was just clipped.
+  // h-full fills main's height, which is definite (inherited via flexbox from
+  // the h-screen root) — the same mechanism ChatPage's h-full already relies
+  // on. overflow-y-auto is what actually lets this page scroll instead of
+  // clip. WorkflowChatPanel/AmendmentsPanel/DeliveryPanel each already manage
+  // their own bounded internal scroll areas, so this nests without conflict.
   return (
-    <div className="p-6">
+    <div className="h-full overflow-y-auto p-6">
       {/* Header */}
       <div className="mb-6">
         <div className="flex items-center justify-between">
