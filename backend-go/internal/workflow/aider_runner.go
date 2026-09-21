@@ -849,6 +849,11 @@ func (a *AiderRunner) runTestsWithCoverage(
 ) (output string, coverage float64, err error) {
 	cmd := exec.CommandContext(ctx, "go", "test", "-cover", "./...")
 	cmd.Dir = workspacePath
+	// Not the inherited environment. This runs model-generated test code, and the
+	// api process environment holds ENCRYPTION_KEY, JWT_SECRET, every provider API
+	// key and DATABASE_URL with its password. Same allowlist runProjectChecks uses
+	// (verify.go) — one answer to "what may a subprocess see", not two.
+	cmd.Env = validation.MinimalEnv()
 	outputBytes, cmdErr := cmd.CombinedOutput()
 	output = string(outputBytes)
 

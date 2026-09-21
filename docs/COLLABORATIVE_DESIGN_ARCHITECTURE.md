@@ -1371,11 +1371,85 @@ Only these remain for the team; everything in §16 is settled.
   (§9); the QA phase still runs `AiderRunner` unchanged. What "QA" means when the
   code is written by Claude Code outside this system is not defined anywhere in
   this document, and was not guessed at.
-- **Verify commands cannot actually run in the api image.** §17 executes each
-  criterion's `Verify` command against the cloned repo through `verify.go`'s
-  `runProjectChecks`, which correctly reports `unavailable` when the executable is
-  missing. The api image is alpine plus git and rsync — no Go toolchain, no node —
-  so in practice nearly every criterion comes back *unverifiable*, and the useful
-  half of the report is the grep-based contract diff. Making the acceptance checks
-  real means running them somewhere that has a toolchain. Named here because
-  "unverifiable" is honest but is not the same as working.
+- **No memory limit and no network limit on the commands we run.** §17 executes
+  each criterion's `Verify` command against the cloned repo, and the
+  implementation phase builds and tests model-written code. Both now run with an
+  allowlisted environment (see §20), and both are bounded by a wall-clock timeout,
+  but `applyMemoryLimit` is a documented no-op on Linux — Go's `SysProcAttr` has no
+  `Rlimit` field, so a real per-process limit needs `golang.org/x/sys/unix` or a
+  pre-exec hook (`internal/validation/sandbox_linux.go` states this). The container
+  memory limit is the only backstop. A dedicated runner service with cgroup limits
+  and no egress is the right long-term shape; it is not built.
+
+  *(An earlier version of this list claimed the api image had no Go toolchain and
+  therefore could not run these checks at all. That was wrong — commit `31becac`
+  added `go nodejs npm` to the runtime image. The claim came from `verify.go`'s
+  file comment, which described the state of the world before that commit and had
+  not been updated. Both are corrected.)*
+
+---
+
+## 20. Subprocess environment — a credential leak this work uncovered
+
+Not a design decision so much as a defect worth recording, because the shape of
+it will recur every time something new runs a subprocess.
+
+### 20.1 What was wrong
+
+Three places ran build or test commands with `cmd.Env` left nil, which means
+"inherit the parent's environment":
+
+| Site | What it runs |
+|---|---|
+| `verify.go` `runProjectChecks` | `go build`, `go test`, `npm run build`, `npm run test` |
+| `aider_runner.go` `runTestsWithCoverage` | `go test -cover ./...` |
+| §17's acceptance checks (through `runProjectChecks`) | each criterion's `Verify` command, **inside a client's cloned repository** |
+
+The parent is the api process. From `docker-compose.yml`, its environment holds
+`JWT_SECRET`, `ENCRYPTION_KEY` — the key that decrypts clients' stored git tokens
+— `OPENROUTER_API_KEY`, `CAVOTI_API_KEY`, `AIDER_PROXY_TOKEN`, both OAuth client
+secrets, and `DATABASE_URL` with its password.
+
+None of what runs in those subprocesses is our code. `go test` runs tests a model
+generated. `npm run build` runs whatever scripts a `package.json` declares,
+including its dependencies' lifecycle scripts — and since §17, that `package.json`
+can belong to a **client's repository**, which is third-party code we have never
+read. One `process.env` or `os.Environ()` in any of it had every credential the
+platform holds.
+
+### 20.2 What was done
+
+`validation.MinimalEnv` is one allowlist, used by all three sites and by the
+validation pipeline's own sandbox. Allowlist and not blocklist: a blocklist has to
+be updated every time someone adds a secret to the compose file, and the failure
+mode of forgetting is silent.
+
+What is on it, and nothing else: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `TZ`;
+the Go build variables (`GOCACHE`, `GOPATH`, `GOMODCACHE`, `GOROOT`, `GOTMPDIR`,
+`GOFLAGS`, `GOPROXY`, `GOSUMDB`, `GONOSUMDB`, `GOPRIVATE`, `GOOS`, `GOARCH`,
+`CGO_ENABLED`); the Node ones (`npm_config_cache`, `NODE_ENV`, `NODE_PATH`); and
+the Python ones (`PYTHONPATH`, `PYTHONDONTWRITEBYTECODE`).
+
+`GOCACHE` and `npm_config_cache` are load-bearing, not decoration: the Dockerfile
+sets both precisely because the default cache locations are not writable for the
+non-root user, and dropping them would turn a working build into
+"failed to initialize build cache".
+
+Two smaller fixes fell out of the same change. The validation sandbox's inline
+list was missing `GOCACHE` entirely; and it used `os.Getenv`, which cannot tell
+"unset" from "empty", so an unset `GOROOT` was passed to the child as `GOROOT=` —
+not the same thing to every tool. `MinimalEnv` uses `os.LookupEnv` and omits what
+is not set.
+
+### 20.3 What is still open
+
+Named plainly so it is not mistaken for solved:
+
+- **No network restriction.** Limiting egress needs namespaces, not an
+  environment change.
+- **No memory limit.** `applyMemoryLimit` is a no-op on Linux and says so; the
+  container limit is the only backstop.
+- **The git subprocesses still inherit the full environment** (`client_repo.go`).
+  Left deliberately: git needs its environment, and `git clone` does not execute
+  hooks from the remote. If that ever runs anything from a fetched repository, it
+  belongs on the allowlist too.

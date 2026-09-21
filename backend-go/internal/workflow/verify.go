@@ -7,17 +7,18 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"ai_avengers/backend/internal/validation"
 )
 
 // Toolchain-aware workspace verification.
 //
 // This file exists because of one wrong assumption in the original design: that
-// the api container can compile and test the code Aider writes. It cannot. The
-// runtime image is alpine plus ca-certificates, tzdata, git and rsync
-// (backend-go/Dockerfile) — no Go toolchain and no node. So
-// exec.Command("go", "build") returned "executable file not found", and because
-// the old code could not tell that apart from a compile error, three things were
-// permanently broken:
+// the api container can compile and test the code Aider writes. At the time it
+// could not — the runtime image was alpine plus ca-certificates, tzdata, git and
+// rsync, with no Go toolchain and no node. So exec.Command("go", "build")
+// returned "executable file not found", and because the old code could not tell
+// that apart from a compile error, three things were permanently broken:
 //
 //   - observeWorkspace fed the model "Build Errors:" with an EMPTY body on every
 //     iteration. exec's not-found error produces no output, so the model was
@@ -36,6 +37,14 @@ import (
 // Verification is also per-project, not Go-only. Running "go build ./..." in a
 // React expert's workspace was guaranteed to fail and told a frontend expert to
 // go fix a Go build error.
+//
+// STATUS OF THE TOOLCHAIN TODAY, because the paragraph above reads as though it
+// is still missing and it is not: commit 31becac added `go nodejs npm` to the
+// runtime image, so these checks really do run. The unavailable path is still
+// live and still correct — node dependencies are deliberately not installed, a
+// command can time out, and the §17 ingest runs against repositories whose
+// toolchain may be something else entirely — but "the image has no compiler" is
+// history, not current behaviour.
 
 // VerifyStatus is the outcome of checking one project in a workspace.
 type VerifyStatus string
@@ -205,7 +214,30 @@ func (a *AiderRunner) verifyWorkspace(ctx context.Context, workspacePath string)
 //
 // A missing executable is reported as unavailable, never as a code failure.
 // That single distinction is what this file is for.
+//
+// The environment is not inherited, and that is the point:
+//
+// cmd.Env used to be left nil, which means "inherit the parent's environment".
+// The parent is the api process, whose environment holds ENCRYPTION_KEY — the
+// key that decrypts clients' git tokens — plus JWT_SECRET, every provider API
+// key, AIDER_PROXY_TOKEN, both OAuth client secrets, and DATABASE_URL with its
+// password (docker-compose.yml).
+//
+// What runs here is not our code. `go test ./...` runs tests a model generated.
+// `npm run build` runs whatever scripts a package.json declares, including its
+// dependencies' — and since the code-feedback ingest (§17) that package.json can
+// belong to a CLIENT's cloned repository. One line of `process.env` in any of
+// that would have read every credential the platform holds.
+//
+// validation.MinimalEnv is the allowlist, shared with the validation pipeline so
+// there is one answer to "what may a subprocess see" rather than two that drift.
+// Note what it does NOT do: there is no network restriction and no memory limit
+// (see sandbox_linux.go for why the latter is a documented no-op). The wall-clock
+// bound is the caller's context, and for the §17 path that is a per-command
+// timeout.
 func runProjectChecks(ctx context.Context, dir, project string, cmds [][]string) VerifyResult {
+	env := validation.MinimalEnv()
+
 	for _, argv := range cmds {
 		if _, err := exec.LookPath(argv[0]); err != nil {
 			return VerifyResult{
@@ -217,6 +249,7 @@ func runProjectChecks(ctx context.Context, dir, project string, cmds [][]string)
 
 		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 		cmd.Dir = dir
+		cmd.Env = env
 		out, err := cmd.CombinedOutput()
 		if err == nil {
 			continue
