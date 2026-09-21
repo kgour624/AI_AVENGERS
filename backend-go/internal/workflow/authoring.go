@@ -201,6 +201,10 @@ func (r *AuthoringRunner) Run(ctx context.Context, req AiderRunRequest) (*Author
 		}
 		return nil, fmt.Errorf("authoring: no commit after %d iterations", maxIterations)
 	}
+	// Committed something even though the document check never fully passed
+	// — still real, git-committed work. Publishing it is what makes the UI's
+	// Files panel match what `git log` in this workspace already shows.
+	r.publishDesignArtifact(ctx, req, section, workspacePath, commitSHAs)
 	return &AuthoringResult{
 		CommitSHAs:  commitSHAs,
 		Iterations:  maxIterations,
