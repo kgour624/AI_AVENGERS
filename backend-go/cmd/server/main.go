@@ -408,6 +408,19 @@ func buildRouter(
 	wfWorkspaceMerger := workflow.NewWorkspaceMerger(logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfCrossVerifier := workflow.NewCrossVerifier(bbStore, modelGateway, wfAgentLoop, wfAiderRunner, wfTools, logger)
+
+	// wfSections moved up from where it used to be constructed (previously only
+	// needed by the chat wiring below) because AuthoringRunner needs it too, and
+	// AuthoringRunner must exist before wfRunner does.
+	wfSections := workflow.NewDesignSectionStore(postgres.Pool, logger)
+	// AuthoringRunner (§9): the implementation phase now authors design
+	// sections through this, not application code through wfAiderRunner
+	// directly. wfAiderRunner is passed in and reused for its HTTP-call
+	// plumbing, workspace conventions and git helpers — see authoring.go's
+	// file comment for exactly which methods are shared and why duplicating
+	// them would risk drift the next time one side gets a fix.
+	wfAuthoringRunner := workflow.NewAuthoringRunner(wfAiderRunner, wfSections, logger)
+
 	// CostMonitor: enforces per-workflow budget caps (soft + hard limits).
 	// monthly_limit_usd and alert_threshold read from system_settings at startup.
 	// Defaults: $1000/month, 80% alert threshold (architecture doc §17).
@@ -419,7 +432,7 @@ func buildRouter(
 		logger,
 	)
 	wfRunner := workflow.NewWorkflowRunner(
-		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfWorkspaceMerger, wfCrossVerifier,
+		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfAuthoringRunner, wfWorkspaceMerger, wfCrossVerifier,
 		wfCostMonitor, wfTools, bbStore, modelGateway, logger,
 	)
 	// Projector: blackboard events -> workflow_tasks projection (single write path).
@@ -438,7 +451,10 @@ func buildRouter(
 	// AgentLoop's: GateSystem holds no mutable state (assembler + logger only),
 	// and AgentLoop keeps its own private one (agent_loop.go:63).
 	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
-	wfSections := workflow.NewDesignSectionStore(postgres.Pool, logger)
+	// wfSections constructed above (with wfAuthoringRunner) — reused here, not
+	// rebuilt: DesignSectionStore has no state that would make a second
+	// instance wrong, but ListSections/AssignSection must agree on the same
+	// rows, so one instance shared everywhere is the simpler invariant to keep.
 	// wfToolRegistry: the §7 tool loop's catalogue. workspaceRoot matches
 	// AiderRunner's below exactly — read_design/search_design read the same
 	// {workspaceRoot}/{workflowID}/main/ tree AiderRunner's own workspace

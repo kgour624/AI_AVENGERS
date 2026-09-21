@@ -40,36 +40,39 @@ type runnerState struct {
 // WorkflowRunner drives a workflow from start to completion.
 //
 // FLOW:
-//   1. Load workflow + experts from DB
-//   2. Load requirement from blackboard
-//   3. Planner.Plan() -> []TaskSpec
-//   4. DAG.BuildDAG() -> []ExecutionWave (topological sort)
-//   5. Post task_plan_ready event (Projector creates workflow_tasks)
-//   6. AskClient for plan approval -> workflow pauses
-//   7. waitForResume() polls DB
-//   8. executeWaves(): wave by wave, parallel within each wave
-//   9. AskClient for final approval
+//  1. Load workflow + experts from DB
+//  2. Load requirement from blackboard
+//  3. Planner.Plan() -> []TaskSpec
+//  4. DAG.BuildDAG() -> []ExecutionWave (topological sort)
+//  5. Post task_plan_ready event (Projector creates workflow_tasks)
+//  6. AskClient for plan approval -> workflow pauses
+//  7. waitForResume() polls DB
+//  8. executeWaves(): wave by wave, parallel within each wave
+//  9. AskClient for final approval
 //  10. engine.Complete()
 //
 // RECOVERY (Fix 5):
-//   On pod restart: main.go calls ResumeOrphanWorkflows()
-//   -> finds workflows WHERE status='running'
-//   -> re-launches Run() for each
-//   -> Run() reads runner_state + current_task_cursor
-//   -> skips already-completed tasks
+//
+//	On pod restart: main.go calls ResumeOrphanWorkflows()
+//	-> finds workflows WHERE status='running'
+//	-> re-launches Run() for each
+//	-> Run() reads runner_state + current_task_cursor
+//	-> skips already-completed tasks
 //
 // SINGLE WRITE PATH (Fix 1):
-//   Runner posts events on blackboard.
-//   Projector reads events and updates workflow_tasks.
-//   Runner never writes directly to workflow_tasks.
+//
+//	Runner posts events on blackboard.
+//	Projector reads events and updates workflow_tasks.
+//	Runner never writes directly to workflow_tasks.
 type WorkflowRunner struct {
 	db              *pgxpool.Pool
 	engine          *Engine
 	planner         *Planner
 	agentLoop       *AgentLoop
-	aiderRunner     *AiderRunner          // Aider integration for implementation/qa phases
-	workspaceMerger *WorkspaceMerger      // Merges per-expert workspaces after each Aider wave
-	crossVerifier   *CrossVerifier        // Cross-verification protocol (§8)
+	aiderRunner     *AiderRunner            // Aider integration for the QA phase (application code)
+	authoringRunner *AuthoringRunner        // §9: implementation phase now authors design sections, not code
+	workspaceMerger *WorkspaceMerger        // Merges per-expert workspaces after each Aider wave
+	crossVerifier   *CrossVerifier          // Cross-verification protocol (§8)
 	costMonitor     *monitoring.CostMonitor // Per-workflow budget cap enforcement
 	tools           *Tools
 	store           *blackboard.Store
@@ -83,6 +86,7 @@ func NewWorkflowRunner(
 	planner *Planner,
 	agentLoop *AgentLoop,
 	aiderRunner *AiderRunner,
+	authoringRunner *AuthoringRunner,
 	workspaceMerger *WorkspaceMerger,
 	crossVerifier *CrossVerifier,
 	costMonitor *monitoring.CostMonitor,
@@ -97,6 +101,7 @@ func NewWorkflowRunner(
 		planner:         planner,
 		agentLoop:       agentLoop,
 		aiderRunner:     aiderRunner,
+		authoringRunner: authoringRunner,
 		workspaceMerger: workspaceMerger,
 		crossVerifier:   crossVerifier,
 		costMonitor:     costMonitor,
@@ -111,22 +116,23 @@ func NewWorkflowRunner(
 // Designed to run in a goroutine: go runner.Run(ctx, workflowID)
 //
 // Mental execution:
-//   workflowID = abc
-//   experts = [PM, SD, DSA, LLD]
-//   requirement = "Build URL shortener"
 //
-//   Plan: [{PM,deps:[]}, {SD,deps:[PM]}, {DSA,deps:[PM]}, {LLD,deps:[SD,DSA]}]
-//   DAG:  Wave0=[PM], Wave1=[SD,DSA], Wave2=[LLD]
+//	workflowID = abc
+//	experts = [PM, SD, DSA, LLD]
+//	requirement = "Build URL shortener"
 //
-//   Post task_plan_ready -> Projector inserts 4 workflow_tasks
-//   AskClient -> pause
-//   [Client approves]
-//   Wave0: PM runs alone
-//   Wave1: SD + DSA run in parallel (errgroup)
-//   Wave2: LLD runs after both done
-//   AskClient -> pause
-//   [Client approves]
-//   Complete
+//	Plan: [{PM,deps:[]}, {SD,deps:[PM]}, {DSA,deps:[PM]}, {LLD,deps:[SD,DSA]}]
+//	DAG:  Wave0=[PM], Wave1=[SD,DSA], Wave2=[LLD]
+//
+//	Post task_plan_ready -> Projector inserts 4 workflow_tasks
+//	AskClient -> pause
+//	[Client approves]
+//	Wave0: PM runs alone
+//	Wave1: SD + DSA run in parallel (errgroup)
+//	Wave2: LLD runs after both done
+//	AskClient -> pause
+//	[Client approves]
+//	Complete
 func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	log := r.logger.With(zap.String("workflow_id", workflowID.String()))
 	log.Info("workflow runner started")
@@ -343,21 +349,24 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 // Within each wave, tasks run in parallel using goroutines + WaitGroup.
 //
 // Mental execution:
-//   waves = [[PM], [SD, DSA], [LLD]]
 //
-//   Wave 0: launch PM goroutine, wait
-//   Wave 1: launch SD goroutine + DSA goroutine simultaneously, wait for both
-//   Wave 2: launch LLD goroutine, wait
+//	waves = [[PM], [SD, DSA], [LLD]]
+//
+//	Wave 0: launch PM goroutine, wait
+//	Wave 1: launch SD goroutine + DSA goroutine simultaneously, wait for both
+//	Wave 2: launch LLD goroutine, wait
 //
 // WHY WaitGroup not errgroup:
-//   errgroup cancels all goroutines on first error.
-//   We want ALL tasks in a wave to complete (even if some fail).
-//   Failed tasks are marked via blackboard events, not by cancelling others.
+//
+//	errgroup cancels all goroutines on first error.
+//	We want ALL tasks in a wave to complete (even if some fail).
+//	Failed tasks are marked via blackboard events, not by cancelling others.
 //
 // WORKSPACE MERGE (Aider phases only):
-//   After each wave completes, WorkspaceMerger merges per-expert workspaces
-//   into a shared main/ workspace so the next wave's experts see all prior work.
-//   Merge errors are non-fatal: logged and execution continues.
+//
+//	After each wave completes, WorkspaceMerger merges per-expert workspaces
+//	into a shared main/ workspace so the next wave's experts see all prior work.
+//	Merge errors are non-fatal: logged and execution continues.
 func (r *WorkflowRunner) executeWaves(
 	ctx context.Context,
 	workflowID uuid.UUID,
@@ -454,7 +463,61 @@ func (r *WorkflowRunner) executeWaves(
 
 				// Route to appropriate executor based on phase.
 				if useAider {
-					// Implementation/QA: Use AiderRunner (file system + git).
+					// Implementation phase now means AUTHORING (§9 of
+					// COLLABORATIVE_DESIGN_ARCHITECTURE.md): each expert edits
+					// its own design section and appends to the spine, instead
+					// of writing application code. This is the doc's stated
+					// change, not an optional mode — §9's table states
+					// "Editable files / Verification / Completion" as definite
+					// replacements, not a toggle. AiderRunner.Run (application
+					// code) is retired from this path.
+					//
+					// QA phase is NOT covered here — left calling AiderRunner
+					// unchanged below. §9 does not define what "QA" means once
+					// application code is written by an external agent rather
+					// than this system; redefining it was not part of this
+					// step's scope and inventing a meaning here would be
+					// guessing at a decision the doc never made. Tracked as a
+					// gap, not silently resolved.
+					if state.Phase == PhaseImplementation {
+						reqSpec := AiderRunRequest{
+							WorkflowID:      workflowID,
+							Expert:          expert,
+							TaskID:          uuid.Nil,
+							TaskTitle:       t.Title,
+							TaskDescription: t.Description,
+							WorkflowPhase:   state.Phase,
+						}
+						result, err := r.authoringRunner.Run(ctx, reqSpec)
+						if err != nil {
+							r.logger.Error("runner: authoring task failed",
+								zap.String("expert", expert.Name),
+								zap.Error(err),
+							)
+							errMu.Lock()
+							if firstErr == nil {
+								firstErr = err
+							}
+							state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
+							errMu.Unlock()
+						} else {
+							r.logger.Info("runner: authoring task completed",
+								zap.String("expert", expert.Name),
+								zap.String("section", result.SectionPath),
+								zap.Bool("completed", result.Completed),
+							)
+							errMu.Lock()
+							state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
+							errMu.Unlock()
+							waveMu.Lock()
+							waveExpertIDs = append(waveExpertIDs, expert.ID.String())
+							waveMu.Unlock()
+						}
+						r.saveRunnerState(ctx, workflowID, state)
+						return
+					}
+
+					// QA (unchanged): Use AiderRunner (file system + git).
 					_, err := r.aiderRunner.Run(ctx, AiderRunRequest{
 						WorkflowID:      workflowID,
 						Expert:          expert,
@@ -698,8 +761,10 @@ func (r *WorkflowRunner) loadRequirement(ctx context.Context, workflowID uuid.UU
 // returns the decision recorded on the approval row.
 //
 // GateName must be one of approval_requests_gate_check (migration 006):
-//   'intake','high_level_design','detailed_design','handoff',
-//   'budget_exceeded','ad_hoc'
+//
+//	'intake','high_level_design','detailed_design','handoff',
+//	'budget_exceeded','ad_hoc'
+//
 // 'detailed_design' is correct here: this gate sits immediately after the
 // Detailed Design phase and gates the start of implementation — "Client
 // approval gate 3" in DOMAIN_EXPERT_COLLABORATION_DESIGN.md §9.
