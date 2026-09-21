@@ -184,6 +184,7 @@ func (r *AuthoringRunner) Run(ctx context.Context, req AiderRunRequest) (*Author
 			zap.Strings("problems", result.Problems),
 		)
 		if result.Passed {
+			r.publishDesignArtifact(ctx, req, section, workspacePath, commitSHAs)
 			return &AuthoringResult{
 				CommitSHAs:  commitSHAs,
 				Iterations:  iteration,
