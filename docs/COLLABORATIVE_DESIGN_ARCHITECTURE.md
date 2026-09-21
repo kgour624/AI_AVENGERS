@@ -1004,11 +1004,14 @@ the choice and the reason, so nobody re-opens them without knowing why.
 
 ---
 
-## 17. Option B — the code-feedback loop (deferred; full plan)
+## 17. Option B — the code-feedback loop (SHIPPED)
 
-**Not implemented now.** This section exists so that when the team decides to
-build it, the plan is here — no transcript, no re-discovery. It follows the same
-control-plane / content-plane split as the rest of this document.
+**Implemented.** `internal/workflow/code_feedback.go` (orchestration) and
+`code_feedback_scan.go` (the comparator). Endpoint:
+`POST /api/v1/workflows/{id}/code-feedback` with `{provider, repo_url, branch}`.
+
+The plan below is what was built, with one step deliberately left out — see
+§17.7. What changed from the plan as written, and why, is in §17.6.
 
 ### 17.1 What it is
 
@@ -1085,19 +1088,92 @@ DECISIONS.md: DEC-012 "reconciled with build R; C-030 added, AC-50-01 reaffirmed
 next build reads: since DEC-011, C-030 added
 ```
 
-### 17.6 Why deferred
+### 17.6 What changed while building it
 
-It depends on §18 (reading a client repo) and on the basic loop being proven.
-Building it before the design→chat→amend loop works would be building on unproven
-ground — the same mistake as wiring the whole Aider pipeline before a single LLM
-call had ever succeeded.
+Five things the plan did not say, each found by running the code rather than by
+reading it.
+
+**1. The comparator's reach is narrower than "compare code to the design", and
+the boundary is now written down.** Four buckets, no more: does a criterion's own
+`Verify` command pass; does a path the design names appear in the repo's source;
+does a path the repo declares appear nowhere in the design; and — not attempted —
+whether the implementation is *correct*. Everything found is a **question routed
+to the owning expert**, never an automatic write. That is what makes a heuristic
+acceptable: a false positive costs one question in the amendment queue.
+
+**2. The harness is inside the client's repo, which almost made the whole report
+meaningless.** The §18 export pushes `final.md`, `ACCEPTANCE.md`, `DECISIONS.md`,
+`CLAUDE.md` and `design/` into the client's repository. A naive scan therefore
+finds every designed endpoint "present in the code" — because the design document
+*is* in the code — and the unbuilt list is empty forever. The scan excludes the
+harness files at the repo root, excludes `design/`, and excludes **all markdown**:
+the question is "was it built", and a document describing an endpoint is not an
+endpoint.
+
+**3. A `Verify:` line is model-authored text, and running it is executing that
+text.** It runs through an allowlist of executables (`go`, `npm`, `npx`, `node`,
+`python`, `pytest`, `make`, `grep`, `test`, `ls`, `cat`, and the package-manager
+variants) with no shell: `sh`, `bash`, `curl`, `rm`, `git` are absent by
+intention, and an unquoted shell operator (`|`, `&&`, `;`, `>`, backtick) makes
+the criterion **unverifiable with that stated as the reason** rather than a
+refusal the client cannot interpret. Quoted operators are fine —
+`go test -run 'TestA|TestB'` is an ordinary command.
+
+**4. One regexp bug that would have inverted the entire report.** The endpoint
+extractor's first version did not allow a pipe between the method and the path.
+A design that writes its API as a markdown table with Method and Path in separate
+columns — the shape §3.3 itself uses — matched *nothing*, so every designed
+endpoint would have been reported as "the code declares an endpoint the design
+never defined", with the design sitting right there. Caught by running the
+extractor against a table.
+
+**5. Findings are written on their own context.** The analysis has a 20-minute
+budget; the report and the amendments are written on a fresh 60-second one.
+Sharing the analysis context meant that the slow, failing run — the one whose
+report matters most — was the one that silently produced none.
+
+### 17.7 What is NOT built, and why not
+
+Step 6 of §17.2 also asks for a `DECISIONS.md` entry recording the round. That is
+a **write to the harness**, and writing to the harness is §7.5 steps 3-6 (an
+Aider session on an `amend/` branch, then a merge) — still unbuilt. Writing
+`DECISIONS.md` from the ingest would be a second, unapproved way to change the
+design, which is precisely what §7.5 step 2 exists to prevent: *"an unapproved
+write is a silent change to the contract the code was built against."*
+
+So the round is recorded on the blackboard, every amendment references the report
+event that produced it, and the `DECISIONS.md` entry arrives with the approved
+amendments once the apply path exists.
+
+### 17.8 Events this adds
+
+No migration: `blackboard_events.event_type` has no CHECK (§10).
+
+| Event | Posted when |
+|---|---|
+| `code_feedback_ingested` | one per ingest, carrying the whole report |
+| `code_feedback_failed` | the ingest could not finish (clone failed, timed out) |
+| `design_amendment_proposed` | one per finding, with `to_expert_id` set to the routed expert and `references_event_ids` pointing at the report |
+
+Routing: an unsatisfied criterion and a designed-but-absent contract item go to
+the expert owning that **section path** (matched against `workflow_design_sections`,
+never against the owner name in the markdown — `acceptanceLineRe` captures the
+owner as `\S+`, so a two-word expert name arrives truncated). An
+undesigned-but-built item goes to the integrator (§16.6).
 
 ---
 
-## 18. Option B — git-push export (deferred; full plan)
+## 18. Option B — git-push export (SHIPPED)
 
-**Not implemented now.** ZIP ships first (§16.5). This is the plan for pushing the
-harness to a client's git remote when asked.
+**Implemented.** `internal/workflow/export_git.go`, with the credential rules in
+`client_remote.go` and `client_repo.go`. Endpoint:
+`POST /api/v1/workflows/{id}/export/git` with
+`{provider, repo_url, branch, create_repo, private}`. Synchronous — the response
+carries the commit SHA.
+
+Note on §16.5: this was planned as the *second* delivery route, after ZIP. ZIP
+was never built, so this is currently the only export. That is a gap to close,
+not a decision that was made.
 
 ### 18.1 What exists to build on
 
@@ -1130,20 +1206,66 @@ So export is mostly wiring two things that already exist.
   written to disk in the workspace — it goes into the remote URL for one push and
   the remote is removed after.
 
-### 18.4 The one risk, named
+### 18.4 The one risk, named — and what was actually done about it
 
-Pushing carries a token. It must be injected into the remote URL in memory for
-the single push and the remote removed immediately after, never committed, never
-logged. `internal/repo` already stores tokens encrypted; this path must not
-undo that by writing the token into `.git/config` and leaving it there. The
-mental check before shipping: after a push, `git remote -v` in the workspace
-must show no client remote and no token anywhere on disk.
+Pushing carries a token. §18.4 originally said the remote must be added and then
+removed. **No remote is added at all.** `git push <url> <refspec>` takes the URL
+as an argument and persists nothing; verified directly — after a push,
+`git remote -v` is empty and `.git/config` contains zero `url` lines. `git clone`
+is the opposite: it *does* write the URL to `remote.origin.url`, so the ingest
+path removes that remote immediately after cloning. Both paths then run
+`assertNoSecretOnDisk`, which is §18.4's "mental check before shipping" turned
+into an assertion that runs every time — including after a *failed* push, because
+a failed push can still have written something.
 
-### 18.5 Why deferred
+Two more guards that the plan did not mention and that matter more than the
+config question:
 
-ZIP delivers the same artifact with none of the token risk and none of the
-provider-API surface. Git push is a convenience worth building only when a client
-asks to skip the download-and-upload step — not before.
+**The remote host is validated before the token is ever read.** The repo URL is
+client-supplied input. Without an allowlist, a request body saying
+`{"repo_url": "https://evil.example/x"}` hands the client's write-scoped token to
+`evil.example`. Only `github.com` and `gitlab.com` are accepted, the host is taken
+from the allowlist rather than from the input, credentials embedded in the input
+URL are discarded, and ssh remotes are refused with the real reason. Self-hosted
+GitLab is deliberately absent: `internal/repo` hardcodes `gitlab.com` for its API
+calls, so a self-hosted instance is not supported anywhere in the product.
+
+**Every byte of git output is scrubbed before it is logged or returned.** git
+echoes the push URL verbatim in several of its error messages.
+
+Also refused: force push. A push that would overwrite existing history is
+rejected by git and reported as *"this repo already has commits on that branch"*
+with the action to take. A `--force` flag here would turn a convenience feature
+into a way to destroy a client's repository from one API call.
+
+### 18.5 A real bug this uncovered
+
+§18.1 claimed the harness workspace "is already a git repository with real commit
+history". **It was not.** `WorkspaceMerger` creates `main/` with `os.MkdirAll` and
+rsyncs into it with `--exclude .git`; nothing ever ran `git init` there. Two live
+consequences, both pre-dating this work:
+
+- `MergeWave`'s multi-expert path calls `commitMerge`, whose first command is
+  `git add .` inside `main/`. In a directory that is not a repository — and whose
+  parents are not either — that command fails with
+  `fatal: not a git repository`, so **every multi-expert wave merge was failing**
+  at that step.
+- `MergeWave`'s single-expert path never committed at all, so whether the harness
+  had any history depended on how many experts happened to be in the wave.
+
+Fixed in `ensureGitRepo`, called from both merge paths, so the merge is fixed too
+rather than only the export.
+
+One thing to not overstate: because rsync excludes `.git`, per-expert commit
+authorship does **not** survive into `main/`. `main/`'s log is one commit per wave
+merge. That is a real decision trail, just coarser than "every expert's own
+commits" — §18.2's wording was optimistic.
+
+Related: `git init` picks the branch name from `init.defaultBranch`, which is
+unset in this image, so the local branch is whatever the installed git defaults to
+(`master` today). The push reads the actual branch and maps it onto the requested
+target branch. Assuming `main` would have been a push to a branch that does not
+exist.
 
 ---
 
@@ -1158,3 +1280,24 @@ Only these remain for the team; everything in §16 is settled.
 - **Testing-review depth (§16.1).** Does the testing expert only *review*
   acceptance criteria, or may it *add* its own? This design allows adding; confirm
   that is wanted.
+- **The §7.5 apply path.** Mutating tools (§7.4) and every code-feedback finding
+  (§17) produce `design_amendment_proposed` events. Steps 3-6 of §7.5 — client
+  approval rendered as a diff, one Aider commit on `amend/{chat_id}/{n}`, the
+  merge into `main/`, the `DECISIONS.md` entry — are not built. Until they are,
+  the loop proposes but never writes, which blocks §17.7 as a side effect. This is
+  now the largest single gap in the design.
+- **ZIP export (§16.5).** Recorded as the first delivery route and never built.
+  §18 shipped instead, so the only way to get the harness out today requires the
+  client to connect a git provider.
+- **QA phase under the new model.** The implementation phase now authors design
+  (§9); the QA phase still runs `AiderRunner` unchanged. What "QA" means when the
+  code is written by Claude Code outside this system is not defined anywhere in
+  this document, and was not guessed at.
+- **Verify commands cannot actually run in the api image.** §17 executes each
+  criterion's `Verify` command against the cloned repo through `verify.go`'s
+  `runProjectChecks`, which correctly reports `unavailable` when the executable is
+  missing. The api image is alpine plus git and rsync — no Go toolchain, no node —
+  so in practice nearly every criterion comes back *unverifiable*, and the useful
+  half of the report is the grep-based contract diff. Making the acceptance checks
+  real means running them somewhere that has a toolchain. Named here because
+  "unverifiable" is honest but is not the same as working.
