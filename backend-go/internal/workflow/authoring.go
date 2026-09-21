@@ -213,6 +213,93 @@ func (r *AuthoringRunner) Run(ctx context.Context, req AiderRunRequest) (*Author
 	}, nil
 }
 
+// publishDesignArtifact posts one design_section_written event so the Files
+// panel (KanbanPage.tsx) and its useFileStream.ts hook can render an
+// authored design section exactly like they already render a
+// code_artifact_produced event.
+//
+// WHY THIS WAS MISSING
+//
+// Run() above commits the section to git and returns an AuthoringResult to
+// runner.go, which only logs it and moves on. Nothing was ever posted to
+// the blackboard, so the ONLY UI path that shows a produced file —
+// FilesPanel, wired to code_artifact_produced/wave_completed (files_sse.go)
+// — never learned the file existed. The design was real: on disk,
+// committed, reachable by `git log` in this workflow's workspace. It was
+// simply never announced anywhere the frontend could hear it.
+//
+// WHY THE CONTENT IS RICHER THAN §10'S {section_path, commit_sha,
+// acceptance_ids[]}
+//
+// blackboard_events.content is schemaless JSONB (§10 itself notes
+// event_type has no CHECK), so adding fields is additive, not a departure
+// from the doc. The extra fields — filename, file_path, content, language,
+// lines_of_code, operation, validation_passed, validation_error — are
+// exactly AiderRunner.publishCodeArtifacts's shape for
+// code_artifact_produced. Matching that shape means files_sse.go needs one
+// more EventType case, and the frontend needs NONE: useFileStream.ts's
+// file_artifact handler reads by field presence (content?.filePath), not by
+// which backend event produced it, so a fully-shaped payload renders
+// through FilesPanel unchanged.
+//
+// Non-fatal, same as every other blackboard.Post call in this file's
+// neighbourhood (wave_completed in runner.go, cost_limit_exceeded, etc.): a
+// lost UI announcement must never fail or retry a turn that already
+// committed real work to git.
+func (r *AuthoringRunner) publishDesignArtifact(
+	ctx context.Context, req AiderRunRequest, section DesignSection,
+	workspacePath string, commitSHAs []string,
+) {
+	if len(commitSHAs) == 0 {
+		return // nothing new was committed this turn — see Run()'s own guard above
+	}
+
+	content, err := os.ReadFile(filepath.Join(workspacePath, section.SectionPath))
+	if err != nil {
+		r.logger.Warn("authoring: could not read section file to publish it",
+			zap.String("section", section.SectionPath), zap.Error(err))
+		return
+	}
+
+	// acceptance_ids: every AC-* entry whose `section:` column names THIS
+	// section. Matched on section path, not on the owner name acceptanceLineRe
+	// also captures — a two-word expert name arrives truncated there
+	// (ownerTokenFromSectionPath, amendment_text.go, exists for exactly this
+	// reason), but section.SectionPath is machine-generated and always exact.
+	var acceptanceIDs []string
+	if acceptance, aErr := os.ReadFile(filepath.Join(workspacePath, acceptanceMD)); aErr == nil {
+		for _, m := range acceptanceLineRe.FindAllStringSubmatch(string(acceptance), -1) {
+			if m[3] == section.SectionPath {
+				acceptanceIDs = append(acceptanceIDs, m[1])
+			}
+		}
+	}
+
+	_, err = r.aider.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:       req.WorkflowID,
+		EventType:        "design_section_written",
+		PostedByExpertID: &req.Expert.ID,
+		Content: map[string]interface{}{
+			"section_path":      section.SectionPath,
+			"filename":          filepath.Base(section.SectionPath),
+			"file_path":         section.SectionPath,
+			"content":           string(content),
+			"language":          "markdown",
+			"lines_of_code":     countLines(content),
+			"commit_sha":        commitSHAs[len(commitSHAs)-1],
+			"acceptance_ids":    acceptanceIDs,
+			"phase":             req.WorkflowPhase,
+			"operation":         r.aider.detectFileOperation(req.WorkflowID, section.SectionPath),
+			"validation_passed": true, // no build/test concept for a design document
+			"validation_error":  "",
+		},
+	})
+	if err != nil {
+		r.logger.Error("authoring: design_section_written post failed — the section is committed to git but will not appear in the Files panel",
+			zap.String("section", section.SectionPath), zap.Error(err))
+	}
+}
+
 // seedAuthoringWorkspace writes the four protocol files (creating them from
 // the template on the very first turn) and every OTHER expert's section as
 // read-only context, then commits. Returns the read-only file list.
