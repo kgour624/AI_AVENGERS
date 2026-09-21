@@ -559,7 +559,7 @@ Mutating — each produces a **proposal**, never a direct write:
 | Tool | Purpose |
 |---|---|
 | `propose_amendment(target, old, new, reason)` | Change a design statement (§7.5) |
-| `propose_acceptance(section, statement, verify)` | Add or change a criterion |
+| `propose_acceptance(section, statement, verify, done_when)` | Add a criterion. The **id and owner are assigned, not asked for** — `AC-{section_no}-{next}` from `workflow_design_sections`, and the owner token is the expert slug already in the section path. A model filling in its own id is how two `AC-20-01` entries end up in one file; and the owner must be a single token or `acceptanceLineRe` truncates it. |
 | `raise_conflict(statement_id, position, reason)` | `design_conflict_raised` (§5) |
 | `ask_expert(expert_id, question)` | `Tools.AskExpert` — consult a peer mid-answer |
 | `ask_client(summary)` | `Tools.AskClient` — escalate to the human |
@@ -568,30 +568,96 @@ Four of these are `workflow.Tools` methods already written and already debugged 
 including the foreign-key bug in `AskClient` where a zero UUID was passed as
 `posted_by_expert_id` and every gate failed on the first call (`2f40b17`).
 
-### 7.5 Write-back: propose, approve, commit
+### 7.5 Write-back: propose, approve, commit (SHIPPED)
 
 A chat that cannot change the design is a support channel. The value is the loop
 closing. But nothing is written because a model said it would be a good idea.
 
+**Implemented.** `internal/workflow/amendment.go` (flow) and `amendment_text.go`
+(the deterministic apply). Endpoints:
+
 ```
-1. PROPOSE   the expert calls propose_amendment. A structured amendment:
-             target file, target statement ID, old text, new text, reason.
-             Stored as design_amendment_proposed. Nothing on disk yet.
-2. APPROVE   rendered to the client as a diff, through the existing
-             approval_requests machinery. Reject and edit-then-approve are both
-             first-class.
-3. APPLY     one Aider session on branch amend/{chat_id}/{n}. One commit.
-4. RECORD    design_amended with commit SHA, chat id, message id, approving user.
-5. MERGE     workspace_merger merges the branch into main/.
-6. LOG       DECISIONS.md gains an entry, newest first.
+GET  /api/v1/workflows/{id}/amendments               ?status=pending|approved|rejected|all
+POST /api/v1/workflows/{id}/amendments/{aid}/respond {decision, edited_text, notes}
+```
+
+```
+1. PROPOSE   the expert calls propose_amendment: target file, old text, new text,
+             reason. One design_amendment_proposed event AND one pending
+             approval_requests row (gate_name='design_amendment', which migration
+             018 already allows). Nothing on disk.
+2. APPROVE   the client lists pending amendments and answers approve,
+             approve_with_edit or reject. Idempotent — a second click is a 409.
+3. APPLY     an exact text replacement, then one commit. NOT an Aider session,
+             and NOT on a branch — see below.
+4. RECORD    design_amended with commit SHA, approval id, decision id, approver.
+5. MERGE     not needed — nothing was branched.
+6. LOG       DECISIONS.md gains an entry, newest first, with a DEC-nnn id.
 ```
 
 Step 2 is not optional. The design is the source of truth for everything
 downstream; an unapproved write is a silent change to the contract the code was
 built against.
 
-**Why a branch.** An amendment can arrive mid-phase. A branch keeps the proposal
-out of `main/` until approved and gives us the diff to render at step 2.
+#### Two departures from the plan above, both deliberate
+
+**No Aider session.** An amendment is a structured `{target, old_text, new_text}`,
+so applying it is an exact string replacement. Handing that to a model buys
+nothing and costs three things already paid for on the Aider path:
+non-determinism (it rewrites text nobody asked about), money per amendment, and
+the failure mode where the model proposes no edits and the run silently produces
+nothing — fixed twice already (`1faf3e5`, `d9fa1c3`). `applyAmendmentText` has a
+defined answer for every input:
+
+| Input | Result |
+|---|---|
+| `old_text` empty | append (this is how a new criterion or statement row is added) |
+| `old_text` appears exactly once | replace |
+| `old_text` appears 0 times | **refuse** — the design moved; propose again |
+| `old_text` appears more than once | **refuse**, with the count — the proposal does not say which one |
+
+The last two are the point. A model asked to "replace this line" when the line
+occurs twice will pick one; picking one is a guess at the contract the code is
+built against. This is the same rule Aider's own SEARCH/REPLACE blocks follow,
+which is why no model is needed to follow it.
+
+**No branch.** The branch had two stated jobs. "Gives us the diff to render at
+step 2" is already satisfied — `old_text`/`new_text` *is* the diff, stored
+structurally in `artifact_content`, and it is what the approval screen renders.
+"Keeps the proposal out of `main/` until approved" is satisfied by writing nothing
+until approval, which is the actual behaviour. Against that, a branch adds a real
+hazard: `main/` is the shared workspace a running wave rsyncs into, and a
+`git checkout` there would swap files under a wave in progress. Step 5 disappears
+with it — there is nothing to merge back.
+
+#### Why not the existing approvals endpoint
+
+`POST /workflows/{id}/approvals/{aid}/respond` already exists and an amendment is
+an `approval_requests` row, so reusing it looks obvious. Three reasons it cannot
+be:
+
+1. Its body is `{decision, notes, generic_allowance_pct}` — there is nowhere to
+   put edited text, so edit-then-approve could not be first-class.
+2. On approve it calls `Engine.Resume`, moving the workflow to `running`.
+   Approving an amendment on a finished workflow would restart it.
+3. There is no list endpoint. Approval identity reaches the frontend only over
+   the kanban SSE stream, which fires on `question_to_client` and renders only
+   while the workflow is `paused_for_approval`. An amendment raises no such event
+   and pauses nothing, so without a list a client cannot discover one exists.
+
+#### The one limitation, named
+
+An approved amendment is **refused while the workflow is running** (409, "the
+design is being written right now"). A wave merge rsyncs each expert workspace
+over `main/`, and those workspaces were seeded from `main/` *before* the
+amendment — so a merge landing after an apply would silently overwrite it.
+Refusing is honest; making `WorkspaceMerger` amendment-aware is the real fix and
+a larger change than this.
+
+Concurrency within one process is handled by a mutex around read-modify-write of
+the harness files. That assumes one api process per workspace directory, which
+holds because the workspace is a local volume. A shared-storage deployment would
+need a Postgres advisory lock instead.
 
 ### 7.6 What "as intelligent as Claude/Kiro" means here, concretely
 
@@ -1153,7 +1219,17 @@ No migration: `blackboard_events.event_type` has no CHECK (§10).
 |---|---|
 | `code_feedback_ingested` | one per ingest, carrying the whole report |
 | `code_feedback_failed` | the ingest could not finish (clone failed, timed out) |
-| `design_amendment_proposed` | one per finding, with `to_expert_id` set to the routed expert and `references_event_ids` pointing at the report |
+| `code_feedback_question` | one per finding, with `to_expert_id` set to the routed expert and `references_event_ids` pointing at the report |
+
+**Why `code_feedback_question` and not `design_amendment_proposed`.** They were
+the same event type at first, and that conflated two things needing different
+actions from different people. A `design_amendment_proposed` carries a concrete
+`{old_text, new_text}` and a pending approval row: the **client** approves it and
+it is written (§7.5). A finding here has no such text — it is a question an
+**expert** must answer ("still required, or drop it?"), and the expert's answer is
+what then becomes a real amendment via `propose_amendment`. One event type for
+both would leave the UI unable to tell "you must approve this" from "an expert
+must answer this", and would put un-approvable rows in the amendments list.
 
 Routing: an unsatisfied criterion and a designed-but-absent contract item go to
 the expert owning that **section path** (matched against `workflow_design_sections`,
@@ -1280,12 +1356,14 @@ Only these remain for the team; everything in §16 is settled.
 - **Testing-review depth (§16.1).** Does the testing expert only *review*
   acceptance criteria, or may it *add* its own? This design allows adding; confirm
   that is wanted.
-- **The §7.5 apply path.** Mutating tools (§7.4) and every code-feedback finding
-  (§17) produce `design_amendment_proposed` events. Steps 3-6 of §7.5 — client
-  approval rendered as a diff, one Aider commit on `amend/{chat_id}/{n}`, the
-  merge into `main/`, the `DECISIONS.md` entry — are not built. Until they are,
-  the loop proposes but never writes, which blocks §17.7 as a side effect. This is
-  now the largest single gap in the design.
+- **Amendments are refused while a wave is running (§7.5).** The safe answer, not
+  the right one. `WorkspaceMerger` rsyncs expert workspaces over `main/`, and
+  those were seeded before the amendment, so a merge would overwrite an applied
+  amendment. Making the merger amendment-aware is the real fix.
+- **No frontend for amendments.** The endpoints exist and are tested; nothing in
+  the React app lists or renders them yet. The existing `ApprovalGate` cannot be
+  reused — it only appears while the workflow is `paused_for_approval`, and an
+  amendment deliberately pauses nothing.
 - **ZIP export (§16.5).** Recorded as the first delivery route and never built.
   §18 shipped instead, so the only way to get the harness out today requires the
   client to connect a git provider.

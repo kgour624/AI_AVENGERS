@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/blackboard"
@@ -305,7 +306,7 @@ func (t *Tools) AskClient(ctx context.Context, req AskClientRequest) (uuid.UUID,
 	// the Approve/Request Changes buttons. Without approval_id in the event
 	// content, content?.approvalId is undefined and the if(approvalId) guard
 	// in useKanbanStream.ts always fails — buttons never appear.
-	approvalID, err := t.createApprovalRequest(ctx, req)
+	approvalID, err := createApprovalRequest(ctx, t.engine.db, req)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("AskClient: create approval: %w", err)
 	}
@@ -373,7 +374,15 @@ func (t *Tools) AskClient(ctx context.Context, req AskClientRequest) (uuid.UUID,
 }
 
 // createApprovalRequest inserts a row into approval_requests.
-func (t *Tools) createApprovalRequest(ctx context.Context, req AskClientRequest) (uuid.UUID, error) {
+//
+// A package-level function taking the pool, not a method on Tools, because the
+// amendment flow (§7.5) needs to create an approval WITHOUT the rest of
+// AskClient: AskClient's contract is pause-the-workflow-and-wait, and an
+// amendment proposed inside a chat must not freeze the design phase or any wave
+// in progress. Keeping one INSERT site is what makes that safe — see the
+// cited_event_ids note below for what a second copy of this query would have
+// duplicated.
+func createApprovalRequest(ctx context.Context, db *pgxpool.Pool, req AskClientRequest) (uuid.UUID, error) {
 	var approvalID uuid.UUID
 
 	// Marshal artifact content
@@ -386,17 +395,20 @@ func (t *Tools) createApprovalRequest(ctx context.Context, req AskClientRequest)
 		}
 	}
 
-	// Build cited_event_ids as Postgres UUID[]
-	citedJSON := []byte("{}")
-	if len(req.CitedEventIDs) > 0 {
-		var err error
-		citedJSON, err = marshalJSON(req.CitedEventIDs)
-		if err != nil {
-			return uuid.Nil, fmt.Errorf("marshal cited events: %w", err)
-		}
-	}
+	// cited_event_ids is a Postgres UUID[] written through a ::uuid[] text cast.
+	//
+	// This used to be marshalJSON, and that was a live bug: it produces
+	// ["a1b2-…","c3d4-…"], and Postgres reads a leading '[' in an array literal
+	// as an explicit dimension specifier, so the INSERT failed with "malformed
+	// array literal … '[' must introduce explicitly-specified array dimensions".
+	// It only ever worked because the empty default "{}" is the common path —
+	// the one caller that passes cited events is the handoff gate
+	// (runner.go:333, every artifact id), which therefore always failed. Same
+	// bug, same fix, as blackboard.Store.Post; the helper is shared so it cannot
+	// be fixed in one place and left broken in the other.
+	citedLiteral := blackboard.UUIDArrayLiteral(req.CitedEventIDs)
 
-	err := t.engine.db.QueryRow(ctx,
+	err := db.QueryRow(ctx,
 		`INSERT INTO approval_requests
 			(workflow_id, gate_name, summary, artifact_content,
 			 cited_event_ids, cost_so_far_usd, estimated_remaining_usd)
@@ -406,7 +418,7 @@ func (t *Tools) createApprovalRequest(ctx context.Context, req AskClientRequest)
 		req.GateName,
 		req.Summary,
 		string(artifactJSON),
-		string(citedJSON),
+		citedLiteral,
 		req.CostSoFarUSD,
 		req.EstimatedRemUSD,
 	).Scan(&approvalID)

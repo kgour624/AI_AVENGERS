@@ -141,16 +141,19 @@ func NewToolRegistry(workspaceRoot string, logger *zap.Logger) *ToolRegistry {
 	})
 
 	r.register(Tool{
-		Name:        "propose_amendment",
-		Description: "Propose a change to a design statement. Requires client approval before anything is written.",
-		InputSchema: `{"target": "string, required", "old_text": "string, required", "new_text": "string, required", "reason": "string, required"}`,
+		Name: "propose_amendment",
+		Description: "Propose a change to a design file. old_text must be copied EXACTLY from the " +
+			"file (use read_design first) and must appear there only once — it is replaced verbatim " +
+			"once the client approves. Leave old_text empty to append instead of replace.",
+		InputSchema: `{"target": "string, required", "old_text": "string, required (empty means append)", "new_text": "string, required", "reason": "string, required"}`,
 		Mutating:    true,
 		Handler:     toolProposeAmendment,
 	})
 	r.register(Tool{
-		Name:        "propose_acceptance",
-		Description: "Propose a new or changed acceptance criterion for a section.",
-		InputSchema: `{"section": "string, required", "statement": "string, required", "verify": "string, required"}`,
+		Name: "propose_acceptance",
+		Description: "Propose a new acceptance criterion for a section. The id and owner are assigned " +
+			"for you; verify must be a real command that exits zero or non-zero.",
+		InputSchema: `{"section": "string, required", "statement": "string, required", "verify": "string, required", "done_when": "string, required"}`,
 		Mutating:    true,
 		Handler:     toolProposeAcceptance,
 	})
@@ -513,6 +516,12 @@ func mustJSON(v any) json.RawMessage {
 // nothing else. See the file comment for why.
 // ============================================================
 
+// toolProposeAmendment records a proposal through proposeAmendment
+// (amendment.go), which posts the event AND creates the pending approval row.
+//
+// It used to post only the event, which meant the chat could describe a change
+// that nothing could ever act on — the client had no list to approve from and no
+// id to approve by. §7.5's step 1 and step 2 are one write, not two features.
 func toolProposeAmendment(ctx context.Context, l *toolLoopContext, input json.RawMessage) (any, error) {
 	var args struct {
 		Target  string `json:"target"`
@@ -527,58 +536,117 @@ func toolProposeAmendment(ctx context.Context, l *toolLoopContext, input json.Ra
 		return nil, fmt.Errorf("propose_amendment: target, new_text and reason are required")
 	}
 
-	ev, err := l.store.Post(ctx, blackboard.PostRequest{
-		WorkflowID:       l.workflowID,
-		EventType:        "design_amendment_proposed",
-		PostedByExpertID: &l.expert.ID,
-		Content: map[string]any{
-			"chat_id":  l.chatID,
-			"target":   args.Target,
-			"old_text": args.OldText,
-			"new_text": args.NewText,
-			"reason":   args.Reason,
-		},
+	// Checked here as well as at apply time, so a model that names a file that
+	// does not exist is told immediately rather than after a client has approved
+	// something unappliable.
+	allowed, err := amendableTargets(ctx, l.sections, l.workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("propose_amendment: %w", err)
+	}
+	if !allowed[args.Target] {
+		return nil, fmt.Errorf("propose_amendment: %q is not an amendable file — use list_sections, %q or %q",
+			args.Target, finalMD, acceptanceMD)
+	}
+
+	proposed, err := proposeAmendment(ctx, l.db, l.store, ProposeAmendmentRequest{
+		WorkflowID: l.workflowID,
+		ExpertID:   l.expert.ID,
+		ExpertName: l.expert.Name,
+		ChatID:     l.chatID,
+		Kind:       amendmentKindStatement,
+		Target:     args.Target,
+		OldText:    args.OldText,
+		NewText:    args.NewText,
+		Reason:     args.Reason,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("propose_amendment: %w", err)
 	}
 	return map[string]any{
-		"proposed": true,
-		"event_id": ev.ID,
-		"note":     "Recorded. This is a proposal — nothing is written until the client approves it.",
+		"proposed":    true,
+		"approval_id": proposed.ApprovalID,
+		"event_id":    proposed.EventID,
+		"note": "Recorded as a pending amendment. Nothing is written until the client " +
+			"approves it, and the exact old text you gave must still be in the file at that point.",
 	}, nil
 }
 
+// toolProposeAcceptance builds the criterion block itself rather than leaving it
+// to the model.
+//
+// The id, the owner token and the section path are all DERIVED: the id is
+// AC-{section_no}-{next}, the section number comes from
+// workflow_design_sections, and the owner token is the expert slug already
+// embedded in the section path. None of it is asked for, because all three must
+// match what documentCheck (authoring.go) validates and what acceptanceLineRe
+// parses — and a model filling in its own id is how two AC-20-01 entries end up
+// in one file.
 func toolProposeAcceptance(ctx context.Context, l *toolLoopContext, input json.RawMessage) (any, error) {
 	var args struct {
 		Section   string `json:"section"`
 		Statement string `json:"statement"`
 		Verify    string `json:"verify"`
+		DoneWhen  string `json:"done_when"`
 	}
 	if err := json.Unmarshal(input, &args); err != nil {
 		return nil, fmt.Errorf("propose_acceptance: invalid input: %w", err)
 	}
-	if args.Section == "" || args.Statement == "" || args.Verify == "" {
-		return nil, fmt.Errorf("propose_acceptance: section, statement and verify are required")
+	if args.Section == "" || args.Statement == "" || args.Verify == "" || args.DoneWhen == "" {
+		return nil, fmt.Errorf("propose_acceptance: section, statement, verify and done_when are all required")
 	}
 
-	ev, err := l.store.Post(ctx, blackboard.PostRequest{
-		WorkflowID:       l.workflowID,
-		EventType:        "design_amendment_proposed",
-		PostedByExpertID: &l.expert.ID,
-		Content: map[string]any{
-			"chat_id":   l.chatID,
-			"target":    "ACCEPTANCE.md",
-			"section":   args.Section,
-			"statement": args.Statement,
-			"verify":    args.Verify,
-			"kind":      "acceptance_criterion",
-		},
+	sections, err := l.sections.ListSections(ctx, l.workflowID)
+	if err != nil {
+		return nil, fmt.Errorf("propose_acceptance: list sections: %w", err)
+	}
+	sectionNo := 0
+	for _, sec := range sections {
+		if sec.SectionPath == args.Section {
+			sectionNo = sec.SectionNo
+			break
+		}
+	}
+	if sectionNo == 0 {
+		return nil, fmt.Errorf("propose_acceptance: %q is not a design section in this workflow — use list_sections", args.Section)
+	}
+
+	// The next index is read from the file as it stands, so a criterion proposed
+	// now does not collide with one an authoring turn wrote a minute ago.
+	existing := ""
+	if full, err := designPath(l.workspaceRoot, l.workflowID, acceptanceMD); err == nil {
+		if data, readErr := os.ReadFile(full); readErr == nil {
+			existing = string(data)
+		}
+	}
+	acID := fmt.Sprintf("AC-%d-%02d", sectionNo, acceptanceIDsForSection(existing, sectionNo)+1)
+
+	block := formatAcceptanceBlock(
+		acID, ownerTokenFromSectionPath(args.Section), args.Section,
+		args.Statement, args.Verify, args.DoneWhen,
+	)
+
+	proposed, err := proposeAmendment(ctx, l.db, l.store, ProposeAmendmentRequest{
+		WorkflowID: l.workflowID,
+		ExpertID:   l.expert.ID,
+		ExpertName: l.expert.Name,
+		ChatID:     l.chatID,
+		Kind:       amendmentKindAcceptance,
+		Target:     acceptanceMD,
+		OldText:    "", // a new criterion is an append, so there is nothing to replace
+		NewText:    block,
+		Reason:     fmt.Sprintf("%s adds %s for %s", l.expert.Name, acID, args.Section),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("propose_acceptance: %w", err)
 	}
-	return map[string]any{"proposed": true, "event_id": ev.ID}, nil
+	return map[string]any{
+		"proposed":     true,
+		"approval_id":  proposed.ApprovalID,
+		"event_id":     proposed.EventID,
+		"criterion_id": acID,
+		"criterion":    block,
+		"note":         "Recorded as a pending amendment. Nothing is written until the client approves it.",
+	}, nil
 }
 
 func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMessage) (any, error) {

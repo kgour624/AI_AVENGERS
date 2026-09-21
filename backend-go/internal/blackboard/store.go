@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -123,10 +124,22 @@ func (s *Store) Post(ctx context.Context, req PostRequest) (*Event, error) {
 	}
 
 	// Step 4: Build references array (Postgres UUID[])
-	refsJSON, _ := json.Marshal(req.ReferencesEventIDs)
-	if req.ReferencesEventIDs == nil {
-		refsJSON = []byte("{}")
-	}
+	//
+	// This used to be json.Marshal, and that was a live bug: it produces
+	// ["a1b2-…","c3d4-…"], and the parameter is cast with $7::uuid[]. Postgres
+	// reads a leading '[' in an array literal as the start of an explicit
+	// dimension specifier (the [1:2]={…} form), so every post with a non-empty
+	// references list failed with
+	//
+	//	malformed array literal … "[" must introduce explicitly-specified array dimensions
+	//
+	// The empty case marshalled to "[]" only when the slice was non-nil-but-empty
+	// and to the correct "{}" when nil, which is why this went unnoticed: the
+	// common path posts no references at all. What it broke, silently:
+	// cross_verifier.go:274 and :540 (every verification finding), and
+	// Tools.AskClient's cited events — i.e. the handoff gate, which passes every
+	// artifact id.
+	refsLiteral := UUIDArrayLiteral(req.ReferencesEventIDs)
 
 	// Step 5: INSERT with ON CONFLICT DO NOTHING
 	// RETURNING gives us the new row's id + sequence_number + posted_at.
@@ -146,7 +159,7 @@ func (s *Store) Post(ctx context.Context, req PostRequest) (*Event, error) {
 		req.PostedByClient,
 		req.ToExpertID,
 		string(contentJSON),
-		string(refsJSON),
+		refsLiteral,
 		revision,
 		dedupKey,
 	).Scan(&event.ID, &event.SequenceNumber, &event.PostedAt)
@@ -332,4 +345,32 @@ func (s *Store) publishNotification(ctx context.Context, event Event) {
 			zap.Error(err),
 		)
 	}
+}
+
+// UUIDArrayLiteral renders a slice of UUIDs as a Postgres array literal:
+// {a1b2…,c3d4…}. An empty or nil slice gives {}.
+//
+// Exported because two tables in two packages carry a UUID[] column written
+// through a ::uuid[] text cast — blackboard_events.references_event_ids here,
+// and approval_requests.cited_event_ids in internal/workflow — and both had the
+// same json.Marshal bug. One implementation means one place to be right.
+//
+// No quoting or escaping: a uuid.UUID stringifies to hex and hyphens only, so
+// there is no input that could need it. That is a property of the type, not an
+// assumption about the caller — which is why this takes []uuid.UUID and not
+// []string.
+func UUIDArrayLiteral(ids []uuid.UUID) string {
+	if len(ids) == 0 {
+		return "{}"
+	}
+	var b strings.Builder
+	b.WriteByte('{')
+	for i, id := range ids {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(id.String())
+	}
+	b.WriteByte('}')
+	return b.String()
 }

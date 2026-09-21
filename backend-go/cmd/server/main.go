@@ -484,6 +484,13 @@ func buildRouter(
 	)
 	wfDeliveryHandler := workflow.NewDeliveryHandler(wfGitExporter, wfCodeFeedback, logger)
 
+	// Amendments (§7.5): the write-back path for everything the chat's mutating
+	// tools propose. Shares wfSections (the amendable-file allowlist is derived
+	// from the assigned sections) and the same workspaceRoot, because an approved
+	// amendment is committed into the very tree the export pushes.
+	wfAmendments := workflow.NewAmendmentService(postgres.Pool, bbStore, wfSections, workspaceRoot, logger)
+	wfAmendmentHandler := workflow.NewAmendmentHandler(wfAmendments, logger)
+
 	// Resume any workflows that were running before pod restart.
 	// WHY background context: must outlive the HTTP server startup.
 	go wfRunner.ResumeOrphanWorkflows(context.Background())
@@ -654,6 +661,12 @@ func buildRouter(
 		// ownership against c.MustGet("user_id"), and a different wildcard name
 		// at this path position would conflict with the workflow routes above.
 		wfDeliveryHandler.RegisterRoutes(protected)
+
+		// Amendments (§7.5). Separate from the approvals route above on purpose
+		// — see amendment_handler.go's file comment for the three reasons that
+		// endpoint cannot be reused (no edited-content field, it resumes the
+		// workflow, and there is no list endpoint).
+		wfAmendmentHandler.RegisterRoutes(protected)
 	}
 
 	// ============================================================

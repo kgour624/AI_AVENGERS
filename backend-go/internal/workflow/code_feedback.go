@@ -12,19 +12,21 @@ package workflow
 //	INGEST     cloneClientRepo                 — shallow clone, token never on disk
 //	DIFF       code_feedback_scan.go           — Verify commands + contract set diff
 //	REPORT     postReport                      — one code_feedback_ingested event
-//	AMEND      postAmendments                  — design_amendment_proposed per finding
-//	GATE       (existing §7.5 approval path)    — unchanged, not re-implemented here
+//	AMEND      postAmendments                  — one code_feedback_question per finding,
+//	                                            routed to the expert who owns it
+//	GATE       amendment.go (§7.5)             — the expert's answer becomes a real
+//	                                            amendment, the client approves it,
+//	                                            and DECISIONS.md records the round
 //
-// WHAT THIS DOES NOT DO, AND WHY NOT
+// WHERE THE ROUND GETS RECORDED
 //
-// §17.2 step 6 also asks for a DECISIONS.md entry recording the round. That
-// entry is a WRITE to the harness, and writing to the harness is §7.5 step 3-6
-// (one Aider session on an amend/ branch, then a merge) — a path that is not
-// built yet. Writing DECISIONS.md from here would be a second, unapproved way
-// to change the design, which is the one thing §7.5's step 2 exists to prevent
-// ("an unapproved write is a silent change to the contract the code was built
-// against"). So the round is recorded on the blackboard, and the DECISIONS.md
-// entry arrives with the approved amendments once the apply path exists.
+// §17.2 step 6 asks for a DECISIONS.md entry. That entry is written by the §7.5
+// apply path (amendment.go), not from here, and that is the right seam: the log
+// records a decision a CLIENT made, and nothing in this file has one. A finding
+// is a question; it becomes a decision only after an expert turns it into a
+// concrete amendment and the client approves that. Writing DECISIONS.md from the
+// ingest would be an unapproved change to the contract the code was built
+// against — exactly what §7.5 step 2 exists to prevent.
 //
 // WHY EVERY FINDING IS A QUESTION AND NOT A VERDICT
 //
@@ -442,7 +444,7 @@ func (s *CodeFeedbackService) postReport(ctx context.Context, workflowID uuid.UU
 	return ev.ID, nil
 }
 
-// postAmendments turns each finding into one routed design_amendment_proposed
+// postAmendments turns each finding into one routed code_feedback_question
 // event. Returns how many were posted.
 //
 // Every event references the report event, so the amendment queue can always
@@ -540,9 +542,21 @@ func (s *CodeFeedbackService) postAmendments(
 		if a.detail != "" {
 			content["detail"] = a.detail
 		}
+		// code_feedback_question, NOT design_amendment_proposed.
+		//
+		// They were the same event type at first, and that conflated two things
+		// that need different actions from different people. A
+		// design_amendment_proposed now carries a concrete {old_text, new_text}
+		// and a pending approval row: the CLIENT approves it and it is written
+		// (§7.5, amendment.go). A finding here has no such text — it is a
+		// question an EXPERT has to answer ("still required, or drop it?"), and
+		// the expert's answer is what then becomes a real amendment through
+		// propose_amendment. One event type for both would leave the UI unable
+		// to tell "you must approve this" from "an expert must answer this", and
+		// would put un-approvable rows in the amendments list.
 		if _, err := s.store.Post(ctx, blackboard.PostRequest{
 			WorkflowID:         workflowID,
-			EventType:          "design_amendment_proposed",
+			EventType:          "code_feedback_question",
 			PostedByClient:     true,
 			ToExpertID:         a.routeTo,
 			Content:            content,
