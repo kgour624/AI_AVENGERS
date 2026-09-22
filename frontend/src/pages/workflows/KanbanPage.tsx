@@ -14,6 +14,7 @@ import { WorkflowChatPanel } from '@/components/workflow/WorkflowChatPanel'
 import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
 import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
+import { ActivityLog } from '@/components/workflow/ActivityLog'
 
 // ApprovalGate component — renders Approve/Request Changes buttons.
 // Shown when workflow.status === 'paused_for_approval'.
@@ -544,6 +545,12 @@ function KanbanPage() {
         expertNames={expertNames}
         filterExpertId={filterExpertId}
         onClearFilter={() => setFilterExpertId(null)}
+      />
+
+      {/* Activity Log — full chronological audit trail of all blackboard events */}
+      <ActivityLog
+        events={blackboard?.events ?? []}
+        expertNames={expertNames}
       />
 
       {/* Live file browser — populated once experts start producing code */}
