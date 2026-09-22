@@ -223,7 +223,7 @@ export default function ChatPage() {
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-6">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((virtualRow) => {
-            const m = messages[virtualRow.index]!
+            const m = filteredMessages[virtualRow.index]!
             return (
               <div
                 key={m.id}
