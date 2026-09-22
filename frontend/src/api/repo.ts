@@ -81,6 +81,7 @@ export type RepoSyncStatus =
       repoName: string
       totalChunks: number
       lastSyncAt: string | null
+      errorMessage?: string
     }
 
 export const getRepoSyncStatus = (projectId: string) =>

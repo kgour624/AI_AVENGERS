@@ -1,6 +1,9 @@
 import { useState } from 'react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useRepoSyncStatus } from '@/hooks/useRepoSyncStatus'
+import { syncRepo } from '@/api/repo'
 import { Button } from '@/components/ui/Button'
+import { Badge } from '@/components/ui/Badge'
 import { RepoConnectModal } from './RepoConnectModal'
 
 /**
@@ -15,13 +18,30 @@ import { RepoConnectModal } from './RepoConnectModal'
  * connect - but repo/status is the live source of truth for sync
  * progress, which the Project object has no field for at all).
  *
- * Still uses PAT-based connectRepo per the documented OAuth gap in
- * api/repo.ts - RepoConnectModal's copy explains this to the user
- * directly rather than presenting a button that implies OAuth.
+ * Feature #5 fix (docs bug list): Added manual "Sync Now" button,
+ * error message display, and status badges for better UX.
  */
+
+const STATUS_CONFIG = {
+  pending: { variant: 'warning' as const, label: 'PENDING' },
+  syncing: { variant: 'info' as const, label: 'SYNCING' },
+  complete: { variant: 'success' as const, label: 'SYNCED' },
+  failed: { variant: 'danger' as const, label: 'FAILED' },
+}
+
 export function RepoStatus({ projectId }: { projectId: string }) {
   const [isModalOpen, setIsModalOpen] = useState(false)
   const { data: status, isLoading } = useRepoSyncStatus(projectId)
+  const queryClient = useQueryClient()
+
+  const syncMutation = useMutation({
+    mutationFn: () => syncRepo(projectId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: ['projects', projectId, 'repo', 'status'],
+      })
+    },
+  })
 
   if (isLoading) {
     return <div className="h-16 animate-pulse rounded-lg bg-surface-overlay" />
@@ -41,16 +61,43 @@ export function RepoStatus({ projectId }: { projectId: string }) {
     )
   }
 
-  const statusIcon =
-    status.status === 'complete' ? '\u2705' : status.status === 'failed' ? '\u274c' : '\u23f3'
+  const statusConfig = STATUS_CONFIG[status.status]
+  const isSyncing = status.status === 'syncing'
 
   return (
     <div className="rounded-lg border border-surface-border bg-surface-raised p-4">
-      <p className="text-sm text-text-primary">
-        {statusIcon} {status.repoName} \u00b7 {status.status} \u00b7 {status.totalChunks} chunks
-      </p>
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Badge variant={statusConfig.variant}>{statusConfig.label}</Badge>
+          <span className="text-sm font-medium text-text-primary">{status.repoName}</span>
+          <span className="text-xs text-text-disabled">·</span>
+          <span className="text-xs text-text-secondary">{status.totalChunks} chunks</span>
+        </div>
+        <Button
+          variant="secondary"
+          size="sm"
+          onClick={() => syncMutation.mutate()}
+          disabled={isSyncing || syncMutation.isPending}
+          isLoading={syncMutation.isPending}
+        >
+          {isSyncing ? 'Syncing...' : 'Sync Now'}
+        </Button>
+      </div>
+
       {status.lastSyncAt && (
-        <p className="mt-1 text-xs text-text-secondary">Last synced: {status.lastSyncAt}</p>
+        <p className="mt-2 text-xs text-text-secondary">Last synced: {status.lastSyncAt}</p>
+      )}
+
+      {status.status === 'failed' && status.errorMessage && (
+        <p className="mt-2 text-xs text-mode-refuse">
+          <span className="font-medium">Error:</span> {status.errorMessage}
+        </p>
+      )}
+
+      {syncMutation.isError && (
+        <p className="mt-2 text-xs text-mode-refuse">
+          Failed to trigger sync. Please try again.
+        </p>
       )}
     </div>
   )

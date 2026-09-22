@@ -268,30 +268,37 @@ func (s *Service) SyncRepo(ctx context.Context, connectionID uuid.UUID) error {
 
 // GetSyncStatus returns the current sync status.
 func (s *Service) GetSyncStatus(ctx context.Context, projectID uuid.UUID) (map[string]interface{}, error) {
-	var status, repoURL, repoName string
+	var status, repoURL, repoName, errorMsg string
 	var totalChunks int
 	var lastSync *time.Time
 
 	err := s.db.QueryRow(ctx,
 		`SELECT sync_status, repo_url, COALESCE(repo_name,''),
-		        total_chunks, last_sync_at
+		        total_chunks, last_sync_at, COALESCE(error_message, '')
 		 FROM repo_connections
 		 WHERE project_id=$1
 		 ORDER BY created_at DESC LIMIT 1`,
 		projectID,
-	).Scan(&status, &repoURL, &repoName, &totalChunks, &lastSync)
+	).Scan(&status, &repoURL, &repoName, &totalChunks, &lastSync, &errorMsg)
 	if err != nil {
 		return map[string]interface{}{"connected": false}, nil
 	}
 
-	return map[string]interface{}{
+	result := map[string]interface{}{
 		"connected":    true,
 		"status":       status,
 		"repo_url":     repoURL,
 		"repo_name":    repoName,
 		"total_chunks": totalChunks,
 		"last_sync_at": lastSync,
-	}, nil
+	}
+
+	// Include error message if sync failed
+	if errorMsg != "" {
+		result["error_message"] = errorMsg
+	}
+
+	return result, nil
 }
 
 // runSync performs the actual repo sync in background.
