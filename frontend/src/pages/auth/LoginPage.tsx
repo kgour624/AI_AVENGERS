@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useState, type FormEvent, useCallback } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { motion, useReducedMotion } from 'framer-motion'
 import { login } from '@/api/auth'
@@ -20,6 +20,8 @@ export default function LoginPage() {
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [showForgotMsg, setShowForgotMsg] = useState(false)
+  const handleForgotPassword = useCallback(() => setShowForgotMsg((p) => !p), [])
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
@@ -133,7 +135,23 @@ export default function LoginPage() {
             </Button>
           </form>
 
-          <p className="mt-5 text-center text-xs text-text-disabled">
+          {/* Forgot Password */}
+          <div className="mt-4 text-center">
+            <button
+              type="button"
+              onClick={handleForgotPassword}
+              className="text-xs text-text-disabled transition-colors hover:text-text-secondary"
+            >
+              Forgot Password?
+            </button>
+            {showForgotMsg && (
+              <p className="mt-2 rounded-md border border-glass-border bg-surface-overlay/60 px-3 py-2 text-xs text-text-secondary">
+                {'\uD83D\uDCEC'} Please contact your admin to reset your password.
+              </p>
+            )}
+          </div>
+
+          <p className="mt-4 text-center text-xs text-text-disabled">
             No account?{' '}
             <Link to="/register" className="text-glow-purple/80 transition-colors hover:text-glow-purple">
               Register
