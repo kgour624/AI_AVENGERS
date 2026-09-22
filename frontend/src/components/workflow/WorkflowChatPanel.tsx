@@ -9,6 +9,7 @@ import {
   addChatParticipant,
   removeChatParticipant,
   setKnowledgeMode,
+  proposeChange,
 } from '@/api/workflowChat'
 import { queryKeys } from '@/api/queryKeys'
 import { Card } from '@/components/ui/Card'
@@ -165,15 +166,100 @@ function ParticipantsRow({
   )
 }
 
+// ProposeChangeBar sits below the send row, collapsed by default.
+function ProposeChangeBar({ chatId, workflowId }: { chatId: string; workflowId: string }) {
+  const queryClient = useQueryClient()
+  const [open, setOpen] = useState(false)
+  const [goal, setGoal] = useState('')
+  const [submitted, setSubmitted] = useState<string | null>(null)
+  const [proposeError, setProposeError] = useState<string | null>(null)
+
+  const proposeMut = useMutation({
+    mutationFn: () => proposeChange(chatId, goal.trim()),
+    onSuccess: (cr) => {
+      setSubmitted(cr.id)
+      setGoal('')
+      setOpen(false)
+      setProposeError(null)
+      queryClient.invalidateQueries({ queryKey: queryKeys.workflowChats.messages(chatId) })
+      queryClient.invalidateQueries({ queryKey: queryKeys.workflows.blackboard(workflowId) })
+    },
+    onError: (err) => setProposeError(handleAPIError(err)),
+  })
+
+  if (submitted) {
+    return (
+      <div className="flex items-center gap-2 border-t border-glow-purple/20 bg-glow-purple/5 px-3 py-2">
+        <span className="flex-1 text-xs text-glow-purple">
+          Change request submitted. Experts will re-run their sections and you will be asked to approve.
+        </span>
+        <button type="button" onClick={() => setSubmitted(null)}
+          className="text-[10px] text-text-disabled hover:text-text-secondary">dismiss</button>
+      </div>
+    )
+  }
+
+  if (!open) {
+    return (
+      <div className="border-t border-surface-border px-3 py-1.5">
+        <button type="button" onClick={() => setOpen(true)}
+          className="text-[11px] text-text-disabled hover:text-glow-purple transition-colors">
+          Propose a design change
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="border-t border-glow-purple/30 bg-glow-purple/5 p-2">
+      <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-glow-purple">Propose a design change</p>
+      <p className="mb-2 text-[11px] text-text-disabled">
+        Describe what you want changed. Relevant experts will re-run their sections and you will approve the result.
+      </p>
+      <div className="flex gap-2">
+        <textarea
+          value={goal}
+          onChange={(e) => setGoal(e.target.value)}
+          onKeyDown={(e) => {
+            if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+              e.preventDefault()
+              if (goal.trim()) proposeMut.mutate()
+            }
+          }}
+          placeholder="e.g. Add a bulk-move endpoint to the file manager API"
+          rows={2}
+          className="flex-1 resize-none rounded border border-glow-purple/30 bg-surface-base px-2 py-1.5 text-xs text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-1 focus:ring-glow-purple"
+        />
+        <div className="flex flex-col gap-1">
+          <Button size="sm" isLoading={proposeMut.isPending}
+            disabled={!goal.trim() || proposeMut.isPending}
+            onClick={() => proposeMut.mutate()}>Submit</Button>
+          <button type="button"
+            onClick={() => { setOpen(false); setGoal(''); setProposeError(null) }}
+            className="rounded px-2 py-1 text-[11px] text-text-disabled hover:text-text-secondary">Cancel</button>
+        </div>
+      </div>
+      {proposeError && <p className="mt-1.5 text-xs text-mode-refuse">{proposeError}</p>}
+    </div>
+  )
+}
+
 function MessageBubble({
   message,
 }: {
   message: import('@/api/workflowChat').WorkflowChatMessage
 }) {
   if (message.role === 'user') {
+    const isChangeReq = message.content.startsWith('[CHANGE REQUEST]')
     return (
-      <div className="ml-auto max-w-[85%] rounded-md bg-brand/10 p-3 text-sm text-text-primary">
-        {message.content}
+      <div className={cn(
+        'ml-auto max-w-[85%] rounded-md p-3 text-sm text-text-primary',
+        isChangeReq ? 'border border-glow-purple/40 bg-glow-purple/10' : 'bg-brand/10'
+      )}>
+        {isChangeReq && (
+          <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-glow-purple">Change request</span>
+        )}
+        {isChangeReq ? message.content.replace('[CHANGE REQUEST] ', '') : message.content}
       </div>
     )
   }
@@ -301,6 +387,8 @@ function ChatThread({
           Send
         </Button>
       </div>
+
+      <ProposeChangeBar chatId={chatId} workflowId={workflowId} />
     </div>
   )
 }
