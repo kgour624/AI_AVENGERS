@@ -78,6 +78,33 @@ export default function ChatPage() {
   const { sendMessage } = useSSEStream()
   const revalidator = useRevalidator()
   const [pendingUserText, setPendingUserText] = useState<string | null>(null)
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
+  const [editingContent, setEditingContent] = useState('')
+  const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null)
+
+  async function handleDeleteMessage(messageId: string) {
+    if (!window.confirm('Delete this message?')) return
+    setDeletingMessageId(messageId)
+    try {
+      await deleteMessage(messageId)
+      await revalidator.revalidate()
+    } catch (err) {
+      console.error('delete message failed', err)
+    } finally {
+      setDeletingMessageId(null)
+    }
+  }
+
+  async function handleSaveEdit(messageId: string) {
+    if (!editingContent.trim()) return
+    try {
+      await updateMessage(messageId, editingContent.trim())
+      await revalidator.revalidate()
+      setEditingMessageId(null)
+    } catch (err) {
+      console.error('update message failed', err)
+    }
+  }
 
   const stream = useStreamStore((s) => s.activeStreams.get(chat.id))
   const clearStream = useStreamStore((s) => s.clearStream)
