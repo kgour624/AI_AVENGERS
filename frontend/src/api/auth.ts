@@ -26,3 +26,21 @@ export const logout = () => baseAPI.post('/api/v1/auth/logout').then((res) => re
 // no name/email to show even once this endpoint existed. Wired into
 // hooks/useAuth.ts's bootstrap flow.
 export const getMe = () => baseAPI.get<ApiResponse<User>>('/api/v1/auth/me').then((res) => res.data.data!)
+
+// forgotPassword — POST /auth/forgot-password
+// Always resolves (backend never reveals whether the email exists).
+export const forgotPassword = (email: string) =>
+  baseAPI
+    .post<ApiResponse<{ message: string }>>('/api/v1/auth/forgot-password', { email })
+    .then((res) => res.data.data!)
+
+// resetPassword — POST /auth/reset-password
+// token: the raw token from the reset link (?token=...)
+// newPassword: must be ≥8 characters
+export const resetPassword = (token: string, newPassword: string) =>
+  baseAPI
+    .post<ApiResponse<{ message: string }>>('/api/v1/auth/reset-password', {
+      token,
+      new_password: newPassword,
+    })
+    .then((res) => res.data.data!)
