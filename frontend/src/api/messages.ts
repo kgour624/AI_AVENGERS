@@ -27,3 +27,13 @@ export interface RateRequest {
 
 export const rateMessage = (messageId: string, rating: RateRequest) =>
   baseAPI.post(`/api/v1/messages/${messageId}/rate`, rating).then((res) => res.data)
+
+export const deleteMessage = (messageId: string) =>
+  baseAPI
+    .delete<ApiResponse<{ status: string }>>(`/api/v1/messages/${messageId}`)
+    .then((res) => res.data.data!)
+
+export const updateMessage = (messageId: string, content: string) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/messages/${messageId}`, { content })
+    .then((res) => res.data.data!)
