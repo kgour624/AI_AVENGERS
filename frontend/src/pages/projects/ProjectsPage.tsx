@@ -98,7 +98,11 @@ export default function ProjectsPage() {
         >
           {projects.map((p, i) => (
             <motion.div key={p.id} variants={i < ARC_MOTION.maxStaggerItems ? fadeUp : undefined}>
-              <ProjectCard project={p} />
+              <ProjectCard
+                project={p}
+                onDeleted={() => revalidator.revalidate()}
+                onArchiveToggled={() => revalidator.revalidate()}
+              />
             </motion.div>
           ))}
         </motion.div>
