@@ -1114,6 +1114,80 @@ func handleLogout(jwtService *auth.JWTService) gin.HandlerFunc {
 	}
 }
 
+// handleForgotPassword POST /auth/forgot-password
+// Generates a password-reset token for the given email.
+//
+// WHY always 200: returning an error when the email is not found leaks
+// whether an account exists (email enumeration attack). The raw token
+// is logged server-side so an admin can relay it manually until an
+// email integration is wired.
+func handleForgotPassword(svc *auth.AuthService, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Email string `json:"email" binding:"required,email"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+
+		rawToken, err := svc.ForgotPassword(c.Request.Context(), req.Email)
+		if err != nil {
+			logger.Error("forgot-password: service error",
+				zap.String("email", req.Email),
+				zap.Error(err),
+			)
+			response.InternalError(c)
+			return
+		}
+
+		// Log the raw token so an admin can relay it manually.
+		// TODO: replace with email delivery once SMTP is configured.
+		if rawToken != "" {
+			logger.Info("password reset token (relay to user manually until email is wired)",
+				zap.String("email", req.Email),
+				zap.String("reset_token", rawToken),
+			)
+		}
+
+		// Always return the same response — do not reveal whether the email exists.
+		response.OK(c, map[string]string{
+			"message": "If that email is registered, a reset link has been sent.",
+		})
+	}
+}
+
+// handleResetPassword POST /auth/reset-password
+// Validates a reset token and sets a new password.
+func handleResetPassword(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Token       string `json:"token" binding:"required"`
+			NewPassword string `json:"new_password" binding:"required,min=8"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+
+		if err := svc.ResetPassword(c.Request.Context(), req.Token, req.NewPassword); err != nil {
+			switch err {
+			case auth.ErrInvalidResetToken:
+				response.BadRequest(c, "INVALID_TOKEN", "Reset token is invalid or has expired.")
+			case auth.ErrPasswordTooShort:
+				response.BadRequest(c, "PASSWORD_TOO_SHORT", err.Error())
+			default:
+				response.InternalError(c)
+			}
+			return
+		}
+
+		response.OK(c, map[string]string{
+			"message": "Password reset successful. Please log in with your new password.",
+		})
+	}
+}
+
 // buildLogger creates a zap logger with the given level.
 func buildLogger(level string) (*zap.Logger, error) {
 	var zapLevel zapcore.Level
