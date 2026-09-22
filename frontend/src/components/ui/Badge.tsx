@@ -24,7 +24,7 @@ export function ModeBadge({ mode, className }: ModeBadgeProps) {
 
 export interface BadgeProps {
   children: React.ReactNode
-  variant?: 'neutral' | 'brand' | 'success' | 'warn' | 'danger'
+  variant?: 'neutral' | 'brand' | 'success' | 'warning' | 'info' | 'danger'
   className?: string
 }
 
@@ -38,7 +38,8 @@ export function Badge({ children, variant = 'neutral', className }: BadgeProps) 
         'shadow-[0_0_8px_oklch(68%_0.28_295_/_0.2)]',
       ],
       variant === 'success' && 'border-mode-advise/30 bg-mode-advise/10 text-mode-advise',
-      variant === 'warn'    && 'border-mode-warn/30 bg-mode-warn/10 text-mode-warn',
+      variant === 'warning' && 'border-mode-warn/30 bg-mode-warn/10 text-mode-warn',
+      variant === 'info'    && 'border-brand/30 bg-brand/10 text-brand',
       variant === 'danger'  && 'border-mode-refuse/30 bg-mode-refuse/10 text-mode-refuse',
       className
     )}>
