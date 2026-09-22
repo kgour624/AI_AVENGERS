@@ -125,9 +125,9 @@ export default function ChatPage() {
   const expertsById = useMemo(() => new Map(experts.map((e) => [e.expertId, e])), [experts])
 
   const virtualizer = useVirtualizer({
-    count: messages.length,
+    count: filteredMessages.length,
     getScrollElement: () => scrollContainerRef.current,
-    estimateSize: () => 120, // corrected per-row once measured - see header comment
+    estimateSize: () => 120,
     measureElement: (el) => el.getBoundingClientRect().height,
     overscan: 5,
   })
