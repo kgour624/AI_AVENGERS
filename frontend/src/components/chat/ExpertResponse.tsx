@@ -233,31 +233,18 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
             </button>
           )}
 
-          {response.gateStopped >= 0 && (
-            <button
+              <button
               type="button"
               onClick={() => setShowReasoning((v) => !v)}
               className="text-xs text-text-secondary hover:text-text-primary"
             >
               {showReasoning ? '\u25bc' : '\u25b6'} Why did I say this?
             </button>
-          )}
         </div>
       </div>
 
       {showReasoning && (
-        <div className="mt-2 rounded-md border border-surface-border bg-surface-overlay p-3 text-xs text-text-secondary space-y-1">
-          <p><span className="text-text-primary font-medium">Gate stopped:</span> {response.gateStopped} of 5</p>
-          <p><span className="text-text-primary font-medium">Mode:</span> {response.mode}</p>
-          <p><span className="text-text-primary font-medium">Confidence:</span> {Math.round(response.confidence * 100)}%</p>
-          {response.gateStopped === 0 && <p className="text-mode-advise">{'\u2713'} Passed all 5 gates — full cited answer generated.</p>}
-          {response.gateStopped === 1 && <p className="text-mode-ask">Stopped at Gate 1: insufficient information to answer. Clarifying questions raised.</p>}
-          {response.gateStopped === 2 && <p className="text-mode-refuse">Stopped at Gate 2: question not covered by training material.</p>}
-          {response.gateStopped === 3 && <p className="text-mode-warn">Gate 3 warning: answer may conflict with expert charter rules. Proceeded with caution.</p>}
-          {response.gateStopped === 4 && <p className="text-mode-pushback">Stopped at Gate 4: solution may be over-engineered for current needs.</p>}
-          {response.gateStopped === 5 && <p className="text-mode-refuse">Stopped at Gate 5: China Wall — could not produce a fully cited answer after retries.</p>}
-          <p className="text-text-disabled">See AI_AVENGERS_SYSTEM_ARCHITECTURE.md {'\u00a7'}10 for gate details.</p>
-        </div>
+        <ReasoningPanel gateStopped={response.gateStopped} mode={response.mode} confidence={response.confidence} />
       )}
     </motion.div>
   )
