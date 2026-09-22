@@ -162,6 +162,47 @@ func (s *Service) PermanentDelete(ctx context.Context, chatID, clientID uuid.UUI
 	return nil
 }
 
+// DeleteMessage hard-deletes a single user message.
+func (s *Service) DeleteMessage(ctx context.Context, messageID, clientID uuid.UUID) error {
+	var exists bool
+	s.db.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM messages m
+			JOIN chats c ON c.id = m.chat_id
+			WHERE m.id=$1 AND c.client_id=$2 AND m.role='user'
+		)`,
+		messageID, clientID,
+	).Scan(&exists)
+	if !exists {
+		return ErrNotFound
+	}
+	_, err := s.db.Exec(ctx, `DELETE FROM messages WHERE id=$1`, messageID)
+	if err != nil {
+		return fmt.Errorf("delete message failed: %w", err)
+	}
+	return nil
+}
+
+// UpdateMessageContent edits the text of a user message.
+func (s *Service) UpdateMessageContent(ctx context.Context, messageID, clientID uuid.UUID, content string) error {
+	if content == "" {
+		return fmt.Errorf("content cannot be empty")
+	}
+	result, err := s.db.Exec(ctx,
+		`UPDATE messages m SET content=$1
+		 FROM chats c
+		 WHERE m.id=$2 AND m.chat_id=c.id AND c.client_id=$3 AND m.role='user'`,
+		content, messageID, clientID,
+	)
+	if err != nil {
+		return fmt.Errorf("update message failed: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // GetNextTurnNumber returns the next turn number for a chat.
 // WHY: Turn number tracks conversation position.
 // Used by memory manager and rolling summary trigger.
