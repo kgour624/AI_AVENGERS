@@ -1,7 +1,7 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { getBlackboard, getWorkflow, respondToApproval, cancelWorkflow } from '@/api/workflows'
+import { getBlackboard, getWorkflow, respondToApproval, cancelWorkflow, retryTask } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
 import { useFileStream } from '@/hooks/useFileStream'
 import type { FileEntry } from '@/hooks/useFileStream'
@@ -233,18 +233,60 @@ const COLUMNS: { key: KanbanTask['status']; label: string; color: string }[] = [
   { key: 'done',         label: 'Done',         color: 'text-mode-advise' },
 ]
 
-function TaskCard({ task, onSelect }: { task: KanbanTask; onSelect: () => void }) {
+function TaskCard({ task, onSelect, workflowId }: { task: KanbanTask; onSelect: () => void; workflowId: string }) {
+  const [retrying, setRetrying] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const queryClient = useQueryClient()
+
+  const handleRetry = async (e: React.MouseEvent) => {
+    e.stopPropagation() // Prevent card click
+    setRetrying(true)
+    setError(null)
+    try {
+      await retryTask(workflowId, task.id)
+      // Invalidate queries to refresh Kanban board
+      queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      queryClient.invalidateQueries({ queryKey: ['blackboard', workflowId] })
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Retry failed')
+    } finally {
+      setRetrying(false)
+    }
+  }
+
+  const isFailed = task.status === 'blocked' || task.status === 'cancelled'
+
   return (
     <Card
       onClick={onSelect}
-      className="mb-2 cursor-pointer p-3 hover:border-glow-purple/40"
+      className={cn(
+        'mb-2 cursor-pointer p-3 hover:border-glow-purple/40',
+        isFailed && 'border-mode-refuse/40 bg-mode-refuse/5'
+      )}
       title="Show this expert's deliverables"
     >
-      <p className="text-sm font-medium text-text-primary">{task.title}</p>
-      <p className="mt-1 text-xs text-text-secondary">{task.expertName}</p>
-      {task.costUsd > 0 && (
-        <p className="mt-1 text-xs text-text-disabled">${task.costUsd.toFixed(4)}</p>
-      )}
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium text-text-primary">{task.title}</p>
+          <p className="mt-1 text-xs text-text-secondary">{task.expertName}</p>
+          {task.costUsd > 0 && (
+            <p className="mt-1 text-xs text-text-disabled">${task.costUsd.toFixed(4)}</p>
+          )}
+          {error && (
+            <p className="mt-1 text-xs text-mode-refuse">{error}</p>
+          )}
+        </div>
+        {isFailed && (
+          <button
+            onClick={handleRetry}
+            disabled={retrying}
+            className="shrink-0 rounded border border-brand/60 bg-brand/10 px-2 py-1 text-xs font-medium text-brand hover:bg-brand/20 disabled:opacity-50"
+            title="Retry this failed task"
+          >
+            {retrying ? '...' : '🔄 Retry'}
+          </button>
+        )}
+      </div>
     </Card>
   )
 }
@@ -588,6 +630,7 @@ function KanbanPage() {
                       key={task.id}
                       task={task}
                       onSelect={() => setFilterExpertId(task.assignedExpertId)}
+                      workflowId={id!}
                     />
                   ))}
                   {colTasks.length === 0 && (
