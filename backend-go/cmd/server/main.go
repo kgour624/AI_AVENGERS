@@ -654,6 +654,7 @@ func buildRouter(
 			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
 			workflows.POST("/:id/cancel", wfHandler.CancelWorkflow)
+			workflows.POST("/:id/tasks/:taskId/retry", wfHandler.RetryTask)
 		}
 
 		// Workflow chat (§6). Registered on `protected`, so these inherit
