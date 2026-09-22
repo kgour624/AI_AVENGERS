@@ -75,6 +75,7 @@ export function ProjectCard({
   }
 
   return (
+    <div className="group relative">
     <Card glow="purple">
       <div className="flex items-start justify-between gap-2">
         <p className="font-medium text-text-primary">{project.name}</p>
