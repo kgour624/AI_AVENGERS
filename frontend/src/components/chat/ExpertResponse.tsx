@@ -82,15 +82,32 @@ function ReasoningPanel({
   confidence: number
 }) {
   return (
-    <div className="mt-3 rounded-md border border-surface-border bg-surface-overlay/60 p-3 text-xs">
-      <p className="mb-2 font-semibold text-text-primary">Decision trace</p>
+    <motion.div
+      initial={{ opacity: 0, height: 0 }}
+      animate={{ opacity: 1, height: 'auto' }}
+      exit={{ opacity: 0, height: 0 }}
+      transition={{ duration: 0.2, ease: 'easeOut' }}
+      className="mt-3 overflow-hidden rounded-md border border-brand/30 bg-gradient-to-br from-brand/5 to-surface-overlay/60 p-4 text-xs shadow-sm"
+    >
+      <div className="mb-3 flex items-center gap-2">
+        <span className="text-lg">{'\ud83e\udde0'}</span>
+        <p className="font-semibold text-text-primary">Decision Trace</p>
+        <span className="ml-auto rounded-full bg-brand/20 px-2 py-0.5 text-[10px] font-medium text-brand">AI Reasoning</span>
+      </div>
 
       {/* Structure-permission sentinel — special case */}
       {gateStopped === -1 && (
-        <p className="mb-2 text-mode-ask">
-          {'\u2753'} This is a structure-permission question — the expert asked whether to use a
-          structured template or plain prose before answering. Gates were not evaluated.
-        </p>
+        <div className="mb-3 rounded-md border border-mode-ask/30 bg-mode-ask/5 p-3">
+          <div className="flex items-start gap-2">
+            <span className="text-base">{'\u2753'}</span>
+            <div>
+              <p className="font-medium text-mode-ask">Structure Permission Question</p>
+              <p className="mt-1 text-text-secondary">
+                The expert asked whether to use a structured template or plain prose before answering. Gates were not evaluated.
+              </p>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Gate pipeline */}
@@ -122,22 +139,24 @@ function ReasoningPanel({
                 </span>
 
                 <div className="min-w-0 flex-1">
-                  <span className="font-medium text-text-primary">
-                    Gate {gate.num} — {gate.name}
-                  </span>
-                  {status === 'stopped' && (
-                    <>
-                      <span className={cn('ml-1.5 font-semibold', gate.stopColor)}>
+                  <div className="flex items-center gap-2">
+                    <span className="font-medium text-text-primary">
+                      Gate {gate.num} — {gate.name}
+                    </span>
+                    {status === 'stopped' && (
+                      <span className={cn('rounded-full px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide', gate.stopColor, 'bg-current/10')}>
                         stopped here
                       </span>
-                      <p className="mt-0.5 text-text-secondary">{gate.description}</p>
-                    </>
-                  )}
-                  {status === 'passed' && (
-                    <span className="ml-1.5 text-text-disabled">passed</span>
-                  )}
-                  {status === 'skipped' && (
-                    <span className="ml-1.5 text-text-disabled">not reached</span>
+                    )}
+                    {status === 'passed' && (
+                      <span className="text-[10px] text-text-disabled">passed</span>
+                    )}
+                    {status === 'skipped' && (
+                      <span className="text-[10px] text-text-disabled">not reached</span>
+                    )}
+                  </div>
+                  {status === 'stopped' && (
+                    <p className="mt-1 text-text-secondary leading-relaxed">{gate.description}</p>
                   )}
                 </div>
               </div>
@@ -147,14 +166,27 @@ function ReasoningPanel({
       )}
 
       {/* Summary row */}
-      <div className="mt-2 flex items-center gap-3 border-t border-surface-border pt-2 text-text-disabled">
-        <span>Mode: <span className="text-text-secondary">{mode}</span></span>
-        <span>Confidence: <span className="text-text-secondary">{Math.round(confidence * 100)}%</span></span>
+      <div className="mt-3 flex flex-wrap items-center gap-3 rounded-md border border-surface-border/50 bg-surface-base/40 px-3 py-2 text-text-disabled">
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wider">Mode:</span>
+          <span className="font-medium text-text-secondary">{mode}</span>
+        </div>
+        <div className="h-3 w-px bg-surface-border" />
+        <div className="flex items-center gap-1.5">
+          <span className="text-[10px] uppercase tracking-wider">Confidence:</span>
+          <span className="font-medium text-text-secondary">{Math.round(confidence * 100)}%</span>
+        </div>
         {gateStopped === 0 && (
-          <span className="text-mode-advise">{'\u2713'} All 5 gates passed</span>
+          <>
+            <div className="h-3 w-px bg-surface-border" />
+            <span className="flex items-center gap-1 text-mode-advise">
+              <span>{'\u2713'}</span>
+              <span className="font-medium">All 5 gates passed</span>
+            </span>
+          </>
         )}
       </div>
-    </div>
+    </motion.div>
   )
 }
 
@@ -374,19 +406,26 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
             <button
               type="button"
               onClick={handleReplyClick}
-              className="text-xs text-text-secondary hover:text-text-primary"
+              className="rounded-md border border-surface-border bg-surface-overlay px-2 py-1 text-xs text-text-secondary hover:text-text-primary hover:border-brand/40 transition-colors"
             >
               Reply
             </button>
           )}
 
-              <button
-              type="button"
-              onClick={() => setShowReasoning((v) => !v)}
-              className="text-xs text-text-secondary hover:text-text-primary"
-            >
-              {showReasoning ? '\u25bc' : '\u25b6'} Why did I say this?
-            </button>
+          <button
+            type="button"
+            onClick={() => setShowReasoning((v) => !v)}
+            className={cn(
+              'flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-all duration-200',
+              showReasoning
+                ? 'border-brand/60 bg-brand/10 text-brand shadow-sm'
+                : 'border-surface-border bg-surface-overlay text-text-secondary hover:text-text-primary hover:border-brand/40'
+            )}
+            title="View decision trace and gate-by-gate reasoning"
+          >
+            <span className="text-sm">{showReasoning ? '\u25bc' : '\u25b6'}</span>
+            <span>Why did I say this?</span>
+          </button>
         </div>
       </div>
 
