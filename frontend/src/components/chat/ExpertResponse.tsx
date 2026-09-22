@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import ReactMarkdown from 'react-markdown'
 import { motion, useReducedMotion } from 'framer-motion'
-import type { ExpertResponse as ExpertResponseType } from '@/types/expert'
+import type { ExpertResponse as ExpertResponseType, GateStopped, ResponseMode } from '@/types/expert'
 import { ModeBadge } from '@/components/ui/Badge'
 import { CitationChip } from './CitationChip'
 import { CodeBlock } from './CodeBlock'
@@ -10,6 +10,153 @@ import { useReplyStore } from '@/stores/replyStore'
 import { splitContentByCitations } from '@/utils/parseCitations'
 import { cn } from '@/utils/cn'
 import { ARC_MOTION } from '@/design-system/motion'
+
+// ============================================================
+// ReasoningPanel — gate-by-gate decision breakdown
+// ============================================================
+
+const GATES: {
+  num: 1 | 2 | 3 | 4 | 5
+  name: string
+  description: string
+  passColor: string
+  stopColor: string
+}[] = [
+  {
+    num: 1,
+    name: 'Clarity',
+    description: 'Does the expert have enough information to answer? If not, clarifying questions are raised (ASK mode).',
+    passColor: 'text-mode-advise',
+    stopColor: 'text-mode-ask',
+  },
+  {
+    num: 2,
+    name: 'Coverage',
+    description: 'Is the question covered by the expert\'s training material? Out-of-scope questions are refused here.',
+    passColor: 'text-mode-advise',
+    stopColor: 'text-mode-refuse',
+  },
+  {
+    num: 3,
+    name: 'Charter',
+    description: 'Does the answer comply with the expert\'s reasoning charter and domain rules? Violations trigger WARN or PUSH_BACK.',
+    passColor: 'text-mode-advise',
+    stopColor: 'text-mode-warn',
+  },
+  {
+    num: 4,
+    name: 'Complexity',
+    description: 'Is the proposed solution appropriately scoped? Over-engineered answers are pushed back for simplification.',
+    passColor: 'text-mode-advise',
+    stopColor: 'text-mode-pushback',
+  },
+  {
+    num: 5,
+    name: 'China Wall',
+    description: 'Can the answer be fully grounded in cited training material? If not, the expert refuses rather than hallucinate.',
+    passColor: 'text-mode-advise',
+    stopColor: 'text-mode-refuse',
+  },
+]
+
+function gateStatus(
+  gateNum: 1 | 2 | 3 | 4 | 5,
+  gateStopped: GateStopped
+): 'passed' | 'stopped' | 'skipped' {
+  // gateStopped=0 means all gates passed (answer generated after Gate 5)
+  if (gateStopped === 0) return 'passed'
+  // gateStopped=-1 is the structure-permission sentinel — gates not run
+  if (gateStopped === -1) return 'skipped'
+  if (gateNum < gateStopped) return 'passed'
+  if (gateNum === gateStopped) return 'stopped'
+  return 'skipped'
+}
+
+function ReasoningPanel({
+  gateStopped,
+  mode,
+  confidence,
+}: {
+  gateStopped: GateStopped
+  mode: ResponseMode
+  confidence: number
+}) {
+  return (
+    <div className="mt-3 rounded-md border border-surface-border bg-surface-overlay/60 p-3 text-xs">
+      <p className="mb-2 font-semibold text-text-primary">Decision trace</p>
+
+      {/* Structure-permission sentinel — special case */}
+      {gateStopped === -1 && (
+        <p className="mb-2 text-mode-ask">
+          {'\u2753'} This is a structure-permission question — the expert asked whether to use a
+          structured template or plain prose before answering. Gates were not evaluated.
+        </p>
+      )}
+
+      {/* Gate pipeline */}
+      {gateStopped !== -1 && (
+        <div className="space-y-2">
+          {GATES.map((gate) => {
+            const status = gateStatus(gate.num, gateStopped)
+            return (
+              <div
+                key={gate.num}
+                className={cn(
+                  'flex items-start gap-2 rounded px-2 py-1.5',
+                  status === 'stopped' && 'border border-surface-border bg-surface-base/60',
+                  status === 'skipped' && 'opacity-40'
+                )}
+              >
+                {/* Status icon */}
+                <span
+                  className={cn(
+                    'mt-0.5 shrink-0 font-bold',
+                    status === 'passed' && gate.passColor,
+                    status === 'stopped' && gate.stopColor,
+                    status === 'skipped' && 'text-text-disabled'
+                  )}
+                >
+                  {status === 'passed' && '\u2713'}
+                  {status === 'stopped' && '\u25cf'}
+                  {status === 'skipped' && '\u25cb'}
+                </span>
+
+                <div className="min-w-0 flex-1">
+                  <span className="font-medium text-text-primary">
+                    Gate {gate.num} — {gate.name}
+                  </span>
+                  {status === 'stopped' && (
+                    <>
+                      <span className={cn('ml-1.5 font-semibold', gate.stopColor)}>
+                        stopped here
+                      </span>
+                      <p className="mt-0.5 text-text-secondary">{gate.description}</p>
+                    </>
+                  )}
+                  {status === 'passed' && (
+                    <span className="ml-1.5 text-text-disabled">passed</span>
+                  )}
+                  {status === 'skipped' && (
+                    <span className="ml-1.5 text-text-disabled">not reached</span>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* Summary row */}
+      <div className="mt-2 flex items-center gap-3 border-t border-surface-border pt-2 text-text-disabled">
+        <span>Mode: <span className="text-text-secondary">{mode}</span></span>
+        <span>Confidence: <span className="text-text-secondary">{Math.round(confidence * 100)}%</span></span>
+        {gateStopped === 0 && (
+          <span className="text-mode-advise">{'\u2713'} All 5 gates passed</span>
+        )}
+      </div>
+    </div>
+  )
+}
 
 /**
  * ARC-51 §9 (docs/ARC51_UI_CONTRACT.md): mode -> left-border glow
