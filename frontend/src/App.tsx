@@ -6,6 +6,8 @@ import { RouteError } from '@/components/layout/RouteError'
 
 import LoginPage from '@/pages/auth/LoginPage'
 import RegisterPage from '@/pages/auth/RegisterPage'
+import ForgotPasswordPage from '@/pages/auth/ForgotPasswordPage'
+import ResetPasswordPage from '@/pages/auth/ResetPasswordPage'
 import { projectsRoute } from '@/pages/projects/ProjectsPage'
 import { projectRoute } from '@/pages/projects/ProjectPage'
 import { chatRoute } from '@/pages/chat/ChatPage'
@@ -26,6 +28,8 @@ import { expertsRoute } from '@/pages/experts/ExpertsPage'
 const router = createBrowserRouter([
   { path: '/login', element: <LoginPage /> },
   { path: '/register', element: <RegisterPage /> },
+  { path: '/forgot-password', element: <ForgotPasswordPage /> },
+  { path: '/reset-password', element: <ResetPasswordPage /> },
 
   {
     element: <AuthGuard />,
