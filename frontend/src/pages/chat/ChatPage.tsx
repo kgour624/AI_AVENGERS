@@ -18,6 +18,30 @@ import { CodeBlock } from '@/components/chat/CodeBlock'
 import { persistedMessageToExpertResponse } from '@/utils/adaptMessage'
 
 /**
+ * HighlightedText component - highlights search query matches in text.
+ * WHY separate component: keeps the highlighting logic isolated and reusable.
+ * Case-insensitive matching with yellow highlight on matches.
+ */
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  if (!query.trim()) return <>{text}</>
+  
+  const parts = text.split(new RegExp(`(${query})`, 'gi'))
+  return (
+    <>
+      {parts.map((part, i) => 
+        part.toLowerCase() === query.toLowerCase() ? (
+          <mark key={i} className="bg-glow-amber/30 text-text-primary rounded px-0.5">
+            {part}
+          </mark>
+        ) : (
+          <span key={i}>{part}</span>
+        )
+      )}
+    </>
+  )
+}
+
+/**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 5 (loader pattern) and
  * section 10 (Chat Page wireframe: history + live streaming turn +
  * synthesis + MessageInput at the bottom).
@@ -87,9 +111,12 @@ export default function ChatPage() {
   const [searchQuery, setSearchQuery] = useState('')
   const [showSearch, setShowSearch] = useState(false)
 
+  // Filter messages based on search query
+  // WHY case-insensitive: users expect "API" to match "api" and vice versa
+  // WHY trim: ignore leading/trailing whitespace in search
   const filteredMessages = useMemo(() => {
     if (!searchQuery.trim()) return messages
-    const q = searchQuery.toLowerCase()
+    const q = searchQuery.toLowerCase().trim()
     return messages.filter((m) => m.content.toLowerCase().includes(q))
   }, [messages, searchQuery])
 
@@ -250,22 +277,32 @@ export default function ChatPage() {
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               placeholder="Search messages..."
-              className="rounded-md border border-surface-border bg-surface-overlay px-3 py-1.5 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
+              onKeyDown={(e) => {
+                if (e.key === 'Escape') { setShowSearch(false); setSearchQuery('') }
+              }}
+              className="w-64 rounded-md border border-surface-border bg-surface-overlay px-3 py-1.5 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
             />
             <button
               onClick={() => { setShowSearch(false); setSearchQuery('') }}
               className="text-xs text-text-secondary hover:text-text-primary"
+              title="Close search"
             >{'\u2715'}</button>
           </div>
         ) : (
           <button
             onClick={() => setShowSearch(true)}
-            className="text-sm text-text-secondary hover:text-text-primary"
-            title="Search messages"
-          >{'\ud83d\udd0d'}</button>
+            className="flex items-center gap-1.5 rounded-md border border-surface-border bg-surface-overlay px-3 py-1.5 text-sm text-text-secondary hover:text-text-primary hover:border-brand/40 transition-colors"
+            title="Search in chat"
+          >
+            <span>{'\ud83d\udd0d'}</span>
+            <span>Search</span>
+          </button>
         )}
         {searchQuery && (
-          <span className="text-xs text-text-disabled">{filteredMessages.length} result{filteredMessages.length !== 1 ? 's' : ''}</span>
+          <span className="text-xs text-text-disabled">
+            {filteredMessages.length} result{filteredMessages.length !== 1 ? 's' : ''}
+            {filteredMessages.length === 0 && ' - try different keywords'}
+          </span>
         )}
       </div>
 
@@ -309,7 +346,17 @@ export default function ChatPage() {
                       </div>
                     ) : (
                       <div className="relative">
-                        <div className="rounded-md bg-brand/10 p-3 text-sm text-text-primary">{m.content}</div>
+                        <div className={`rounded-md bg-brand/10 p-3 text-sm text-text-primary ${
+                          searchQuery && m.content.toLowerCase().includes(searchQuery.toLowerCase())
+                            ? 'ring-2 ring-glow-amber/50 bg-glow-amber/5'
+                            : ''
+                        }`}>
+                          {searchQuery && m.content.toLowerCase().includes(searchQuery.toLowerCase()) ? (
+                            <HighlightedText text={m.content} query={searchQuery} />
+                          ) : (
+                            m.content
+                          )}
+                        </div>
                         <div className="absolute -top-6 right-0 hidden group-hover:flex gap-1">
                           <button
                             onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content) }}
