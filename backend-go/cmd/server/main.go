@@ -537,6 +537,8 @@ func buildRouter(
 		authGroup.POST("/admin/login", handleAdminLogin(authService))
 		authGroup.POST("/refresh", handleRefresh(jwtService))
 		authGroup.POST("/logout", middleware.AuthMiddleware(jwtService, logger), handleLogout(jwtService))
+		authGroup.POST("/forgot-password", handleForgotPassword(authService, logger))
+		authGroup.POST("/reset-password", handleResetPassword(authService))
 	}
 
 	// OAuth callback — no JWT (browser redirect from GitHub/GitLab)
