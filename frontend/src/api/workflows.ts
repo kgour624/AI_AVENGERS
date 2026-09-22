@@ -122,9 +122,6 @@ export const respondToApproval = (
   approvalId: string,
   decision: 'approve' | 'approve_with_notes' | 'request_changes' | 'reject_and_restart_phase' | 'cancel_workflow',
   notes?: string,
-  // genericAllowancePct: 0-30. Sent with 'request_changes' to re-run the
-  // design with a bounded generic-knowledge allowance. Omit to leave the
-  // workflow's current setting untouched.
   genericAllowancePct?: number
 ) =>
   baseAPI
@@ -132,4 +129,9 @@ export const respondToApproval = (
       `/api/v1/workflows/${workflowId}/approvals/${approvalId}/respond`,
       { decision, notes, genericAllowancePct }
     )
+    .then((res) => res.data.data!)
+
+export const cancelWorkflow = (workflowId: string) =>
+  baseAPI
+    .post<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}/cancel`)
     .then((res) => res.data.data!)
