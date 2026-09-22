@@ -193,7 +193,31 @@ export default function ChatPage() {
         >
           {'\u2190'} Back to Project
         </Link>
-        <h2 className="text-lg font-medium">{chat.title}</h2>
+        <h2 className="flex-1 text-lg font-medium">{chat.title}</h2>
+        {showSearch ? (
+          <div className="flex items-center gap-2">
+            <input
+              autoFocus
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search messages..."
+              className="rounded-md border border-surface-border bg-surface-overlay px-3 py-1.5 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
+            />
+            <button
+              onClick={() => { setShowSearch(false); setSearchQuery('') }}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >{'\u2715'}</button>
+          </div>
+        ) : (
+          <button
+            onClick={() => setShowSearch(true)}
+            className="text-sm text-text-secondary hover:text-text-primary"
+            title="Search messages"
+          >{'\ud83d\udd0d'}</button>
+        )}
+        {searchQuery && (
+          <span className="text-xs text-text-disabled">{filteredMessages.length} result{filteredMessages.length !== 1 ? 's' : ''}</span>
+        )}
       </div>
 
       <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-6">
