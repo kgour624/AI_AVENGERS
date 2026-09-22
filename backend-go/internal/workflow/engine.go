@@ -550,3 +550,22 @@ func isValidTransition(current, next string) bool {
 	// next must be strictly after current
 	return nextIdx > currentIdx
 }
+
+// Cancel sets a workflow's status to 'cancelled'.
+// Only running/paused workflows can be cancelled.
+func (e *Engine) Cancel(ctx context.Context, workflowID, clientID uuid.UUID) error {
+	result, err := e.db.Exec(ctx,
+		`UPDATE workflows
+		 SET status=$1, updated_at=NOW()
+		 WHERE id=$2 AND client_id=$3
+		   AND status IN ('running','paused_for_approval','paused_for_client_input','draft')`,
+		StatusCancelled, workflowID, clientID,
+	)
+	if err != nil {
+		return fmt.Errorf("cancel workflow: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return fmt.Errorf("workflow not found or already in terminal state")
+	}
+	return nil
+}
