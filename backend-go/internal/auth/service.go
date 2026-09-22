@@ -2,6 +2,9 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -73,6 +76,8 @@ var (
 	ErrInvalidTOTP        = errors.New("invalid TOTP code")
 	ErrTOTPRequired       = errors.New("TOTP code required for admin login")
 	ErrNotAdmin           = errors.New("admin access required")
+	ErrInvalidResetToken  = errors.New("invalid or expired reset token")
+	ErrPasswordTooShort   = errors.New("password must be at least 8 characters")
 )
 
 // Register creates a new client account.
@@ -286,6 +291,156 @@ func (s *AuthService) GetMe(ctx context.Context, userID uuid.UUID) (*User, error
 // Used by handlers to set cookie MaxAge.
 func (s *AuthService) RefreshExpiryDays() int {
 	return s.jwt.RefreshExpiryDays()
+}
+
+// ForgotPassword generates a password-reset token for the given email.
+//
+// WHY silent no-op on unknown email:
+//   Returning an error when the email is not found leaks whether an
+//   account exists (email enumeration). We always return success to
+//   the caller; the handler logs the raw token so an admin can relay
+//   it manually (or a future email integration can send it).
+//
+// Returns (rawToken, nil) on success, ("", nil) when email not found.
+// The caller MUST NOT expose the distinction to the end user.
+func (s *AuthService) ForgotPassword(ctx context.Context, email string) (rawToken string, err error) {
+	user, err := s.getUserByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, ErrUserNotFound) {
+			// Silent — do not reveal whether the email exists.
+			return "", nil
+		}
+		return "", err
+	}
+
+	// Invalidate any previous unused tokens for this user.
+	// WHY: only one active reset link at a time; prevents confusion if
+	// the user clicks "Forgot Password" twice.
+	_, err = s.db.Exec(ctx,
+		`UPDATE password_reset_tokens
+		    SET used_at = NOW()
+		  WHERE user_id = $1 AND used_at IS NULL`,
+		user.ID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to invalidate old reset tokens: %w", err)
+	}
+
+	// Generate 32 cryptographically-random bytes → hex string (64 chars).
+	// WHY 32 bytes: 256 bits of entropy — brute-force is infeasible.
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("failed to generate reset token: %w", err)
+	}
+	rawToken = hex.EncodeToString(buf)
+
+	// Store SHA-256(rawToken) — never the raw token itself.
+	hash := sha256.Sum256([]byte(rawToken))
+	tokenHash := hex.EncodeToString(hash[:])
+
+	_, err = s.db.Exec(ctx,
+		`INSERT INTO password_reset_tokens (user_id, token_hash)
+		 VALUES ($1, $2)`,
+		user.ID, tokenHash,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to store reset token: %w", err)
+	}
+
+	s.logger.Info("password reset token generated",
+		zap.String("user_id", user.ID.String()),
+		zap.String("email", email),
+	)
+
+	return rawToken, nil
+}
+
+// ResetPassword validates a reset token and sets a new password.
+//
+// Steps:
+//  1. Hash the incoming token and look it up.
+//  2. Validate: exists, not expired, not already used.
+//  3. bcrypt the new password and update users.
+//  4. Mark the token used (single-use).
+//  5. Revoke all active JWT sessions (force re-login).
+func (s *AuthService) ResetPassword(ctx context.Context, rawToken, newPassword string) error {
+	if len(newPassword) < 8 {
+		return ErrPasswordTooShort
+	}
+
+	hash := sha256.Sum256([]byte(rawToken))
+	tokenHash := hex.EncodeToString(hash[:])
+
+	var (
+		tokenID   uuid.UUID
+		userID    uuid.UUID
+		expiresAt time.Time
+		usedAt    *time.Time
+	)
+	err := s.db.QueryRow(ctx,
+		`SELECT id, user_id, expires_at, used_at
+		   FROM password_reset_tokens
+		  WHERE token_hash = $1`,
+		tokenHash,
+	).Scan(&tokenID, &userID, &expiresAt, &usedAt)
+	if err != nil {
+		// No row or scan error — treat both as invalid token.
+		return ErrInvalidResetToken
+	}
+
+	if usedAt != nil {
+		return ErrInvalidResetToken // already used
+	}
+	if time.Now().After(expiresAt) {
+		return ErrInvalidResetToken // expired
+	}
+
+	// Hash new password.
+	hashed, err := bcrypt.GenerateFromPassword([]byte(newPassword), 12)
+	if err != nil {
+		return fmt.Errorf("failed to hash password: %w", err)
+	}
+
+	// Update password.
+	_, err = s.db.Exec(ctx,
+		`UPDATE users
+		    SET hashed_password = $1, updated_at = NOW()
+		  WHERE id = $2`,
+		string(hashed), userID,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to update password: %w", err)
+	}
+
+	// Mark token as used — single-use guarantee.
+	_, err = s.db.Exec(ctx,
+		`UPDATE password_reset_tokens
+		    SET used_at = NOW()
+		  WHERE id = $1`,
+		tokenID,
+	)
+	if err != nil {
+		// Non-fatal: password is already changed. Log and continue.
+		s.logger.Warn("failed to mark reset token used",
+			zap.String("token_id", tokenID.String()),
+			zap.Error(err),
+		)
+	}
+
+	// Revoke all active JWT sessions — user must log in with new password.
+	if err := s.jwt.RevokeAllUserTokens(ctx, userID); err != nil {
+		s.logger.Warn("failed to revoke user tokens after password reset",
+			zap.String("user_id", userID.String()),
+			zap.Error(err),
+		)
+		// Non-fatal: password is changed; old tokens will expire naturally.
+	}
+
+	s.logger.Info("password reset successful",
+		zap.String("user_id", userID.String()),
+	)
+
+	return nil
 }
 
 // getUserByEmail fetches a user by email.
