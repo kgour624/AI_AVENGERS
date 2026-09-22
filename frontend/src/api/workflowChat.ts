@@ -134,3 +134,34 @@ export const listWorkflowChatMessages = (chatId: string, limit?: number) =>
       { params: limit ? { limit } : undefined }
     )
     .then((res) => res.data.data?.messages ?? [])
+
+// ============================================================
+// Change requests (chat-driven coordinated redesign)
+// ============================================================
+
+export interface ChangeRequest {
+  id: string
+  workflowId: string
+  clientId: string
+  sourceChatId?: string
+  sourceMessageId?: string
+  changeGoal: string
+  relevantExpertIds: string[]
+  // pending | running | completed | cancelled
+  status: string
+  blackboardEventId?: string
+  requestedAt: string
+  startedAt?: string
+  completedAt?: string
+}
+
+// proposeChange sends a free-text change goal from the workflow chat.
+// The runner picks it up, determines relevant experts, re-runs their design
+// sections, and presents the same approval gate as the initial design.
+export const proposeChange = (chatId: string, changeGoal: string) =>
+  baseAPI
+    .post<ApiResponse<ChangeRequest>>(
+      `/api/v1/workflow-chats/${chatId}/propose-change`,
+      { changeGoal }
+    )
+    .then((res) => res.data.data!)
