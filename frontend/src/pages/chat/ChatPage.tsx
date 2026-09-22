@@ -3,7 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import ReactMarkdown from 'react-markdown'
 import type { LoaderFunctionArgs } from 'react-router-dom'
 import { useLoaderData, useRevalidator, useParams, Link } from 'react-router-dom'
-import { getChat, getMessages } from '@/api/chats'
+import { getChat, getMessages, updateChatTitle } from '@/api/chats'
 import { getProjectExperts } from '@/api/projects'
 import { deleteMessage, updateMessage } from '@/api/messages'
 import type { ChatLoaderData } from '@/types/project'
@@ -78,6 +78,9 @@ export default function ChatPage() {
   const { sendMessage } = useSSEStream()
   const revalidator = useRevalidator()
   const [pendingUserText, setPendingUserText] = useState<string | null>(null)
+  const [isEditingTitle, setIsEditingTitle] = useState(false)
+  const [titleDraft, setTitleDraft] = useState(chat.title)
+  const [isSavingTitle, setIsSavingTitle] = useState(false)
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [editingContent, setEditingContent] = useState('')
   const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null)
@@ -89,6 +92,21 @@ export default function ChatPage() {
     const q = searchQuery.toLowerCase()
     return messages.filter((m) => m.content.toLowerCase().includes(q))
   }, [messages, searchQuery])
+
+  async function handleSaveTitle() {
+    const trimmed = titleDraft.trim()
+    if (!trimmed || trimmed === chat.title) { setIsEditingTitle(false); return }
+    setIsSavingTitle(true)
+    try {
+      await updateChatTitle(chat.id, trimmed)
+      await revalidator.revalidate()
+    } catch (err) {
+      console.error('rename chat failed', err)
+    } finally {
+      setIsSavingTitle(false)
+      setIsEditingTitle(false)
+    }
+  }
 
   async function handleDeleteMessage(messageId: string) {
     if (!window.confirm('Delete this message?')) return
@@ -193,7 +211,38 @@ export default function ChatPage() {
         >
           {'\u2190'} Back to Project
         </Link>
-        <h2 className="flex-1 text-lg font-medium">{chat.title}</h2>
+        {isEditingTitle ? (
+          <input
+            autoFocus
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={handleSaveTitle}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') { e.preventDefault(); handleSaveTitle() }
+              if (e.key === 'Escape') { setIsEditingTitle(false); setTitleDraft(chat.title) }
+            }}
+            disabled={isSavingTitle}
+            className="flex-1 rounded-md border border-brand/40 bg-surface-overlay px-2 py-1 text-lg font-medium text-text-primary focus:outline-none focus:ring-2 focus:ring-brand/40 disabled:opacity-50"
+          />
+        ) : (
+          <div className="group flex flex-1 items-center gap-1.5">
+            <h2
+              className="cursor-pointer text-lg font-medium hover:text-brand"
+              onDoubleClick={() => { setTitleDraft(chat.title); setIsEditingTitle(true) }}
+              title="Double-click to rename"
+            >
+              {chat.title}
+            </h2>
+            <button
+              onClick={() => { setTitleDraft(chat.title); setIsEditingTitle(true) }}
+              className="opacity-0 transition-opacity group-hover:opacity-100 text-text-disabled hover:text-text-primary"
+              title="Rename chat"
+              aria-label="Rename chat"
+            >
+              {'\u270f\ufe0f'}
+            </button>
+          </div>
+        )}
         {showSearch ? (
           <div className="flex items-center gap-2">
             <input
