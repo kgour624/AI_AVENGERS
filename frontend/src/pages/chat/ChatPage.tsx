@@ -207,8 +207,41 @@ export default function ChatPage() {
                 }}
               >
                 {m.role === 'user' ? (
-                  <div className="ml-auto max-w-[80%] rounded-md bg-brand/10 p-3 text-sm text-text-primary">
-                    {m.content}
+                  <div className="group ml-auto max-w-[80%]">
+                    {editingMessageId === m.id ? (
+                      <div className="flex flex-col gap-2">
+                        <textarea
+                          className="w-full rounded-md bg-brand/10 p-3 text-sm text-text-primary resize-none border border-brand/30 focus:outline-none focus:border-brand"
+                          rows={3}
+                          value={editingContent}
+                          onChange={(e) => setEditingContent(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSaveEdit(m.id) }
+                            if (e.key === 'Escape') setEditingMessageId(null)
+                          }}
+                          autoFocus
+                        />
+                        <div className="flex gap-2 justify-end">
+                          <button onClick={() => setEditingMessageId(null)} className="text-xs text-text-secondary hover:text-text-primary px-2 py-1">Cancel</button>
+                          <button onClick={() => handleSaveEdit(m.id)} className="text-xs bg-brand/20 hover:bg-brand/30 text-text-primary px-3 py-1 rounded">Save</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="relative">
+                        <div className="rounded-md bg-brand/10 p-3 text-sm text-text-primary">{m.content}</div>
+                        <div className="absolute -top-6 right-0 hidden group-hover:flex gap-1">
+                          <button
+                            onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content) }}
+                            className="text-xs text-text-secondary hover:text-text-primary bg-surface-raised border border-surface-border rounded px-2 py-0.5"
+                          >Edit</button>
+                          <button
+                            onClick={() => handleDeleteMessage(m.id)}
+                            disabled={deletingMessageId === m.id}
+                            className="text-xs text-mode-refuse hover:text-mode-refuse/80 bg-surface-raised border border-surface-border rounded px-2 py-0.5 disabled:opacity-50"
+                          >{deletingMessageId === m.id ? '...' : 'Delete'}</button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 ) : (
                   (() => {
