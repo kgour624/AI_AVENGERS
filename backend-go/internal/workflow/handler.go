@@ -514,3 +514,19 @@ func splitComma(s string) []string {
 	result = append(result, s[start:])
 	return result
 }
+
+// CancelWorkflow handles POST /workflows/:id/cancel
+func (h *Handler) CancelWorkflow(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	wfID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid workflow id")
+		return
+	}
+	if err := h.engine.Cancel(c.Request.Context(), wfID, clientID); err != nil {
+		h.logger.Error("cancel workflow failed", zap.Error(err))
+		response.BadRequest(c, "CANCEL_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"status": "cancelled"})
+}
