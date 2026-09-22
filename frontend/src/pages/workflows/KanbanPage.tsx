@@ -1,4 +1,4 @@
-import { useParams } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router-dom'
 import { useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { getBlackboard, getWorkflow, respondToApproval, cancelWorkflow } from '@/api/workflows'
@@ -15,6 +15,72 @@ import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
 import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
 import { ActivityLog } from '@/components/workflow/ActivityLog'
+
+// CancelWorkflowButton — renders a cancel button with confirmation dialog.
+// WHY confirmation: cancelling a workflow is destructive and cannot be undone.
+// Cost already spent is not refunded, and all work is lost.
+function CancelWorkflowButton({ workflowId, workflowTitle }: { workflowId: string; workflowTitle: string }) {
+  const [showConfirm, setShowConfirm] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const navigate = useNavigate()
+  const queryClient = useQueryClient()
+
+  const handleCancel = async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      await cancelWorkflow(workflowId)
+      // Invalidate queries to refresh workflow list
+      queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+      queryClient.invalidateQueries({ queryKey: ['workflows'] })
+      // Navigate back to workflows list
+      navigate('/workflows')
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Failed to cancel workflow')
+      setLoading(false)
+    }
+  }
+
+  if (!showConfirm) {
+    return (
+      <button
+        onClick={() => setShowConfirm(true)}
+        className="flex items-center gap-1.5 rounded-md border border-mode-refuse/60 bg-mode-refuse/10 px-3 py-1.5 text-xs font-medium text-mode-refuse hover:bg-mode-refuse/20 transition-colors"
+        title="Cancel this workflow"
+      >
+        <span>{'\u23f9'}</span>
+        <span>Cancel Workflow</span>
+      </button>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-mode-refuse/60 bg-mode-refuse/10 px-3 py-1.5">
+      <span className="text-xs font-medium text-mode-refuse">Cancel "{workflowTitle}"?</span>
+      {error && (
+        <span className="text-xs text-mode-refuse">{error}</span>
+      )}
+      <button
+        onClick={handleCancel}
+        disabled={loading}
+        className="rounded bg-mode-refuse px-2 py-1 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
+      >
+        {loading ? 'Cancelling...' : 'Yes, Cancel'}
+      </button>
+      <button
+        onClick={() => {
+          setShowConfirm(false)
+          setError(null)
+        }}
+        disabled={loading}
+        className="rounded border border-surface-border px-2 py-1 text-xs font-medium text-text-secondary hover:bg-surface-overlay disabled:opacity-50"
+      >
+        No, Keep Running
+      </button>
+    </div>
+  )
+}
 
 // ApprovalGate component — renders Approve/Request Changes buttons.
 // Shown when workflow.status === 'paused_for_approval'.
@@ -463,17 +529,23 @@ function KanbanPage() {
           <h1 className="text-xl font-semibold text-text-primary">
             {workflow?.title ?? 'Workflow'}
           </h1>
-          {/* SSE connection indicator */}
-          <div className="flex items-center gap-1.5">
-            <span className={cn(
-              'h-2 w-2 rounded-full',
-              stream.isDone ? 'bg-mode-advise'
-              : stream.isConnected ? 'bg-mode-advise animate-pulse'
-              : 'bg-glow-amber animate-pulse'
-            )} />
-            <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
-              {stream.isDone ? 'Complete' : stream.isConnected ? 'Live' : 'Connecting...'}
-            </span>
+          <div className="flex items-center gap-3">
+            {/* Cancel Workflow Button - only show when workflow is running */}
+            {workflow && (workflow.status === 'running' || workflow.status === 'paused_for_approval') && (
+              <CancelWorkflowButton workflowId={id!} workflowTitle={workflow.title} />
+            )}
+            {/* SSE connection indicator */}
+            <div className="flex items-center gap-1.5">
+              <span className={cn(
+                'h-2 w-2 rounded-full',
+                stream.isDone ? 'bg-mode-advise'
+                : stream.isConnected ? 'bg-mode-advise animate-pulse'
+                : 'bg-glow-amber animate-pulse'
+              )} />
+              <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
+                {stream.isDone ? 'Complete' : stream.isConnected ? 'Live' : 'Connecting...'}
+              </span>
+            </div>
           </div>
         </div>
         <div className="mt-1 flex items-center gap-3">
