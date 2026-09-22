@@ -634,6 +634,8 @@ func buildRouter(
 		messages := protected.Group("/messages")
 		{
 			messages.POST("/:id/rate", ratingHandler.Rate)
+			messages.DELETE("/:id", messageHandler.DeleteMessage)
+			messages.PATCH("/:id", messageHandler.UpdateMessage)
 		}
 
 		// Workflow routes (Phase C — collaboration layer)
