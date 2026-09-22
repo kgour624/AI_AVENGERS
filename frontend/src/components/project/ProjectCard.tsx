@@ -158,5 +158,6 @@ export function ProjectCard({
         </Button>
       </Link>
     </Card>
+    </div>
   )
 }
