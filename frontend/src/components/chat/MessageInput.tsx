@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { ExpertPicker } from '@/components/expert/ExpertPicker'
 import { Button } from '@/components/ui/Button'
@@ -11,6 +11,11 @@ import { cn } from '@/utils/cn'
  * "1. Expert multi-select (checkboxes) 2. File upload (drag and drop
  * via react-dropzone) 3. Textarea with auto-resize 4. Send button
  * (disabled while streaming) 5. Keyboard shortcut: Cmd+Enter to send"
+ *
+ * Feature #6 fix (docs bug list): Added persistent expert selection
+ * with "Lock Selection" toggle. When locked, selected experts persist
+ * across messages within the same chat session. Selection is stored
+ * in localStorage per chat ID.
  *
  * Cross-questioned before writing:
  * - What if the user tries to send with zero experts selected? The
@@ -33,6 +38,58 @@ import { cn } from '@/utils/cn'
  *   slot exists), rather than silently building multi-file support
  *   the backend contract doesn't actually accept.
  */
+
+// localStorage keys for persistent selection
+function getSelectionKey(chatId: string) {
+  return `chat_${chatId}_expert_selection`
+}
+
+function getLockKey(chatId: string) {
+  return `chat_${chatId}_selection_locked`
+}
+
+// Load persisted selection from localStorage
+function loadPersistedSelection(chatId: string): Set<string> {
+  try {
+    const stored = localStorage.getItem(getSelectionKey(chatId))
+    if (stored) {
+      return new Set(JSON.parse(stored))
+    }
+  } catch (err) {
+    console.warn('Failed to load persisted expert selection', err)
+  }
+  return new Set()
+}
+
+// Load lock state from localStorage
+function loadLockState(chatId: string): boolean {
+  try {
+    const stored = localStorage.getItem(getLockKey(chatId))
+    return stored === 'true'
+  } catch (err) {
+    console.warn('Failed to load lock state', err)
+  }
+  return false
+}
+
+// Save selection to localStorage
+function saveSelection(chatId: string, selectedIds: Set<string>) {
+  try {
+    localStorage.setItem(getSelectionKey(chatId), JSON.stringify(Array.from(selectedIds)))
+  } catch (err) {
+    console.warn('Failed to save expert selection', err)
+  }
+}
+
+// Save lock state to localStorage
+function saveLockState(chatId: string, locked: boolean) {
+  try {
+    localStorage.setItem(getLockKey(chatId), locked.toString())
+  } catch (err) {
+    console.warn('Failed to save lock state', err)
+  }
+}
+
 export interface MessageInputProps {
   chatId: string
   experts: ProjectExpert[]
@@ -48,9 +105,15 @@ export interface MessageInputProps {
 
 export function MessageInput({ chatId, experts, onSend, isSending }: MessageInputProps) {
   const [message, setMessage] = useState('')
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [attachedFile, setAttachedFile] = useState<File | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  // Feature #6: Persistent expert selection with lock toggle
+  const [isLocked, setIsLocked] = useState(() => loadLockState(chatId))
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => {
+    // Load persisted selection if locked, otherwise start empty
+    return isLocked ? loadPersistedSelection(chatId) : new Set()
+  })
 
   // CT-D4: reply state, isolated per-chat via replyStore (CT-L10 —
   // does not touch streamStore or the message list at all).
@@ -59,6 +122,37 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   const toggleLoopedInExpert = useReplyStore((s) => s.toggleLoopedInExpert)
   const clearReply = useReplyStore((s) => s.clearReply)
 
+  // Persist selection whenever it changes (if locked)
+  useEffect(() => {
+    if (isLocked) {
+      saveSelection(chatId, selectedIds)
+    }
+  }, [chatId, selectedIds, isLocked])
+
+  // Persist lock state whenever it changes
+  useEffect(() => {
+    saveLockState(chatId, isLocked)
+  }, [chatId, isLocked])
+
+  // Handle selection changes
+  function handleSelectionChange(newSelection: Set<string>) {
+    setSelectedIds(newSelection)
+  }
+
+  // Toggle lock state
+  function toggleLock() {
+    const newLockState = !isLocked
+    setIsLocked(newLockState)
+    
+    if (newLockState) {
+      // When locking, save current selection
+      saveSelection(chatId, selectedIds)
+    } else {
+      // When unlocking, optionally clear selection
+      // (keeping it for now - user can manually deselect if needed)
+    }
+  }
+
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const file = acceptedFiles[acceptedFiles.length - 1]
     if (file) setAttachedFile(file)
@@ -66,7 +160,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    noClick: true, // WHY noClick: the visible [\ud83d\udcce] attach button (not the whole textarea) opens the file picker - see the button below calling `open()` via getInputProps's ref trick would be redundant; instead we let users click the paperclip OR drag anywhere onto the input area.
+    noClick: true, // WHY noClick: the visible [📎] attach button (not the whole textarea) opens the file picker - see the button below calling `open()` via getInputProps's ref trick would be redundant; instead we let users click the paperclip OR drag anywhere onto the input area.
     multiple: false,
   })
 
@@ -92,6 +186,12 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     )
     setMessage('')
     setAttachedFile(null)
+    
+    // Feature #6: Only clear selection if NOT locked
+    if (!isLocked) {
+      setSelectedIds(new Set())
+    }
+    
     // CT-D4: clear the reply target on successful send — same moment
     // ChatPage.tsx clears pendingUserText, so "replying to" state never
     // outlives the turn it was drafted for.
@@ -115,7 +215,23 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
 
   return (
     <div className="border-t border-surface-border bg-surface-raised p-3">
-      <ExpertPicker experts={experts} selectedIds={selectedIds} onChange={setSelectedIds} />
+      <div className="flex items-center justify-between">
+        <ExpertPicker experts={experts} selectedIds={selectedIds} onChange={handleSelectionChange} />
+        
+        {/* Feature #6: Lock Selection toggle */}
+        <label className="flex items-center gap-2 text-xs text-text-secondary hover:text-text-primary cursor-pointer">
+          <input
+            type="checkbox"
+            checked={isLocked}
+            onChange={toggleLock}
+            className="cursor-pointer"
+          />
+          <span className="flex items-center gap-1">
+            {isLocked ? '🔒' : '🔓'}
+            <span>Lock Selection</span>
+          </span>
+        </label>
+      </div>
 
       {replyState && (
         <div className="mt-2 flex flex-col gap-2 rounded-md border border-brand/30 bg-brand/5 p-2">
@@ -187,7 +303,9 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
           placeholder={
             selectedIds.size === 0
               ? 'Select at least one expert to ask a question...'
-              : 'Ask a follow-up question... (\u2318+Enter to send)'
+              : isLocked
+              ? 'Ask a follow-up question... (selection locked, ⌘+Enter to send)'
+              : 'Ask a follow-up question... (⌘+Enter to send)'
           }
           rows={1}
           className="flex-1 resize-none bg-transparent text-sm text-text-primary placeholder:text-text-disabled focus:outline-none"
@@ -199,7 +317,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
           aria-label="Attach file"
           className="text-text-secondary hover:text-text-primary"
         >
-          \ud83d\udcce
+          📎
         </button>
         {/* Hidden native input, separate from react-dropzone's own (which has noClick set) - lets the paperclip button trigger a real file picker without also enabling click-anywhere-to-upload on the whole textarea row. */}
         <input
@@ -219,10 +337,16 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
 
       {attachedFile && (
         <p className="mt-1 text-xs text-text-secondary">
-          \ud83d\udcce {attachedFile.name}{' '}
+          📎 {attachedFile.name}{' '}
           <button type="button" onClick={() => setAttachedFile(null)} className="underline">
             remove
           </button>
+        </p>
+      )}
+      
+      {isLocked && selectedIds.size > 0 && (
+        <p className="mt-1 text-xs text-text-disabled">
+          🔒 Selection locked: {selectedIds.size} expert{selectedIds.size !== 1 ? 's' : ''} will be used for all messages
         </p>
       )}
     </div>
