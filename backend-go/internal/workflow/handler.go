@@ -530,3 +530,73 @@ func (h *Handler) CancelWorkflow(c *gin.Context) {
 	}
 	response.OK(c, gin.H{"status": "cancelled"})
 }
+
+// RetryTask handles POST /workflows/:id/tasks/:taskId/retry
+// Resets a failed task to 'todo' status so the workflow runner can retry it.
+// WHY this exists: A single task failure (e.g., LLM timeout, rate limit) can
+// block the entire workflow. This endpoint lets the client manually retry
+// without restarting the whole workflow.
+func (h *Handler) RetryTask(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	wfID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid workflow id")
+		return
+	}
+	taskID, err := uuid.Parse(c.Param("taskId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid task id")
+		return
+	}
+
+	// Verify workflow ownership
+	var ownerID uuid.UUID
+	if err := h.engine.db.QueryRow(c.Request.Context(),
+		`SELECT client_id FROM workflows WHERE id = $1`, wfID,
+	).Scan(&ownerID); err != nil {
+		response.NotFound(c, "workflow")
+		return
+	}
+	if ownerID != clientID {
+		response.Forbidden(c, "not your workflow")
+		return
+	}
+
+	// Reset task status to 'todo' and clear timestamps
+	// WHY clear completed_at: the task is no longer complete
+	// WHY keep started_at: preserves audit trail of first attempt
+	tag, err := h.engine.db.Exec(c.Request.Context(),
+		`UPDATE workflow_tasks SET
+			status = 'todo',
+			completed_at = NULL,
+			updated_at = NOW()
+		 WHERE id = $1 AND workflow_id = $2 AND status IN ('failed', 'blocked')`,
+		taskID, wfID,
+	)
+	if err != nil {
+		h.logger.Error("retry task failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		response.BadRequest(c, "RETRY_FAILED", "task not found or not in failed/blocked state")
+		return
+	}
+
+	// Post task_retry_requested event on blackboard so the workflow runner
+	// knows to pick up this task again
+	_, _ = h.store.Post(c.Request.Context(), blackboard.PostRequest{
+		WorkflowID:     wfID,
+		EventType:      "task_retry_requested",
+		PostedByClient: true,
+		Content: map[string]string{
+			"task_id": taskID.String(),
+		},
+	})
+
+	h.logger.Info("task retry requested",
+		zap.String("workflow_id", wfID.String()),
+		zap.String("task_id", taskID.String()),
+	)
+	response.OK(c, gin.H{"status": "task reset to todo"})
+}
