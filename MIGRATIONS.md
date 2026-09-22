@@ -40,8 +40,10 @@
 | 016 | `016_create_aider_checkpoints` | `aider_checkpoints` (new table) | Aider loop pod-restart recovery: per (workflow, expert, task) iteration + commit checkpoint. |
 | 017 | `017_generic_allowance` | `workflows` (generic_allowance_pct + CHECK 0-30) | Client-controlled generic-knowledge dial. 0 = trained + peer only. |
 | 018 | `018_collaborative_design` | `workflow_design_sections` (new), `workflow_chats` (new), `workflow_chat_participants` (new), `workflow_chat_messages` (new), `expert_categories` (authoring_rank), `workflows` (integrator_auto, integrator_expert_id, generic CHECK widened 0-100), `approval_requests` (gate CHECK + design_conflict, design_amendment), `system_settings` (8 tunables) | Collaborative design architecture: dynamic section assignment, workflow-scoped chat (separate from product chat), tool-loop settings, thresholds moved out of Go. See docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md. |
+| 019 | `019_authoring_rank_seed` | `expert_categories` (authoring_rank UPDATE) | Seed initial authoring ranks for expert categories. |
+| 020 | `020_change_requests` | `change_requests` (new table) | Stores client-initiated change requests from workflow chat. |
 
-**Next migration number: `019`**
+**Next migration number: `021`**
 
 ---
 

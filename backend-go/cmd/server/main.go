@@ -431,6 +431,9 @@ func buildRouter(
 		0.8,    // alert_threshold (80%)
 		logger,
 	)
+	// GateSystem holds no mutable state (assembler + logger only)
+	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
+
 	wfQARunner := workflow.NewQARunner(
 		bbStore, wfGateSystem, modelGateway, wfSections, workspaceRoot, logger,
 	)
@@ -453,7 +456,6 @@ func buildRouter(
 	// A second GateSystem instance is constructed here rather than reaching into
 	// AgentLoop's: GateSystem holds no mutable state (assembler + logger only),
 	// and AgentLoop keeps its own private one (agent_loop.go:63).
-	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
 	// wfSections constructed above (with wfAuthoringRunner) — reused here, not
 	// rebuilt: DesignSectionStore has no state that would make a second
 	// instance wrong, but ListSections/AssignSection must agree on the same

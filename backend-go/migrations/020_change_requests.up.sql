@@ -1,4 +1,4 @@
--- 011_change_requests.up.sql
+-- 020_change_requests.up.sql
 --
 -- Stores change requests raised from the workflow chat.
 -- A change request is a client's free-text instruction to re-run the design
