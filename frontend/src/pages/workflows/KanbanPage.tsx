@@ -13,6 +13,7 @@ import { cn } from '@/utils/cn'
 import { WorkflowChatPanel } from '@/components/workflow/WorkflowChatPanel'
 import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
 import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
+import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
 
 // ApprovalGate component — renders Approve/Request Changes buttons.
 // Shown when workflow.status === 'paused_for_approval'.
@@ -562,10 +563,17 @@ function KanbanPage() {
       {/* Delivery (§17, §18) — push the harness out, or check what got built. */}
       {id && <DeliveryPanel workflowId={id} />}
 
-      {/* Completion notice */}
-      {stream.isDone && (
-        <div className="mt-4 rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-4 text-center">
-          <p className="text-sm font-medium text-mode-advise">{'\u2705'} Workflow Complete</p>
+      {/* Completion notice + Download Design Package */}
+      {(stream.isDone || workflow?.status === 'completed') && (
+        <div className="mt-4 rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-4">
+          <div className="flex items-center justify-between gap-4">
+            <p className="text-sm font-medium text-mode-advise">{'\u2705'} Workflow Complete</p>
+            <DownloadDesignPackageButton
+              workflowTitle={workflow?.title ?? 'workflow'}
+              events={blackboard?.events ?? []}
+              expertNames={expertNames}
+            />
+          </div>
         </div>
       )}
     </div>
