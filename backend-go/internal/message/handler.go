@@ -602,3 +602,50 @@ func minInt(a, b int) int {
 	}
 	return b
 }
+
+// DeleteMessage handles DELETE /messages/:id
+func (h *Handler) DeleteMessage(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	msgID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid message id")
+		return
+	}
+	if err := h.chatSvc.DeleteMessage(c.Request.Context(), msgID, clientID); err != nil {
+		if err == chat.ErrNotFound {
+			response.NotFound(c, "MESSAGE_NOT_FOUND", "message not found or not editable")
+			return
+		}
+		h.logger.Error("delete message failed", zap.Error(err))
+		response.InternalError(c, "DELETE_FAILED", "failed to delete message")
+		return
+	}
+	response.OK(c, gin.H{"status": "deleted"})
+}
+
+// UpdateMessage handles PATCH /messages/:id
+func (h *Handler) UpdateMessage(c *gin.Context) {
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	msgID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid message id")
+		return
+	}
+	var req struct {
+		Content string `json:"content" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_BODY", err.Error())
+		return
+	}
+	if err := h.chatSvc.UpdateMessageContent(c.Request.Context(), msgID, clientID, req.Content); err != nil {
+		if err == chat.ErrNotFound {
+			response.NotFound(c, "MESSAGE_NOT_FOUND", "message not found or not editable")
+			return
+		}
+		h.logger.Error("update message failed", zap.Error(err))
+		response.InternalError(c, "UPDATE_FAILED", "failed to update message")
+		return
+	}
+	response.OK(c, gin.H{"status": "updated"})
+}
