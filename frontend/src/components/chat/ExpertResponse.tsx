@@ -233,13 +233,13 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
             </button>
           )}
 
-          {response.gateStopped > 0 && (
+          {response.gateStopped >= 0 && (
             <button
               type="button"
               onClick={() => setShowReasoning((v) => !v)}
               className="text-xs text-text-secondary hover:text-text-primary"
             >
-              {showReasoning ? '\u25bc' : '\u25b6'} Why did I stop here?
+              {showReasoning ? '\u25bc' : '\u25b6'} Why did I say this?
             </button>
           )}
         </div>
