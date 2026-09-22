@@ -135,3 +135,8 @@ export const cancelWorkflow = (workflowId: string) =>
   baseAPI
     .post<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}/cancel`)
     .then((res) => res.data.data!)
+
+export const retryTask = (workflowId: string, taskId: string) =>
+  baseAPI
+    .post<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}/tasks/${taskId}/retry`)
+    .then((res) => res.data.data!)
