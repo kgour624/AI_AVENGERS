@@ -78,6 +78,9 @@ type WorkflowRunner struct {
 	tools           *Tools
 	store           *blackboard.Store
 	gateway         *gateway.ModelGateway
+	// crSvc is optional: nil disables the change-request watcher.
+	// Set via WithChangeRequestService after construction.
+	crSvc           *ChangeRequestService
 	logger          *zap.Logger
 }
 
@@ -113,6 +116,13 @@ func NewWorkflowRunner(
 		gateway:         gw,
 		logger:          logger,
 	}
+}
+
+// WithChangeRequestService attaches the ChangeRequestService to the runner,
+// enabling the change-request watcher goroutine.
+// Called from main.go after both the runner and the service are constructed.
+func (r *WorkflowRunner) WithChangeRequestService(crSvc *ChangeRequestService) {
+	r.crSvc = crSvc
 }
 
 // Run drives the workflow to completion.
@@ -154,6 +164,16 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		log.Error("runner: load experts failed", zap.Error(err))
 		_ = r.engine.Fail(ctx, workflowID, "load experts failed")
 		return
+	}
+
+	// Start the change request watcher goroutine.
+	// It runs for the lifetime of this workflow and picks up any change
+	// requests the client submits from the workflow chat.
+	// crSvc is nil when the runner is constructed without change-request
+	// support — the nil check makes the feature opt-in without breaking
+	// existing callers that have not called WithChangeRequestService.
+	if r.crSvc != nil {
+		go r.watchForChangeRequest(ctx, workflowID, experts, nil, r.crSvc)
 	}
 
 	// Step 3: Load requirement.
@@ -921,6 +941,246 @@ func buildPlanContent(tasks []TaskSpec, experts []workflowExpert) map[string]int
 		"task_count": len(tasks),
 		"tasks":      entries,
 	}
+}
+
+// watchForChangeRequest polls for pending change requests while the workflow is
+// running. When it finds one it:
+//   1. Determines which experts are relevant (LLM call — cheap model).
+//   2. Marks the request as running.
+//   3. Re-runs the design phases for those experts (same loop as the initial
+//      design, reusing RestartPhase + executeWaves).
+//   4. Presents the same approval gate the initial design uses.
+//   5. Marks the request as completed.
+//
+// This runs as a goroutine alongside the main Run() goroutine. It exits when
+// ctx is cancelled or the workflow reaches a terminal state.
+//
+// WHY POLLING AND NOT REDIS PUB/SUB
+//
+// Polling the DB every 3 seconds is cheap (one indexed query on status='pending')
+// and consistent with waitForResume's polling pattern. The latency (up to 3s)
+// is acceptable for a human-initiated action.
+//
+// WHY NOT BLOCK Run() ON CHANGE REQUESTS
+//
+// Run() drives the workflow state machine forward. A change request can arrive
+// at any point — including while the workflow is paused at an approval gate.
+// Blocking Run() would mean the change request is only processed after the
+// current gate is resolved. A separate goroutine lets the change request be
+// processed immediately.
+//
+// waves may be nil on the first call (before planning completes). The watcher
+// guards against this and uses the full expert list as a fallback.
+func (r *WorkflowRunner) watchForChangeRequest(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	allExperts []workflowExpert,
+	waves []ExecutionWave,
+	crSvc *ChangeRequestService,
+) {
+	log := r.logger.With(
+		zap.String("workflow_id", workflowID.String()),
+		zap.String("goroutine", "watchForChangeRequest"),
+	)
+	log.Info("change request watcher started")
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("change request watcher stopped (context cancelled)")
+			return
+		case <-time.After(3 * time.Second):
+		}
+
+		// Check workflow is still in a live state.
+		wf, err := r.engine.GetByID(ctx, workflowID)
+		if err != nil {
+			log.Warn("watcher: load workflow failed", zap.Error(err))
+			continue
+		}
+		if wf.Status == StatusCompleted || wf.Status == StatusFailed || wf.Status == StatusCancelled {
+			log.Info("change request watcher stopped (workflow terminal)",
+				zap.String("status", wf.Status))
+			return
+		}
+
+		// Look for a pending change request.
+		cr, err := crSvc.GetPendingChangeRequest(ctx, workflowID)
+		if err != nil {
+			log.Warn("watcher: get pending change request failed", zap.Error(err))
+			continue
+		}
+		if cr == nil {
+			continue // nothing pending
+		}
+
+		log.Info("change request detected, starting redesign",
+			zap.String("change_request_id", cr.ID.String()),
+			zap.String("goal", cr.ChangeGoal),
+		)
+
+		// Determine which experts are relevant.
+		relevantIDs := DetermineRelevantExperts(
+			ctx, r.gateway, workflowID, cr.ChangeGoal, allExperts, r.logger,
+		)
+
+		// Mark running before touching the workflow state.
+		if err := crSvc.MarkRunning(ctx, cr.ID, relevantIDs); err != nil {
+			log.Error("watcher: mark running failed", zap.Error(err))
+			continue
+		}
+
+		// Build a filtered expert list.
+		relevantIDSet := make(map[string]struct{}, len(relevantIDs))
+		for _, id := range relevantIDs {
+			relevantIDSet[id.String()] = struct{}{}
+		}
+		var relevantExperts []workflowExpert
+		for _, e := range allExperts {
+			if _, ok := relevantIDSet[e.ID.String()]; ok {
+				relevantExperts = append(relevantExperts, e)
+			}
+		}
+		if len(relevantExperts) == 0 {
+			relevantExperts = allExperts
+		}
+
+		// Filter waves to only include relevant experts.
+		// If waves is nil (planning not yet done) or all waves become empty,
+		// fall back to the full wave set.
+		var relevantWaves []ExecutionWave
+		if waves != nil {
+			relevantWaves = filterWavesForExperts(waves, relevantIDs)
+		}
+		if len(relevantWaves) == 0 && waves != nil {
+			log.Warn("watcher: no relevant waves after filtering, using all waves",
+				zap.String("change_request_id", cr.ID.String()),
+			)
+			relevantWaves = waves
+		}
+		if len(relevantWaves) == 0 {
+			// Planning not yet done — build single-wave from relevant experts.
+			var singleWave ExecutionWave
+			for _, e := range relevantExperts {
+				singleWave = append(singleWave, TaskSpec{
+					ExpertID:    e.ID,
+					Title:       "Redesign for: " + cr.ChangeGoal,
+					Description: cr.ChangeGoal,
+				})
+			}
+			relevantWaves = []ExecutionWave{singleWave}
+		}
+
+		// Post a blackboard event so the Kanban board shows the redesign starting.
+		_, _ = r.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     workflowID,
+			EventType:      "change_request_started",
+			PostedByClient: false,
+			Content: map[string]interface{}{
+				"change_request_id":   cr.ID.String(),
+				"change_goal":         cr.ChangeGoal,
+				"relevant_expert_ids": relevantIDs,
+			},
+		})
+
+		// Re-run design phases for relevant experts.
+		// WHY RestartPhase and not TransitionPhase: this is a backwards move.
+		// TransitionPhase's forward-only validation would reject it.
+		// RestartPhase is the named method for legitimate backwards moves.
+		if err := r.engine.RestartPhase(ctx, workflowID, PhaseHighLevelDesign); err != nil {
+			log.Error("watcher: restart HLD failed", zap.Error(err))
+			_ = crSvc.MarkCompleted(ctx, cr.ID)
+			continue
+		}
+
+		hldState := &runnerState{Phase: PhaseHighLevelDesign}
+		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, hldState); err != nil {
+			log.Error("watcher: HLD waves failed", zap.Error(err))
+			if len(hldState.CompletedExpertIDs) == 0 {
+				_ = crSvc.MarkCompleted(ctx, cr.ID)
+				continue
+			}
+		}
+
+		if err := r.engine.RestartPhase(ctx, workflowID, PhaseDetailedDesign); err != nil {
+			log.Error("watcher: restart DetailedDesign failed", zap.Error(err))
+			_ = crSvc.MarkCompleted(ctx, cr.ID)
+			continue
+		}
+		ddState := &runnerState{Phase: PhaseDetailedDesign}
+		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, ddState); err != nil {
+			log.Error("watcher: DetailedDesign waves failed", zap.Error(err))
+			if len(ddState.CompletedExpertIDs) == 0 {
+				_ = crSvc.MarkCompleted(ctx, cr.ID)
+				continue
+			}
+		}
+
+		// Approval gate — same as the initial design gate.
+		summary := fmt.Sprintf(
+			"Change request redesign complete.\n\nChange goal: %s\n\n"+
+				"%d expert(s) updated their design sections. "+
+				"Review the updated deliverables and approve to continue, "+
+				"or request further changes.",
+			cr.ChangeGoal, len(relevantExperts),
+		)
+		if _, err := r.tools.AskClient(ctx, AskClientRequest{
+			WorkflowID:   workflowID,
+			FromExpertID: uuid.Nil,
+			GateName:     "detailed_design",
+			Summary:      summary,
+		}); err != nil {
+			log.Error("watcher: AskClient failed", zap.Error(err))
+			_ = crSvc.MarkCompleted(ctx, cr.ID)
+			continue
+		}
+
+		if err := r.waitForResume(ctx, workflowID); err != nil {
+			log.Warn("watcher: waitForResume failed", zap.Error(err))
+			_ = crSvc.MarkCompleted(ctx, cr.ID)
+			continue
+		}
+
+		_ = crSvc.MarkCompleted(ctx, cr.ID)
+
+		_, _ = r.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     workflowID,
+			EventType:      "change_request_completed",
+			PostedByClient: false,
+			Content: map[string]interface{}{
+				"change_request_id": cr.ID.String(),
+				"change_goal":       cr.ChangeGoal,
+			},
+		})
+
+		log.Info("change request redesign completed",
+			zap.String("change_request_id", cr.ID.String()),
+		)
+	}
+}
+
+// filterWavesForExperts returns a copy of waves containing only tasks whose
+// expert is in the relevant set. Waves that become empty after filtering are
+// dropped.
+func filterWavesForExperts(waves []ExecutionWave, relevantIDs []uuid.UUID) []ExecutionWave {
+	relevantSet := make(map[string]struct{}, len(relevantIDs))
+	for _, id := range relevantIDs {
+		relevantSet[id.String()] = struct{}{}
+	}
+
+	var filtered []ExecutionWave
+	for _, wave := range waves {
+		var tasks []TaskSpec
+		for _, t := range wave {
+			if _, ok := relevantSet[t.ExpertID.String()]; ok {
+				tasks = append(tasks, t)
+			}
+		}
+		if len(tasks) > 0 {
+			filtered = append(filtered, tasks)
+		}
+	}
+	return filtered
 }
 
 // ResumeOrphanWorkflows finds workflows stuck in 'running' status

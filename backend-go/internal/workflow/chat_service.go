@@ -1132,6 +1132,88 @@ func (s *WorkflowChatService) buildSystemPrompt(expert workflowExpert, gate *Gat
 	return sb.String()
 }
 
+// ProposeChange stores a change request from this chat and posts it on the
+// blackboard so the runner can pick it up.
+//
+// This is the entry point for the coordinated redesign flow:
+//   Client types change in chat -> ProposeChange -> ChangeRequestService.ProposeChange
+//   -> blackboard event -> runner.watchForChangeRequest detects it
+//   -> relevant experts re-run design sections -> approval gate
+//
+// The chat message is stored first (same pattern as Send) so the client's
+// intent is never lost even if the downstream steps fail.
+func (s *WorkflowChatService) ProposeChange(
+	ctx context.Context,
+	chatID, clientID uuid.UUID,
+	changeGoal string,
+	crSvc *ChangeRequestService,
+) (*ChangeRequest, error) {
+	changeGoal = strings.TrimSpace(changeGoal)
+	if changeGoal == "" {
+		return nil, fmt.Errorf("propose change: change_goal is required")
+	}
+
+	ch, err := s.GetChat(ctx, chatID, clientID)
+	if err != nil {
+		return nil, err
+	}
+
+	turn, err := s.nextTurnNumber(ctx, chatID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Store the client's change message in the chat history.
+	var msgID uuid.UUID
+	err = s.db.QueryRow(ctx,
+		`INSERT INTO workflow_chat_messages (chat_id, role, content, turn_number)
+		 VALUES ($1, 'user', $2, $3)
+		 RETURNING id`,
+		chatID, "[CHANGE REQUEST] "+changeGoal, turn,
+	).Scan(&msgID)
+	if err != nil {
+		return nil, fmt.Errorf("propose change: save message: %w", err)
+	}
+
+	// Delegate to ChangeRequestService which owns the change_requests table.
+	cr, err := crSvc.ProposeChange(ctx, ch.WorkflowID, clientID, changeGoal, &chatID, &msgID)
+	if err != nil {
+		return nil, fmt.Errorf("propose change: %w", err)
+	}
+
+	// Acknowledge in the chat so the client sees the request was received.
+	if _, err := s.db.Exec(ctx,
+		`INSERT INTO workflow_chat_messages (chat_id, role, content, turn_number)
+		 VALUES ($1, 'assistant', $2, $3)`,
+		chatID,
+		fmt.Sprintf("Your change request has been received (ID: %s). "+
+			"The relevant experts will re-run their design sections. "+
+			"You will be asked to approve the updated design when ready.", cr.ID),
+		turn,
+	); err != nil {
+		// Non-fatal: the change request was created. A missing ack message
+		// is a UX gap, not a data loss.
+		s.logger.Warn("propose change: ack message failed (non-fatal)",
+			zap.String("chat_id", chatID.String()), zap.Error(err))
+	}
+
+	// Update message count (question + ack = 2 rows).
+	if _, err := s.db.Exec(ctx,
+		`UPDATE workflow_chats SET message_count = message_count + 2, updated_at = NOW()
+		 WHERE id = $1`, chatID,
+	); err != nil {
+		s.logger.Warn("propose change: message_count update failed (non-fatal)",
+			zap.String("chat_id", chatID.String()), zap.Error(err))
+	}
+
+	s.logger.Info("change request proposed from chat",
+		zap.String("chat_id", chatID.String()),
+		zap.String("workflow_id", ch.WorkflowID.String()),
+		zap.String("change_request_id", cr.ID.String()),
+	)
+	return cr, nil
+}
+
 // buildUserPrompt puts the deliverable first, then the design map, then history,
 // then the question.
 func (s *WorkflowChatService) buildUserPrompt(deliverable, sections, history, question string) string {

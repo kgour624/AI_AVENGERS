@@ -307,6 +307,39 @@ func (h *ChatHandler) ListMessages(c *gin.Context) {
 	response.OK(c, gin.H{"messages": msgs})
 }
 
+// ProposeChange POST /api/v1/workflow-chats/:cid/propose-change
+//
+// Client sends a free-text change goal. The service stores it and posts a
+// blackboard event. The runner picks it up and re-runs the relevant design
+// sections. The client is then asked to approve the updated design.
+//
+// Body: {"change_goal": "add bulk move endpoint"}
+func (h *ChatHandler) ProposeChange(crSvc *ChangeRequestService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		clientID := c.MustGet("user_id").(uuid.UUID)
+		chatID, err := uuid.Parse(c.Param("cid"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid chat ID")
+			return
+		}
+
+		var req struct {
+			ChangeGoal string `json:"change_goal" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+
+		cr, err := h.svc.ProposeChange(c.Request.Context(), chatID, clientID, req.ChangeGoal, crSvc)
+		if err != nil {
+			h.respondErr(c, err, "propose change")
+			return
+		}
+		response.Created(c, cr)
+	}
+}
+
 // parsePositiveInt parses a small positive integer without pulling in strconv
 // error handling at every call site. Returns an error for anything else, which
 // callers treat as "use the default".
@@ -354,5 +387,28 @@ func (h *ChatHandler) RegisterRoutes(protected *gin.RouterGroup) {
 		ch.DELETE("/participants/:eid", h.RemoveParticipant)
 		ch.POST("/messages", h.Send)
 		ch.GET("/messages", h.ListMessages)
+	}
+}
+
+// RegisterRoutesWithCR is RegisterRoutes with ChangeRequestService injected.
+// Call this from main.go instead of RegisterRoutes when the change-request
+// feature is wired in.
+func (h *ChatHandler) RegisterRoutesWithCR(protected *gin.RouterGroup, crSvc *ChangeRequestService) {
+	wf := protected.Group("/workflows/:id")
+	{
+		wf.POST("/chats", h.CreateChat)
+		wf.GET("/chats", h.ListChats)
+	}
+
+	ch := protected.Group("/workflow-chats/:cid")
+	{
+		ch.GET("", h.GetChat)
+		ch.PATCH("/knowledge-mode", h.SetKnowledgeMode)
+		ch.POST("/participants", h.AddParticipant)
+		ch.DELETE("/participants/:eid", h.RemoveParticipant)
+		ch.POST("/messages", h.Send)
+		ch.GET("/messages", h.ListMessages)
+		// Coordinated redesign: client proposes a change goal from the chat.
+		ch.POST("/propose-change", h.ProposeChange(crSvc))
 	}
 }
