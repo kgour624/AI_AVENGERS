@@ -81,6 +81,14 @@ export default function ChatPage() {
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null)
   const [editingContent, setEditingContent] = useState('')
   const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [showSearch, setShowSearch] = useState(false)
+
+  const filteredMessages = useMemo(() => {
+    if (!searchQuery.trim()) return messages
+    const q = searchQuery.toLowerCase()
+    return messages.filter((m) => m.content.toLowerCase().includes(q))
+  }, [messages, searchQuery])
 
   async function handleDeleteMessage(messageId: string) {
     if (!window.confirm('Delete this message?')) return
