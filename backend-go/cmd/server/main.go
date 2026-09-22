@@ -651,6 +651,7 @@ func buildRouter(
 			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
 			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
+			workflows.POST("/:id/cancel", wfHandler.CancelWorkflow)
 		}
 
 		// Workflow chat (§6). Registered on `protected`, so these inherit
