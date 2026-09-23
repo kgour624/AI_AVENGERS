@@ -12,13 +12,16 @@ export interface CitationChipProps {
 /**
  * Renders a citation as a human-readable [Source N] chip.
  * Hover: shows chunk text preview in tooltip.
- * Click: opens modal with full chunk text + relevance score.
+ * Click: opens modal with full chunk text + relevance score + source info.
  *
  * WHY [Source N] not [CHUNK_hash]:
  *   UUID hashes are machine identifiers — meaningless to students.
  *   "Source 1" is immediately understandable: "this claim came from
  *   the first source the expert cited."
  *   The full chunkId is still shown in the modal for admin/debug use.
+ *
+ * Feature #23 (2026-09-23): Modal now shows source transcript name and chunk number
+ * so users can see "Source: react_hooks.txt, Chunk #42" instead of just chunk text.
  */
 export function CitationChip({ citation, index }: CitationChipProps) {
   const [isModalOpen, setIsModalOpen] = useState(false)
@@ -27,6 +30,12 @@ export function CitationChip({ citation, index }: CitationChipProps) {
   const preview = citation.text.length > 120
     ? citation.text.slice(0, 120) + '...'
     : citation.text
+
+  // Feature #23: Format source name and chunk number for display
+  // sourceName is optional (may be undefined or empty string)
+  // chunkIndex is optional (may be undefined)
+  const sourceName = citation.sourceName || 'Unknown Source'
+  const chunkNumber = citation.chunkIndex !== undefined ? citation.chunkIndex + 1 : null
 
   return (
     <>
@@ -43,6 +52,19 @@ export function CitationChip({ citation, index }: CitationChipProps) {
 
       <Modal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)}>
         <h3 className="mb-3 text-sm font-semibold text-glow-cyan">Source {index}</h3>
+        
+        {/* Feature #23: Show source transcript name and chunk number */}
+        <div className="mb-3 flex items-center gap-2 text-xs text-text-secondary">
+          <span className="font-medium">From:</span>
+          <span className="font-mono">{sourceName}</span>
+          {chunkNumber !== null && (
+            <>
+              <span className="text-text-disabled">•</span>
+              <span>Chunk #{chunkNumber}</span>
+            </>
+          )}
+        </div>
+
         <div className="rounded-lg border border-surface-border bg-surface-void p-3">
           <p className="text-sm leading-relaxed text-text-primary">{citation.text}</p>
         </div>

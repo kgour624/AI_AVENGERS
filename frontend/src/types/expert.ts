@@ -131,10 +131,27 @@ export interface ExpertTopic {
   exampleQuestions?: string[]
 }
 
+/**
+ * Citation links a claim in an expert's answer to a source chunk from their training material.
+ * Feature #23 (2026-09-23): Added sourceName and chunkIndex so the citation modal can show
+ * which transcript the citation came from and its position in that transcript.
+ */
 export interface Citation {
   chunkId: string
   text: string
   score: number
+  /**
+   * Human-readable transcript filename (e.g. "react_hooks_part1.txt").
+   * Empty string if chunk has no source_file (legacy data, repo chunks, etc.).
+   * Frontend displays "Unknown Source" when empty.
+   */
+  sourceName?: string
+  /**
+   * 0-based position in the original transcript.
+   * Frontend displays as 1-based: "Chunk #43" (index 42 + 1).
+   * Helps users locate the exact position: "this is chunk #42 out of 150".
+   */
+  chunkIndex?: number
 }
 
 /**
