@@ -237,8 +237,14 @@ export interface ExpertResponseProps {
 export function ExpertResponse({ response, persistedMessageId, isStreaming, chatId }: ExpertResponseProps) {
   const [showReasoning, setShowReasoning] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [isExpanded, setIsExpanded] = useState(false)
   const reduceMotion = useReducedMotion()
   const setReplyTarget = useReplyStore((s) => s.setReplyTarget)
+
+  // Feature #13: Calculate word count to determine if response is long
+  const wordCount = response.content.split(/\s+/).filter(word => word.length > 0).length
+  const isLongResponse = wordCount > 500
+  const shouldTruncate = isLongResponse && !isExpanded
 
   function handleCopyResponse() {
     const text =
