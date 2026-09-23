@@ -49,9 +49,10 @@ type CreateProjectRequest struct {
 
 // UpdateProjectRequest holds input for updating a project.
 type UpdateProjectRequest struct {
-	Name             *string `json:"name"`
-	Description      *string `json:"description"`
-	ArchitectureType *string `json:"architecture_type"`
+	Name             *string                 `json:"name"`
+	Description      *string                 `json:"description"`
+	ArchitectureType *string                 `json:"architecture_type"`
+	TechStack        *map[string]interface{} `json:"tech_stack"`
 	// Status: 'active' to enable, 'archived' to disable.
 	// 'archived' moves project to passive section in UI.
 	// 'active' restores it to active section.
@@ -100,7 +101,8 @@ func (s *Service) List(ctx context.Context, clientID uuid.UUID) ([]Project, erro
 		`SELECT id, client_id, name, COALESCE(description,''), status,
 		        COALESCE(repo_url,''), COALESCE(repo_provider,''),
 		        COALESCE(repo_branch,'main'), repo_connected,
-		        COALESCE(architecture_type,''), created_at, updated_at
+		        COALESCE(tech_stack, '{}'), COALESCE(architecture_type,''),
+		        created_at, updated_at
 		 FROM projects
 		 WHERE client_id=$1 AND deleted_at IS NULL
 		 ORDER BY updated_at DESC`,
@@ -117,7 +119,7 @@ func (s *Service) List(ctx context.Context, clientID uuid.UUID) ([]Project, erro
 		if err := rows.Scan(
 			&p.ID, &p.ClientID, &p.Name, &p.Description, &p.Status,
 			&p.RepoURL, &p.RepoProvider, &p.RepoBranch, &p.RepoConnected,
-			&p.ArchitectureType, &p.CreatedAt, &p.UpdatedAt,
+			&p.TechStack, &p.ArchitectureType, &p.CreatedAt, &p.UpdatedAt,
 		); err != nil {
 			continue
 		}
@@ -176,14 +178,15 @@ func (s *Service) GetByID(ctx context.Context, projectID, clientID uuid.UUID) (*
 		`SELECT id, client_id, name, COALESCE(description,''), status,
 		        COALESCE(repo_url,''), COALESCE(repo_provider,''),
 		        COALESCE(repo_branch,'main'), repo_connected,
-		        COALESCE(architecture_type,''), created_at, updated_at
+		        COALESCE(tech_stack, '{}'), COALESCE(architecture_type,''),
+		        created_at, updated_at
 		 FROM projects
 		 WHERE id=$1 AND client_id=$2 AND deleted_at IS NULL`,
 		projectID, clientID,
 	).Scan(
 		&p.ID, &p.ClientID, &p.Name, &p.Description, &p.Status,
 		&p.RepoURL, &p.RepoProvider, &p.RepoBranch, &p.RepoConnected,
-		&p.ArchitectureType, &p.CreatedAt, &p.UpdatedAt,
+		&p.TechStack, &p.ArchitectureType, &p.CreatedAt, &p.UpdatedAt,
 	)
 	if err != nil {
 		return nil, ErrNotFound
@@ -230,6 +233,11 @@ func (s *Service) Update(ctx context.Context, projectID, clientID uuid.UUID, req
 		_, _ = s.db.Exec(ctx,
 			`UPDATE projects SET architecture_type=$1, updated_at=NOW() WHERE id=$2`,
 			*req.ArchitectureType, projectID)
+	}
+	if req.TechStack != nil {
+		_, _ = s.db.Exec(ctx,
+			`UPDATE projects SET tech_stack=$1, updated_at=NOW() WHERE id=$2`,
+			*req.TechStack, projectID)
 	}
 	if req.Status != nil {
 		// Only allow valid status transitions: active <-> archived
