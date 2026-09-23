@@ -613,11 +613,11 @@ func (h *Handler) DeleteMessage(c *gin.Context) {
 	}
 	if err := h.chatSvc.DeleteMessage(c.Request.Context(), msgID, clientID); err != nil {
 		if err == chat.ErrNotFound {
-			response.NotFound(c, "MESSAGE_NOT_FOUND", "message not found or not editable")
+			response.NotFound(c, "Message")
 			return
 		}
 		h.logger.Error("delete message failed", zap.Error(err))
-		response.InternalError(c, "DELETE_FAILED", "failed to delete message")
+		response.InternalError(c)
 		return
 	}
 	response.OK(c, gin.H{"status": "deleted"})
@@ -640,11 +640,11 @@ func (h *Handler) UpdateMessage(c *gin.Context) {
 	}
 	if err := h.chatSvc.UpdateMessageContent(c.Request.Context(), msgID, clientID, req.Content); err != nil {
 		if err == chat.ErrNotFound {
-			response.NotFound(c, "MESSAGE_NOT_FOUND", "message not found or not editable")
+			response.NotFound(c, "Message")
 			return
 		}
 		h.logger.Error("update message failed", zap.Error(err))
-		response.InternalError(c, "UPDATE_FAILED", "failed to update message")
+		response.InternalError(c)
 		return
 	}
 	response.OK(c, gin.H{"status": "updated"})
