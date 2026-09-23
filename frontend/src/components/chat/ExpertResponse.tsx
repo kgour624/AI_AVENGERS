@@ -370,19 +370,39 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
           })}
         </div>
       ) : (
-        <div className="prose prose-invert prose-sm max-w-none text-text-primary">
-          {segments.map((segment, i) =>
-            segment.type === 'text' ? (
-              <ReactMarkdown key={i} components={{ code: CodeBlock }}>
-                {segment.value}
-              </ReactMarkdown>
-            ) : (
-              <CitationChip
-                key={i}
-                citation={segment.citation}
-                index={citationIndexMap.get(segment.citation.chunkId) ?? i + 1}
-              />
-            )
+        <div>
+          <div
+            className={cn(
+              'prose prose-invert prose-sm max-w-none text-text-primary',
+              shouldTruncate && 'max-h-[400px] overflow-hidden relative'
+            )}
+          >
+            {segments.map((segment, i) =>
+              segment.type === 'text' ? (
+                <ReactMarkdown key={i} components={{ code: CodeBlock }}>
+                  {segment.value}
+                </ReactMarkdown>
+              ) : (
+                <CitationChip
+                  key={i}
+                  citation={segment.citation}
+                  index={citationIndexMap.get(segment.citation.chunkId) ?? i + 1}
+                />
+              )
+            )}
+            {/* Fade overlay when truncated */}
+            {shouldTruncate && (
+              <div className="absolute bottom-0 left-0 right-0 h-24 bg-gradient-to-t from-surface-raised to-transparent pointer-events-none" />
+            )}
+          </div>
+          {/* Show more/less button for long responses */}
+          {isLongResponse && (
+            <button
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="mt-2 text-sm text-brand hover:text-brand-hover transition-colors font-medium"
+            >
+              {isExpanded ? '▲ Show less' : '▼ Show more'} ({wordCount} words)
+            </button>
           )}
         </div>
       )}
