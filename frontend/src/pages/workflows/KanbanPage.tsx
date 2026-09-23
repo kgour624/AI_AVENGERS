@@ -118,6 +118,21 @@ function ApprovalGate({
   // dial — approval means "this output is acceptable as it stands".
   const [genericPct, setGenericPct] = useState(currentGenericPct)
 
+  // Feature #18: View Full Artifact - expandable section for reviewing complete deliverable
+  const [showArtifact, setShowArtifact] = useState(false)
+
+  // Fetch latest artifact from blackboard for full content review
+  const { data: blackboard } = useQuery({
+    queryKey: ['blackboard', workflowId],
+    queryFn: () => getBlackboard(workflowId),
+    enabled: !!workflowId,
+  })
+
+  // Find the most recent artifact event before this approval
+  const latestArtifact = blackboard?.events
+    ?.filter((e) => ARTIFACT_TYPES.has(e.eventType))
+    ?.sort((a, b) => new Date(b.postedAt).getTime() - new Date(a.postedAt).getTime())[0]
+
   const respond = async (decision: 'approve' | 'request_changes') => {
     if (!approvalId) {
       setError('Approval ID not yet received from server. Please wait a moment and try again.')
@@ -201,6 +216,43 @@ function ApprovalGate({
           )}
         </div>
       </div>
+
+      {/* Feature #18: View Full Artifact - expandable section for reviewing complete deliverable */}
+      {latestArtifact && (
+        <div className="mt-3 rounded border border-surface-overlay bg-surface-base/60 p-3">
+          <button
+            onClick={() => setShowArtifact(!showArtifact)}
+            className="flex w-full items-center justify-between text-left text-xs font-medium text-text-primary hover:text-brand"
+          >
+            <span>📄 View Full Artifact</span>
+            <span className="text-text-disabled">{showArtifact ? '▲' : '▼'}</span>
+          </button>
+          {showArtifact && (
+            <div className="mt-2 rounded border border-surface-overlay bg-surface-base p-2">
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
+                  {latestArtifact.eventType.replace(/_/g, ' ')}
+                </span>
+                <span className="text-[10px] text-text-disabled">
+                  {new Date(latestArtifact.postedAt).toLocaleString()}
+                </span>
+              </div>
+              <div className="max-h-96 overflow-y-auto">
+                {Object.entries(latestArtifact.content ?? {}).map(([key, value]) => (
+                  <div key={key} className="mb-3">
+                    <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
+                      {key.replace(/_/g, ' ').replace(/([A-Z])/g, ' $1')}
+                    </p>
+                    <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-surface-overlay/60 p-2 text-xs text-text-secondary">
+                      {renderContentValue(value)}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div className="mt-3 flex gap-2">
         <button
