@@ -11,6 +11,7 @@ import { ProjectExpertManager } from '@/components/project/ProjectExpertManager'
 import { ProjectTimeline } from '@/components/project/ProjectTimeline'
 import { ProjectMemoryPanel } from '@/components/project/ProjectMemoryPanel'
 import { EditProjectModal } from '@/components/project/EditProjectModal'
+import { TechStackEditor } from '@/components/project/TechStackEditor'
 import { Button } from '@/components/ui/Button'
 
 /**
@@ -89,6 +90,15 @@ export default function ProjectPage() {
       <div className="mt-4">
         <p className="mb-1 text-sm font-medium text-text-secondary">Experts in this project</p>
         <ProjectExpertManager projectId={project.id} experts={project.experts} />
+      </div>
+
+      <div className="mt-6">
+        <p className="mb-1 text-sm font-medium text-text-secondary">Tech Stack</p>
+        <TechStackEditor
+          projectId={project.id}
+          techStack={project.techStack}
+          onUpdated={() => revalidator.revalidate()}
+        />
       </div>
 
       <div className="mt-6">
