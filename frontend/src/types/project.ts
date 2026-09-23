@@ -28,7 +28,7 @@ export interface Project {
   repoProvider?: RepoProvider
   repoConnected: boolean
   repoLastSync?: string
-  techStack?: string[]
+  techStack?: string[] | Record<string, any>
   architectureType?: string
   experts: ProjectExpert[]
   createdAt: string
