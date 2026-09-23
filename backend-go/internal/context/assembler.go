@@ -646,8 +646,11 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}
 
+	// Feature #23: Added source_file and chunk_index to SELECT
+	// WHY: Citation modal needs to show which transcript a citation came from
+	// and the chunk's position in that transcript.
 	vectorRows, err := a.db.Query(ctx,
-		`SELECT id, chunk_text, COALESCE(topic,'')
+		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
 		 FROM course_chunks
 		 WHERE expert_id=$1
 		 ORDER BY embedding <=> $2
@@ -660,9 +663,11 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	defer vectorRows.Close()
 
 	type rawChunk struct {
-		ID    uuid.UUID
-		Text  string
-		Topic string
+		ID         uuid.UUID
+		Text       string
+		Topic      string
+		SourceFile string // Feature #23: transcript filename
+		ChunkIndex int    // Feature #23: position in transcript
 	}
 
 	seen := make(map[uuid.UUID]bool)
@@ -670,7 +675,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 
 	for vectorRows.Next() {
 		var c rawChunk
-		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic); err != nil {
+		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
 			continue
 		}
 		if !seen[c.ID] {
@@ -682,8 +687,9 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	// Step 2: Keyword search (full-text)
 	// WHY: Exact terms like "PostgreSQL", "Kafka", "Redis" may not be
 	// captured well by semantic search alone.
+	// Feature #23: Also fetch source_file and chunk_index here
 	keywordRows, err := a.db.Query(ctx,
-		`SELECT id, chunk_text, COALESCE(topic,'')
+		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
 		 FROM course_chunks
 		 WHERE expert_id=$1
 		   AND chunk_text_tsv @@ plainto_tsquery('english', $2)
@@ -694,7 +700,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		defer keywordRows.Close()
 		for keywordRows.Next() {
 			var c rawChunk
-			if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic); err != nil {
+			if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
 				continue
 			}
 			if !seen[c.ID] {
@@ -732,8 +738,14 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 			if i >= limit {
 				break
 			}
+			// Feature #23: Include SourceFile and ChunkIndex in fallback path
 			chunks = append(chunks, chinawall.CourseChunk{
-				ID: c.ID, Text: c.Text, Topic: c.Topic, RerankScore: 0.5,
+				ID:          c.ID,
+				Text:        c.Text,
+				Topic:       c.Topic,
+				RerankScore: 0.5,
+				SourceFile:  c.SourceFile,
+				ChunkIndex:  c.ChunkIndex,
 			})
 		}
 		return chunks, nil
@@ -743,8 +755,14 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	for _, r := range reranked {
 		if r.Index < len(candidates) {
 			c := candidates[r.Index]
+			// Feature #23: Include SourceFile and ChunkIndex in reranked results
 			chunks = append(chunks, chinawall.CourseChunk{
-				ID: c.ID, Text: c.Text, Topic: c.Topic, RerankScore: r.Score,
+				ID:          c.ID,
+				Text:        c.Text,
+				Topic:       c.Topic,
+				RerankScore: r.Score,
+				SourceFile:  c.SourceFile,
+				ChunkIndex:  c.ChunkIndex,
 			})
 		}
 	}
