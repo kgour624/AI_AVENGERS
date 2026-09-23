@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 're
 import { useDropzone } from 'react-dropzone'
 import { ExpertPicker } from '@/components/expert/ExpertPicker'
 import { Button } from '@/components/ui/Button'
+import { Tooltip } from '@/components/ui/Tooltip'
 import { useReplyStore } from '@/stores/replyStore'
 import type { ProjectExpert } from '@/types/project'
 import { cn } from '@/utils/cn'
@@ -213,24 +214,51 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
 
   const canSend = message.trim().length > 0 && selectedIds.size > 0 && !isSending
 
+  // Feature #19: Keyboard shortcuts help content
+  // WHY multi-line tooltip: shows all shortcuts at once, not just one
+  // WHY platform-specific: Mac users see ⌘, Windows/Linux users see Ctrl
+  const isMac = typeof navigator !== 'undefined' && navigator.platform.toUpperCase().indexOf('MAC') >= 0
+  const modKey = isMac ? '⌘' : 'Ctrl'
+  const keyboardShortcuts = [
+    `${modKey}+Enter: Send message`,
+    'Shift+Enter: New line',
+    'Esc: Cancel reply (when replying)',
+  ].join('\n')
+
   return (
     <div className="border-t border-surface-border bg-surface-raised p-3">
       <div className="flex items-center justify-between">
         <ExpertPicker experts={experts} selectedIds={selectedIds} onChange={handleSelectionChange} />
         
-        {/* Feature #6: Lock Selection toggle */}
-        <label className="flex items-center gap-2 text-xs text-text-secondary hover:text-text-primary cursor-pointer">
-          <input
-            type="checkbox"
-            checked={isLocked}
-            onChange={toggleLock}
-            className="cursor-pointer"
-          />
-          <span className="flex items-center gap-1">
-            {isLocked ? '🔒' : '🔓'}
-            <span>Lock Selection</span>
-          </span>
-        </label>
+        <div className="flex items-center gap-3">
+          {/* Feature #19: Keyboard Shortcut Help
+              WHY corner placement: non-intrusive, discoverable
+              WHY ⌨️ icon: universal symbol for keyboard shortcuts
+              WHY tooltip not modal: quick reference, no interruption */}
+          <Tooltip content={<pre className="text-xs whitespace-pre-wrap">{keyboardShortcuts}</pre>}>
+            <button
+              type="button"
+              className="text-text-secondary hover:text-text-primary transition-colors"
+              aria-label="Keyboard shortcuts"
+            >
+              ⌨️
+            </button>
+          </Tooltip>
+
+          {/* Feature #6: Lock Selection toggle */}
+          <label className="flex items-center gap-2 text-xs text-text-secondary hover:text-text-primary cursor-pointer">
+            <input
+              type="checkbox"
+              checked={isLocked}
+              onChange={toggleLock}
+              className="cursor-pointer"
+            />
+            <span className="flex items-center gap-1">
+              {isLocked ? '🔒' : '🔓'}
+              <span>Lock Selection</span>
+            </span>
+          </label>
+        </div>
       </div>
 
       {replyState && (
