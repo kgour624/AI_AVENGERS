@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { updateProject } from '@/api/projects'
 import { Button } from '@/components/ui/Button'
 
@@ -12,7 +12,8 @@ interface TechStackEditorProps {
  * TechStackEditor - Feature #24
  * 
  * Displays and edits tech stack tags for a project.
- * Tags are stored as a string array in the backend's tech_stack JSONB field.
+ * Tags are stored as a string array in the frontend but sent as
+ * an object to the backend (keys = tag names, values = true).
  * 
  * UI Pattern:
  * - Display tags as chips with × remove button
@@ -20,9 +21,21 @@ interface TechStackEditorProps {
  * - Auto-save on add/remove (no separate Save button)
  */
 export function TechStackEditor({ projectId, techStack = [], onUpdated }: TechStackEditorProps) {
-  const [tags, setTags] = useState<string[]>(techStack)
+  const [tags, setTags] = useState<string[]>([])
   const [newTag, setNewTag] = useState('')
   const [isAdding, setIsAdding] = useState(false)
+
+  // Convert techStack prop to tags array on mount/update
+  useEffect(() => {
+    if (Array.isArray(techStack)) {
+      setTags(techStack)
+    } else if (techStack && typeof techStack === 'object') {
+      // Backend might return object format {"React": true, "Node.js": true}
+      setTags(Object.keys(techStack))
+    } else {
+      setTags([])
+    }
+  }, [techStack])
 
   const handleAddTag = async () => {
     const trimmed = newTag.trim()
