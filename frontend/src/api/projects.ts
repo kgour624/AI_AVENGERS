@@ -31,6 +31,7 @@ export interface UpdateProjectRequest {
   name?: string
   description?: string
   status?: 'active' | 'archived'
+  tech_stack?: Record<string, any>
 }
 
 export const updateProject = (projectId: string, req: UpdateProjectRequest) =>
