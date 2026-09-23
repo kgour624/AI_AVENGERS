@@ -166,6 +166,8 @@ export default function ChatPage() {
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const isNearBottomRef = useRef(true)
+  // Feature #22: Track scroll position to show/hide "Scroll to Bottom" button
+  const [showScrollButton, setShowScrollButton] = useState(false)
 
   const expertsById = useMemo(() => new Map(experts.map((e) => [e.expertId, e])), [experts])
 
@@ -180,14 +182,22 @@ export default function ChatPage() {
   // Track whether the user is scrolled near the bottom, so streaming
   // updates only auto-scroll when that was already true - see header
   // comment for why unconditional auto-scroll is a real UX hazard here.
+  // Feature #22: Also update showScrollButton state based on scroll position
   useEffect(() => {
     const el = scrollContainerRef.current
     if (!el) return
     function handleScroll() {
       const threshold = 80 // px - "close enough to bottom" tolerance
-      isNearBottomRef.current = el!.scrollHeight - el!.scrollTop - el!.clientHeight < threshold
+      const isNearBottom = el!.scrollHeight - el!.scrollTop - el!.clientHeight < threshold
+      isNearBottomRef.current = isNearBottom
+      // Feature #22: Show button when user scrolls up (not near bottom)
+      // WHY threshold: only show button when meaningfully scrolled up,
+      // not for tiny scroll jitter at the bottom
+      setShowScrollButton(!isNearBottom)
     }
     el.addEventListener('scroll', handleScroll)
+    // Initial check on mount
+    handleScroll()
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
@@ -200,6 +210,18 @@ export default function ChatPage() {
     // changes (revalidated after completion) - both are moments new
     // content might now be below the fold.
   }, [messages.length, stream?.expertResponses.length, stream?.synthesis, pendingUserText])
+
+  // Feature #22: Scroll to bottom handler
+  // WHY smooth scroll: instant jump is jarring, smooth scroll is more natural
+  // WHY also update isNearBottomRef: prevents button from briefly reappearing
+  // after scroll completes (the scroll event fires async)
+  function scrollToBottom() {
+    const el = scrollContainerRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+    isNearBottomRef.current = true
+    setShowScrollButton(false)
+  }
 
   async function handleSend(
     text: string,
@@ -306,7 +328,7 @@ export default function ChatPage() {
         )}
       </div>
 
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-6">
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto p-6 relative">
         <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
           {virtualizer.getVirtualItems().map((virtualRow) => {
             const m = filteredMessages[virtualRow.index]!
@@ -438,6 +460,22 @@ export default function ChatPage() {
             </p>
           )}
         </div>
+
+        {/* Feature #22: Floating "Scroll to Bottom" button
+            WHY bottom-right: standard chat UI pattern (WhatsApp, Telegram, Slack)
+            WHY only when scrolled up: no need when already at bottom
+            WHY fixed positioning: stays visible even when scrolling
+            WHY z-10: above chat content but below modals */}
+        {showScrollButton && (
+          <button
+            onClick={scrollToBottom}
+            className="fixed bottom-24 right-8 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-brand/40 bg-surface-raised shadow-lg transition-all duration-200 hover:scale-110 hover:border-brand hover:bg-brand/10 hover:shadow-xl"
+            title="Scroll to bottom"
+            aria-label="Scroll to bottom"
+          >
+            <span className="text-lg">⬇</span>
+          </button>
+        )}
       </div>
 
       <MessageInput chatId={chat.id} experts={experts} onSend={handleSend} isSending={isStreamActive} />
