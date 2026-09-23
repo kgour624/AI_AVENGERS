@@ -10,6 +10,7 @@ import { CreateExpertModal } from '@/components/admin/CreateExpertModal'
 import { EditCharterModal } from '@/components/admin/EditCharterModal'
 import { EditExpertConfigModal } from '@/components/admin/EditExpertConfigModal'
 import { IngestionPipelineModal } from '@/components/admin/IngestionPipelineModal'
+import { ExpertCapabilitiesTable } from '@/components/admin/ExpertCapabilitiesTable'
 import { useIngestionStatus } from '@/hooks/useIngestionStatus'
 import { trainingStatusLabel } from '@/types/expert'
 
@@ -183,6 +184,9 @@ function AdminExperts() {
                 setPipelineExpertName(name)
               }}
             />
+
+            {/* Feature #26: Capabilities Overview */}
+            <ExpertCapabilitiesTable expert={expert} />
 
             <div className="mt-3 flex flex-wrap gap-2">
               <Button variant="secondary" size="sm" onClick={() => setUploadTargetId(expert.id)}>
