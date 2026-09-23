@@ -17,11 +17,21 @@ import (
 )
 
 // CourseChunk is a retrieved chunk with its rerank score.
+// WHY SourceFile and ChunkIndex added (Feature #23, 2026-09-23):
+//   Citation modal showed chunk text but NOT which transcript it came from.
+//   Users couldn't tell if a citation was from "React Hooks" or "State Management".
+//   ChunkIndex helps locate the exact position in the source transcript.
 type CourseChunk struct {
 	ID          uuid.UUID
 	Text        string
 	Topic       string
 	RerankScore float32
+	// SourceFile: original transcript filename (e.g. "react_hooks_part1.txt")
+	// Empty string if chunk has no source_file (legacy data, repo chunks, etc.)
+	SourceFile  string
+	// ChunkIndex: 0-based position in the original transcript
+	// Helps users locate "this is chunk #42 out of 150 in that transcript"
+	ChunkIndex  int
 }
 
 // EnforceResult is the output of China Wall enforcement.
@@ -42,10 +52,22 @@ type EnforceResult struct {
 }
 
 // Citation links a claim to a source chunk.
+// WHY SourceName and ChunkIndex added (Feature #23, 2026-09-23):
+//   Frontend CitationChip modal showed chunk text + score, but NOT which
+//   transcript the citation came from. Users couldn't tell if a citation
+//   was from "React Hooks" or "State Management" transcript.
+//   ChunkIndex helps users locate the exact position: "Chunk #42 of 150".
 type Citation struct {
 	ChunkID uuid.UUID `json:"chunk_id"`
 	Text    string    `json:"text"`
 	Score   float32   `json:"score"`
+	// SourceName: human-readable transcript filename (e.g. "react_hooks_part1.txt")
+	// Empty string if chunk has no source_file (legacy data, repo chunks, etc.)
+	// Frontend displays "Unknown Source" when empty.
+	SourceName string `json:"source_name,omitempty"`
+	// ChunkIndex: 0-based position in the original transcript
+	// Frontend displays as 1-based: "Chunk #43" (index 42 + 1)
+	ChunkIndex int `json:"chunk_index,omitempty"`
 }
 
 // Enforcer implements the 4-layer China Wall system.
@@ -958,6 +980,10 @@ func (e *Enforcer) cleanChunkIDs(answer string) string {
 }
 
 // extractCitations finds [CHUNK_uuid] references in the answer.
+// WHY SourceName and ChunkIndex added (Feature #23, 2026-09-23):
+//   Frontend CitationChip modal needs to show which transcript a citation
+//   came from, not just the chunk text. "Source: react_hooks_part1.txt, Chunk #42"
+//   is much more useful than just showing 200 chars of text with no context.
 func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citation {
 	pattern := regexp.MustCompile(`\[CHUNK_([a-f0-9-]+)\]`)
 	matches := pattern.FindAllStringSubmatch(answer, -1)
@@ -985,9 +1011,14 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 		if chunk, ok := chunkMap[chunkIDStr]; ok {
 			chunkID, _ := uuid.Parse(chunkIDStr)
 			citations = append(citations, Citation{
-				ChunkID: chunkID,
-				Text:    chunk.Text[:minInt(200, len(chunk.Text))],
-				Score:   chunk.RerankScore,
+				ChunkID:    chunkID,
+				Text:       chunk.Text[:minInt(200, len(chunk.Text))],
+				Score:      chunk.RerankScore,
+				// Feature #23: Include source transcript name and chunk position
+				// so frontend can display "Source: react_hooks.txt, Chunk #42"
+				// instead of just showing chunk text with no context.
+				SourceName: chunk.SourceFile,
+				ChunkIndex: chunk.ChunkIndex,
 			})
 		}
 	}
