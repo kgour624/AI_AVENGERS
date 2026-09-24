@@ -316,6 +316,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB (pgvector), AI (summarization), System Design. |
 | **Files/Risk/Rollback** | `internal/memory/*` + a job. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: inspect summary row after consolidation. |
+| **DONE (B7)** | Mig 026: `memory_type` +`summary`/`preference`; columns `weight` (0–1), `last_accessed_at`. `Consolidator` (6h ticker, root-ctx cancel): (1) **DecayPreferences** — exponential half-life 30d on `preference` only; `importance>=5` never decays; weight&lt;0.05 → supersede (never DELETE). (2) **ConsolidateProject** — min 12 active non-summary rows, cooldown 24h, max 40 source rows; `ModelCheap` prescriptive JSON (decisions/numbers/constraints/open_items/snr); write one `summary` L2 row (importance 5); supersede older summaries + covered sources (externalize, re-retrievable); L3 `memory_consolidated`. Search ranks by `distance/(weight*importance)`; bumps `last_accessed_at` on hit. Assembler surfaces summary first. Pure tests: decay math, verdict parse, format. Wire: `buildRouter` starts `NewConsolidator(...).Run(ctx)`. |
 
 ### B8 — Verification-first answers (claim → evidence)
 | Part | Detail |
@@ -327,6 +328,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, China Wall, System Design (trust). |
 | **Files/Risk/Rollback** | `internal/chinawall/*`, `internal/decision/*`. Risk: High (core answer path). Rollback: feature flag + revert. |
 | **Limitation** | `go build ./...`; manual: answer with a fabricated claim must be marked/refused. |
+| **DONE (B8)** | Flat-path only. `ClaimVerifyEnabled` (absent env → true via `IsSet`; kill switch `CHINA_WALL_CLAIM_VERIFY_ENABLED=false`). After quality gate: deterministic `extractMaterialClaims` (skip code/headings/short) → one batched `ModelCheap` verify (JSON: supported/refuted/unverifiable + confidence + justification + span + chunk_ids) → `normalizeClaimReports` (P9: no span / no chunks demotes supported→unverifiable; P3 missing index→unverifiable) → `annotateUnverified` labels `[UNVERIFIED]`/`[REFUTED]` inline + verification footer. Fail-open on LLM error. `EnforceResult.Claims` → DecisionResult → ExpertResponse → SSE `claims`. Prefer cited chunks as reference. Structured path deferred. Tests: extract/parse/normalize/annotate/chunks. |
 
 ### B9 — Context-budget policy (bound history; eviction vs summarization vs external)
 | Part | Detail |
@@ -338,6 +340,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Go, AI (context engineering), DB. |
 | **Files/Risk/Rollback** | `internal/message/*`, `internal/chat/*`, `internal/workflow/*` (context assembly). Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: long-thread test stays in budget and still answers with prior facts. |
+| **DONE (B9)** | Chat `Assemble()` now a hard budget. Named pct constants (summary 10, L2 20, recent 20, history 15, chunks 35). Course chunks capped at 35% via `trimChunksToBudget` (was unbounded — main overflow); repo chunks share that slice. New `enforceHardCeiling`: when total &gt; budget, evict lowest-value first — history → oldest recent → L2 tail → chunk tail; **never** the reply thread (explicit client action) and summary only as last resort; logs if reply thread alone is oversized. System prompt already separate (enforcer builds it, concatenated at call time) so eviction can't delete it. Rolling summary prompt made **prescriptive** (`buildRollingSummaryPrompt`: keep decisions/numbers/constraints/open items/commands). Token counting stays local (`estimateTokens`). Tests: `assembler_budget_test.go`, `summary_prompt_test.go`. |
 
 ---
 
@@ -487,9 +490,9 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B4 | gate threshold calibration | B | ✅ done | (pending PR, this branch) |
 | B5 | self-learning hardening | B | ✅ done | (pending PR, this branch) |
 | B6 | answer quality regeneration | B | ✅ done | (pending PR, this branch) |
-| B7 | memory consolidation | B | ⬜ pending | — |
-| B8 | verification-first answers | B | ⬜ pending | — |
-| B9 | context-budget policy | B | ⬜ pending | — |
+| B7 | memory consolidation | B | ✅ done | (pending PR, this branch) |
+| B8 | verification-first answers | B | ✅ done | (pending PR, this branch) |
+| B9 | context-budget policy | B | ✅ done | (pending PR, this branch) |
 | C1 | provenance chain | C | ⬜ pending | — |
 | C2 | expert versioning/drift | C | ⬜ pending | — |
 | C3 | eval harness + golden set | C | ⬜ pending | — |

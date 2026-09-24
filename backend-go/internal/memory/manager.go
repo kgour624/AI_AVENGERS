@@ -145,11 +145,12 @@ func (m *Manager) RecordTurn(
 			_ = m.l2.Append(bgCtx, L2Entry{
 				ProjectID:     projectID,
 				ExpertID:      expertID,
-				MemoryType:    "decision",
+				MemoryType:    "decision", // fact: never decays (B7 weight stays 1.0)
 				Content:       userMessage[:minInt(500, len(userMessage))],
 				Context:       assistantResponse[:minInt(500, len(assistantResponse))],
 				TurnReference: turnNumber,
 				Importance:    importance,
+				Weight:        1.0,
 			})
 		}()
 	}

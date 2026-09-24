@@ -60,6 +60,9 @@ type DecisionResult struct {
 	// TemplateSections (CT-B4): mirrors chinawall.EnforceResult.TemplateSections.
 	// nil for every flat-text expert response (CT-L2).
 	TemplateSections []chinawall.TemplateSectionResult
+	// Claims (B8): mirrors chinawall.EnforceResult.Claims. nil when claim
+	// verify disabled / fail-open / structured path.
+	Claims []chinawall.ClaimReport
 }
 
 // Engine implements the 5-gate decision system.
@@ -211,6 +214,7 @@ func (e *Engine) Process(
 			Confidence:       enforceResult.Confidence,
 			Warning:          warning,
 			TemplateSections: enforceResult.TemplateSections,
+			Claims:           enforceResult.Claims,
 		}, nil
 
 	case "partial":

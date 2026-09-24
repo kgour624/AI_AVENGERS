@@ -380,6 +380,9 @@ func (h *Handler) Send(c *gin.Context) {
 				// Frontend (CT-D5, not yet built) renders this when present,
 				// falls back to "content" above otherwise.
 				"template_sections": expertResp.TemplateSections,
+				// B8: claim→evidence reports; nil/omitted when verify off.
+				// Content already carries [UNVERIFIED]/[REFUTED] labels.
+				"claims": expertResp.Claims,
 			})
 
 			// Save assistant message SYNCHRONOUSLY.
@@ -637,12 +640,7 @@ func (h *Handler) generateRollingSummary(ctx context.Context, chatID uuid.UUID, 
 		return
 	}
 
-	prompt := fmt.Sprintf(`Summarize this conversation history in 3-5 sentences.
-Capture: main topics, key decisions, current project state.
-
-%s
-
-Summary:`, strings.Join(summaries, "\n"))
+	prompt := buildRollingSummaryPrompt(summaries)
 
 	resp, err := h.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
@@ -659,6 +657,27 @@ Summary:`, strings.Join(summaries, "\n"))
 		turnStart = 1
 	}
 	_ = h.chatSvc.SaveRollingSummary(ctx, chatID, resp.Content, turnStart, turnNumber)
+}
+
+// buildRollingSummaryPrompt builds a PRESCRIPTIVE summarization prompt
+// (B9, §3.1 P5 / Arpit last-video §5): a generic "summarize this" loses
+// the details that matter. Name exactly what to keep. Pure — unit-tested.
+func buildRollingSummaryPrompt(summaries []string) string {
+	instructions := `Compress this conversation history into a compact, high-signal rolling summary.
+Preserve EXACTLY these if present (do not paraphrase away):
+- decisions made and their rationale
+- concrete numbers, versions, IDs, limits, and rates
+- constraints / must-not rules and tech choices locked
+- open questions still blocking work
+- commands, file paths, or config keys mentioned
+Drop chit-chat, greetings, and restated questions.
+Format as short labelled bullets. Omit any section that has nothing.
+
+HISTORY:
+` + strings.Join(summaries, "\n") + `
+
+ROLLING SUMMARY:`
+	return instructions
 }
 
 // sendSSE writes a single SSE event to the response writer.

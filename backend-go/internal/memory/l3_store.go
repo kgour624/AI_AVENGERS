@@ -45,8 +45,9 @@ const (
 	EventRatingRecorded    = "rating_recorded"
 	EventExpertSwitched    = "expert_switched"
 	EventChinaWallViolation = "china_wall_violation"
-	EventGateStopped       = "gate_stopped"
-	EventIngestionComplete = "ingestion_complete"
+	EventGateStopped        = "gate_stopped"
+	EventIngestionComplete  = "ingestion_complete"
+	EventMemoryConsolidated = "memory_consolidated" // B7: L2→summary pass
 )
 
 // L3Store handles the append-only master event log.

@@ -14,15 +14,18 @@ import (
 
 // L2Entry is a single memory record in the group memory table.
 type L2Entry struct {
-	ID           uuid.UUID `json:"id"`
-	ProjectID    uuid.UUID `json:"project_id"`
-	ExpertID     uuid.UUID `json:"expert_id"`
-	MemoryType   string    `json:"memory_type"`
-	Content      string    `json:"content"`
-	Context      string    `json:"context"`
-	TurnReference int      `json:"turn_reference"`
-	Importance   int       `json:"importance"`
-	CreatedAt    time.Time `json:"created_at"`
+	ID            uuid.UUID `json:"id"`
+	ProjectID     uuid.UUID `json:"project_id"`
+	ExpertID      uuid.UUID `json:"expert_id"`
+	MemoryType    string    `json:"memory_type"`
+	Content       string    `json:"content"`
+	Context       string    `json:"context"`
+	TurnReference int       `json:"turn_reference"`
+	Importance    int       `json:"importance"`
+	// Weight (B7): retention weight in [0,1]. Facts default 1.0 forever;
+	// preferences decay over idle time. Search ranks by weight*importance.
+	Weight    float64   `json:"weight"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // L2Store handles PostgreSQL-backed group memory operations.
@@ -47,6 +50,10 @@ func NewL2Store(db *pgxpool.Pool, embedder ml.Embedder, logger *zap.Logger) *L2S
 // Append adds a new memory entry to L2.
 // Generates embedding for semantic search.
 func (s *L2Store) Append(ctx context.Context, entry L2Entry) error {
+	weight := entry.Weight
+	if weight <= 0 || weight > 1 {
+		weight = 1.0
+	}
 	// Generate embedding for semantic search
 	embedding, err := s.embedder.EmbedSingle(ctx, entry.Content)
 	if err != nil {
@@ -54,21 +61,21 @@ func (s *L2Store) Append(ctx context.Context, entry L2Entry) error {
 		// Store without embedding — won't be searchable but won't fail
 		_, err = s.db.Exec(ctx,
 			`INSERT INTO project_memory_l2
-				(project_id, expert_id, memory_type, content, context, turn_reference, importance)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+				(project_id, expert_id, memory_type, content, context, turn_reference, importance, weight)
+			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 			entry.ProjectID, entry.ExpertID, entry.MemoryType,
-			entry.Content, entry.Context, entry.TurnReference, entry.Importance,
+			entry.Content, entry.Context, entry.TurnReference, entry.Importance, weight,
 		)
 		return err
 	}
 
 	_, err = s.db.Exec(ctx,
 		`INSERT INTO project_memory_l2
-			(project_id, expert_id, memory_type, content, context, turn_reference, embedding, importance)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			(project_id, expert_id, memory_type, content, context, turn_reference, embedding, importance, weight)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		entry.ProjectID, entry.ExpertID, entry.MemoryType,
 		entry.Content, entry.Context, entry.TurnReference,
-		pgvector.NewVector(embedding), entry.Importance,
+		pgvector.NewVector(embedding), entry.Importance, weight,
 	)
 	return err
 }
@@ -88,13 +95,17 @@ func (s *L2Store) SearchByQuery(ctx context.Context, projectID uuid.UUID, query 
 		return s.searchByKeyword(ctx, projectID, query, limit)
 	}
 
-	// Semantic search
+	// Semantic search. Rank by vector distance, then boost by
+	// weight*importance so decayed preferences sink and critical/summary
+	// facts stay on top (B7). COALESCE weight handles pre-026 rows if
+	// the column default has not backfilled yet (DEFAULT 1.0 does).
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, expert_id, memory_type, content,
 		        COALESCE(context,''), COALESCE(turn_reference,0), importance, created_at
 		 FROM project_memory_l2
 		 WHERE project_id=$1 AND is_superseded=FALSE AND embedding IS NOT NULL
-		 ORDER BY embedding <=> $2
+		   AND COALESCE(weight, 1.0) >= 0.05
+		 ORDER BY (embedding <=> $2) / GREATEST(COALESCE(weight,1.0) * GREATEST(importance,1), 0.05)
 		 LIMIT $3`,
 		projectID, pgvector.NewVector(embedding), limit,
 	)
@@ -107,6 +118,7 @@ func (s *L2Store) SearchByQuery(ctx context.Context, projectID uuid.UUID, query 
 	if err != nil {
 		return nil, err
 	}
+	s.bumpAccess(ctx, entries)
 
 	// If semantic search returned few results, supplement with keyword search
 	if len(entries) < limit/2 {
@@ -128,6 +140,19 @@ func (s *L2Store) SearchByQuery(ctx context.Context, projectID uuid.UUID, query 
 	return entries, nil
 }
 
+// bumpAccess refreshes last_accessed_at for retrieved rows so hot
+// preferences resist decay (LFU-style proxy, Arpit last-video §4).
+func (s *L2Store) bumpAccess(ctx context.Context, entries []L2Entry) {
+	if len(entries) == 0 {
+		return
+	}
+	ids := make([]uuid.UUID, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	s.touchAccess(ctx, ids)
+}
+
 // searchByKeyword searches L2 using PostgreSQL full-text search.
 // Used as fallback when semantic search returns few results.
 func (s *L2Store) searchByKeyword(ctx context.Context, projectID uuid.UUID, query string, limit int) ([]L2Entry, error) {
@@ -137,8 +162,9 @@ func (s *L2Store) searchByKeyword(ctx context.Context, projectID uuid.UUID, quer
 		 FROM project_memory_l2
 		 WHERE project_id=$1
 		   AND is_superseded=FALSE
+		   AND COALESCE(weight, 1.0) >= 0.05
 		   AND content_tsv @@ plainto_tsquery('english', $2)
-		 ORDER BY importance DESC, created_at DESC
+		 ORDER BY (COALESCE(weight,1.0) * importance) DESC, created_at DESC
 		 LIMIT $3`,
 		projectID, query, limit,
 	)
@@ -146,7 +172,12 @@ func (s *L2Store) searchByKeyword(ctx context.Context, projectID uuid.UUID, quer
 		return s.GetRecent(ctx, projectID, limit)
 	}
 	defer rows.Close()
-	return scanL2Rows(rows)
+	entries, err := scanL2Rows(rows)
+	if err != nil {
+		return nil, err
+	}
+	s.bumpAccess(ctx, entries)
+	return entries, nil
 }
 
 // GetByExpert returns all L2 entries for a specific expert in a project.
@@ -156,7 +187,8 @@ func (s *L2Store) GetByExpert(ctx context.Context, projectID, expertID uuid.UUID
 		        COALESCE(context,''), COALESCE(turn_reference,0), importance, created_at
 		 FROM project_memory_l2
 		 WHERE project_id=$1 AND expert_id=$2 AND is_superseded=FALSE
-		 ORDER BY importance DESC, created_at DESC
+		   AND COALESCE(weight, 1.0) >= 0.05
+		 ORDER BY (COALESCE(weight,1.0) * importance) DESC, created_at DESC
 		 LIMIT 20`,
 		projectID, expertID,
 	)
@@ -168,13 +200,15 @@ func (s *L2Store) GetByExpert(ctx context.Context, projectID, expertID uuid.UUID
 }
 
 // GetRecent returns most recent L2 entries for a project.
+// B7: rank by weight*importance so decayed prefs sink and summaries float.
 func (s *L2Store) GetRecent(ctx context.Context, projectID uuid.UUID, limit int) ([]L2Entry, error) {
 	rows, err := s.db.Query(ctx,
 		`SELECT id, project_id, expert_id, memory_type, content,
 		        COALESCE(context,''), COALESCE(turn_reference,0), importance, created_at
 		 FROM project_memory_l2
 		 WHERE project_id=$1 AND is_superseded=FALSE
-		 ORDER BY importance DESC, created_at DESC
+		   AND COALESCE(weight, 1.0) >= 0.05
+		 ORDER BY (COALESCE(weight,1.0) * importance) DESC, created_at DESC
 		 LIMIT $2`,
 		projectID, limit,
 	)

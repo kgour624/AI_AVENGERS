@@ -84,6 +84,10 @@ type ExpertResponse struct {
 	// falling back to plain Content otherwise, exactly like every layer
 	// below this one already does.
 	TemplateSections []chinawall.TemplateSectionResult `json:"template_sections,omitempty"`
+	// Claims (B8): atomic claim→evidence reports. nil when claim verify
+	// off / fail-open / structured. Frontend may render labels already
+	// embedded in Content; this is the structured form for C1 provenance.
+	Claims []chinawall.ClaimReport `json:"claims,omitempty"`
 	// ReplyToUserMessageID (CT-C4): set ONLY when GateStopped==-1 (this
 	// response IS a structure-permission ASK, decision/engine.go's
 	// gateStructurePermission sentinel). message/handler.go's
@@ -553,6 +557,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		Warning:     result.Warning,
 		Questions:   result.Questions,
 		TemplateSections: result.TemplateSections,
+		Claims:      result.Claims,
 		// ReplyToUserMessageID (CT-C4): only set when this IS a
 		// structure-permission ASK (sentinel GateStopped==-1, see
 		// decision/engine.go's gateStructurePermission). userMsgID copy

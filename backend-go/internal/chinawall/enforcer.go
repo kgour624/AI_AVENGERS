@@ -54,6 +54,11 @@ type EnforceResult struct {
 	// the path is structured (structured scoring deferred). Observability
 	// only — never used to refuse a cited answer after retries are spent.
 	QualityScore float64
+	// Claims (B8): atomic claim→evidence reports for the flat-path answer.
+	// nil when claim verify is disabled, failed open, or structured path
+	// (structured claim verify deferred). Unverifiable/refuted claims are
+	// also labelled inline in Answer; never silently asserted (P9).
+	Claims []ClaimReport
 }
 
 // Citation links a claim to a source chunk.
@@ -290,13 +295,15 @@ func (e *Enforcer) Enforce(
 				ctx, question, chunks, expertName, reasoningCharter, replyContext, BaseProfile,
 				cleanAnswer, baseGenerated.Citations,
 			)
+			claimRes := e.verifyClaims(ctx, ans, chunks, cites)
 			return &EnforceResult{
 				Status:       "success",
-				Answer:       ans,
+				Answer:       claimRes.Answer,
 				Citations:    cites,
 				Coverage:     coverage,
 				Confidence:   float64(bestScore),
 				QualityScore: qScore,
+				Claims:       claimRes.Claims,
 			}, nil
 		} else {
 			return e.buildRefusal("empty_after_strip", "Could not generate a properly cited answer"), nil
@@ -307,13 +314,15 @@ func (e *Enforcer) Enforce(
 		ctx, question, chunks, expertName, reasoningCharter, replyContext, profile,
 		cleanAnswer, generated.Citations,
 	)
+	claimRes := e.verifyClaims(ctx, ans, chunks, cites)
 	return &EnforceResult{
 		Status:       "success",
-		Answer:       ans,
+		Answer:       claimRes.Answer,
 		Citations:    cites,
 		Coverage:     coverage,
 		Confidence:   float64(bestScore),
 		QualityScore: qScore,
+		Claims:       claimRes.Claims,
 	}, nil
 }
 
