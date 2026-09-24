@@ -109,7 +109,10 @@ Example: {"topic": "sharding", "subtopic": "consistent_hashing", "confidence": 0
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
 		UserPrompt:  prompt,
-		MaxTokens:   80,
+		// P2: 80 tokens was impossible for a reasoning model — the whole budget
+		// went to reasoning and `content` came back empty. 2048 is the floor
+		// CodeCraftAPI itself enforces (https://codecraftapi.com/docs/reasoning).
+		MaxTokens:   2048,
 		Temperature: 0.1,
 		UseCache:    true,
 	})
@@ -162,7 +165,7 @@ func (e *TopicExtractor) extractBatch(ctx context.Context, chunks []TextChunk) (
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
 		UserPrompt:  sb.String(),
-		MaxTokens:   500,
+		MaxTokens:   2048, // P2: was 500 — below the reasoning-model floor
 		Temperature: 0.1,
 	})
 	if err != nil {

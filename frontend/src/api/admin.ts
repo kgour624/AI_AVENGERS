@@ -182,6 +182,18 @@ export const resumeIngestionJob = (expertId: string, jobId: string) =>
     )
     .then((res) => res.data.data!)
 
+// retryIngestionJob: the PAUSED-job path (charter LLM failed).
+// WHY separate from resume: the backend contract distinguishes
+// paused -> /retry from failed -> /resume. The paused branch of the ingestion
+// modal used to call /resume, which the backend rejects for paused jobs
+// (400 NOT_RESUMABLE) — the whole reason "Resume" appeared to do nothing.
+export const retryIngestionJob = (expertId: string, jobId: string) =>
+  baseAPI
+    .post<ApiResponse<{ jobId: string; status: string; message: string }>>(
+      `/api/v1/admin/experts/${expertId}/jobs/${jobId}/retry`
+    )
+    .then((res) => res.data.data!)
+
 // Feature #7 fix (docs bug list): projectCount/messageCount added -
 // previously ListClients returned neither, so there was no data for
 // the frontend to show beyond the enable/disable toggle. Both are now

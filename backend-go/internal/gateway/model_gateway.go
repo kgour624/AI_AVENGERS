@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -348,6 +349,17 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 					zap.String("provider", p.Name()),
 					zap.Error(err),
 				)
+				// Deterministic failure: the provider returned 200 but no usable
+				// content (typically a reasoning model whose completion budget
+				// was spent on reasoning). Re-sending the identical request
+				// cannot succeed — it only burns credits — so stop retrying.
+				// The fallback provider (when configured) still gets a turn.
+				if errors.Is(err, providers.ErrEmptyContent) {
+					g.logger.Warn("LLM call returned empty content — skipping retries (deterministic)",
+						zap.String("provider", p.Name()),
+					)
+					break
+				}
 				continue
 			}
 

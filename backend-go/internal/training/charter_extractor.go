@@ -145,7 +145,11 @@ Write in first person. Only what THIS instructor taught. Include numbers where m
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelStrong,
 		UserPrompt:  prompt,
-		MaxTokens:   1500,
+		// P2: 1500 was below CodeCraftAPI's documented default (8192) and its
+		// 16000+ guidance for reasoning. Reasoning tokens count toward
+		// completion_tokens, so a small budget was spent on thinking and left
+		// `content` empty ("empty content in response") — pausing ingestion.
+		MaxTokens:   21000,
 		Temperature: 0.3,
 		UseCache:    false,
 	})
@@ -202,7 +206,7 @@ Rules:
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelStrong,
 		UserPrompt:  prompt,
-		MaxTokens:   1000,
+		MaxTokens:   21000, // P2: reasoning models need headroom (was 1000)
 		Temperature: 0.2,
 		UseCache:    false,
 	})

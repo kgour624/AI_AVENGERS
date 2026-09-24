@@ -223,7 +223,7 @@ Be specific. Max 8 items each. Return ONLY JSON.`,
 	resp, err := b.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
 		UserPrompt:  prompt,
-		MaxTokens:   400,
+		MaxTokens:   2048, // P2: was 400 — below the reasoning-model floor
 		Temperature: 0.2,
 	})
 	if err != nil {
