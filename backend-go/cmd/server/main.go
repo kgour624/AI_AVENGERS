@@ -476,6 +476,12 @@ func buildRouter(
 	wfWorkspaceMerger := workflow.NewWorkspaceMerger(logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfCrossVerifier := workflow.NewCrossVerifier(bbStore, modelGateway, wfAgentLoop, wfAiderRunner, wfTools, logger)
+	// C7: adversarial debate overlay on high-stakes artifacts (attack→defend
+	// →verdict, hop-bound). Kill switch = DEBATE_ENABLED=false.
+	wfCrossVerifier.SetDebatePolicy(workflow.DebatePolicy{
+		Enabled: cfg.Debate.Enabled,
+		MaxHops: cfg.Debate.MaxHops,
+	})
 
 	// wfSections moved up from where it used to be constructed (previously only
 	// needed by the chat wiring below) because AuthoringRunner needs it too, and

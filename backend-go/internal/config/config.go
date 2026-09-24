@@ -29,7 +29,19 @@ type Config struct {
 	Versioning          VersioningConfig
 	Tenant              TenantConfig
 	Freshness           FreshnessConfig
+	Debate              DebateConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// DebateConfig controls C7 adversarial review on high-stakes artifacts.
+type DebateConfig struct {
+	// Enabled: after mandatory reviewers approve a high-stakes artifact,
+	// run attack→defend→verdict (bounded hops). Absent env → true (IsSet
+	// pattern, same as B6/B8/C1–C6). Explicit false is the kill switch.
+	Enabled bool
+	// MaxHops: max attack→defend cycles before final verdict. Default 2
+	// (A19 hop bound). Each hop costs 2 LLM calls + 1 verdict call max.
+	MaxHops int
 }
 
 // FreshnessConfig controls C6 knowledge freshness detection.
@@ -331,6 +343,10 @@ func Load() (*Config, error) {
 			Enabled:          true, // C6 default on; overridden below if env set
 			MaxCorpusAgeDays: v.GetInt("FRESHNESS_MAX_CORPUS_AGE_DAYS"),
 		},
+		Debate: DebateConfig{
+			Enabled: true, // C7 default on; overridden below if env set
+			MaxHops: v.GetInt("DEBATE_MAX_HOPS"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -371,6 +387,10 @@ func Load() (*Config, error) {
 	// C6: same IsSet pattern — absent → true; explicit false disables.
 	if v.IsSet("FRESHNESS_ENABLED") {
 		cfg.Freshness.Enabled = v.GetBool("FRESHNESS_ENABLED")
+	}
+	// C7: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("DEBATE_ENABLED") {
+		cfg.Debate.Enabled = v.GetBool("DEBATE_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -511,6 +531,10 @@ func (c *Config) applyDefaults() {
 	// C6: corpus freshness window default.
 	if c.Freshness.MaxCorpusAgeDays <= 0 {
 		c.Freshness.MaxCorpusAgeDays = 180
+	}
+	// C7: adversarial debate hop bound default (A19-aligned).
+	if c.Debate.MaxHops <= 0 {
+		c.Debate.MaxHops = 2
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000

@@ -431,6 +431,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Multi-agent, AI, Go. |
 | **Files/Risk/Rollback** | `internal/workflow/cross_verifier.go` + new rounds. Risk: Medium–High (cost). Rollback: flag. |
 | **Limitation** | `go build ./...`; manual: force a contested artifact. |
+| **DONE (C7)** | `internal/workflow/adversarial_debate.go`: bounded critic–refiner overlay on A7. After mandatory reviewers approve a **high-stakes** artifact (`architecture_decision`, `data_model_proposed`, `api_contract_proposed`, `module_design_proposed`, `code_artifact_produced`), run attack → defend × `MaxHops` (default 2, A19) → verdict. Red-team catalog (injection/jailbreak, token smuggling, boundary probing, secret extraction, tool exploitation, goal hijacking, psychophancy, security, completeness). Attack uses `ModelStrong`; defend `ModelCheap`. Clean attack (`NONE`) short-circuits PASS (no verdict call). Verdict enum `PASS`/`FAIL`/`ESCALATE`; pure `ParseDebateVerdict` **fail-closed** (empty/unknown → FAIL). Blackboard events: `debate_attack`, `debate_defend`, `debate_verdict`. FAIL → `artifact_blocked` + `ErrArtifactBlocked`; ESCALATE → `review_escalated_to_client` and **no** `artifact_approved` (same posture as max-revision); PASS → falls through to `artifact_approved`. Config `DebateConfig{Enabled(absent→true), MaxHops(2)}` + `DEBATE_*` kill switch via `CrossVerifier.SetDebatePolicy`. Pure tests: AttackIsClean / ClassifyAttackSeverity / ParseDebateVerdict / IsHighStakes / SetDebatePolicy nil-safe. **Deferred:** multi-critic Mixture-of-Agents; design-artifact producer re-run via AgentLoop (still Aider-only for code); continuous simulation red-team corpus (C3 golden covers probes). |
 
 ### C8 — Bring-your-own-expert / connector knowledge
 | Part | Detail |
@@ -505,7 +506,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C4 | tenant isolation | C | ✅ done | (pending PR, this branch) |
 | C5 | cost/usage product | C | ✅ done | (pending PR, this branch) |
 | C6 | knowledge freshness | C | ✅ done | (pending PR, this branch) |
-| C7 | adversarial debate | C | ⬜ pending | — |
+| C7 | adversarial debate | C | ✅ done | (pending PR, this branch) |
 | C8 | bring-your-own-expert | C | ⬜ pending | — |
 | C9 | explainability surface | C | ⬜ pending | — |
 | C10 | reliability-as-product | C | ⬜ pending | — |
