@@ -577,15 +577,33 @@ func (a *Assembler) GetProjectMemoryText(
 		}
 	}
 	if len(pc.L2Entries) > 0 {
-		sb.WriteString("Cross-expert project decisions:\n")
+		// B7: surface consolidated summary first (highest-SNR block), then
+		// remaining non-summary rows. Decayed/superseded already filtered
+		// by L2 search.
+		var summaryBlock strings.Builder
+		var otherBlock strings.Builder
 		for _, e := range pc.L2Entries {
 			if e.Content == "" {
 				continue
 			}
-			sb.WriteString(fmt.Sprintf("- %s\n", e.Content))
+			if e.MemoryType == "summary" {
+				summaryBlock.WriteString(e.Content)
+				summaryBlock.WriteString("\n\n")
+			} else {
+				otherBlock.WriteString(fmt.Sprintf("- [%s] %s\n", e.MemoryType, e.Content))
+			}
+		}
+		if summaryBlock.Len() > 0 {
+			sb.WriteString("Project consolidated summary:\n")
+			sb.WriteString(summaryBlock.String())
 			wrote = true
 		}
-		sb.WriteString("\n")
+		if otherBlock.Len() > 0 {
+			sb.WriteString("Cross-expert project decisions:\n")
+			sb.WriteString(otherBlock.String())
+			sb.WriteString("\n")
+			wrote = true
+		}
 	}
 	if !wrote {
 		return ""

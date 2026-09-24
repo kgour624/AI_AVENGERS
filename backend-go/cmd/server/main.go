@@ -173,7 +173,7 @@ func main() {
 	embedder := ml.NewDynamicEmbedder(postgres.Pool, mlClient, ccEmbedder, logger)
 
 	// Build router — single call, single definition
-	router := buildRouter(cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, embedder, domainRegistry, categoryRegistry)
+	router := buildRouter(ctx, cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, embedder, domainRegistry, categoryRegistry)
 
 	// 24-hour auto-fail checker for paused ingestion jobs.
 	// WHY here not in admin_handler: server-lifecycle concern, not per-request.
@@ -344,6 +344,7 @@ func main() {
 // We use our own structured zap logger and recovery middleware.
 // gin.New() gives us full control over middleware order.
 func buildRouter(
+	ctx context.Context,
 	cfg *config.Config,
 	logger *zap.Logger,
 	postgres *db.Pool,
@@ -375,6 +376,9 @@ func buildRouter(
 
 	// Initialize core services
 	memManager := memory.NewManager(postgres.Pool, redisClient.Client, embedder, logger)
+	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
+	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
+	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
 	// domainRegistry is already initialized in main() and passed here.
 	chinawallEnforcer := chinawall.NewEnforcer(cfg.ChinaWall, modelGateway, mlClient, logger, domainRegistry)
 	decisionEngine := decision.NewEngine(postgres.Pool, modelGateway, chinawallEnforcer, logger)

@@ -316,6 +316,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB (pgvector), AI (summarization), System Design. |
 | **Files/Risk/Rollback** | `internal/memory/*` + a job. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: inspect summary row after consolidation. |
+| **DONE (B7)** | Mig 026: `memory_type` +`summary`/`preference`; columns `weight` (0–1), `last_accessed_at`. `Consolidator` (6h ticker, root-ctx cancel): (1) **DecayPreferences** — exponential half-life 30d on `preference` only; `importance>=5` never decays; weight&lt;0.05 → supersede (never DELETE). (2) **ConsolidateProject** — min 12 active non-summary rows, cooldown 24h, max 40 source rows; `ModelCheap` prescriptive JSON (decisions/numbers/constraints/open_items/snr); write one `summary` L2 row (importance 5); supersede older summaries + covered sources (externalize, re-retrievable); L3 `memory_consolidated`. Search ranks by `distance/(weight*importance)`; bumps `last_accessed_at` on hit. Assembler surfaces summary first. Pure tests: decay math, verdict parse, format. Wire: `buildRouter` starts `NewConsolidator(...).Run(ctx)`. |
 
 ### B8 — Verification-first answers (claim → evidence)
 | Part | Detail |
@@ -487,7 +488,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B4 | gate threshold calibration | B | ✅ done | (pending PR, this branch) |
 | B5 | self-learning hardening | B | ✅ done | (pending PR, this branch) |
 | B6 | answer quality regeneration | B | ✅ done | (pending PR, this branch) |
-| B7 | memory consolidation | B | ⬜ pending | — |
+| B7 | memory consolidation | B | ✅ done | (pending PR, this branch) |
 | B8 | verification-first answers | B | ⬜ pending | — |
 | B9 | context-budget policy | B | ⬜ pending | — |
 | C1 | provenance chain | C | ⬜ pending | — |
