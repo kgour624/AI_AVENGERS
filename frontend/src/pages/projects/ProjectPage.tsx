@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { LoaderFunctionArgs } from 'react-router-dom'
-import { useLoaderData, useNavigate, useRevalidator, Outlet, Link } from 'react-router-dom'
+import { useLoaderData, useNavigate, useRevalidator, Link } from 'react-router-dom'
 import { getProject, deleteProject } from '@/api/projects'
 import { getProjectTimeline } from '@/api/memory'
 import type { Project } from '@/types/project'
@@ -96,7 +96,9 @@ export default function ProjectPage() {
         <p className="mb-1 text-sm font-medium text-text-secondary">Tech Stack</p>
         <TechStackEditor
           projectId={project.id}
-          techStack={project.techStack}
+          // Project.techStack is string[] | Record<string,any> (legacy rows
+          // stored an object); the editor only understands the array form.
+          techStack={Array.isArray(project.techStack) ? project.techStack : undefined}
           onUpdated={() => revalidator.revalidate()}
         />
       </div>

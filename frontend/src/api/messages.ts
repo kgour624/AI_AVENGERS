@@ -1,4 +1,5 @@
 import { baseAPI } from './base'
+import type { ApiResponse } from '@/types/api'
 
 /**
  * NOTE: sendMessage is intentionally NOT here. Per

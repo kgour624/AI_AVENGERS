@@ -40,6 +40,19 @@ const STAGE_LABELS: Record<string, string> = {
   paused: 'Paused — waiting for admin action',
 }
 
+// RegenFeedback renders the regenerate-charter result under the button.
+// WHY a component (not inline JSX): the inline `regenFeedback[id] && (...).ok`
+// pattern does not narrow inside the nested template literal, which TS flags as
+// "possibly undefined". A typed prop narrows cleanly.
+function RegenFeedback({ feedback }: { feedback?: { ok: boolean; msg: string } }) {
+  if (!feedback) return null
+  return (
+    <p className={`text-[10px] ${feedback.ok ? 'text-green-400' : 'text-red-400'}`}>
+      {feedback.msg}
+    </p>
+  )
+}
+
 function ExpertRow({
   expertId,
   expertName,
@@ -69,7 +82,7 @@ function ExpertRow({
           </span>
         )}
         {(latestJob.costUsd ?? 0) > 0 && (
-          <span className="ml-2 text-glow-amber/70">${latestJob.costUsd.toFixed(3)}</span>
+          <span className="ml-2 text-glow-amber/70">${(latestJob.costUsd ?? 0).toFixed(3)}</span>
         )}
       </p>
       {(isActive || latestJob.status === 'failed') && (
@@ -215,15 +228,7 @@ function AdminExperts() {
                   >
                     {regeneratingIds.has(expert.id) ? '\u23f3 Generating...' : '\u26a1 Regenerate Charter'}
                   </Button>
-                  {regenFeedback[expert.id] && (
-                    <p
-                      className={`text-[10px] ${
-                        regenFeedback[expert.id].ok ? 'text-green-400' : 'text-red-400'
-                      }`}
-                    >
-                      {regenFeedback[expert.id].msg}
-                    </p>
-                  )}
+                  <RegenFeedback feedback={regenFeedback[expert.id]} />
                 </div>
               )}
             </div>
