@@ -343,12 +343,15 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 
 			if !skipHLD {
 				if attempt == 1 {
-					_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
+					if err := r.mustTransition(ctx, workflowID, PhaseHighLevelDesign, log); err != nil {
+						return
+					}
 				} else {
 					// Backwards move, so TransitionPhase's forward-only validation
 					// does not apply. See Engine.RestartPhase.
 					if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseHighLevelDesign); rErr != nil {
 						log.Error("runner: restart HLD failed", zap.Error(rErr))
+						_ = r.engine.Fail(ctx, workflowID, fmt.Sprintf("restart HLD failed: %v", rErr))
 						return
 					}
 					log.Info("runner: re-running design phases on client request",
@@ -370,9 +373,12 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 
 			if !skipDLD {
 				if attempt == 1 {
-					_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseDetailedDesign, nil, 0)
+					if err := r.mustTransition(ctx, workflowID, PhaseDetailedDesign, log); err != nil {
+						return
+					}
 				} else if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseDetailedDesign); rErr != nil {
 					log.Error("runner: restart detailed design failed", zap.Error(rErr))
+					_ = r.engine.Fail(ctx, workflowID, fmt.Sprintf("restart detailed design failed: %v", rErr))
 					return
 				}
 
@@ -427,7 +433,9 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 
 	// --- Phase: Implementation (Aider) ---
 	if resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseImplementation) {
-		_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseImplementation, nil, 0)
+		if err := r.mustTransition(ctx, workflowID, PhaseImplementation, log); err != nil {
+			return
+		}
 		state = seedPhase(PhaseImplementation)
 		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
 			log.Error("runner: Implementation waves failed", zap.Error(err))
@@ -446,7 +454,9 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 
 	// --- Phase: QA (Aider - test generation) ---
 	if resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseQA) {
-		_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseQA, nil, 0)
+		if err := r.mustTransition(ctx, workflowID, PhaseQA, log); err != nil {
+			return
+		}
 		state = seedPhase(PhaseQA)
 		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
 			log.Error("runner: QA waves failed", zap.Error(err))
@@ -466,7 +476,9 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	}
 
 	// Step 9: Final approval.
-	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHandoff, nil, 0)
+	if err := r.mustTransition(ctx, workflowID, PhaseHandoff, log); err != nil {
+		return
+	}
 	allArtifacts, _ := r.store.GetByType(ctx, workflowID,
 		[]string{"architecture_decision", "data_model_proposed", "api_contract_proposed",
 			"module_design_proposed", "code_artifact_produced", "requirement_captured"}, 0)
@@ -915,6 +927,28 @@ func snapshotRunnerState(state *runnerState, mu *sync.Mutex) *runnerState {
 // saveRunnerState writes runner_state to workflows table.
 // Called after each task completes for pod-restart recovery.
 // (current_task_cursor column exists from migration 014 but is unused —
+// mustTransition calls Engine.TransitionPhase and fails the workflow loudly
+// on error (A16). Previously every TransitionPhase call discarded its error
+// (`_, _ =`), so a DB failure or invalid transition left the runner advancing
+// while workflows.current_phase did not — phase drift vs runner_state.
+// Returns a non-nil error after Fail so callers can return immediately.
+func (r *WorkflowRunner) mustTransition(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	nextPhase string,
+	log *zap.Logger,
+) error {
+	if _, err := r.engine.TransitionPhase(ctx, workflowID, nextPhase, nil, 0); err != nil {
+		log.Error("runner: phase transition failed",
+			zap.String("to", nextPhase),
+			zap.Error(err),
+		)
+		_ = r.engine.Fail(ctx, workflowID, fmt.Sprintf("phase transition to %s failed: %v", nextPhase, err))
+		return err
+	}
+	return nil
+}
+
 // phase + completed expert IDs are enough for skip-based resume.)
 // Callers that share state across wave goroutines MUST pass a snapshot
 // (see snapshotRunnerState) — never the live concurrent pointer.

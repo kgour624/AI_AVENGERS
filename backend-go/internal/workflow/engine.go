@@ -236,6 +236,12 @@ func (e *Engine) TransitionPhase(
 		return nil, fmt.Errorf("workflow transition: load: %w", err)
 	}
 
+	// Idempotent: already on nextPhase (common on resume after a prior
+	// successful transition + boundary checkpoint). No-op success (A16).
+	if w.CurrentPhase == nextPhase {
+		return w, nil
+	}
+
 	// Validate forward transition
 	if !isValidTransition(w.CurrentPhase, nextPhase) {
 		return nil, fmt.Errorf("workflow transition: invalid: %s -> %s", w.CurrentPhase, nextPhase)
