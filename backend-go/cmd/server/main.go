@@ -391,7 +391,7 @@ func buildRouter(
 	// To disable: pass nil instead of questionProcessor to NewOrchestrator.
 	questionProcessor := selflearning.NewQuestionProcessor(modelGateway, logger)
 
-	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, questionProcessor, logger)
+	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, questionProcessor, modelGateway, logger)
 
 	// Initialize domain services
 	projectSvc := project.NewService(postgres.Pool, logger)

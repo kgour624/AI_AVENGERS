@@ -16,6 +16,7 @@ import (
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/ratelimit"
@@ -95,9 +96,13 @@ type ExpertResponse struct {
 
 // SynthesisResult holds the combined view when multiple experts respond.
 type SynthesisResult struct {
-	Agreements     []string       `json:"agreements"`
+	Agreements     []string        `json:"agreements"`
 	Contradictions []Contradiction `json:"contradictions"`
-	Summary        string         `json:"summary"`
+	Summary        string          `json:"summary"`
+	// Method (B1): "llm" when the real synthesis call succeeded, "fallback"
+	// when it was skipped/failed and the deterministic non-LLM merge ran
+	// instead (§3.1 P3 — a synthesis failure must degrade, not crash chat).
+	Method string `json:"method"`
 }
 
 // Contradiction is a point where two experts disagree.
@@ -137,6 +142,12 @@ type Orchestrator struct {
 	// disabled) — loadExperts treats nil registry exactly like "expert has
 	// no category_id", never panics on nil dereference (see loadExperts).
 	categoryRegistry *category.Registry
+	// gw is used by synthesize (B1) for the real LLM synthesis call.
+	// Never nil in production (NewOrchestrator requires it); a nil gw only
+	// happens in tests that construct Orchestrator{} directly, and
+	// synthesize's nil-check falls back to the deterministic non-LLM merge
+	// so those tests keep working unchanged.
+	gw *gateway.ModelGateway
 	// selfLearning (Self-Learning Mode): nil = disabled (zero regression).
 	// When non-nil, processWithExpert runs Understand → Extract → Verify
 	// on the raw question before passing it to the decision engine.
@@ -175,6 +186,7 @@ func NewOrchestrator(
 	memManager *memory.Manager,
 	categoryRegistry *category.Registry,
 	selfLearning *selflearning.QuestionProcessor,
+	gw *gateway.ModelGateway,
 	logger *zap.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
@@ -184,6 +196,7 @@ func NewOrchestrator(
 		memManager:       memManager,
 		categoryRegistry: categoryRegistry,
 		selfLearning:     selfLearning,
+		gw:               gw,
 		logger:           logger,
 		// Default: 5 burst, 2 requests/second per expert.
 		// WHY these numbers: LLM providers typically allow 5-10 RPM per key.
@@ -282,10 +295,12 @@ collected:
 		return nil, fmt.Errorf("all experts failed or timed out")
 	}
 
-	// Synthesize if multiple experts
+	// Synthesize if multiple experts. Uses timeoutCtx (not the outer ctx)
+	// so a slow synthesis call cannot run past the same 120s budget the
+	// expert collection above is already bound to.
 	var synthesis *SynthesisResult
 	if len(expertResponses) > 1 {
-		synthesis = o.synthesize(expertResponses)
+		synthesis = o.synthesize(timeoutCtx, expertResponses)
 	}
 
 	// Update memory async (non-blocking)
@@ -520,9 +535,109 @@ func structurePermissionAskParent(gateStopped int, userMessageID uuid.UUID) *uui
 	return &id
 }
 
-// synthesize finds agreements and contradictions between expert responses.
-func (o *Orchestrator) synthesize(responses []ExpertResponse) *SynthesisResult {
-	// Simple synthesis: find ADVISE responses and note any WARN/REFUSE
+// synthesize merges multiple experts' actual answers into one coherent view
+// (B1). Previously this built pseudo-agreements/contradictions from Mode
+// alone (ADVISE vs WARN) without ever reading the answer text — two experts
+// giving the same advice in different words showed up as "agreement" with no
+// content, and a real semantic disagreement between two ADVISE responses was
+// invisible.
+//
+// One dedicated LLM call reads every expert's Content and returns a strict
+// JSON verdict (§3.1 P1: structured output, not prose we regex). Low
+// temperature, single pass (P11) — this is a synthesis/aggregation step, not
+// a reasoning task. On any failure (gw nil, call error, malformed JSON) it
+// falls back to the deterministic non-LLM merge (P3: degrade, don't crash
+// chat over a synthesis failure) — synthesizeFallback below is the original
+// logic, unchanged, so existing tests/behaviour for that path still hold.
+func (o *Orchestrator) synthesize(ctx context.Context, responses []ExpertResponse) *SynthesisResult {
+	if o.gw == nil {
+		return o.synthesizeFallback(responses)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Multiple domain experts answered the same question independently. ")
+	sb.WriteString("Read their actual answers below and produce a synthesis.\n\n")
+	for i, r := range responses {
+		content := r.Content
+		if len(content) > 1500 {
+			content = content[:1500] + "\n... [truncated]"
+		}
+		fmt.Fprintf(&sb, "--- Expert %d: %s (domain: %s) ---\n%s\n\n", i+1, r.ExpertName, r.Domain, content)
+	}
+	sb.WriteString(
+		"Treat every expert's answer as a final verdict from their domain — do not " +
+			"discard or downweight any of them just because they differ from the majority.\n\n" +
+			"Return JSON only, no prose outside the JSON:\n" +
+			`{"agreements": ["point experts agree on", ...], ` +
+			`"disagreements": [{"topic": "...", "expert_a": "name", "position_a": "...", "expert_b": "name", "position_b": "..."}], ` +
+			`"summary": "one paragraph synthesis for the client"}` +
+			"\nIf there are no real disagreements, disagreements must be an empty array — do not invent one.",
+	)
+
+	resp, err := o.gw.Call(ctx, gateway.LLMRequest{
+		Model:       gateway.ModelCheap,
+		UserPrompt:  sb.String(),
+		MaxTokens:   700,
+		Temperature: 0.1,
+	})
+	if err != nil {
+		o.logger.Warn("synthesize: LLM call failed, using fallback merge", zap.Error(err))
+		return o.synthesizeFallback(responses)
+	}
+
+	var parsed struct {
+		Agreements    []string `json:"agreements"`
+		Disagreements []struct {
+			Topic     string `json:"topic"`
+			ExpertA   string `json:"expert_a"`
+			PositionA string `json:"position_a"`
+			ExpertB   string `json:"expert_b"`
+			PositionB string `json:"position_b"`
+		} `json:"disagreements"`
+		Summary string `json:"summary"`
+	}
+	clean := strings.TrimSpace(resp.Content)
+	clean = strings.TrimPrefix(clean, "```json")
+	clean = strings.TrimPrefix(clean, "```")
+	clean = strings.TrimSuffix(clean, "```")
+	clean = strings.TrimSpace(clean)
+	start := strings.Index(clean, "{")
+	end := strings.LastIndex(clean, "}")
+	if start == -1 || end == -1 || end < start {
+		o.logger.Warn("synthesize: LLM response had no JSON object, using fallback merge")
+		return o.synthesizeFallback(responses)
+	}
+	if err := json.Unmarshal([]byte(clean[start:end+1]), &parsed); err != nil {
+		o.logger.Warn("synthesize: LLM response JSON parse failed, using fallback merge", zap.Error(err))
+		return o.synthesizeFallback(responses)
+	}
+
+	result := &SynthesisResult{
+		Agreements: parsed.Agreements,
+		Summary:    parsed.Summary,
+		Method:     "llm",
+	}
+	for _, d := range parsed.Disagreements {
+		result.Contradictions = append(result.Contradictions, Contradiction{
+			Topic:     d.Topic,
+			ExpertA:   d.ExpertA,
+			PositionA: d.PositionA,
+			ExpertB:   d.ExpertB,
+			PositionB: d.PositionB,
+		})
+	}
+	if result.Summary == "" {
+		result.Summary = fmt.Sprintf("%d expert(s) responded.", len(responses))
+	}
+	return result
+}
+
+// synthesizeFallback is the original heuristic merge: notes that multiple
+// experts responded and pairs any WARN/PUSHBACK against ADVISE responses as
+// a contradiction. Used only when the real LLM synthesis (above) is
+// unavailable or fails — never the primary path anymore, but kept exactly as
+// it was so the degraded case has known, tested behaviour.
+func (o *Orchestrator) synthesizeFallback(responses []ExpertResponse) *SynthesisResult {
 	var advising []ExpertResponse
 	var warnings []ExpertResponse
 
@@ -535,7 +650,7 @@ func (o *Orchestrator) synthesize(responses []ExpertResponse) *SynthesisResult {
 		}
 	}
 
-	result := &SynthesisResult{}
+	result := &SynthesisResult{Method: "fallback"}
 
 	if len(advising) > 1 {
 		result.Agreements = []string{"Multiple experts have relevant knowledge on this topic"}
