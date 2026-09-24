@@ -68,17 +68,40 @@ type HistoryEntry struct {
 	Importance     int
 }
 
-// Assembler builds smart context for LLM calls.
-// Respects token budget: never exceeds MaxTokens.
+// Context budget policy (B9, §3.1 P5).
 //
-// Budget allocation (WHY these percentages):
-// 10% rolling summary — compressed history, always include
+// CONTEXT IS A BUDGET. Every turn must stay within MaxTokens. The system
+// prompt is NOT part of this budget: it is built separately by the
+// enforcer (chinawall.generateFlatText) and concatenated at call time, so
+// eviction of chat context can never delete it.
+//
+// Allocation (WHY these percentages):
+// 10% rolling summary — compressed history (prescriptive), keep
 // 20% L2 project memory — what other experts decided
-// 20% recent messages — last 3 turns for continuity
+// 20% recent messages — last N turns for continuity
 // 15% semantic history — relevant past turns
 // 35% course chunks — expert knowledge (most important)
 //
+// Eviction priority when the hard ceiling is hit (lowest value first):
+// semantic history → oldest recent → L2 tail → repo/course tail.
+// Never evicted: rolling summary (compressed) and the reply thread
+// (explicit client action — "if unsure whether an old step is needed
+// later, don't evict").
+//
 // WHY this order: Most important context last = less lost-in-middle.
+const (
+	budgetSummaryPct   = 10
+	budgetL2Pct        = 20
+	budgetRecentPct    = 20
+	budgetHistoryPct   = 15
+	budgetChunksPct    = 35
+	// budgetSummarySlack: rolling summary is compressed and high-value;
+	// allow it a little room beyond its strict 10% before dropping it.
+	budgetSummarySlack = 500
+)
+
+// Assembler builds smart context for LLM calls.
+// Respects token budget: never exceeds MaxTokens.
 type Assembler struct {
 	db          *pgxpool.Pool
 	embedder    ml.Embedder       // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
@@ -234,7 +257,7 @@ func (a *Assembler) Assemble(
 	// 1. Rolling summary (10% budget)
 	if summaryRes.err == nil && summaryRes.text != "" {
 		summaryTokens := estimateTokens(summaryRes.text)
-		if tokensUsed+summaryTokens <= budget*10/100+500 {
+		if tokensUsed+summaryTokens <= budget*budgetSummaryPct/100+budgetSummarySlack {
 			assembled.RollingSummary = summaryRes.text
 			tokensUsed += summaryTokens
 		}
@@ -248,7 +271,7 @@ func (a *Assembler) Assemble(
 	// cross-expert decisions could silently consume far more than its
 	// 2. L2 project memory (20% budget) — from fan-out result
 	if l2Res.err == nil && l2Res.projCtx != nil {
-		l2Budget := budget * 20 / 100
+		l2Budget := budget * budgetL2Pct / 100
 		l2Tokens := 0
 		kept := l2Res.projCtx.L2Entries[:0:0]
 		for _, entry := range l2Res.projCtx.L2Entries {
@@ -272,7 +295,7 @@ func (a *Assembler) Assemble(
 
 	// 3. Recent messages (20% budget) — from fan-out result
 	if recentRes.err == nil {
-		recentBudget := budget * 20 / 100
+		recentBudget := budget * budgetRecentPct / 100
 		recentTokens := 0
 		var kept []Message
 		for i := len(recentRes.msgs) - 1; i >= 0; i-- {
@@ -298,7 +321,7 @@ func (a *Assembler) Assemble(
 
 	// 4. Semantic history (15% budget) — from fan-out result
 	if historyRes.err == nil {
-		historyBudget := budget * 15 / 100
+		historyBudget := budget * budgetHistoryPct / 100
 		historyTokens := 0
 		var kept []HistoryEntry
 		for _, h := range historyRes.entries {
@@ -313,16 +336,28 @@ func (a *Assembler) Assemble(
 		tokensUsed += historyTokens
 	}
 
-	// 5. Course chunks — most important, always include (from fan-out result)
+	// 5. Course chunks — most important, always include (from fan-out result).
+	// B9: capped at the documented 35% slice (was unbounded — the main
+	// source of over-budget turns). Highest-rerank chunks win.
+	// chunkTokensUsed tracks the shared course+repo chunk slice separately
+	// from the cumulative total, so sections 1-4 don't consume chunk room.
+	chunksBudget := budget * budgetChunksPct / 100
+	chunkTokensUsed := 0
 	if chunksRes.err != nil {
 		a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
 			zap.String("expert_id", expertID.String()),
 			zap.Error(chunksRes.err),
 		)
 	} else {
-		assembled.CourseChunks = chunksRes.chunks
-		for _, c := range chunksRes.chunks {
-			tokensUsed += estimateTokens(c.Text)
+		kept, chunkTokens := trimChunksToBudget(chunksRes.chunks, chunksBudget)
+		assembled.CourseChunks = kept
+		chunkTokensUsed += chunkTokens
+		tokensUsed += chunkTokens
+		if len(kept) < len(chunksRes.chunks) {
+			a.logger.Debug("course chunks truncated to stay within their 35% budget",
+				zap.Int("kept", len(kept)),
+				zap.Int("total", len(chunksRes.chunks)),
+			)
 		}
 		if len(chunksRes.chunks) == 0 {
 			a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content",
@@ -332,21 +367,26 @@ func (a *Assembler) Assemble(
 		}
 	}
 
-	// 6. Connected repo code chunks (additive, optional) — from fan-out result
+	// 6. Connected repo code chunks (additive, optional) — from fan-out result.
+	// B9: shares the same 35% chunk slice; repo chunks are appended after
+	// course chunks, so they are the first evicted at the tail.
 	if repoChunksRes.err != nil {
 		a.logger.Warn("getRepoChunks failed — continuing without connected-repo context",
 			zap.String("project_id", projectID.String()),
 			zap.Error(repoChunksRes.err),
 		)
-	} else if len(repoChunksRes.chunks) > 0 && tokensUsed < budget*95/100 {
-		assembled.CourseChunks = append(assembled.CourseChunks, repoChunksRes.chunks...)
-		for _, c := range repoChunksRes.chunks {
-			tokensUsed += estimateTokens(c.Text)
+	} else if len(repoChunksRes.chunks) > 0 {
+		if room := chunksBudget - chunkTokensUsed; room > 0 {
+			kept, repoTokens := trimChunksToBudget(repoChunksRes.chunks, room)
+			assembled.CourseChunks = append(assembled.CourseChunks, kept...)
+			chunkTokensUsed += repoTokens
+			tokensUsed += repoTokens
 		}
 	}
 
 	// 7. Reply thread (CT-C2). Runs after fan-out — depends on replyToMessageID.
-	// Runs regardless of remaining budget: a reply is an explicit client action.
+	// Runs regardless of remaining budget: a reply is an explicit client action
+	// and is never evicted (B9 P5: unsure whether needed later → keep).
 	if replyToMessageID != nil {
 		thread, err := a.getReplyThread(ctx, *replyToMessageID, includeFullThread)
 		if err != nil {
@@ -362,15 +402,96 @@ func (a *Assembler) Assemble(
 		}
 	}
 
+	// 8. HARD CEILING (B9): the per-section caps above sum to ~100%, but
+	// the summary slack + reply thread can still push past the budget.
+	// Enforce an absolute cap by evicting lowest-value sections first.
+	tokensUsed = enforceHardCeiling(assembled, budget, tokensUsed, a.logger)
 	assembled.TotalTokens = tokensUsed
 
 	a.logger.Debug("context assembled",
 		zap.Int("tokens", tokensUsed),
+		zap.Int("budget", budget),
 		zap.Int("chunks", len(assembled.CourseChunks)),
 		zap.Int("turn", turnNumber),
 	)
 
 	return assembled, nil
+}
+
+// trimChunksToBudget returns as many leading chunks (best-reranked first)
+// as fit within tokenBudget, plus the tokens used. The last chunk is NOT
+// split — a half-chunk is worse than a missing one for grounding.
+// Pure — unit-tested.
+func trimChunksToBudget(chunks []chinawall.CourseChunk, tokenBudget int) ([]chinawall.CourseChunk, int) {
+	if tokenBudget <= 0 || len(chunks) == 0 {
+		return nil, 0
+	}
+	used := 0
+	var kept []chinawall.CourseChunk
+	for _, c := range chunks {
+		t := estimateTokens(c.Text)
+		if used+t > tokenBudget && len(kept) > 0 {
+			break
+		}
+		kept = append(kept, c)
+		used += t
+	}
+	return kept, used
+}
+
+// enforceHardCeiling guarantees TotalTokens <= budget by evicting
+// low-value sections in a fixed priority order (B9 P5). Never evicts the
+// rolling summary (compressed, high value) or the reply thread (explicit
+// client action). Returns the (reduced) token count. Deterministic.
+func enforceHardCeiling(assembled *AssembledContext, budget, tokensUsed int, logger *zap.Logger) int {
+	if assembled == nil || tokensUsed <= budget {
+		return tokensUsed
+	}
+	over := func() int { return tokensUsed - budget }
+
+	// Priority 1: semantic history (luxury — most queries don't need it).
+	for len(assembled.RelevantHistory) > 0 && tokensUsed > budget {
+		last := len(assembled.RelevantHistory) - 1
+		tokensUsed -= estimateTokens(assembled.RelevantHistory[last].OneLineSummary)
+		assembled.RelevantHistory = assembled.RelevantHistory[:last]
+	}
+	// Priority 2: oldest recent messages (keep newest for continuity).
+	for len(assembled.RecentMessages) > 1 && tokensUsed > budget {
+		tokensUsed -= estimateTokens(assembled.RecentMessages[0].Content)
+		assembled.RecentMessages = assembled.RecentMessages[1:]
+	}
+	// Priority 3: L2 project memory tail.
+	if assembled.ProjectContext != nil {
+		for len(assembled.ProjectContext.L2Entries) > 0 && tokensUsed > budget {
+			last := len(assembled.ProjectContext.L2Entries) - 1
+			tokensUsed -= estimateTokens(assembled.ProjectContext.L2Entries[last].Content)
+			assembled.ProjectContext.L2Entries = assembled.ProjectContext.L2Entries[:last]
+		}
+	}
+	// Priority 4: chunk tail (repo appended last → evicted first).
+	for len(assembled.CourseChunks) > 0 && tokensUsed > budget {
+		last := len(assembled.CourseChunks) - 1
+		tokensUsed -= estimateTokens(assembled.CourseChunks[last].Text)
+		assembled.CourseChunks = assembled.CourseChunks[:last]
+	}
+	// Priority 5 (last resort): rolling summary. Only if still over after
+	// every evictable section is gone — means the reply thread alone is
+	// over budget; drop the summary rather than violate the hard cap.
+	if tokensUsed > budget && assembled.RollingSummary != "" {
+		tokensUsed -= estimateTokens(assembled.RollingSummary)
+		assembled.RollingSummary = ""
+	}
+
+	if logger != nil && tokensUsed > budget {
+		// Reply thread alone exceeds the budget — explicit client action
+		// wins; log so operators can see a genuinely oversized reply.
+		logger.Warn("context still over budget after eviction (reply thread pinned)",
+			zap.Int("tokens", tokensUsed),
+			zap.Int("budget", budget),
+			zap.Int("over", over()),
+		)
+	}
+	return tokensUsed
 }
 
 // getReplyThread resolves reply context for a message that has a

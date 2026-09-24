@@ -340,6 +340,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Go, AI (context engineering), DB. |
 | **Files/Risk/Rollback** | `internal/message/*`, `internal/chat/*`, `internal/workflow/*` (context assembly). Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: long-thread test stays in budget and still answers with prior facts. |
+| **DONE (B9)** | Chat `Assemble()` now a hard budget. Named pct constants (summary 10, L2 20, recent 20, history 15, chunks 35). Course chunks capped at 35% via `trimChunksToBudget` (was unbounded — main overflow); repo chunks share that slice. New `enforceHardCeiling`: when total &gt; budget, evict lowest-value first — history → oldest recent → L2 tail → chunk tail; **never** the reply thread (explicit client action) and summary only as last resort; logs if reply thread alone is oversized. System prompt already separate (enforcer builds it, concatenated at call time) so eviction can't delete it. Rolling summary prompt made **prescriptive** (`buildRollingSummaryPrompt`: keep decisions/numbers/constraints/open items/commands). Token counting stays local (`estimateTokens`). Tests: `assembler_budget_test.go`, `summary_prompt_test.go`. |
 
 ---
 
@@ -491,7 +492,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B6 | answer quality regeneration | B | ✅ done | (pending PR, this branch) |
 | B7 | memory consolidation | B | ✅ done | (pending PR, this branch) |
 | B8 | verification-first answers | B | ✅ done | (pending PR, this branch) |
-| B9 | context-budget policy | B | ⬜ pending | — |
+| B9 | context-budget policy | B | ✅ done | (pending PR, this branch) |
 | C1 | provenance chain | C | ⬜ pending | — |
 | C2 | expert versioning/drift | C | ⬜ pending | — |
 | C3 | eval harness + golden set | C | ⬜ pending | — |
