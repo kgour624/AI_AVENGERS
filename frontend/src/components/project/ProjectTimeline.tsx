@@ -1,5 +1,4 @@
 import type { L3Event } from '@/types/memory'
-import { formatRelativeTime } from '@/utils/format'
 
 /**
  * L3 master event log visualization.

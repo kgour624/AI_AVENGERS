@@ -119,6 +119,10 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   // CT-D4: reply state, isolated per-chat via replyStore (CT-L10 —
   // does not touch streamStore or the message list at all).
   const replyState = useReplyStore((s) => s.replies.get(chatId))
+  // replyTarget: hoisted so the null-check is a single, well-narrowed binding.
+  // TS does not carry `replyState.target` narrowing into the .filter()
+  // callbacks below, but a stable local + optional chaining does.
+  const replyTarget = replyState?.target ?? null
   const setIncludeFullThread = useReplyStore((s) => s.setIncludeFullThread)
   const toggleLoopedInExpert = useReplyStore((s) => s.toggleLoopedInExpert)
   const clearReply = useReplyStore((s) => s.clearReply)
@@ -182,7 +186,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
       trimmed,
       Array.from(selectedIds),
       attachedFile ?? undefined,
-      replyState?.target.messageId,
+      replyTarget?.messageId,
       replyState?.includeFullThread
     )
     setMessage('')
@@ -261,13 +265,13 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
         </div>
       </div>
 
-      {replyState && (
+      {replyState && replyTarget && (
         <div className="mt-2 flex flex-col gap-2 rounded-md border border-brand/30 bg-brand/5 p-2">
           <div className="flex items-center justify-between">
             <p className="text-xs text-text-secondary">
-              Replying to{replyState.target.expertName ? ` ${replyState.target.expertName}` : ''}:{' '}
+              Replying to{replyTarget.expertName ? ` ${replyTarget.expertName}` : ''}:{' '}
               <span className="text-text-primary">
-                &ldquo;{replyState.target.preview}&rdquo;
+                &ldquo;{replyTarget.preview}&rdquo;
               </span>
             </p>
             <button
@@ -288,11 +292,11 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
             Include full thread (off by default, pins only the message above)
           </label>
 
-          {experts.filter((e) => e.expertId !== replyState.target.expertId).length > 0 && (
+          {experts.filter((e) => e.expertId !== replyTarget?.expertId).length > 0 && (
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs text-text-disabled">Loop in:</span>
               {experts
-                .filter((e) => e.expertId !== replyState.target.expertId)
+                .filter((e) => e.expertId !== replyTarget?.expertId)
                 .map((expert) => (
                   <label
                     key={expert.expertId}

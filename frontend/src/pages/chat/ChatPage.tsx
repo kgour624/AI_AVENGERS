@@ -169,8 +169,6 @@ export default function ChatPage() {
   // Feature #22: Track scroll position to show/hide "Scroll to Bottom" button
   const [showScrollButton, setShowScrollButton] = useState(false)
 
-  const expertsById = useMemo(() => new Map(experts.map((e) => [e.expertId, e])), [experts])
-
   const virtualizer = useVirtualizer({
     count: filteredMessages.length,
     getScrollElement: () => scrollContainerRef.current,

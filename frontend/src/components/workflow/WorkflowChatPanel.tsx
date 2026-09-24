@@ -83,11 +83,9 @@ function CreateChatForm({
 
 function ParticipantsRow({
   chatId,
-  workflowId,
   availableExperts,
 }: {
   chatId: string
-  workflowId: string
   availableExperts: WorkflowChatExpertOption[]
 }) {
   const queryClient = useQueryClient()
@@ -284,7 +282,7 @@ function MessageBubble({
           {message.expertName ?? 'Expert'}
         </span>
         {generic && (
-          <Badge variant={generic.genericBlocked === false ? 'warn' : 'neutral'}>
+          <Badge variant={generic.genericBlocked === false ? 'warning' : 'neutral'}>
             {generic.genericBlocked === false
               ? `generic ${generic.genericAllowancePct ?? 0}%`
               : 'trained only'}
@@ -333,7 +331,7 @@ function ChatThread({
 
   return (
     <div className="flex h-full flex-col">
-      <ParticipantsRow chatId={chatId} workflowId={workflowId} availableExperts={availableExperts} />
+      <ParticipantsRow chatId={chatId} availableExperts={availableExperts} />
 
       <div className="flex-1 space-y-2 overflow-y-auto p-3">
         {isLoading && <p className="text-xs text-text-disabled">Loading...</p>}

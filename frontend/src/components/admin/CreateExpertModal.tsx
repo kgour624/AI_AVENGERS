@@ -5,7 +5,6 @@ import { Input } from '@/components/ui/Input'
 import { Button } from '@/components/ui/Button'
 import { createExpert, getExpertCategories } from '@/api/admin'
 import { handleAPIError } from '@/utils/errors'
-import { cn } from '@/utils/cn'
 
 export interface CreateExpertModalProps {
   isOpen: boolean

@@ -92,7 +92,7 @@ function AmendmentCard({ workflowId, amendment }: { workflowId: string; amendmen
               ? 'success'
               : amendment.status === 'rejected'
                 ? 'danger'
-                : 'warn'
+                : 'warning'
           }
         >
           {amendment.status}
@@ -164,12 +164,6 @@ function AmendmentCard({ workflowId, amendment }: { workflowId: string; amendmen
             </>
           )}
         </div>
-      )}
-
-      {amendment.commitSha && (
-        <p className="mt-2 text-[10px] text-text-disabled">
-          committed {amendment.commitSha.slice(0, 8)}
-        </p>
       )}
     </Card>
   )

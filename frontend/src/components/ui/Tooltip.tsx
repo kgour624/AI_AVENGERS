@@ -7,7 +7,9 @@ import { cn } from '@/utils/cn'
  * dependency on chat-specific state.
  */
 export interface TooltipProps {
-  content: string
+  // ReactNode (not string): MessageInput passes a formatted <pre> for the
+  // keyboard-shortcut help. Rendering is a direct child, so any node works.
+  content: ReactNode
   children: ReactNode
   className?: string
 }

@@ -46,3 +46,25 @@ export const getMessages = (chatId: string, options?: { signal?: AbortSignal }) 
   baseAPI
     .get<ApiResponse<Message[]>>(`/api/v1/chats/${chatId}/messages`, { signal: options?.signal })
     .then((res) => res.data.data!)
+
+// #27: global (cross-project) chat search. One row per matching chat, carrying
+// the project name so a hit is recognizable without knowing where it lives.
+export interface ChatSearchResult {
+  chatId: string
+  chatTitle: string
+  projectId: string
+  projectName: string
+  messageCount: number
+  isArchived: boolean
+  updatedAt: string
+  titleMatch: boolean
+  contentMatches: number
+}
+
+export const searchChats = (query: string, options?: { signal?: AbortSignal }) =>
+  baseAPI
+    .get<ApiResponse<{ query: string; results: ChatSearchResult[] }>>('/api/v1/search/chats', {
+      params: { q: query },
+      signal: options?.signal,
+    })
+    .then((res) => res.data.data?.results ?? [])

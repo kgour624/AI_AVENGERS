@@ -10,14 +10,14 @@ import { Skeleton } from '@/components/ui/Skeleton'
 import { CreateWorkflowModal } from './CreateWorkflowModal'
 import { cn } from '@/utils/cn'
 
-const STATUS_VARIANT: Record<string, 'brand' | 'neutral' | 'warn' | 'refuse'> = {
+const STATUS_VARIANT: Record<string, 'brand' | 'neutral' | 'warning' | 'danger'> = {
   draft:                   'neutral',
   running:                 'brand',
-  paused_for_approval:     'warn',
-  paused_for_client_input: 'warn',
+  paused_for_approval:     'warning',
+  paused_for_client_input: 'warning',
   completed:               'neutral',
   cancelled:               'neutral',
-  failed:                  'refuse',
+  failed:                  'danger',
 }
 
 function WorkflowsPage() {

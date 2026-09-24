@@ -27,7 +27,7 @@ export function StreamingIndicator({ stream, expertCount }: { stream: StreamStat
       <div className="flex flex-wrap gap-4">
         {stream.expertResponses.map((response, i) => (
           <div key={response.expertId ?? i} className="flex flex-col items-center gap-1">
-            <ExpertAvatar domain={response.domain} status="responded" mode={response.mode} size="sm" />
+            <ExpertAvatar domain={response.domain ?? ''} status="responded" mode={response.mode} size="sm" />
             <span className="max-w-[72px] truncate text-xs text-text-secondary">
               {response.expertName ?? 'Expert'}
             </span>

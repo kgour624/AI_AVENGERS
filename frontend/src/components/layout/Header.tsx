@@ -3,6 +3,7 @@ import { useUIStore } from '@/stores/uiStore'
 import { useAuthStore } from '@/stores/authStore'
 import { logout as logoutApi } from '@/api/auth'
 import { queryClient } from '@/api/queryKeys'
+import { GlobalChatSearch } from '@/components/layout/GlobalChatSearch'
 
 export function Header() {
   const navigate = useNavigate()
@@ -34,6 +35,8 @@ export function Header() {
         </Link>
       </div>
       <div className="flex flex-shrink-0 items-center gap-2 sm:gap-4">
+        {/* #27: global chat search across every project. */}
+        <GlobalChatSearch />
         {isAdmin && (
           <Link to="/admin"
             className="text-xs font-medium uppercase tracking-wider text-glow-purple/70 transition-colors duration-150 ease-arc hover:text-glow-purple hover:drop-shadow-[0_0_8px_oklch(68%_0.28_295_/_0.6)] whitespace-nowrap">
