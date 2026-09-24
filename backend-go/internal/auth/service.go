@@ -15,6 +15,8 @@ import (
 	"github.com/pquerna/otp/totp"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
+
+	"ai_avengers/backend/internal/ports"
 )
 
 // User represents a user record from the database.
@@ -36,6 +38,9 @@ type AuthService struct {
 	db     *pgxpool.Pool
 	jwt    *JWTService
 	logger *zap.Logger
+	// publisher emits domain events (entitlement.granted) after grant writes.
+	// Optional — nil means no-op (Null Object via skip). Set via SetEventPublisher.
+	publisher ports.EventPublisher
 }
 
 // NewAuthService creates a new auth service.
@@ -44,6 +49,34 @@ func NewAuthService(db *pgxpool.Pool, jwt *JWTService, logger *zap.Logger) *Auth
 		db:     db,
 		jwt:    jwt,
 		logger: logger,
+	}
+}
+
+// SetEventPublisher wires the transactional outbox (or any ports.EventPublisher).
+// Safe to leave unset — grant flows work without events.
+func (s *AuthService) SetEventPublisher(p ports.EventPublisher) {
+	s.publisher = p
+}
+
+func (s *AuthService) publishGrantEvents(ctx context.Context, actorID, userID uuid.UUID, expertIDs []uuid.UUID) {
+	if s.publisher == nil || len(expertIDs) == 0 {
+		return
+	}
+	events := make([]ports.DomainEvent, 0, len(expertIDs))
+	for _, eid := range expertIDs {
+		events = append(events, ports.DomainEvent{
+			AggregateType: "entitlement",
+			AggregateID:   userID,
+			EventType:     "entitlement.granted",
+			Payload: map[string]interface{}{
+				"account_id": userID.String(),
+				"expert_id":  eid.String(),
+				"granted_by": actorID.String(),
+			},
+		})
+	}
+	if err := s.publisher.Publish(ctx, events...); err != nil {
+		s.logger.Warn("outbox publish entitlement.granted failed (non-fatal)", zap.Error(err))
 	}
 }
 
@@ -774,6 +807,10 @@ func (s *AuthService) CreateManagedAccount(ctx context.Context, actorID uuid.UUI
 		return nil, err
 	}
 
+	if req.Role == "domain_expert" && len(user.ExpertIDs) > 0 {
+		s.publishGrantEvents(ctx, actorID, user.ID, user.ExpertIDs)
+	}
+
 	s.logger.Info("managed account created",
 		zap.String("user_id", user.ID.String()),
 		zap.String("role", user.Role),
@@ -883,7 +920,11 @@ func (s *AuthService) SetAccountExpertGrants(ctx context.Context, actorID, userI
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.publishGrantEvents(ctx, actorID, userID, expertIDs)
+	return nil
 }
 
 // UpdateManagedAccount toggles is_active (and optional role stay).

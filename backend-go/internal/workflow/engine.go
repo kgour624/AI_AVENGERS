@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/observability"
 )
 
 // Phase constants — must match CHECK constraint in migration 006.
@@ -382,6 +384,7 @@ func (e *Engine) Fail(ctx context.Context, workflowID uuid.UUID, reason string) 
 	if err != nil {
 		return fmt.Errorf("workflow fail: %w", err)
 	}
+	observability.Global.IncWorkflowFailed()
 	e.logger.Error("workflow failed",
 		zap.String("workflow_id", workflowID.String()),
 		zap.String("reason", reason),

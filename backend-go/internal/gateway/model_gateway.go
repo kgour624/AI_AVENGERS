@@ -17,6 +17,7 @@ import (
 
 	"ai_avengers/backend/internal/config"
 	"ai_avengers/backend/internal/gateway/providers"
+	"ai_avengers/backend/internal/observability"
 )
 
 // LLMRequest is the input to the model gateway.
@@ -322,6 +323,8 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			currentCost := g.totalCost.Load().(float64)
 			g.totalCost.Store(currentCost + cost)
 			g.callCount.Add(1)
+			observability.Global.IncLLMCall()
+			observability.Global.AddLLMCost(cost)
 
 			// Attribute the spend to the workflow, if this call belongs to one.
 			// Only reached on a real provider call — the cache hit above
@@ -349,6 +352,7 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			}
 			return result, nil
 		}
+		observability.Global.IncLLMError()
 		return nil, lastErr
 	}
 
@@ -459,6 +463,8 @@ func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan s
 		currentCost := g.totalCost.Load().(float64)
 		g.totalCost.Store(currentCost + cost)
 		g.callCount.Add(1)
+		observability.Global.IncLLMCall()
+		observability.Global.AddLLMCost(cost)
 		g.logger.Info("LLM stream complete",
 			zap.String("provider", provider.Name()),
 			zap.String("tier", string(req.Model)),

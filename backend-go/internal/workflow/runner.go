@@ -17,6 +17,7 @@ import (
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/monitoring"
+	"ai_avengers/backend/internal/observability"
 )
 
 // maxDesignAttempts bounds how many times the design phases may be produced
@@ -149,6 +150,7 @@ func (r *WorkflowRunner) WithChangeRequestService(crSvc *ChangeRequestService) {
 func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	log := r.logger.With(zap.String("workflow_id", workflowID.String()))
 	log.Info("workflow runner started")
+	observability.Global.IncWorkflowStarted()
 
 	// Step 1: Load workflow.
 	wf, err := r.engine.GetByID(ctx, workflowID)
