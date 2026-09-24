@@ -116,6 +116,15 @@ type ChinaWallConfig struct {
 	RerankerThreshold float64
 	RelaxedThreshold  float64
 	MaxRetries        int
+	// QualityJudgeEnabled (B6): when true, flat-path answers are scored by
+	// an LLM-as-judge after Layer 4. Off = zero extra calls (rollback switch).
+	QualityJudgeEnabled bool
+	// QualityFloor: minimum Overall score (0-1) to accept. Below this the
+	// enforcer regenerates up to MaxQualityRetries times with judge feedback.
+	QualityFloor float64
+	// MaxQualityRetries: extra generate+judge cycles after the first. 0 =
+	// score only, never regenerate. Default 1 (bounded, P10).
+	MaxQualityRetries int
 }
 
 type ContextConfig struct {
@@ -218,9 +227,12 @@ func Load() (*Config, error) {
 			TimeoutSeconds: v.GetInt("ML_SIDECAR_TIMEOUT_SECONDS"),
 		},
 		ChinaWall: ChinaWallConfig{
-			RerankerThreshold: v.GetFloat64("CHINA_WALL_RERANKER_THRESHOLD"),
-			RelaxedThreshold:  v.GetFloat64("CHINA_WALL_RELAXED_THRESHOLD"),
-			MaxRetries:        v.GetInt("CHINA_WALL_MAX_RETRIES"),
+			RerankerThreshold:   v.GetFloat64("CHINA_WALL_RERANKER_THRESHOLD"),
+			RelaxedThreshold:    v.GetFloat64("CHINA_WALL_RELAXED_THRESHOLD"),
+			MaxRetries:          v.GetInt("CHINA_WALL_MAX_RETRIES"),
+			QualityJudgeEnabled: true, // B6 default on; overridden below if env set
+			QualityFloor:        v.GetFloat64("CHINA_WALL_QUALITY_FLOOR"),
+			MaxQualityRetries:   v.GetInt("CHINA_WALL_MAX_QUALITY_RETRIES"),
 		},
 		Context: ContextConfig{
 			MaxTokens:        v.GetInt("CONTEXT_MAX_TOKENS"),
@@ -261,6 +273,17 @@ func Load() (*Config, error) {
 				cfg.CORSAllowedOrigins = append(cfg.CORSAllowedOrigins, o)
 			}
 		}
+	}
+
+	// B6: GetBool is false when the env is absent, so only honour an
+	// explicit CHINA_WALL_QUALITY_JUDGE_ENABLED=false; absent → true.
+	if v.IsSet("CHINA_WALL_QUALITY_JUDGE_ENABLED") {
+		cfg.ChinaWall.QualityJudgeEnabled = v.GetBool("CHINA_WALL_QUALITY_JUDGE_ENABLED")
+	}
+	// MaxQualityRetries: absent → default 1 in applyDefaults; explicit 0
+	// stays 0 (score-only, no regen). Tracked via a sentinel when unset.
+	if !v.IsSet("CHINA_WALL_MAX_QUALITY_RETRIES") {
+		cfg.ChinaWall.MaxQualityRetries = -1 // sentinel: applyDefaults fills 1
 	}
 
 	// Validate required fields — fail fast
@@ -379,6 +402,15 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ChinaWall.MaxRetries == 0 {
 		c.ChinaWall.MaxRetries = 5
+	}
+	// B6 quality-judge numeric defaults. Bool default (true) is set in Load
+	// so an absent env does not flip the feature off. MaxQualityRetries
+	// sentinel -1 (absent) → 1; explicit 0 stays 0 (score-only).
+	if c.ChinaWall.QualityFloor <= 0 || c.ChinaWall.QualityFloor > 1 {
+		c.ChinaWall.QualityFloor = 0.7
+	}
+	if c.ChinaWall.MaxQualityRetries < 0 {
+		c.ChinaWall.MaxQualityRetries = 1
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000

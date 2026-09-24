@@ -20,6 +20,7 @@ import (
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/training"
+	"ai_avengers/backend/internal/workflow"
 )
 
 // AdminHandler handles all admin panel HTTP requests.
@@ -2442,4 +2443,182 @@ func (h *AdminHandler) UpdateEmbeddingSettings(c *gin.Context) {
 		"status": "updated",
 		"note":   "Changes take effect on next Embed() call. No restart needed.",
 	})
+}
+
+// ============================================================
+// GATE THRESHOLDS (B4) — per-domain Gate 1 usable/strong config
+// ============================================================
+//
+// Thresholds live in gate_thresholds (migration 025), not in code (P8).
+// Calibration from ratings only WRITES proposals (source='calibrated');
+// GateSystem only consumes source IN ('applied','manual'). Admin must
+// explicitly Apply — no blind auto-tune (P7; eval harness not yet in repo).
+
+// ListGateThresholds GET /admin/gate-thresholds
+// Returns every known domain + its row (if any) + the effective pair
+// GateSystem would use right now (applied/manual, else package default).
+func (h *AdminHandler) ListGateThresholds(c *gin.Context) {
+	rows, err := workflow.ListGateThresholds(c.Request.Context(), h.db)
+	if err != nil {
+		h.logger.Error("list gate thresholds failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	def := workflow.DefaultGateThresholds()
+	response.OK(c, gin.H{
+		"defaults": gin.H{
+			"usable": def.Usable,
+			"strong": def.Strong,
+			"source": def.Source,
+		},
+		"thresholds": rows,
+	})
+}
+
+// CalibrateGateThresholds POST /admin/gate-thresholds/calibrate
+// Aggregates ratings per expert domain and writes calibrated proposals
+// for domains with enough samples. Does NOT apply them.
+func (h *AdminHandler) CalibrateGateThresholds(c *gin.Context) {
+	proposed, err := workflow.ProposeGateThresholds(c.Request.Context(), h.db, h.logger)
+	if err != nil {
+		h.logger.Error("calibrate gate thresholds failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{
+		"proposed_count": len(proposed),
+		"proposed":       proposed,
+		"note":           "Proposals are source='calibrated' only. Call POST /admin/gate-thresholds/:domain/apply to make one live.",
+	})
+}
+
+// ApplyGateThreshold POST /admin/gate-thresholds/:domain/apply
+// Promotes a calibrated (or existing) row to source='applied'. Live for
+// GateSystem within thresholdCacheTTL (30s) or on next cold miss.
+func (h *AdminHandler) ApplyGateThreshold(c *gin.Context) {
+	domain := c.Param("domain")
+	adminID := c.MustGet("user_id").(uuid.UUID)
+	row, err := workflow.ApplyGateThreshold(c.Request.Context(), h.db, domain, adminID)
+	if err != nil {
+		h.logger.Warn("apply gate threshold failed",
+			zap.String("domain", domain), zap.Error(err))
+		response.BadRequest(c, "APPLY_FAILED", err.Error())
+		return
+	}
+	response.OK(c, row)
+}
+
+// SetGateThreshold PATCH /admin/gate-thresholds/:domain
+// Manual override — source='manual', immediately live.
+func (h *AdminHandler) SetGateThreshold(c *gin.Context) {
+	domain := c.Param("domain")
+	var req struct {
+		Usable float64 `json:"usable" binding:"required"`
+		Strong float64 `json:"strong" binding:"required"`
+		Notes  string  `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	adminID := c.MustGet("user_id").(uuid.UUID)
+	row, err := workflow.SetGateThreshold(
+		c.Request.Context(), h.db, domain, req.Usable, req.Strong, adminID, req.Notes,
+	)
+	if err != nil {
+		h.logger.Warn("set gate threshold failed",
+			zap.String("domain", domain), zap.Error(err))
+		response.BadRequest(c, "SET_FAILED", err.Error())
+		return
+	}
+	response.OK(c, row)
+}
+
+// ============================================================
+// GATE THRESHOLDS (B4) — per-domain Gate 1 usable/strong config
+// ============================================================
+//
+// Thresholds live in gate_thresholds (migration 025), not in code (P8).
+// Calibration from ratings only WRITES proposals (source='calibrated');
+// GateSystem only consumes source IN ('applied','manual'). Admin must
+// explicitly Apply — no blind auto-tune (P7; eval harness not yet in repo).
+
+// ListGateThresholds GET /admin/gate-thresholds
+// Returns every known domain + its row (if any) + the effective pair
+// GateSystem would use right now (applied/manual, else package default).
+func (h *AdminHandler) ListGateThresholds(c *gin.Context) {
+	rows, err := workflow.ListGateThresholds(c.Request.Context(), h.db)
+	if err != nil {
+		h.logger.Error("list gate thresholds failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	def := workflow.DefaultGateThresholds()
+	response.OK(c, gin.H{
+		"defaults": gin.H{
+			"usable": def.Usable,
+			"strong": def.Strong,
+			"source": def.Source,
+		},
+		"thresholds": rows,
+	})
+}
+
+// CalibrateGateThresholds POST /admin/gate-thresholds/calibrate
+// Aggregates ratings per expert domain and writes calibrated proposals
+// for domains with enough samples. Does NOT apply them.
+func (h *AdminHandler) CalibrateGateThresholds(c *gin.Context) {
+	proposed, err := workflow.ProposeGateThresholds(c.Request.Context(), h.db, h.logger)
+	if err != nil {
+		h.logger.Error("calibrate gate thresholds failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{
+		"proposed_count": len(proposed),
+		"proposed":       proposed,
+		"note":           "Proposals are source='calibrated' only. Call POST /admin/gate-thresholds/:domain/apply to make one live.",
+	})
+}
+
+// ApplyGateThreshold POST /admin/gate-thresholds/:domain/apply
+// Promotes a calibrated (or existing) row to source='applied'. Live for
+// GateSystem within thresholdCacheTTL (30s) or on next cold miss.
+func (h *AdminHandler) ApplyGateThreshold(c *gin.Context) {
+	domain := c.Param("domain")
+	adminID := c.MustGet("user_id").(uuid.UUID)
+	row, err := workflow.ApplyGateThreshold(c.Request.Context(), h.db, domain, adminID)
+	if err != nil {
+		h.logger.Warn("apply gate threshold failed",
+			zap.String("domain", domain), zap.Error(err))
+		response.BadRequest(c, "APPLY_FAILED", err.Error())
+		return
+	}
+	response.OK(c, row)
+}
+
+// SetGateThreshold PATCH /admin/gate-thresholds/:domain
+// Manual override — source='manual', immediately live.
+func (h *AdminHandler) SetGateThreshold(c *gin.Context) {
+	domain := c.Param("domain")
+	var req struct {
+		Usable float64 `json:"usable" binding:"required"`
+		Strong float64 `json:"strong" binding:"required"`
+		Notes  string  `json:"notes"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	adminID := c.MustGet("user_id").(uuid.UUID)
+	row, err := workflow.SetGateThreshold(
+		c.Request.Context(), h.db, domain, req.Usable, req.Strong, adminID, req.Notes,
+	)
+	if err != nil {
+		h.logger.Warn("set gate threshold failed",
+			zap.String("domain", domain), zap.Error(err))
+		response.BadRequest(c, "SET_FAILED", err.Error())
+		return
+	}
+	response.OK(c, row)
 }

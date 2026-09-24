@@ -3,11 +3,11 @@ package selflearning
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"go.uber.org/zap"
 
-	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/gateway"
 )
 
@@ -17,6 +17,33 @@ import (
 // already domain-aligned — processing adds latency with no accuracy gain.
 // The RAG vector search handles these correctly without extraction.
 const minTokensForProcessing = 20
+
+// minRunesForSpacelessQuestion is the fallback eligibility bar for scripts
+// that do not separate words with spaces (e.g. Chinese/Japanese). Without
+// it, a long CJK question is a single whitespace token and would always be
+// skipped. WHY 40 runes: matches roughly the 20-token bar for space-
+// separated text (CJK "words" average ~2 runes).
+const minRunesForSpacelessQuestion = 40
+
+// Guard bounds for the extracted question (B5). Fail-closed: any breach
+// rejects the extraction and the caller falls back to the ORIGINAL
+// question, so a degenerate rewrite can never reach RAG.
+const (
+	// minExtractedTokens: a rewrite shorter than this carries no signal.
+	minExtractedTokens = 4
+	// maxExtractLengthRatio: extracted must not balloon past this × the
+	// original token count — a sign the model narrated instead of extracting.
+	maxExtractLengthRatio = 2.0
+)
+
+// constraintTokenPatterns: deterministic signals that must survive
+// extraction. Numbers carry counts/limits/complexities; ALL-CAPS tokens
+// carry domain terms (BFS, SQL, API); quoted spans carry literal names.
+var (
+	numberRe = regexp.MustCompile(`\d+(?:\.\d+)?`)
+	capsRe   = regexp.MustCompile(`\b[A-Z][A-Z0-9]{1,}\b`)
+	quotedRe = regexp.MustCompile(`"([^"]+)"|'([^']+)'`)
+)
 
 // ProcessedQuestion is the output of QuestionProcessor.Process.
 // Original is NEVER modified — it is always the raw user question.
@@ -29,6 +56,12 @@ type ProcessedQuestion struct {
 	UnderstandingLog   string // Step 1 output — used by Step 3 verify
 	VerificationPassed bool   // true = use Extracted; false = use Original
 	SkippedReason      string // non-empty when processing was skipped
+
+	// Eval (B5, §3.1 P7): component-wise quality of the extraction,
+	// logged for observability. Routing does NOT consume it yet — the
+	// full eval-set harness is deferred to Phase C.
+	EvalScore   float64
+	EvalReasons []string
 }
 
 // understandingOutput holds the parsed result of Step 1.
@@ -71,7 +104,15 @@ func NewQuestionProcessor(gw *gateway.ModelGateway, logger *zap.Logger) *Questio
 // Process runs the Understand → Extract → Verify pipeline on the raw question.
 //
 // expertName, expertDomain, reasoningCharter come from the domain expert.
-// chunks are the already-retrieved course chunks (used for domain context).
+//
+// NOTE (B5): the previous `chunks []chinawall.CourseChunk` parameter was
+// declared but never used anywhere in the pipeline, and the chunks handed
+// in were retrieved by the assembler using the ORIGINAL (story-noisy)
+// question — i.e. exactly the wrong-retrieval signal this processor exists
+// to fix. Feeding them back would reinforce bad retrieval, so the dead
+// parameter was removed rather than wired. The extracted question is what
+// the decision engine later re-retrieves with (orchestrator.go), so
+// extraction still reaches RAG.
 //
 // Mental execution:
 //   Input: "Alice is on a chessboard. Knight moves. Find minimum moves."
@@ -97,18 +138,17 @@ func (p *QuestionProcessor) Process(
 	expertName string,
 	expertDomain string,
 	reasoningCharter string,
-	chunks []chinawall.CourseChunk,
 ) *ProcessedQuestion {
 	result := &ProcessedQuestion{
 		Original: question,
 	}
 
 	// Skip heuristic: very short questions are already domain-aligned.
-	// Counting whitespace-split tokens is O(n) but n is tiny (question length).
-	if len(strings.Fields(question)) < minTokensForProcessing {
+	if !shouldProcess(question) {
+		tokens, runes := countTokens(question), len([]rune(question))
 		result.SkippedReason = fmt.Sprintf(
-			"question too short (%d tokens < %d threshold)",
-			len(strings.Fields(question)), minTokensForProcessing,
+			"question too short (%d tokens / %d runes below threshold)",
+			tokens, runes,
 		)
 		p.logger.Debug("self-learning skipped: short question",
 			zap.String("expert", expertName),
@@ -158,6 +198,50 @@ func (p *QuestionProcessor) Process(
 	result.Extracted = extracted
 
 	// ============================================================
+	// STEP 2.5: DETERMINISTIC GUARDS (B5)
+	// Cheap, model-independent checks that run BEFORE the LLM verify so
+	// that a dropped constraint can never reach RAG even if Step 3 says
+	// YES. Fail-closed: on any breach the caller uses the Original.
+	// ============================================================
+	origTokens := countTokens(question)
+	extrTokens := countTokens(extracted)
+
+	// (a) Length guard: too short (no signal) or ballooned (narration).
+	if extrTokens < minExtractedTokens {
+		result.SkippedReason = fmt.Sprintf(
+			"guard_length: extracted too short (%d tokens < %d)", extrTokens, minExtractedTokens,
+		)
+		p.logger.Warn("self-learning guard: extracted too short — using original",
+			zap.String("expert", expertName), zap.String("reason", result.SkippedReason))
+		return result
+	}
+	if origTokens > 0 && float64(extrTokens) > maxExtractLengthRatio*float64(origTokens) {
+		result.SkippedReason = fmt.Sprintf(
+			"guard_length: extracted ballooned (%d > %.1f×%d)", extrTokens, maxExtractLengthRatio, origTokens,
+		)
+		p.logger.Warn("self-learning guard: extracted ballooned — using original",
+			zap.String("expert", expertName), zap.String("reason", result.SkippedReason))
+		return result
+	}
+
+	// (b) Constraint-preservation guard: numbers / ALL-CAPS domain terms /
+	// quoted literals present in the original must survive the rewrite.
+	missingConstraints := missingConstraintTokens(question, extracted)
+	if len(missingConstraints) > 0 {
+		result.SkippedReason = "guard_constraint_dropped: " + strings.Join(missingConstraints, ",")
+		p.logger.Warn("self-learning guard: constraints dropped — using original",
+			zap.String("expert", expertName),
+			zap.Strings("missing", missingConstraints),
+		)
+		return result
+	}
+
+	// Component-wise eval (B5/P7): always computed and logged so extraction
+	// quality is observable before it is chained into retrieval. Routing
+	// does not consume it yet (full eval harness deferred to Phase C).
+	result.EvalScore, result.EvalReasons = evaluateExtraction(question, extracted)
+
+	// ============================================================
 	// STEP 3: VERIFY
 	// Check extracted version against original.
 	// Ensures no important constraints or edge cases were dropped.
@@ -190,10 +274,114 @@ func (p *QuestionProcessor) Process(
 	p.logger.Info("self-learning processing complete",
 		zap.String("expert", expertName),
 		zap.String("domain", expertDomain),
-		zap.Int("original_tokens", len(strings.Fields(question))),
-		zap.Int("extracted_tokens", len(strings.Fields(extracted))),
+		zap.Int("original_tokens", origTokens),
+		zap.Int("extracted_tokens", extrTokens),
+		zap.Float64("eval_score", result.EvalScore),
+		zap.Strings("eval_reasons", result.EvalReasons),
 	)
 	return result
+}
+
+// countTokens counts whitespace-separated tokens. Single source of truth
+// so the eligibility check and the guards agree on length.
+func countTokens(s string) int {
+	return len(strings.Fields(s))
+}
+
+// shouldProcess reports whether a question is long enough to be worth the
+// 3-call pipeline. Space-separated scripts use the token bar; a question
+// with no spaces at all (CJK) is judged by rune count instead, so a long
+// spaceless question is not silently skipped.
+func shouldProcess(question string) bool {
+	if countTokens(question) >= minTokensForProcessing {
+		return true
+	}
+	return countTokens(question) <= 1 && len([]rune(question)) >= minRunesForSpacelessQuestion
+}
+
+// constraintTokens returns the deduplicated numbers, ALL-CAPS tokens and
+// quoted spans present in s — the signals extraction must not drop.
+func constraintTokens(s string) []string {
+	seen := make(map[string]struct{})
+	var out []string
+	add := func(tok string) {
+		tok = strings.TrimSpace(tok)
+		if tok == "" {
+			return
+		}
+		if _, ok := seen[tok]; ok {
+			return
+		}
+		seen[tok] = struct{}{}
+		out = append(out, tok)
+	}
+	for _, m := range numberRe.FindAllString(s, -1) {
+		add(m)
+	}
+	for _, m := range capsRe.FindAllString(s, -1) {
+		add(m)
+	}
+	for _, m := range quotedRe.FindAllStringSubmatch(s, -1) {
+		// Group 1 = double-quoted body, group 2 = single-quoted body.
+		if len(m) > 1 && m[1] != "" {
+			add(m[1])
+		} else if len(m) > 2 && m[2] != "" {
+			add(m[2])
+		}
+	}
+	return out
+}
+
+// missingConstraintTokens returns every constraint token found in original
+// that does not appear (case-sensitively for numbers/caps; the quoted body
+// is matched against the extraction as-is) in extracted.
+func missingConstraintTokens(original, extracted string) []string {
+	var missing []string
+	for _, tok := range constraintTokens(original) {
+		if !strings.Contains(extracted, tok) {
+			missing = append(missing, tok)
+		}
+	}
+	return missing
+}
+
+// evaluateExtraction is the component-wise eval (B5/P7). It scores the
+// rewrite on constraint preservation and length ratio, returning the score
+// plus human-readable reasons for the log. Pure function — unit-tested.
+func evaluateExtraction(original, extracted string) (float64, []string) {
+	reasons := make([]string, 0, 4)
+
+	origTokens := countTokens(original)
+	extrTokens := countTokens(extracted)
+
+	// Constraint component: fraction of original constraint tokens kept.
+	constraints := constraintTokens(original)
+	constraintScore := 1.0
+	if len(constraints) > 0 {
+		kept := len(constraints) - len(missingConstraintTokens(original, extracted))
+		constraintScore = float64(kept) / float64(len(constraints))
+		reasons = append(reasons, fmt.Sprintf("constraints %d/%d preserved", kept, len(constraints)))
+	} else {
+		reasons = append(reasons, "no explicit constraints in original")
+	}
+
+	// Length component: how close the rewrite is to the original length.
+	// A ratio near 1.0 is ideal; very small means over-compression.
+	lengthScore := 1.0
+	if origTokens > 0 {
+		ratio := float64(extrTokens) / float64(origTokens)
+		if ratio > 1.0 {
+			ratio = 1.0
+		}
+		lengthScore = ratio
+		reasons = append(reasons, fmt.Sprintf("length ratio %.2f (%d→%d tokens)", ratio, origTokens, extrTokens))
+	}
+
+	// Weighted total. Constraint preservation dominates (0.6) because a
+	// dropped limit is far worse than a slightly short rewrite.
+	score := 0.6*constraintScore + 0.4*lengthScore
+	reasons = append(reasons, fmt.Sprintf("score %.2f", score))
+	return score, reasons
 }
 
 // stepUnderstand runs Step 1: Expert reads problem through domain lens.

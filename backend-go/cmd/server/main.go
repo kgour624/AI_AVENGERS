@@ -391,7 +391,7 @@ func buildRouter(
 	// To disable: pass nil instead of questionProcessor to NewOrchestrator.
 	questionProcessor := selflearning.NewQuestionProcessor(modelGateway, logger)
 
-	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, questionProcessor, logger)
+	orch := orchestrator.NewOrchestrator(postgres.Pool, contextAssembler, decisionEngine, memManager, categoryRegistry, questionProcessor, modelGateway, logger)
 
 	// Initialize domain services
 	projectSvc := project.NewService(postgres.Pool, logger)
@@ -423,7 +423,7 @@ func buildRouter(
 	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, validationPipeline, logger)
 	// WorkflowRunner: drives workflows from start to completion.
 	wfPlanner := workflow.NewPlanner(modelGateway, logger)
-	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, contextAssembler, logger)
+	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, contextAssembler, memManager, logger)
 	// AiderRunner: executes implementation/qa phases using Aider.
 	// WHY separate from AgentLoop: File system as context, git history as memory.
 	// Workspace root: configurable via AIDER_WORKSPACE_ROOT env var.
@@ -466,7 +466,7 @@ func buildRouter(
 		logger,
 	)
 	// GateSystem holds no mutable state (assembler + logger only)
-	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
+	wfGateSystem := workflow.NewGateSystem(contextAssembler, postgres.Pool, logger)
 
 	wfQARunner := workflow.NewQARunner(
 		postgres.Pool, bbStore, wfGateSystem, modelGateway, wfSections, workspaceRoot, logger,
@@ -792,6 +792,12 @@ func buildRouter(
 		adminGroup.GET("/domain-profiles", adminHandler.ListDomainProfiles)
 		adminGroup.GET("/domain-profiles/:domain", adminHandler.GetDomainProfile)
 		adminGroup.PATCH("/domain-profiles/:domain", adminHandler.UpdateDomainProfile)
+		// Gate 1 thresholds (B4) — per-domain usable/strong config.
+		// Calibrate writes proposals only; Apply / Set make them live.
+		adminGroup.GET("/gate-thresholds", adminHandler.ListGateThresholds)
+		adminGroup.POST("/gate-thresholds/calibrate", adminHandler.CalibrateGateThresholds)
+		adminGroup.POST("/gate-thresholds/:domain/apply", adminHandler.ApplyGateThreshold)
+		adminGroup.PATCH("/gate-thresholds/:domain", adminHandler.SetGateThreshold)
 	}
 
 	return router

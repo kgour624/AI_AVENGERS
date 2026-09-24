@@ -13,6 +13,7 @@ import (
 	"ai_avengers/backend/internal/blackboard"
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/observability"
 )
 
@@ -54,20 +55,25 @@ type AgentLoop struct {
 	assembler      *appcontext.Assembler
 	gateSystem     *GateSystem
 	experienceBank *ExperienceBank
-	logger         *zap.Logger
+	// memManager (B3): optional write-back of settled workflow design
+	// decisions into L1/L2/L3 project memory. Nil-safe — when unset the
+	// loop still runs, it just does not populate memory (A6 injection
+	// then remains empty for workflow-only projects).
+	memManager *memory.Manager
+	logger     *zap.Logger
 }
 
-func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *gateway.ModelGateway, assembler *appcontext.Assembler, logger *zap.Logger) *AgentLoop {
+func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *gateway.ModelGateway, assembler *appcontext.Assembler, memManager *memory.Manager, logger *zap.Logger) *AgentLoop {
 	var gs *GateSystem
 	var eb *ExperienceBank
 	if assembler != nil {
-		gs = NewGateSystem(assembler, logger)
+		gs = NewGateSystem(assembler, db, logger)
 		eb = NewExperienceBank(db, logger)
 	}
 	return &AgentLoop{
 		db: db, tools: tools, store: store, gateway: gw,
 		assembler: assembler, gateSystem: gs, experienceBank: eb,
-		logger: logger,
+		memManager: memManager, logger: logger,
 	}
 }
 
@@ -330,12 +336,82 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 	// Signal task done via blackboard event.
 	_ = PostTaskStatus(ctx, a.store, req.WorkflowID, req.Expert.ID, "done")
 
+	// B3: write the settled design decision into project memory so A6's
+	// [PROJECT MEMORY] injection is actually populated for later waves /
+	// future workflows. One record per expert-task (final artifact only),
+	// never per iteration — §3.1 P4 (no noise). Non-fatal by design: a
+	// memory hiccup must never abort a finished task.
+	if result.Completed && result.ArtifactEventID != nil {
+		a.recordWorkflowDecision(ctx, req, *result.ArtifactEventID)
+	}
+
 	a.logger.Info("agent loop finished",
 		zap.String("expert", req.Expert.Name),
 		zap.Int("iterations", result.Iterations),
 		zap.Bool("completed", result.Completed),
 	)
 	return result, nil
+}
+
+// recordWorkflowDecision (B3) persists one L1/L2/L3 memory entry for a
+// completed design-phase expert task. Resolves project_id + client_id
+// from the workflows row (AgentLoopRequest does not carry them — only
+// WorkflowID), pulls a short content summary from the final blackboard
+// artifact, and hands off to memory.Manager.RecordTurn with chatID=nil
+// and messageID=nil (workflow has neither chats nor messages rows).
+//
+// Failures are logged and swallowed: memory is a side-channel; the
+// expert's artifact is already on the blackboard and is the source of
+// truth for this wave.
+func (a *AgentLoop) recordWorkflowDecision(ctx context.Context, req AgentLoopRequest, artifactEventID uuid.UUID) {
+	if a == nil || a.memManager == nil || a.db == nil {
+		return
+	}
+	var projectID, clientID uuid.UUID
+	err := a.db.QueryRow(ctx,
+		`SELECT project_id, client_id FROM workflows WHERE id = $1`,
+		req.WorkflowID,
+	).Scan(&projectID, &clientID)
+	if err != nil || projectID == uuid.Nil || clientID == uuid.Nil {
+		a.logger.Warn("agent loop: memory write-back skipped (workflow lookup)",
+			zap.String("workflow_id", req.WorkflowID.String()),
+			zap.Error(err),
+		)
+		return
+	}
+
+	// Content for L2: task title as the decision label; a compact
+	// phase/artifact tag as the context. Full artifact body already
+	// lives on the blackboard — we deliberately do not re-dump multi-KB
+	// content into L2 (P5: keep the persisted form compact). Truncation
+	// is also handled inside RecordTurn (500/200 char caps).
+	userMessage := req.TaskTitle
+	if userMessage == "" {
+		userMessage = req.TaskDescription
+	}
+	assistantResponse := fmt.Sprintf(
+		"workflow_design phase=%s workflow=%s artifact=%s expert=%s",
+		req.WorkflowPhase, req.WorkflowID.String(),
+		artifactEventID.String(), req.Expert.Name,
+	)
+
+	// RecordTurn itself is already async (spawns go routines for L1/L2/L3)
+	// and swallows write errors internally — safe to call inline.
+	a.memManager.RecordTurn(
+		ctx,
+		projectID, req.Expert.ID, clientID,
+		nil, // chatID: workflow has no chat row
+		nil, // messageID: workflow has no messages row
+		0,   // turnNumber: workflow has no chat turn counter
+		userMessage, assistantResponse,
+		"workflow_design",
+		4, // importance >= 3 → L1+L2+L3; design decisions are high-value
+	)
+	a.logger.Info("agent loop: workflow decision recorded to project memory",
+		zap.String("expert", req.Expert.Name),
+		zap.String("project_id", projectID.String()),
+		zap.String("task", req.TaskTitle),
+	)
 }
 
 // buildBlackboardContext builds context from blackboard artifacts only.

@@ -16,6 +16,7 @@ import (
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/ratelimit"
@@ -95,18 +96,63 @@ type ExpertResponse struct {
 
 // SynthesisResult holds the combined view when multiple experts respond.
 type SynthesisResult struct {
-	Agreements     []string       `json:"agreements"`
+	Agreements     []string        `json:"agreements"`
 	Contradictions []Contradiction `json:"contradictions"`
-	Summary        string         `json:"summary"`
+	Summary        string          `json:"summary"`
+	// Method (B1): "llm" when the real synthesis call succeeded, "fallback"
+	// when it was skipped/failed and the deterministic non-LLM merge ran
+	// instead (§3.1 P3 — a synthesis failure must degrade, not crash chat).
+	Method string `json:"method"`
+	// NeedsEscalation (B2): true when at least one contradiction's
+	// Resolution is escalate — the client must decide rather than just read
+	// a flagged note. Derived from len(Escalations) > 0, never set
+	// independently, so it can never disagree with the per-item policies.
+	NeedsEscalation bool `json:"needs_escalation"`
+	// Escalations (B2b): the subset of Contradictions whose Resolution is
+	// escalate, surfaced separately so the frontend does not have to filter
+	// Contradictions itself to build a "needs your decision" banner. Chat
+	// has no approval_requests table (that is workflow-only, G1) — the
+	// client acts by replying, same as a Gate 1 ASK's Questions.
+	Escalations []Contradiction `json:"escalations"`
+	// EscalationSummary is a one-line human summary of Escalations, empty
+	// when there are none.
+	EscalationSummary string `json:"escalation_summary,omitempty"`
 }
 
-// Contradiction is a point where two experts disagree.
+// Contradiction classification values (B2). Kept as named constants so the
+// policy is judgeable in one place, not scattered as string literals.
+const (
+	// ContradictionTypeContextConflict (Type-1): one expert's position
+	// conflicts with the provided context/evidence — catchable, so it can
+	// often be resolved deterministically against the source.
+	ContradictionTypeContextConflict = "context_conflict"
+	// ContradictionTypeFabrication (Type-2): an expert asserts something
+	// with no supporting evidence — hard to catch, so it is treated with
+	// more caution (never auto-noted away).
+	ContradictionTypeFabrication = "fabrication"
+
+	// ResolutionNoted: a real but minor difference the client can read past.
+	ResolutionNoted = "noted"
+	// ResolutionEscalate: the disagreement needs a client decision.
+	ResolutionEscalate = "escalate"
+)
+
+// Contradiction is a point where two experts disagree (B2). Beyond the two
+// positions it now carries the classification (Type) and the resolution
+// policy (Resolution) the synthesis decided for this specific disagreement.
 type Contradiction struct {
 	Topic     string `json:"topic"`
 	ExpertA   string `json:"expert_a"`
 	PositionA string `json:"position_a"`
 	ExpertB   string `json:"expert_b"`
 	PositionB string `json:"position_b"`
+	// Type is one of ContradictionType* — what kind of disagreement this is.
+	// Defaults to ContradictionTypeFabrication when the model omitted or
+	// returned an unknown value (fail-closed: treat as the harder case).
+	Type string `json:"type"`
+	// Resolution is one of Resolution* — what should happen. Defaults to
+	// ResolutionEscalate when missing/unknown (fail-closed §3.1 P3).
+	Resolution string `json:"resolution"`
 }
 
 // expertRecord holds DB data for an expert.
@@ -137,6 +183,12 @@ type Orchestrator struct {
 	// disabled) — loadExperts treats nil registry exactly like "expert has
 	// no category_id", never panics on nil dereference (see loadExperts).
 	categoryRegistry *category.Registry
+	// gw is used by synthesize (B1) for the real LLM synthesis call.
+	// Never nil in production (NewOrchestrator requires it); a nil gw only
+	// happens in tests that construct Orchestrator{} directly, and
+	// synthesize's nil-check falls back to the deterministic non-LLM merge
+	// so those tests keep working unchanged.
+	gw *gateway.ModelGateway
 	// selfLearning (Self-Learning Mode): nil = disabled (zero regression).
 	// When non-nil, processWithExpert runs Understand → Extract → Verify
 	// on the raw question before passing it to the decision engine.
@@ -175,6 +227,7 @@ func NewOrchestrator(
 	memManager *memory.Manager,
 	categoryRegistry *category.Registry,
 	selfLearning *selflearning.QuestionProcessor,
+	gw *gateway.ModelGateway,
 	logger *zap.Logger,
 ) *Orchestrator {
 	return &Orchestrator{
@@ -184,6 +237,7 @@ func NewOrchestrator(
 		memManager:       memManager,
 		categoryRegistry: categoryRegistry,
 		selfLearning:     selfLearning,
+		gw:               gw,
 		logger:           logger,
 		// Default: 5 burst, 2 requests/second per expert.
 		// WHY these numbers: LLM providers typically allow 5-10 RPM per key.
@@ -282,10 +336,12 @@ collected:
 		return nil, fmt.Errorf("all experts failed or timed out")
 	}
 
-	// Synthesize if multiple experts
+	// Synthesize if multiple experts. Uses timeoutCtx (not the outer ctx)
+	// so a slow synthesis call cannot run past the same 120s budget the
+	// expert collection above is already bound to.
 	var synthesis *SynthesisResult
 	if len(expertResponses) > 1 {
-		synthesis = o.synthesize(expertResponses)
+		synthesis = o.synthesize(timeoutCtx, expertResponses)
 	}
 
 	// Update memory async (non-blocking)
@@ -418,13 +474,16 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	timer.Start("self_learning")
 	questionForRAG := req.Message
 	if o.selfLearning != nil {
+		// B5: the dead CourseChunks argument was removed — it was
+		// retrieved with the ORIGINAL (story-noisy) question, so passing
+		// it into the extractor would reinforce wrong retrieval. The
+		// extracted question is what the decision engine re-retrieves with.
 		processed := o.selfLearning.Process(
 			ctx,
 			req.Message,
 			expert.Name,
 			expert.Domain,
 			expert.ReasoningCharter,
-			assembledCtx.CourseChunks,
 		)
 		if processed.VerificationPassed {
 			questionForRAG = processed.Extracted
@@ -520,9 +579,192 @@ func structurePermissionAskParent(gateStopped int, userMessageID uuid.UUID) *uui
 	return &id
 }
 
-// synthesize finds agreements and contradictions between expert responses.
-func (o *Orchestrator) synthesize(responses []ExpertResponse) *SynthesisResult {
-	// Simple synthesis: find ADVISE responses and note any WARN/REFUSE
+// synthesize merges multiple experts' actual answers into one coherent view
+// (B1). Previously this built pseudo-agreements/contradictions from Mode
+// alone (ADVISE vs WARN) without ever reading the answer text — two experts
+// giving the same advice in different words showed up as "agreement" with no
+// content, and a real semantic disagreement between two ADVISE responses was
+// invisible.
+//
+// One dedicated LLM call reads every expert's Content and returns a strict
+// JSON verdict (§3.1 P1: structured output, not prose we regex). Low
+// temperature, single pass (P11) — this is a synthesis/aggregation step, not
+// a reasoning task. On any failure (gw nil, call error, malformed JSON) it
+// falls back to the deterministic non-LLM merge (P3: degrade, don't crash
+// chat over a synthesis failure) — synthesizeFallback below is the original
+// logic, unchanged, so existing tests/behaviour for that path still hold.
+func (o *Orchestrator) synthesize(ctx context.Context, responses []ExpertResponse) *SynthesisResult {
+	if o.gw == nil {
+		return o.synthesizeFallback(responses)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("Multiple domain experts answered the same question independently. ")
+	sb.WriteString("Read their actual answers below and produce a synthesis.\n\n")
+	for i, r := range responses {
+		content := r.Content
+		if len(content) > 1500 {
+			content = content[:1500] + "\n... [truncated]"
+		}
+		fmt.Fprintf(&sb, "--- Expert %d: %s (domain: %s) ---\n%s\n\n", i+1, r.ExpertName, r.Domain, content)
+	}
+	sb.WriteString(
+		"Treat every expert's answer as a final verdict from their domain — do not " +
+			"discard or downweight any of them just because they differ from the majority.\n\n" +
+			"For each disagreement, classify it:\n" +
+			`  - "type": "context_conflict" if one position contradicts the provided ` +
+			"question/context, otherwise \"fabrication\" if a position has no supporting evidence.\n" +
+			`  - "resolution": "escalate" if the client must decide (the two positions are ` +
+			`materially incompatible or high-stakes), otherwise "noted" if it is a minor ` +
+			"difference the client can read past. When unsure, choose 'escalate'.\n\n" +
+			"Return JSON only, no prose outside the JSON:\n" +
+			`{"agreements": ["point experts agree on", ...], ` +
+			`"disagreements": [{"topic": "...", "expert_a": "name", "position_a": "...", ` +
+			`"expert_b": "name", "position_b": "...", "type": "context_conflict|fabrication", ` +
+			`"resolution": "noted|escalate"}], ` +
+			`"summary": "one paragraph synthesis for the client"}` +
+			"\nIf there are no real disagreements, disagreements must be an empty array — do not invent one.",
+	)
+
+	resp, err := o.gw.Call(ctx, gateway.LLMRequest{
+		Model:       gateway.ModelCheap,
+		UserPrompt:  sb.String(),
+		MaxTokens:   700,
+		Temperature: 0.1,
+	})
+	if err != nil {
+		o.logger.Warn("synthesize: LLM call failed, using fallback merge", zap.Error(err))
+		return o.synthesizeFallback(responses)
+	}
+
+	var parsed struct {
+		Agreements    []string `json:"agreements"`
+		Disagreements []struct {
+			Topic      string `json:"topic"`
+			ExpertA    string `json:"expert_a"`
+			PositionA  string `json:"position_a"`
+			ExpertB    string `json:"expert_b"`
+			PositionB  string `json:"position_b"`
+			Type       string `json:"type"`
+			Resolution string `json:"resolution"`
+		} `json:"disagreements"`
+		Summary string `json:"summary"`
+	}
+	clean := strings.TrimSpace(resp.Content)
+	clean = strings.TrimPrefix(clean, "```json")
+	clean = strings.TrimPrefix(clean, "```")
+	clean = strings.TrimSuffix(clean, "```")
+	clean = strings.TrimSpace(clean)
+	start := strings.Index(clean, "{")
+	end := strings.LastIndex(clean, "}")
+	if start == -1 || end == -1 || end < start {
+		o.logger.Warn("synthesize: LLM response had no JSON object, using fallback merge")
+		return o.synthesizeFallback(responses)
+	}
+	if err := json.Unmarshal([]byte(clean[start:end+1]), &parsed); err != nil {
+		o.logger.Warn("synthesize: LLM response JSON parse failed, using fallback merge", zap.Error(err))
+		return o.synthesizeFallback(responses)
+	}
+
+	result := &SynthesisResult{
+		Agreements: parsed.Agreements,
+		Summary:    parsed.Summary,
+		Method:     "llm",
+	}
+	for _, d := range parsed.Disagreements {
+		c := Contradiction{
+			Topic:      d.Topic,
+			ExpertA:    d.ExpertA,
+			PositionA:  d.PositionA,
+			ExpertB:    d.ExpertB,
+			PositionB:  d.PositionB,
+			Type:       normalizeContradictionType(d.Type),
+			Resolution: normalizeResolution(d.Resolution),
+		}
+		// Fail-closed (B2/§3.1 P3): a fabrication-typed disagreement is
+		// never silently "noted" away — force escalation for it even if
+		// the model said noted. context_conflict keeps the model's policy.
+		if c.Type == ContradictionTypeFabrication && c.Resolution == ResolutionNoted {
+			c.Resolution = ResolutionEscalate
+		}
+		result.Contradictions = append(result.Contradictions, c)
+	}
+	if result.Summary == "" {
+		result.Summary = fmt.Sprintf("%d expert(s) responded.", len(responses))
+	}
+	applyEscalations(result)
+	return result
+}
+
+// applyEscalations derives Escalations/EscalationSummary/NeedsEscalation
+// from Contradictions (B2b) — the single place that decides what counts as
+// "needs a client decision", so synthesize() and synthesizeFallback() can
+// never disagree with each other about it.
+func applyEscalations(result *SynthesisResult) {
+	for _, c := range result.Contradictions {
+		if c.Resolution == ResolutionEscalate {
+			result.Escalations = append(result.Escalations, c)
+		}
+	}
+	result.NeedsEscalation = len(result.Escalations) > 0
+	if result.NeedsEscalation {
+		result.EscalationSummary = fmt.Sprintf(
+			"%d point(s) need your decision: %s",
+			len(result.Escalations),
+			escalationTopics(result.Escalations),
+		)
+	}
+}
+
+// escalationTopics joins each escalation's Topic (falling back to
+// "ExpertA vs ExpertB" when Topic is empty) into a short comma-separated
+// list for EscalationSummary.
+func escalationTopics(escalations []Contradiction) string {
+	topics := make([]string, 0, len(escalations))
+	for _, e := range escalations {
+		t := e.Topic
+		if t == "" {
+			t = fmt.Sprintf("%s vs %s", e.ExpertA, e.ExpertB)
+		}
+		topics = append(topics, t)
+	}
+	return strings.Join(topics, "; ")
+}
+
+// normalizeContradictionType maps the model's raw "type" to a known value,
+// defaulting to fabrication (the harder case) when missing or unrecognised
+// — fail-closed: never let an unknown value be treated as the mild case.
+func normalizeContradictionType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case ContradictionTypeContextConflict:
+		return ContradictionTypeContextConflict
+	case ContradictionTypeFabrication:
+		return ContradictionTypeFabrication
+	default:
+		return ContradictionTypeFabrication
+	}
+}
+
+// normalizeResolution maps the model's raw "resolution" to a known value,
+// defaulting to escalate when missing or unrecognised — fail-closed: an
+// unclassified disagreement needs a client decision, not a silent note.
+func normalizeResolution(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case ResolutionNoted:
+		return ResolutionNoted
+	case ResolutionEscalate:
+		return ResolutionEscalate
+	default:
+		return ResolutionEscalate
+	}
+}
+
+// synthesizeFallback is the original heuristic merge: notes that multiple
+// experts responded and pairs any WARN/PUSHBACK against ADVISE responses as
+// a contradiction. Used only when the real LLM synthesis (above) is
+// unavailable or fails — never the primary path anymore, but kept exactly as
+// it was so the degraded case has known, tested behaviour.
+func (o *Orchestrator) synthesizeFallback(responses []ExpertResponse) *SynthesisResult {
 	var advising []ExpertResponse
 	var warnings []ExpertResponse
 
@@ -535,7 +777,7 @@ func (o *Orchestrator) synthesize(responses []ExpertResponse) *SynthesisResult {
 		}
 	}
 
-	result := &SynthesisResult{}
+	result := &SynthesisResult{Method: "fallback"}
 
 	if len(advising) > 1 {
 		result.Agreements = []string{"Multiple experts have relevant knowledge on this topic"}
@@ -543,17 +785,23 @@ func (o *Orchestrator) synthesize(responses []ExpertResponse) *SynthesisResult {
 
 	for _, w := range warnings {
 		for _, a := range advising {
+			// Fail-closed policy for the degraded path too (B2): a
+			// warn-vs-advise split is treated as an escalate-worthy
+			// context conflict rather than silently noted.
 			result.Contradictions = append(result.Contradictions, Contradiction{
-				Topic:     "approach",
-				ExpertA:   a.ExpertName,
-				PositionA: "Proceed with implementation",
-				ExpertB:   w.ExpertName,
-				PositionB: w.Warning,
+				Topic:      "approach",
+				ExpertA:    a.ExpertName,
+				PositionA:  "Proceed with implementation",
+				ExpertB:    w.ExpertName,
+				PositionB:  w.Warning,
+				Type:       ContradictionTypeContextConflict,
+				Resolution: ResolutionEscalate,
 			})
 		}
 	}
 
 	result.Summary = fmt.Sprintf("%d expert(s) responded. Review each response carefully.", len(responses))
+	applyEscalations(result)
 	return result
 }
 
@@ -567,17 +815,20 @@ func (o *Orchestrator) updateMemory(ctx context.Context, req OrchestratorRequest
 		if resp.Mode == decision.ModeADVISE {
 			importance = 4
 		}
-		// Bug 3.2 fix (docs bug list): pass nil, not uuid.New(). The real
-		// assistant message row does not exist yet at this point (it is
-		// saved separately by message/handler.go's saveAssistantMessage,
-		// possibly in a goroutine that has not completed) - a fabricated
-		// random UUID here violated master_event_log's message_id FK on
-		// every turn. RecordTurn's messageID param is now *uuid.UUID
-		// (nullable), matching the nullable FK column exactly.
+		// Bug 3.2 fix (docs bug list): pass nil messageID, not uuid.New().
+		// The real assistant message row does not exist yet at this point
+		// (it is saved separately by message/handler.go's
+		// saveAssistantMessage, possibly in a goroutine that has not
+		// completed) - a fabricated random UUID here violated
+		// master_event_log's message_id FK on every turn. RecordTurn's
+		// messageID param is *uuid.UUID (nullable), matching the nullable
+		// FK column exactly. B3: chatID is also *uuid.UUID — chat path
+		// still passes the real chat; workflow path will pass nil.
+		chatID := req.ChatID
 		o.memManager.RecordTurn(
 			ctx,
 			req.ProjectID, resp.ExpertID, req.ClientID,
-			req.ChatID, nil,
+			&chatID, nil,
 			req.TurnNumber,
 			req.Message, resp.Content,
 			string(resp.Mode), importance,

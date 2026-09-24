@@ -256,6 +256,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, Multi-agent, Go. |
 | **Files/Risk/Rollback** | `internal/orchestrator/*`, maybe `decision/*`. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: seed two experts that conflict and inspect the result JSON. |
+| **DONE (B2 + B2b)** | `Contradiction` gained `Type`/`Resolution` (normalize* fail-closed: unknown type→fabrication, unknown resolution→escalate; fabrication never downgraded to noted). `SynthesisResult` gained `Escalations` (the escalate subset), `EscalationSummary`, `NeedsEscalation` — derived once in `applyEscalations`, used by both `synthesize` and `synthesizeFallback`. Chat has no approval_requests table (workflow-only, G1); the client acts by replying, same as a Gate 1 ASK. |
 
 ### B3 — Workflow memory write-back (complete A6)
 | Part | Detail |
@@ -267,6 +268,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Go, DB (nullable FK, add/upsert), AI (memory tiers). |
 | **Files/Risk/Rollback** | `internal/workflow/agent_loop.go` or `runner.go`; `internal/memory/manager.go` (signature), `internal/orchestrator/orchestrator.go` (caller). Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: run a workflow then query L2 memory for the project. |
+| **DONE (B3)** | `RecordTurn` chatID → `*uuid.UUID` (orchestrator passes `&req.ChatID`; workflow passes `nil`). `AgentLoop` gains optional `*memory.Manager`; on `Completed && ArtifactEventID != nil` calls `recordWorkflowDecision` (looks up `project_id`/`client_id` from `workflows`, writes L1+L2+L3 via `RecordTurn` with `decisionMode="workflow_design"`, importance 4, chatID/messageID nil). One record per expert-task (not per iteration). Upsert/decay deferred to B7. |
 
 ### B4 — Gate threshold calibration from feedback
 | Part | Detail |
@@ -278,6 +280,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, System Design, DB. |
 | **Files/Risk/Rollback** | `internal/decision/*`, `internal/rating/*`, config. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: seed ratings and observe threshold shift. |
+| **DONE (B4)** | Migration `025_gate_thresholds` (per-domain usable/strong, source calibrated/applied/manual). `GateSystem` takes `db`, `thresholdsFor(domain)` with 30s cache — only applied/manual live; missing row → package defaults (byte-identical to pre-B4). `RunGates` + `HasKnowledge(domain)` use it. `ProposeGateThresholds` from ratings (min 20 samples; high-accept loosen / high-reject tighten; never overwrites applied/manual). Admin: `GET/POST calibrate/POST apply/PATCH` under `/admin/gate-thresholds`. P7: no blind auto-apply (eval harness deferred). |
 
 ### B5 — Question pre-processing / self-learning hardening
 | Part | Detail |
@@ -289,6 +292,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, Go. |
 | **Files/Risk/Rollback** | `internal/*` self-learning package. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: DSA story problem → correct chunks. |
+| **DONE (B5)** | Removed the dead `chunks []chinawall.CourseChunk` param from `Process` (it was never used, and the chunks were retrieved with the story-noisy original question — feeding them back would reinforce wrong retrieval). Added deterministic fail-closed guards BEFORE the LLM verify: length (too short / ballooned >2×) and constraint preservation (numbers, ALL-CAPS domain terms, quoted literals from the original must survive the rewrite). Added component-wise `evaluateExtraction` (constraint-preservation 0.6 + length ratio 0.4) logged via `EvalScore`/`EvalReasons` — observability only, routing unchanged (full eval harness deferred). Token eligibility now handles space-less CJK via rune count. Pure funcs unit-tested in `processor_test.go`. |
 
 ### B6 — Answer quality scoring & regeneration
 | Part | Detail |
@@ -300,6 +304,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, China Wall, Go. |
 | **Files/Risk/Rollback** | `internal/chinawall/*`, `internal/decision/*`. Risk: Medium–High (cost). Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: force a weak answer and observe one regeneration. |
+| **DONE (B6)** | Flat-path only. `ChinaWallConfig` + Load defaults: `QualityJudgeEnabled` (absent env → true via `IsSet`), `QualityFloor` 0.7, `MaxQualityRetries` 1 (absent → 1, explicit 0 = score-only). `quality_judge.go`: `judgeAnswer` via `ModelFast` (divergent from generator `ModelStrong`); strict JSON rubric accuracy/coverage/structure/overall + feedback; top-level filter `Overall >= floor` (not average); parse clamp [0,1]; fail-open on LLM/parse error (`Method=fail_open`, score 0, no regen). `applyQualityGate` after Layer 4 success; regen up to N with `REVISION FEEDBACK` on user prompt, `tokenCh=nil` (no second stream); keeps best by overall; never refuses a cited answer after retries. `generateWithCitations` variadic `revisionFeedback`; empty = first-generate byte-identical. `EnforceResult.QualityScore`. Kill switch: `CHINA_WALL_QUALITY_JUDGE_ENABLED=false`. Structured path deferred. Tests: `quality_judge_test.go` (parse/fence/clamp/top-level/cap). |
 
 ### B7 — Project memory consolidation (L2 → summaries → L3)
 | Part | Detail |
@@ -476,12 +481,12 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A17 | watcher/main single-flight | A | ✅ done | (pending PR, this branch) |
 | A18 | watcher waves=nil | A | ✅ done | (pending PR, this branch) |
 | A19 | escalation deadlock/cycle guard | A | ✅ done | (pending PR, this branch) |
-| B1 | LLM synthesis | B | ⬜ pending | — |
-| B2 | semantic contradiction detection | B | ⬜ pending | — |
-| B3 | workflow memory write-back | B | ⬜ pending | — |
-| B4 | gate threshold calibration | B | ⬜ pending | — |
-| B5 | self-learning hardening | B | ⬜ pending | — |
-| B6 | answer quality regeneration | B | ⬜ pending | — |
+| B1 | LLM synthesis | B | ✅ done | (pending PR, this branch) |
+| B2 | semantic contradiction detection | B | ✅ done | (pending PR, this branch) |
+| B3 | workflow memory write-back | B | ✅ done | (pending PR, this branch) |
+| B4 | gate threshold calibration | B | ✅ done | (pending PR, this branch) |
+| B5 | self-learning hardening | B | ✅ done | (pending PR, this branch) |
+| B6 | answer quality regeneration | B | ✅ done | (pending PR, this branch) |
 | B7 | memory consolidation | B | ⬜ pending | — |
 | B8 | verification-first answers | B | ⬜ pending | — |
 | B9 | context-budget policy | B | ⬜ pending | — |
