@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -13,9 +16,23 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/observability"
 )
+
+// defaultIngestionWorkers bounds how many topic/embed batches run at once (T3).
+//
+// WHY 3: it mirrors orchestrator.expertMaxConcurrency (3). The bottleneck in
+// both parallel stages is external — the LLM provider's rate limit for topic
+// extraction, the ML sidecar's CPU for embeddings — not this process's CPU.
+// Adding workers past the provider's capacity only moves the queue to the
+// provider; 3 keeps chunks flowing without tripping rate limits or spawning a
+// goroutine per batch on a 15k-chunk transcript.
+//
+// Overridable with INGESTION_WORKERS (bounded 1..32) so a beefier sidecar or a
+// higher-rate provider key can be exploited without a code change.
+const defaultIngestionWorkers = 3
 
 // IngestionPipeline orchestrates the full transcript ingestion process.
 // Flow: Load text -> Clean -> Chunk -> Extract topics -> Embed -> Store
@@ -34,6 +51,11 @@ type IngestionPipeline struct {
 	topics   *TopicExtractor
 	charters *CharterExtractor
 	capability *CapabilityBuilder
+	// events is the durable job timeline (T1). Nil-safe: when unwired, emits
+	// are dropped and ingestion behaves exactly as before.
+	events  *jobevents.Store
+	// workers caps concurrent topic/embed batches (T3).
+	workers int
 	logger   *zap.Logger
 }
 
@@ -45,13 +67,28 @@ type IngestionPipeline struct {
 // sidecar is kept as a separate *ml.SidecarClient because the smoke test
 // step calls Rerank(), which is sidecar-only and NOT part of the Embedder
 // interface (locked decision: reranking always stays on the Python sidecar).
+//
+// events is the durable job event log (T1). Nil is a valid value (events
+// unwired / table not yet migrated) — every emit site is nil-safe, so
+// ingestion never depends on the timeline being wired.
 func NewIngestionPipeline(
 	db *pgxpool.Pool,
 	embedder ml.Embedder,
 	sidecar *ml.SidecarClient,
 	gw *gateway.ModelGateway,
+	events *jobevents.Store,
 	logger *zap.Logger,
 ) *IngestionPipeline {
+	workers := defaultIngestionWorkers
+	if raw := os.Getenv("INGESTION_WORKERS"); raw != "" {
+		if n, parseErr := strconv.Atoi(raw); parseErr == nil && n >= 1 && n <= 32 {
+			workers = n
+		} else {
+			logger.Warn("invalid INGESTION_WORKERS, using default",
+				zap.String("value", raw), zap.Int("default", defaultIngestionWorkers))
+		}
+	}
+
 	return &IngestionPipeline{
 		db:         db,
 		embedder:   embedder,
@@ -61,8 +98,69 @@ func NewIngestionPipeline(
 		topics:     NewTopicExtractor(gw, embedder, logger),
 		charters:   NewCharterExtractor(gw, logger),
 		capability: NewCapabilityBuilder(gw, logger),
+		events:     events,
+		workers:    workers,
 		logger:     logger,
 	}
+}
+
+// emit appends one timeline event (T1). Best-effort by design: a broken
+// timeline must never abort an ingestion run, so a failure is logged, not
+// propagated.
+func (p *IngestionPipeline) emit(ctx context.Context, jobID, expertID uuid.UUID, stage, kind string, detail interface{}) {
+	if p.events == nil {
+		return
+	}
+	if _, err := p.events.Append(ctx, jobevents.AppendRequest{
+		JobID:    jobID,
+		ExpertID: expertID,
+		Stage:    stage,
+		Kind:     kind,
+		Detail:   detail,
+	}); err != nil {
+		p.logger.Warn("ingestion event append failed (non-fatal)",
+			zap.String("kind", kind),
+			zap.String("stage", stage),
+			zap.Error(err),
+		)
+	}
+}
+
+// emitFinal appends a terminal event (complete/failed/paused) using a fresh
+// context when the run's context is already cancelled — otherwise a timeout or
+// shutdown would erase the one event an admin most needs to see.
+func (p *IngestionPipeline) emitFinal(ctx context.Context, jobID, expertID uuid.UUID, stage, kind string, detail interface{}) {
+	if p.events == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		fresh, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		ctx = fresh
+	}
+	p.emit(ctx, jobID, expertID, stage, kind, detail)
+}
+
+// beginStage records the stage transition (job row) and emits stage_started.
+// Returns the start time to hand to endStage.
+func (p *IngestionPipeline) beginStage(ctx context.Context, jobID, expertID uuid.UUID, stage, detail string) time.Time {
+	p.updateStage(ctx, jobID, stage, detail)
+	p.emit(ctx, jobID, expertID, stage, jobevents.KindStageStarted, map[string]interface{}{
+		"detail": detail,
+	})
+	return time.Now()
+}
+
+// endStage emits stage_done with the measured duration plus any extra facts
+// the caller wants on the timeline.
+func (p *IngestionPipeline) endStage(ctx context.Context, jobID, expertID uuid.UUID, stage string, startedAt time.Time, extra map[string]interface{}) {
+	detail := map[string]interface{}{
+		"duration_ms": time.Since(startedAt).Milliseconds(),
+	}
+	for k, v := range extra {
+		detail[k] = v
+	}
+	p.emit(ctx, jobID, expertID, stage, jobevents.KindStageDone, detail)
 }
 
 // currentEmbedding reads the active embedding provider/model from
@@ -168,6 +266,20 @@ func (p *IngestionPipeline) IngestTranscript(
 	// Update job status to running
 	p.updateJobStatus(ctx, jobID, "running", "", 0, 0)
 
+	// T1: open the timeline for this run. `resumed` + the checkpoint stage tell
+	// the admin at a glance whether this is a fresh run or a continuation.
+	resumedFrom := ""
+	if isResume && cp != nil {
+		resumedFrom = cp.Stage
+	}
+	p.emit(ctx, jobID, expertID, StagePending, jobevents.KindRunStarted, map[string]interface{}{
+		"resumed":          isResume,
+		"resumed_from":     resumedFrom,
+		"workers":          p.workers,
+		"transcript_chars": len(transcript),
+		"source_file":      sourceFile,
+	})
+
 	// ============================================================
 	// STEP 0: TRANSCRIPT CLEANING (always runs, before chunking)
 	// ============================================================
@@ -184,6 +296,14 @@ func (p *IngestionPipeline) IngestTranscript(
 	if transcript != "" {
 		cleaner := NewTranscriptCleaner()
 		originalLen := len(transcript)
+		// NOTE: cleaning is not one of the 6 UI stages, so it does not touch
+		// current_stage (which has a CHECK constraint). It is emitted as its
+		// own timeline entry so the log still shows where the time went.
+		cleanStarted := time.Now()
+		p.emit(ctx, jobID, expertID, "cleaning", jobevents.KindStageStarted, map[string]interface{}{
+			"label":          "Cleaning transcript",
+			"original_chars": originalLen,
+		})
 		ptimer.Start("clean")
 		transcript = cleaner.Clean(transcript)
 		ptimer.Stop("clean")
@@ -192,6 +312,12 @@ func (p *IngestionPipeline) IngestTranscript(
 		if originalLen > 0 {
 			reductionPct = (originalLen - cleanedLen) * 100 / originalLen
 		}
+		p.emit(ctx, jobID, expertID, "cleaning", jobevents.KindStageDone, map[string]interface{}{
+			"duration_ms":    time.Since(cleanStarted).Milliseconds(),
+			"original_chars": originalLen,
+			"cleaned_chars":  cleanedLen,
+			"reduction_pct":  reductionPct,
+		})
 		p.logger.Info("transcript cleaned",
 			zap.Int("original_chars", originalLen),
 			zap.Int("cleaned_chars", cleanedLen),
@@ -200,6 +326,9 @@ func (p *IngestionPipeline) IngestTranscript(
 		if cleanedLen == 0 {
 			err := fmt.Errorf("transcript is empty after cleaning")
 			p.updateJobStatus(ctx, jobID, "failed", err.Error(), 0, 0)
+			p.emitFinal(ctx, jobID, expertID, "cleaning", jobevents.KindFailed, map[string]interface{}{
+				"reason": err.Error(),
+			})
 			return nil, err
 		}
 	}
@@ -210,6 +339,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	// If resuming from topic_extraction or later, load chunks from DB
 	// instead of re-chunking (chunking is deterministic but expensive for large transcripts).
 	var chunks []TextChunk
+	chunkStarted := time.Now()
 	if isResume && StageOrder[cp.Stage] >= StageOrder[StageTopicExtraction] {
 		// Load existing chunks from DB — scoped to THIS job's source file.
 		// WHY sourceFile filter: without it, loadChunksFromDB returns ALL
@@ -223,18 +353,34 @@ func (p *IngestionPipeline) IngestTranscript(
 			chunks = p.chunker.Chunk(transcript)
 		}
 		p.logger.Info("resume: loaded chunks from DB", zap.Int("count", len(chunks)))
+		// Resume path: chunking was already done in an earlier run. Record it
+		// so the timeline shows where the stored chunks came from instead of
+		// silently skipping step 1.
+		p.emit(ctx, jobID, expertID, StageChunking, jobevents.KindStageDone, map[string]interface{}{
+			"chunks":          len(chunks),
+			"from_checkpoint": true,
+		})
 	} else {
-		p.updateStage(ctx, jobID, StageChunking, "Splitting transcript...")
+		chunkStarted = p.beginStage(ctx, jobID, expertID, StageChunking, "Splitting transcript...")
 		ptimer.Start("chunk")
 		chunks = p.chunker.Chunk(transcript)
 		ptimer.Stop("chunk")
 		if len(chunks) == 0 {
 			err := fmt.Errorf("no chunks created from transcript")
 			p.updateJobStatus(ctx, jobID, "failed", err.Error(), 0, 0)
+			p.emitFinal(ctx, jobID, expertID, StageChunking, jobevents.KindFailed, map[string]interface{}{
+				"reason": err.Error(),
+			})
 			return nil, err
 		}
+		p.endStage(ctx, jobID, expertID, StageChunking, chunkStarted, map[string]interface{}{
+			"chunks": len(chunks),
+		})
 	}
 	p.logger.Info("chunking complete", zap.Int("chunks", len(chunks)))
+	// Publish the denominator immediately so the UI can render "0 / N" before
+	// the first batch finishes.
+	p.updateJobProgress(ctx, jobID, 0, len(chunks))
 
 	// Init progress tracker and checkpoint writer
 	tracker := NewProgressTracker(p.db, jobID, len(chunks), p.logger)
@@ -254,99 +400,169 @@ func (p *IngestionPipeline) IngestTranscript(
 
 	const topicBatchSize = 50
 	resumeTopicBatch := 0
-	if isResume && cp != nil && cp.Stage == StageTopicExtraction {
-		resumeTopicBatch = cp.LastBatchIndex
-		p.logger.Info("resume: skipping topic batches", zap.Int("skip_to_batch", resumeTopicBatch))
-	}
 
-	// P1: if the checkpoint is already PAST topic extraction (paused at
-	// charter, or any later stage) the stored chunks are already tagged.
-	// Re-running the topic LLM on every retry is what made "Retry" look
-	// broken: N LLM calls per attempt (credits burned), then the charter call
-	// failed again and the job landed straight back in 'paused'. Reuse the
-	// stored topics and mark every batch as done so the loop below is a no-op.
+	// Topic results live in memory until step 6 (store), so a checkpoint alone
+	// cannot say which batches are safely recoverable:
+	//   * cp.Stage == topic_extraction → nothing was stored yet, so a "skip the
+	//     first N batches" resume would silently keep the "general" fallback for
+	//     those chunks (pre-existing bug: they were never persisted).
+	//   * cp.Stage >= charter_extraction → the chunks ARE in the DB, so the
+	//     stored topics can be reused. This is what makes Retry cheap (P1).
+	// A partial match (fewer stored rows than chunks) falls back to a full
+	// recompute rather than storing fallback "general" topics — an all-general
+	// corpus makes Gate 2 refuse every future question.
 	totalTopicBatches := (len(chunks) + topicBatchSize - 1) / topicBatchSize
 	if isResume && cp != nil && StageOrder[cp.Stage] >= StageOrder[StageCharterExtraction] {
 		if stored, loadErr := p.loadTopicsFromDB(ctx, expertID, sourceFile, len(chunks)); loadErr == nil && len(stored) == len(chunks) {
 			topicResults = stored
+			resumeTopicBatch = totalTopicBatches
 			p.logger.Info("resume: reused stored topics (no LLM call)", zap.Int("count", len(stored)))
-		} else if loadErr != nil {
-			p.logger.Warn("resume: could not load stored topics — keeping fallback topics",
-				zap.Error(loadErr))
+		} else {
+			p.logger.Warn("resume: stored topics unavailable or incomplete — recomputing topic extraction",
+				zap.Int("expected_chunks", len(chunks)),
+				zap.Error(loadErr),
+			)
 		}
-		resumeTopicBatch = totalTopicBatches
 	}
 
 	// Only announce / enter the topic stage when we are actually going to tag
 	// chunks. On a resume past this stage, current_stage must NOT be
 	// downgraded back to topic_extraction.
+	topicStarted := time.Now()
 	if resumeTopicBatch < totalTopicBatches {
-		p.updateStage(ctx, jobID, StageTopicExtraction,
+		topicStarted = p.beginStage(ctx, jobID, expertID, StageTopicExtraction,
 			fmt.Sprintf("0/%d chunks tagged", len(chunks)))
 	}
 
 	ptimer.Start("topic_extract")
-	for batchStart := 0; batchStart < len(chunks); batchStart += topicBatchSize {
-		batchIdx := batchStart / topicBatchSize
-		// Skip already-processed batches on resume
-		if batchIdx < resumeTopicBatch {
-			continue
-		}
 
-		batchEnd := batchStart + topicBatchSize
-		if batchEnd > len(chunks) {
-			batchEnd = len(chunks)
-		}
-		batch := chunks[batchStart:batchEnd]
+	// T3: parallel topic extraction.
+	// WHY safe to parallelize: batches are independent — each reads its own
+	// slice of chunks and writes its own slice of topicResults, so there is no
+	// shared mutable state. One LLM call per batch IS the stage's latency.
+	//
+	// WHY the contiguous prefix: batches finish out of order. Resume skips the
+	// first N completed batches, which is only correct if N is a PREFIX that is
+	// fully done. Anything after a gap is re-done on resume — cheap (one batch
+	// of LLM work) and always correct, versus a corrupted resume position.
+	//
+	// WHY a semaphore: bounds concurrency to p.workers so we stay inside the
+	// provider's rate limit and never spawn a goroutine per batch on a
+	// 15k-chunk transcript.
+	topicCtx, topicCancel := context.WithCancel(ctx)
+	defer topicCancel()
 
-		batchResults, batchErr := p.topics.ExtractBatch(ctx, batch)
-		if batchErr != nil {
-			// Distinguish fatal errors (payment/auth) from transient errors.
-			// Fatal: 402 (credits exhausted), 401 (invalid key), 403 (forbidden).
-			//   → Pause the job. Continuing would store all remaining chunks
-			//     with topic="general", destroying topic diversity and making
-			//     Gate 2 fail for every future question. This is worse than
-			//     not training at all.
-			// Transient: 429 (rate limit), 5xx (server error), network timeout.
-			//   → Use fallback topic="general" for this batch and continue.
-			//     A few "general" chunks are acceptable; all chunks being
-			//     "general" is not.
-			if isFatalLLMError(batchErr) {
-				p.logger.Error("topic extraction: fatal LLM error — pausing job to prevent all-general-topic disaster",
-					zap.Int("batch", batchIdx),
-					zap.Int("chunks_done", batchStart),
-					zap.Int("chunks_total", len(chunks)),
-					zap.Error(batchErr),
-				)
-				return nil, p.pauseOnLLMFailure(
-					ctx, jobID, cpWriter,
-					len(chunks), tracker.TotalCost(), start,
-					fmt.Sprintf("Topic extraction fatal LLM error at batch %d: %s", batchIdx, batchErr.Error()),
-				)
+	var (
+		topicWG          sync.WaitGroup
+		topicMu          sync.Mutex
+		topicFatalErr    error
+		topicCompleted   = make([]bool, totalTopicBatches)
+		topicPrefix      = resumeTopicBatch
+		topicBatchesDone = resumeTopicBatch
+	)
+	topicSem := make(chan struct{}, p.workers)
+
+	for batchIdx := resumeTopicBatch; batchIdx < totalTopicBatches; batchIdx++ {
+		topicWG.Add(1)
+		go func(batchIdx int) {
+			defer topicWG.Done()
+
+			// Fail-fast: a fatal provider error (credits/auth) cancels the rest.
+			if topicCtx.Err() != nil {
+				return
 			}
-			// Transient error — use fallback for this batch, continue.
-			p.logger.Warn("topic batch failed (transient), using fallback topic",
-				zap.Int("batch", batchIdx), zap.Error(batchErr))
-		} else {
-			copy(topicResults[batchStart:batchEnd], batchResults)
-		}
+			select {
+			case topicSem <- struct{}{}:
+			case <-topicCtx.Done():
+				return
+			}
+			defer func() { <-topicSem }()
 
-		// Checkpoint every batch
-		if batchIdx%1 == 0 { // every batch for topics (they're expensive)
+			batchStart := batchIdx * topicBatchSize
+			batchEnd := min(batchStart+topicBatchSize, len(chunks))
+			batch := chunks[batchStart:batchEnd]
+
+			batchResults, batchErr := p.topics.ExtractBatch(topicCtx, batch)
+
+			topicMu.Lock()
+			defer topicMu.Unlock()
+
+			if batchErr != nil {
+				// Distinguish fatal errors (payment/auth) from transient errors.
+				// Fatal: 402 (credits exhausted), 401 (invalid key), 403 (forbidden).
+				//   → Pause the job. Continuing would store all remaining chunks
+				//     with topic="general", destroying topic diversity and making
+				//     Gate 2 fail for every future question. This is worse than
+				//     not training at all.
+				// Transient: 429 (rate limit), 5xx (server error), network timeout.
+				//   → Use fallback topic="general" for this batch and continue.
+				//     A few "general" chunks are acceptable; all chunks being
+				//     "general" is not.
+				if isFatalLLMError(batchErr) {
+					p.logger.Error("topic extraction: fatal LLM error — pausing job to prevent all-general-topic disaster",
+						zap.Int("batch", batchIdx),
+						zap.Int("chunks_total", len(chunks)),
+						zap.Error(batchErr),
+					)
+					if topicFatalErr == nil {
+						topicFatalErr = fmt.Errorf("batch %d: %w", batchIdx, batchErr)
+						topicCancel()
+					}
+					return
+				}
+				p.logger.Warn("topic batch failed (transient), using fallback topic",
+					zap.Int("batch", batchIdx), zap.Error(batchErr))
+			} else {
+				copy(topicResults[batchStart:batchEnd], batchResults)
+			}
+
+			topicCompleted[batchIdx] = true
+			topicBatchesDone++
+			for topicPrefix < totalTopicBatches && topicCompleted[topicPrefix] {
+				topicPrefix++
+			}
+			chunksDone := min(topicPrefix*topicBatchSize, len(chunks))
+
+			// Checkpoint on every completed batch (topics are expensive).
 			cpWriter.Write(ctx, JobCheckpoint{
 				Stage:          StageTopicExtraction,
-				ChunksDone:     batchEnd,
+				ChunksDone:     chunksDone,
 				ChunksTotal:    len(chunks),
-				LastBatchIndex: batchIdx + 1,
+				LastBatchIndex: topicPrefix,
 				CostUSDSoFar:   tracker.TotalCost(),
 				StartedAt:      start,
 			})
-			tracker.UpdateDB(ctx, batchEnd, StageTopicExtraction,
-				fmt.Sprintf("%d/%d chunks tagged", batchEnd, len(chunks)))
-		}
+			tracker.UpdateDB(ctx, chunksDone, StageTopicExtraction,
+				fmt.Sprintf("%d/%d chunks tagged", chunksDone, len(chunks)))
+			p.emit(ctx, jobID, expertID, StageTopicExtraction, jobevents.KindBatchDone, map[string]interface{}{
+				"batch_index":   batchIdx,
+				"batches_total": totalTopicBatches,
+				"batches_done":  topicBatchesDone,
+				"chunks_done":   chunksDone,
+				"chunks_total":  len(chunks),
+				"workers":       p.workers,
+			})
+		}(batchIdx)
 	}
+	topicWG.Wait()
 	ptimer.Stop("topic_extract")
-	p.logger.Info("topic extraction complete")
+
+	if topicFatalErr != nil {
+		return nil, p.pauseOnLLMFailure(
+			ctx, jobID, expertID, cpWriter,
+			len(chunks), tracker.TotalCost(), start,
+			fmt.Sprintf("Topic extraction fatal LLM error: %s", topicFatalErr.Error()),
+		)
+	}
+	if resumeTopicBatch < totalTopicBatches {
+		p.endStage(ctx, jobID, expertID, StageTopicExtraction, topicStarted, map[string]interface{}{
+			"chunks":  len(chunks),
+			"batches": totalTopicBatches,
+			"topics":  countUniqueTopics(topicResults),
+			"workers": p.workers,
+		})
+	}
+	p.logger.Info("topic extraction complete", zap.Int("workers", p.workers))
 
 	// ============================================================
 	// STEP 3: CHARTER EXTRACTION (single call, resumable)
@@ -366,7 +582,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	}
 
 	if !charterAlreadyDone {
-		p.updateStage(ctx, jobID, StageCharterExtraction, "Extracting expert charter...")
+		charterStarted := p.beginStage(ctx, jobID, expertID, StageCharterExtraction, "Extracting expert charter...")
 		ptimer.Start("charter_extract")
 		extractedCharter, extractErr := p.charters.Extract(ctx, transcript, expertName)
 		ptimer.Stop("charter_extract")
@@ -392,12 +608,16 @@ func (p *IngestionPipeline) IngestTranscript(
 				zap.Error(extractErr),
 			)
 			return nil, p.pauseOnLLMFailure(
-				ctx, jobID, cpWriter,
+				ctx, jobID, expertID, cpWriter,
 				len(chunks), tracker.TotalCost(), start,
 				fmt.Sprintf("Charter LLM failed: %s", extractErr.Error()),
 			)
 		}
 		charter = extractedCharter
+		p.endStage(ctx, jobID, expertID, StageCharterExtraction, charterStarted, map[string]interface{}{
+			"charter_chars":                  len(charter.ReasoningCharter),
+			"clarification_charter_entries":  len(charter.ClarificationCharter),
+		})
 		// Checkpoint: charter done
 		cpWriter.Write(ctx, JobCheckpoint{
 			Stage:            StageCharterExtraction,
@@ -408,13 +628,19 @@ func (p *IngestionPipeline) IngestTranscript(
 			CostUSDSoFar:     tracker.TotalCost(),
 			StartedAt:        start,
 		})
+	} else {
+		// Resume: charter was already extracted and loaded from the DB.
+		p.emit(ctx, jobID, expertID, StageCharterExtraction, jobevents.KindStageDone, map[string]interface{}{
+			"from_checkpoint": true,
+			"charter_chars":   len(charter.ReasoningCharter),
+		})
 	}
 	p.logger.Info("charter extraction complete")
 
 	// ============================================================
 	// STEP 4: EMBEDDING (batched, resumable)
 	// ============================================================
-	p.updateStage(ctx, jobID, StageEmbedding,
+	embedStarted := p.beginStage(ctx, jobID, expertID, StageEmbedding,
 		fmt.Sprintf("0/%d embeddings generated", len(chunks)))
 
 	embeddings := make([][]float32, len(chunks))
@@ -424,51 +650,115 @@ func (p *IngestionPipeline) IngestTranscript(
 	//   25 chunks ≈ 10s per batch — well within 300s timeout.
 	//   Smaller batches also mean more frequent checkpoints.
 	const embedBatchSize = 25
-	resumeEmbedBatch := 0
-	if isResume && cp != nil && cp.Stage == StageEmbedding {
-		resumeEmbedBatch = cp.LastBatchIndex
-		p.logger.Info("resume: skipping embed batches", zap.Int("skip_to_batch", resumeEmbedBatch))
-	}
+	// NOTE: embeddings are NOT skipped on resume. They exist only in memory
+	// until step 6 stores them, so "skip the first N batches" would leave those
+	// chunks with a nil vector and make the INSERT fail (or store a zero
+	// vector). Embedding runs on the local ML sidecar, so recomputing is cheap;
+	// correctness is not. Checkpointing still records progress for the UI.
+	totalEmbedBatches := (len(chunks) + embedBatchSize - 1) / embedBatchSize
 
 	ptimer.Start("embed")
-	for batchStart := 0; batchStart < len(chunks); batchStart += embedBatchSize {
-		batchIdx := batchStart / embedBatchSize
-		if batchIdx < resumeEmbedBatch {
-			continue
-		}
 
-		batchEnd := batchStart + embedBatchSize
-		if batchEnd > len(chunks) {
-			batchEnd = len(chunks)
-		}
+	// T3: parallel embedding. Same design as the topic stage above:
+	// independent batches, bounded workers, contiguous-prefix checkpointing,
+	// fail-fast on the first hard error (an unavailable sidecar will fail
+	// every batch — aborting beats burning minutes on doomed calls).
+	embedCtx, embedCancel := context.WithCancel(ctx)
+	defer embedCancel()
 
-		texts := make([]string, batchEnd-batchStart)
-		for i, c := range chunks[batchStart:batchEnd] {
-			texts[i] = c.Text
-		}
+	var (
+		embedWG          sync.WaitGroup
+		embedMu          sync.Mutex
+		embedErr         error
+		embedCompleted   = make([]bool, totalEmbedBatches)
+		embedPrefix      int
+		embedBatchesDone int
+	)
+	embedSem := make(chan struct{}, p.workers)
 
-		batchEmbeds, embedErr := p.embedder.Embed(ctx, texts)
-		if embedErr != nil {
-			p.updateJobStatus(ctx, jobID, "failed",
-				"ML sidecar unavailable: "+embedErr.Error(), batchStart, len(chunks))
-			return nil, fmt.Errorf("embedding batch %d failed: %w", batchIdx, embedErr)
-		}
-		copy(embeddings[batchStart:batchEnd], batchEmbeds)
+	for batchIdx := 0; batchIdx < totalEmbedBatches; batchIdx++ {
+		embedWG.Add(1)
+		go func(batchIdx int) {
+			defer embedWG.Done()
 
-		// Checkpoint every batch
-		cpWriter.Write(ctx, JobCheckpoint{
-			Stage:            StageEmbedding,
-			ChunksDone:       batchEnd,
-			ChunksTotal:      len(chunks),
-			CharterExtracted: true,
-			LastBatchIndex:   batchIdx + 1,
-			CostUSDSoFar:     tracker.TotalCost(),
-			StartedAt:        start,
-		})
-		tracker.UpdateDB(ctx, batchEnd, StageEmbedding,
-			fmt.Sprintf("%d/%d embeddings generated", batchEnd, len(chunks)))
+			if embedCtx.Err() != nil {
+				return
+			}
+			select {
+			case embedSem <- struct{}{}:
+			case <-embedCtx.Done():
+				return
+			}
+			defer func() { <-embedSem }()
+
+			batchStart := batchIdx * embedBatchSize
+			batchEnd := min(batchStart+embedBatchSize, len(chunks))
+
+			texts := make([]string, batchEnd-batchStart)
+			for i, c := range chunks[batchStart:batchEnd] {
+				texts[i] = c.Text
+			}
+
+			batchEmbeds, err := p.embedder.Embed(embedCtx, texts)
+			if err != nil {
+				embedMu.Lock()
+				if embedErr == nil {
+					embedErr = fmt.Errorf("embedding batch %d failed: %w", batchIdx, err)
+					embedCancel()
+				}
+				embedMu.Unlock()
+				return
+			}
+			copy(embeddings[batchStart:batchEnd], batchEmbeds)
+
+			embedMu.Lock()
+			defer embedMu.Unlock()
+
+			embedCompleted[batchIdx] = true
+			embedBatchesDone++
+			for embedPrefix < totalEmbedBatches && embedCompleted[embedPrefix] {
+				embedPrefix++
+			}
+			chunksDone := min(embedPrefix*embedBatchSize, len(chunks))
+
+			// Checkpoint on every completed batch.
+			cpWriter.Write(ctx, JobCheckpoint{
+				Stage:            StageEmbedding,
+				ChunksDone:       chunksDone,
+				ChunksTotal:      len(chunks),
+				CharterExtracted: true,
+				LastBatchIndex:   embedPrefix,
+				CostUSDSoFar:     tracker.TotalCost(),
+				StartedAt:        start,
+			})
+			tracker.UpdateDB(ctx, chunksDone, StageEmbedding,
+				fmt.Sprintf("%d/%d embeddings generated", chunksDone, len(chunks)))
+			p.emit(ctx, jobID, expertID, StageEmbedding, jobevents.KindBatchDone, map[string]interface{}{
+				"batch_index":   batchIdx,
+				"batches_total": totalEmbedBatches,
+				"batches_done":  embedBatchesDone,
+				"chunks_done":   chunksDone,
+				"chunks_total":  len(chunks),
+				"workers":       p.workers,
+			})
+		}(batchIdx)
 	}
+	embedWG.Wait()
 	ptimer.Stop("embed")
+
+	if embedErr != nil {
+		p.updateJobStatus(ctx, jobID, "failed",
+			"ML sidecar unavailable: "+embedErr.Error(), 0, len(chunks))
+		p.emitFinal(ctx, jobID, expertID, StageEmbedding, jobevents.KindFailed, map[string]interface{}{
+			"reason": embedErr.Error(),
+		})
+		return nil, fmt.Errorf("embedding failed: %w", embedErr)
+	}
+	p.endStage(ctx, jobID, expertID, StageEmbedding, embedStarted, map[string]interface{}{
+		"chunks":  len(chunks),
+		"batches": totalEmbedBatches,
+		"workers": p.workers,
+	})
 	p.logger.Info("embeddings generated", zap.Int("count", len(embeddings)))
 
 	// Step 5: Optional cleanup for full-replace mode.
@@ -491,15 +781,38 @@ func (p *IngestionPipeline) IngestTranscript(
 
 	// Step 6: Store chunks. In append mode, ON CONFLICT dedups against
 	// existing (expert_id, chunk_hash) pairs so repeat ingestion is idempotent.
-	p.updateStage(ctx, jobID, StageStoring, fmt.Sprintf("Saving %d chunks to database...", len(chunks)))
+	storeStarted := p.beginStage(ctx, jobID, expertID, StageStoring,
+		fmt.Sprintf("Saving %d chunks to database...", len(chunks)))
 	ptimer.Start("store")
 	chunkIDs, err := p.storeChunks(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile)
 	ptimer.Stop("store")
 	if err != nil {
 		p.updateJobStatus(ctx, jobID, "failed", "storage failed: "+err.Error(), 0, 0)
+		p.emitFinal(ctx, jobID, expertID, StageStoring, jobevents.KindFailed, map[string]interface{}{
+			"reason": err.Error(),
+		})
 		return nil, fmt.Errorf("chunk storage failed: %w", err)
 	}
 	p.logger.Info("chunks stored", zap.Int("count", len(chunkIDs)))
+	p.endStage(ctx, jobID, expertID, StageStoring, storeStarted, map[string]interface{}{
+		"chunks": len(chunkIDs),
+	})
+
+	// T2: double confirmation. The pipeline is not trusted to grade its own
+	// homework — re-read the database and compare it against what this run
+	// claims it produced. The result is recorded as a `verified` event so the
+	// admin sees "claim vs reality" without opening psql.
+	verifyTopics := countUniqueTopics(topicResults)
+	verifyGeneral := 0
+	for _, t := range topicResults {
+		if t.Topic == "" || t.Topic == "general" {
+			verifyGeneral++
+		}
+	}
+	if _, verifyErr := p.verifyStoredCorpus(ctx, jobID, expertID, sourceFile,
+		len(chunks), verifyTopics, verifyGeneral); verifyErr != nil {
+		p.logger.Warn("post-store verification failed (non-fatal)", zap.Error(verifyErr))
+	}
 
 	// Step 7: Update expert charters
 	//
@@ -549,6 +862,13 @@ func (p *IngestionPipeline) IngestTranscript(
 	}
 
 	// Step 8: Build capability table
+	// NOTE: "capability_build" is NOT a valid current_stage value (the column
+	// has a CHECK constraint from migration 011), so this stage is tracked on
+	// the event timeline only — the job row keeps showing 'storing'/'smoke_test'.
+	capabilityStarted := time.Now()
+	p.emit(ctx, jobID, expertID, "capability_build", jobevents.KindStageStarted, map[string]interface{}{
+		"label": "Building capability table",
+	})
 	ptimer.Start("capability_build")
 	capabilities, err := p.capability.Build(ctx, chunks, topicResults)
 	if err != nil {
@@ -563,6 +883,11 @@ func (p *IngestionPipeline) IngestTranscript(
 		p.storeCapabilities(ctx, expertID, capabilities)
 	}
 	ptimer.Stop("capability_build")
+	p.emit(ctx, jobID, expertID, "capability_build", jobevents.KindStageDone, map[string]interface{}{
+		"duration_ms": time.Since(capabilityStarted).Milliseconds(),
+		"topics":      len(capabilities),
+		"llm_used":    err == nil,
+	})
 
 	// Step 9: Update expert stats.
 	// BUG FIX (2026-09-08): previously used len(chunks)/uniqueTopics
@@ -613,6 +938,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	// Step 10: Smoke test — verify the expert is actually retrievable.
 	// WHY here: chunks + capabilities are in DB, so retrieval is possible.
 	// WHY before marking complete: training_status must reflect real state.
+	smokeStarted := p.beginStage(ctx, jobID, expertID, StageSmokeTest, "Running smoke test...")
 	ptimer.Start("smoke_test")
 	smokeTestPassed, smokePassCount, smokeErr := p.runSmokeTest(ctx, expertID, expertName)
 	ptimer.Stop("smoke_test")
@@ -622,6 +948,12 @@ func (p *IngestionPipeline) IngestTranscript(
 			zap.Error(smokeErr),
 		)
 	}
+	p.endStage(ctx, jobID, expertID, StageSmokeTest, smokeStarted, map[string]interface{}{
+		"passed":       smokeTestPassed,
+		"probes_passed": smokePassCount,
+		"probes_total":  smokeTestProbeCount,
+		"error":        errorString(smokeErr),
+	})
 
 	if smokeTestPassed {
 		// Mark expert as trained and publicly visible.
@@ -681,6 +1013,27 @@ func (p *IngestionPipeline) IngestTranscript(
 		)
 	}
 
+	// T1: close the timeline with the final ledger — everything an admin would
+	// otherwise have to reconstruct from server logs, in one durable record.
+	phaseTotals := map[string]int64{}
+	for _, phase := range ptimer.Results() {
+		phaseTotals[phase.Phase] = phase.Duration.Milliseconds()
+	}
+	p.emitFinal(ctx, jobID, expertID, StageComplete, jobevents.KindComplete, map[string]interface{}{
+		"chunks_this_run":   len(chunks),
+		"topics":            uniqueTopics,
+		"corpus_total":      actualTotalChunks,
+		"corpus_topics":     actualTotalTopics,
+		"avg_depth":         avgDepth,
+		"duration_ms":       duration,
+		"smoke_test_passed": smokeTestPassed,
+		"smoke_probes":      smokePassCount,
+		"cost_usd":          tracker.TotalCost(),
+		"workers":           p.workers,
+		"phase_ms":          phaseTotals,
+		"source_file":       sourceFile,
+	})
+
 	return &IngestionResult{
 		ExpertID:      expertID,
 		TotalChunks:   len(chunks),
@@ -690,22 +1043,20 @@ func (p *IngestionPipeline) IngestTranscript(
 	}, nil
 }
 
-// storeChunks inserts all chunks into the database.
-// Links prev/next chunk IDs for context navigation.
+// storeChunks inserts all chunks into the database and links prev/next ids.
 //
-// Dedup: uses ON CONFLICT (expert_id, chunk_hash) DO NOTHING. If a chunk
-// with the same hash already exists for this expert, INSERT is a no-op
-// and RETURNING id returns no rows (pgx.QueryRow -> pgx.ErrNoRows).
-// In that case, look up the existing chunk's id and use it — this keeps
-// prev/next linking intact even when partially-duplicate transcripts are
-// re-ingested. In practice, this is rare in replace mode (table was just
-// wiped) and common in append mode (that's the whole point).
+// T4 (batched): the original implementation issued one INSERT plus up to two
+// link UPDATEs per chunk — ~45k round trips for a 15k-chunk transcript, which
+// is why "Saving to database" dominated the run. It now:
+//  1. INSERTs `storeBatchSize` rows per statement (ON CONFLICT DO NOTHING kept,
+//     so append-mode dedup semantics are unchanged).
+//  2. Resolves ids for the whole batch in ONE query (covers both freshly
+//     inserted rows and pre-existing duplicates).
+//  3. Links prev/next id in one batched UPDATE via unnest — after all inserts,
+//     because a chunk's neighbours may live in another batch.
 //
-// Mental execution:
-// Insert chunk 0 (new) -> get new ID
-// Insert chunk 1 (dup) -> ON CONFLICT, no rows returned -> lookup existing ID
-// Update chunk 0 -> set next_chunk_id = chunk 1's existing ID
-// ... repeat for all chunks
+// Ordering is preserved: chunk_index still comes from the chunker, and the
+// link pass walks chunkIDs in index order.
 func (p *IngestionPipeline) storeChunks(
 	ctx context.Context,
 	jobID uuid.UUID,
@@ -727,86 +1078,237 @@ func (p *IngestionPipeline) storeChunks(
 		embedModelArg = embedModel
 	}
 
-	for i, chunk := range chunks {
-		topic := topics[i].Topic
-		subtopic := ""
-		if i < len(topics) {
-			subtopic = topics[i].Subtopic
-		}
-
-		embedding := pgvector.NewVector(embeddings[i])
-
-		// Safety: chunker should always populate ChunkHash, but if a caller
-		// bypassed the chunker and constructed TextChunk directly, compute it
-		// here so the dedup key is never NULL.
-		if chunk.ChunkHash == "" {
-			chunk.ChunkHash = HashChunkText(chunk.Text)
-		}
-
-		var chunkID uuid.UUID
-		err := p.db.QueryRow(ctx,
-			`INSERT INTO course_chunks
-				(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding, chunk_hash,
-				 embedding_provider, embedding_model)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			 ON CONFLICT (expert_id, chunk_hash) DO NOTHING
-			 RETURNING id`,
-			expertID, chunk.Text, chunk.Index, topic, subtopic, sourceFile, embedding, chunk.ChunkHash,
-			embedProvider, embedModelArg,
-		).Scan(&chunkID)
-		if err != nil {
-			// ON CONFLICT DO NOTHING + RETURNING id yields zero rows on conflict,
-			// which pgx surfaces as pgx.ErrNoRows. Treat that as "duplicate":
-			// look up the existing chunk id and continue.
-			if err.Error() == "no rows in result set" {
-				lookupErr := p.db.QueryRow(ctx,
-					`SELECT id FROM course_chunks
-					 WHERE expert_id = $1 AND chunk_hash = $2
-					 LIMIT 1`,
-					expertID, chunk.ChunkHash,
-				).Scan(&chunkID)
-				if lookupErr != nil {
-					return nil, fmt.Errorf("dedup lookup failed for chunk %d: %w", i, lookupErr)
-				}
-				p.logger.Debug("chunk deduplicated",
-					zap.Int("index", i),
-					zap.String("chunk_hash", chunk.ChunkHash),
-				)
-			} else {
-				return nil, fmt.Errorf("failed to insert chunk %d: %w", i, err)
-			}
-		}
-
-		chunkIDs[i] = chunkID
-
-		// Link to previous chunk
-		if i > 0 {
-			// Update current chunk's prev_chunk_id
-			_, err = p.db.Exec(ctx,
-				`UPDATE course_chunks SET prev_chunk_id = $1 WHERE id = $2`,
-				chunkIDs[i-1], chunkID,
-			)
-			if err != nil {
-				p.logger.Warn("failed to link prev chunk", zap.Error(err))
-			}
-
-			// Update previous chunk's next_chunk_id
-			_, err = p.db.Exec(ctx,
-				`UPDATE course_chunks SET next_chunk_id = $1 WHERE id = $2`,
-				chunkID, chunkIDs[i-1],
-			)
-			if err != nil {
-				p.logger.Warn("failed to link next chunk", zap.Error(err))
-			}
-		}
-
-		// Update job progress every 50 chunks
-		if i%50 == 0 {
-			p.updateJobProgress(ctx, jobID, i+1, len(chunks))
+	// Safety: the chunker always populates ChunkHash, but a caller that built
+	// TextChunk directly must still get a dedup key (never NULL).
+	for i := range chunks {
+		if chunks[i].ChunkHash == "" {
+			chunks[i].ChunkHash = HashChunkText(chunks[i].Text)
 		}
 	}
 
+	// storeBatchSize trades statement size against round trips. 200 rows × 10
+	// params = 2000 bind parameters — comfortably under Postgres's 65535 limit.
+	const storeBatchSize = 200
+
+	for batchStart := 0; batchStart < len(chunks); batchStart += storeBatchSize {
+		batchEnd := min(batchStart+storeBatchSize, len(chunks))
+
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO course_chunks
+			(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding, chunk_hash,
+			 embedding_provider, embedding_model)
+		 VALUES `)
+		args := make([]interface{}, 0, (batchEnd-batchStart)*10)
+		for i := batchStart; i < batchEnd; i++ {
+			if i > batchStart {
+				sb.WriteString(",")
+			}
+			base := len(args)
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10))
+
+			topic := topics[i].Topic
+			subtopic := ""
+			if i < len(topics) {
+				subtopic = topics[i].Subtopic
+			}
+			args = append(args,
+				expertID, chunks[i].Text, chunks[i].Index, topic, subtopic,
+				sourceFile, pgvector.NewVector(embeddings[i]), chunks[i].ChunkHash,
+				embedProvider, embedModelArg,
+			)
+		}
+		sb.WriteString(` ON CONFLICT (expert_id, chunk_hash) DO NOTHING`)
+
+		if _, err := p.db.Exec(ctx, sb.String(), args...); err != nil {
+			return nil, fmt.Errorf("failed to insert chunks %d..%d: %w", batchStart, batchEnd-1, err)
+		}
+
+		// Resolve ids for this batch (new rows AND deduplicated rows).
+		idByHash, err := p.lookupChunkIDs(ctx, expertID, chunks[batchStart:batchEnd])
+		if err != nil {
+			return nil, err
+		}
+		for i := batchStart; i < batchEnd; i++ {
+			id, ok := idByHash[chunks[i].ChunkHash]
+			if !ok {
+				// The row must exist: it was either inserted above or already
+				// present (ON CONFLICT). Missing means the dedup key changed
+				// mid-write — surface it instead of storing a zero UUID.
+				return nil, fmt.Errorf("chunk %d missing after insert (hash %s)", i, chunks[i].ChunkHash)
+			}
+			chunkIDs[i] = id
+		}
+
+		chunksDone := batchEnd
+		p.updateJobProgress(ctx, jobID, chunksDone, len(chunks))
+		p.emit(ctx, jobID, expertID, StageStoring, jobevents.KindChunkStored, map[string]interface{}{
+			"chunks_done":  chunksDone,
+			"chunks_total": len(chunks),
+			"batch_size":   batchEnd - batchStart,
+		})
+	}
+
+	// Link pass (after every insert, so cross-batch neighbours resolve).
+	p.linkChunks(ctx, chunkIDs)
+
 	return chunkIDs, nil
+}
+
+// lookupChunkIDs resolves chunk_hash → id for the given chunks in one query.
+//
+// WHY by hash and not RETURNING: ON CONFLICT DO NOTHING returns nothing for a
+// duplicate, so a single INSERT cannot tell us the id of a pre-existing row.
+// One SELECT for the whole batch covers both cases.
+func (p *IngestionPipeline) lookupChunkIDs(ctx context.Context, expertID uuid.UUID, chunks []TextChunk) (map[string]uuid.UUID, error) {
+	if len(chunks) == 0 {
+		return map[string]uuid.UUID{}, nil
+	}
+	hashes := make([]string, 0, len(chunks))
+	for _, c := range chunks {
+		hashes = append(hashes, c.ChunkHash)
+	}
+	rows, err := p.db.Query(ctx,
+		`SELECT chunk_hash, id FROM course_chunks
+		  WHERE expert_id = $1 AND chunk_hash = ANY($2)`,
+		expertID, hashes,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("lookup chunk ids: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]uuid.UUID, len(hashes))
+	for rows.Next() {
+		var hash string
+		var id uuid.UUID
+		if scanErr := rows.Scan(&hash, &id); scanErr != nil {
+			continue
+		}
+		out[hash] = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("lookup chunk ids: rows error: %w", err)
+	}
+	return out, nil
+}
+
+// linkChunks writes prev_chunk_id / next_chunk_id for the run's chunks.
+//
+// Batched with unnest: one UPDATE per linkBatch rows instead of two UPDATEs per
+// chunk. uuid.Nil is the "no neighbour" sentinel and is turned back into SQL
+// NULL by NULLIF, so the first/last chunk keep NULL links.
+//
+// Non-fatal: navigation links are a context convenience, not correctness.
+func (p *IngestionPipeline) linkChunks(ctx context.Context, chunkIDs []uuid.UUID) {
+	if len(chunkIDs) == 0 {
+		return
+	}
+	const linkBatch = 500
+
+	for start := 0; start < len(chunkIDs); start += linkBatch {
+		end := min(start+linkBatch, len(chunkIDs))
+
+		ids := make([]uuid.UUID, 0, end-start)
+		prev := make([]uuid.UUID, 0, end-start)
+		next := make([]uuid.UUID, 0, end-start)
+		for i := start; i < end; i++ {
+			var prevID, nextID uuid.UUID
+			if i > 0 {
+				prevID = chunkIDs[i-1]
+			}
+			if i+1 < len(chunkIDs) {
+				nextID = chunkIDs[i+1]
+			}
+			ids = append(ids, chunkIDs[i])
+			prev = append(prev, prevID)
+			next = append(next, nextID)
+		}
+
+		_, err := p.db.Exec(ctx,
+			`UPDATE course_chunks AS c
+			    SET prev_chunk_id = NULLIF(v.prev_id, '00000000-0000-0000-0000-000000000000'::uuid),
+			        next_chunk_id = NULLIF(v.next_id, '00000000-0000-0000-0000-000000000000'::uuid)
+			   FROM (SELECT unnest($1::uuid[]) AS id,
+			                unnest($2::uuid[]) AS prev_id,
+			                unnest($3::uuid[]) AS next_id) AS v
+			  WHERE c.id = v.id`,
+			ids, prev, next)
+		if err != nil {
+			p.logger.Warn("failed to link chunk navigation (non-fatal)", zap.Error(err))
+			return
+		}
+	}
+}
+
+// verifyStoredCorpus is the T2 "double confirmation" step: it re-reads the
+// database and compares it against what this run claims it produced, then
+// writes the result as a `verified` event.
+//
+// WHY: previously the only way to confirm ingestion had really stored what it
+// claimed was to open psql — the UI showed the pipeline's own numbers. This
+// makes the claim and the check part of the same durable timeline, and a
+// mismatch is visible in amber instead of being silently wrong.
+func (p *IngestionPipeline) verifyStoredCorpus(
+	ctx context.Context,
+	jobID, expertID uuid.UUID,
+	sourceFile string,
+	expectedChunks, expectedTopics, expectedGeneral int,
+) (bool, error) {
+	var stored, storedTopics, storedGeneral, nullEmbeddings int
+	err := p.db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COUNT(DISTINCT topic),
+		       COUNT(*) FILTER (WHERE topic IS NULL OR topic = '' OR topic = 'general'),
+		       COUNT(*) FILTER (WHERE embedding IS NULL)
+		  FROM course_chunks
+		 WHERE expert_id = $1 AND source_file = $2`,
+		expertID, sourceFile,
+	).Scan(&stored, &storedTopics, &storedGeneral, &nullEmbeddings)
+	if err != nil {
+		return false, fmt.Errorf("verify stored corpus: %w", err)
+	}
+
+	// Corpus-wide count gives the admin the "after append" picture, not just
+	// this file's contribution (append mode is the default).
+	var corpusTotal int
+	if scanErr := p.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM course_chunks WHERE expert_id = $1`, expertID,
+	).Scan(&corpusTotal); scanErr != nil {
+		p.logger.Warn("verify: corpus total query failed (non-fatal)", zap.Error(scanErr))
+	}
+
+	ok := stored == expectedChunks &&
+		storedTopics == expectedTopics &&
+		storedGeneral == expectedGeneral &&
+		nullEmbeddings == 0
+
+	p.emit(ctx, jobID, expertID, StageStoring, jobevents.KindVerified, map[string]interface{}{
+		"ok": ok,
+		"claim": map[string]interface{}{
+			"chunks":         expectedChunks,
+			"topics":         expectedTopics,
+			"general_chunks": expectedGeneral,
+		},
+		"reality": map[string]interface{}{
+			"chunks":          stored,
+			"topics":          storedTopics,
+			"general_chunks":  storedGeneral,
+			"null_embeddings": nullEmbeddings,
+		},
+		"corpus_total_chunks": corpusTotal,
+		"source_file":         sourceFile,
+	})
+	return ok, nil
+}
+
+// errorString renders err for a JSON event detail, using "" for nil so the
+// timeline never contains the literal "<nil>".
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 // buildCapabilitiesFromChunks populates expert_capabilities from course_chunks
@@ -955,6 +1457,7 @@ func (p *IngestionPipeline) updateStage(ctx context.Context, jobID uuid.UUID, st
 func (p *IngestionPipeline) pauseOnLLMFailure(
 	ctx context.Context,
 	jobID uuid.UUID,
+	expertID uuid.UUID,
 	cpWriter *CheckpointWriter,
 	chunksTotal int,
 	costSoFar float64,
@@ -1037,6 +1540,9 @@ func (p *IngestionPipeline) pauseOnLLMFailure(
 				fmt.Sprintf("pauseOnLLMFailure: DB update failed twice: %s", fallbackErr.Error()),
 				jobID,
 			)
+			p.emitFinal(ctx, jobID, expertID, StageFailed, jobevents.KindFailed, map[string]interface{}{
+				"reason": fmt.Sprintf("could not persist pause state: %s", fallbackErr.Error()),
+			})
 			// Return the original error, not ErrJobPaused, because the job
 			// is not actually paused — it's failed.
 			return fmt.Errorf("pauseOnLLMFailure: failed to update job status: %w", fallbackErr)
@@ -1051,6 +1557,18 @@ func (p *IngestionPipeline) pauseOnLLMFailure(
 		zap.String("job_id", jobID.String()),
 		zap.String("reason", reason),
 	)
+
+	// T1: record the pause as a first-class event, not just a status column —
+	// this is the row the UI turns into the amber "action required" timeline
+	// entry, and it survives refresh.
+	p.emitFinal(ctx, jobID, expertID, StagePaused, jobevents.KindPaused, map[string]interface{}{
+		"reason":          reason,
+		"chunks_total":    chunksTotal,
+		"cost_usd":        costSoFar,
+		"resume_stage":    StageCharterExtraction,
+		"needs_admin":     true,
+		"hint":            "Fix the cause (provider credits or the model's token budget), then use Retry now.",
+	})
 
 	return ErrJobPaused
 }

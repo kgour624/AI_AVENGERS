@@ -194,6 +194,45 @@ export const retryIngestionJob = (expertId: string, jobId: string) =>
     )
     .then((res) => res.data.data!)
 
+/**
+ * T1 (training transparency): one row of the durable ingestion timeline
+ * (table ingestion_job_events). Unlike the old browser-only log, these come
+ * from the database: they survive a refresh and are identical for every viewer.
+ *
+ * `kind` is one of:
+ *   run_started | stage_started | stage_done | batch_done | chunk_stored |
+ *   verified | paused | failed | complete
+ *
+ * `detail` is kind-specific (batch index, counts, durations, the verification
+ * ledger). It stays loosely typed here because the renderer narrows it per
+ * kind — inventing a single strict shape would be a lie for at least half of
+ * the kinds.
+ */
+export interface IngestionJobEvent {
+  id: string
+  jobId: string
+  expertId: string
+  sequenceNumber: number
+  stage: string
+  kind: string
+  detail: Record<string, unknown>
+  createdAt: string
+}
+
+// getIngestionJobEvents: timeline history for one job. Needed in addition to
+// the SSE stream because the stream closes at a terminal state, so opening the
+// modal on an already-finished run has no live feed to replay.
+//
+// jobId is a QUERY PARAM (not a path segment) — the backend note explains why:
+// GET /experts/:id/jobs/stream already occupies that route tree position.
+export const getIngestionJobEvents = (expertId: string, jobId: string, after = 0, limit = 200) =>
+  baseAPI
+    .get<ApiResponse<{ events: IngestionJobEvent[]; lastSequence: number; timeline: boolean }>>(
+      `/api/v1/admin/experts/${expertId}/jobs/events`,
+      { params: { jobId, after, limit } }
+    )
+    .then((res) => res.data.data!)
+
 // Feature #7 fix (docs bug list): projectCount/messageCount added -
 // previously ListClients returned neither, so there was no data for
 // the frontend to show beyond the enable/disable toggle. Both are now

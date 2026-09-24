@@ -35,6 +35,7 @@ import (
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/knowledge"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/message"
@@ -411,9 +412,14 @@ func buildRouter(
 		freshnessSvc = knowledge.NewFreshness(postgres.Pool,
 			knowledge.Policy{MaxCorpusAgeDays: cfg.Freshness.MaxCorpusAgeDays}, logger)
 	}
+	// T1: durable ingestion timeline (append-only event log + Redis notification).
+	// Shared by both ingestion pipelines (admin + BYO) and by the SSE stream, so
+	// the writer and the readers use exactly one implementation.
+	eventsStore := jobevents.NewStore(postgres.Pool, redisClient.Client, logger)
+
 	// C8: bring-your-own-expert. The training pipeline is stateless, so a
 	// second instance is safe and keeps admin/BYO wiring independent.
-	byoIngestor := training.NewIngestionPipeline(postgres.Pool, embedder, mlClient, modelGateway, logger)
+	byoIngestor := training.NewIngestionPipeline(postgres.Pool, embedder, mlClient, modelGateway, eventsStore, logger)
 	byoSvc := byoexpert.NewService(postgres.Pool, tenantSvc, byoIngestor,
 		byoexpert.Policy{
 			Enabled:           cfg.ByoExpert.Enabled,
@@ -475,7 +481,7 @@ func buildRouter(
 	relSvc.RegisterProbe("ml_sidecar", mlClient.HealthCheck)
 	relHandler := reliability.NewHandler(relSvc, "1.0.0", logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -878,6 +884,7 @@ func buildRouter(
 		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
+		adminGroup.GET("/experts/:id/jobs/events", adminHandler.GetIngestionJobEvents)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/retry", adminHandler.RetryIngestionJob)
 		adminGroup.GET("/clients", adminHandler.ListClients)

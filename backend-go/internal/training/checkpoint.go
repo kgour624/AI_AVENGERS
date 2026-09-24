@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -159,11 +160,18 @@ func LoadCheckpoint(ctx context.Context, db *pgxpool.Pool, jobID uuid.UUID) (*Jo
 
 // ProgressTracker tracks ingestion speed and estimates remaining time.
 // In-memory only — written to DB every checkpointEveryN chunks.
+//
+// T3: the topic/embed batches now run concurrently, so the tracker is read
+// from multiple goroutines (UpdateDB computes the ETA from the running total).
+// A plain sync.Mutex is enough — both AddCost and TotalCost write/read one
+// float, there is no read-heavy path to justify an RWMutex (same reasoning as
+// observability.PhaseTimer).
 type ProgressTracker struct {
 	db          *pgxpool.Pool
 	jobID       uuid.UUID
 	totalChunks int
 	startedAt   time.Time
+	mu          sync.Mutex
 	costUSD     float64
 	logger      *zap.Logger
 }
@@ -180,11 +188,17 @@ func NewProgressTracker(db *pgxpool.Pool, jobID uuid.UUID, totalChunks int, logg
 
 // AddCost accumulates LLM cost.
 func (t *ProgressTracker) AddCost(usd float64) {
+	t.mu.Lock()
 	t.costUSD += usd
+	t.mu.Unlock()
 }
 
 // TotalCost returns accumulated cost.
-func (t *ProgressTracker) TotalCost() float64 { return t.costUSD }
+func (t *ProgressTracker) TotalCost() float64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.costUSD
+}
 
 // UpdateDB writes current progress + ETA to the DB.
 // Called every checkpointEveryN chunks.
@@ -213,7 +227,7 @@ func (t *ProgressTracker) UpdateDB(ctx context.Context, done int, stage, detail 
 			cost_usd                     = $5,
 			estimated_seconds_remaining  = $6
 		 WHERE id = $7`,
-		done, t.totalChunks, stage, detail, t.costUSD, etaSec, t.jobID,
+		done, t.totalChunks, stage, detail, t.TotalCost(), etaSec, t.jobID,
 	)
 	if err != nil {
 		t.logger.Warn("progress update failed", zap.Error(err))
