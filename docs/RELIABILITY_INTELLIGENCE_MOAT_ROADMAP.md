@@ -256,6 +256,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, Multi-agent, Go. |
 | **Files/Risk/Rollback** | `internal/orchestrator/*`, maybe `decision/*`. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: seed two experts that conflict and inspect the result JSON. |
+| **DONE (B2 + B2b)** | `Contradiction` gained `Type`/`Resolution` (normalize* fail-closed: unknown type→fabrication, unknown resolution→escalate; fabrication never downgraded to noted). `SynthesisResult` gained `Escalations` (the escalate subset), `EscalationSummary`, `NeedsEscalation` — derived once in `applyEscalations`, used by both `synthesize` and `synthesizeFallback`. Chat has no approval_requests table (workflow-only, G1); the client acts by replying, same as a Gate 1 ASK. |
 
 ### B3 — Workflow memory write-back (complete A6)
 | Part | Detail |

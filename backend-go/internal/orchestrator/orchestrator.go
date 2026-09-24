@@ -105,9 +105,18 @@ type SynthesisResult struct {
 	Method string `json:"method"`
 	// NeedsEscalation (B2): true when at least one contradiction's
 	// Resolution is escalate — the client must decide rather than just read
-	// a flagged note. Derived from Contradictions, never set independently,
-	// so it can never disagree with the per-item policies.
+	// a flagged note. Derived from len(Escalations) > 0, never set
+	// independently, so it can never disagree with the per-item policies.
 	NeedsEscalation bool `json:"needs_escalation"`
+	// Escalations (B2b): the subset of Contradictions whose Resolution is
+	// escalate, surfaced separately so the frontend does not have to filter
+	// Contradictions itself to build a "needs your decision" banner. Chat
+	// has no approval_requests table (that is workflow-only, G1) — the
+	// client acts by replying, same as a Gate 1 ASK's Questions.
+	Escalations []Contradiction `json:"escalations"`
+	// EscalationSummary is a one-line human summary of Escalations, empty
+	// when there are none.
+	EscalationSummary string `json:"escalation_summary,omitempty"`
 }
 
 // Contradiction classification values (B2). Kept as named constants so the
@@ -675,15 +684,48 @@ func (o *Orchestrator) synthesize(ctx context.Context, responses []ExpertRespons
 		if c.Type == ContradictionTypeFabrication && c.Resolution == ResolutionNoted {
 			c.Resolution = ResolutionEscalate
 		}
-		if c.Resolution == ResolutionEscalate {
-			result.NeedsEscalation = true
-		}
 		result.Contradictions = append(result.Contradictions, c)
 	}
 	if result.Summary == "" {
 		result.Summary = fmt.Sprintf("%d expert(s) responded.", len(responses))
 	}
+	applyEscalations(result)
 	return result
+}
+
+// applyEscalations derives Escalations/EscalationSummary/NeedsEscalation
+// from Contradictions (B2b) — the single place that decides what counts as
+// "needs a client decision", so synthesize() and synthesizeFallback() can
+// never disagree with each other about it.
+func applyEscalations(result *SynthesisResult) {
+	for _, c := range result.Contradictions {
+		if c.Resolution == ResolutionEscalate {
+			result.Escalations = append(result.Escalations, c)
+		}
+	}
+	result.NeedsEscalation = len(result.Escalations) > 0
+	if result.NeedsEscalation {
+		result.EscalationSummary = fmt.Sprintf(
+			"%d point(s) need your decision: %s",
+			len(result.Escalations),
+			escalationTopics(result.Escalations),
+		)
+	}
+}
+
+// escalationTopics joins each escalation's Topic (falling back to
+// "ExpertA vs ExpertB" when Topic is empty) into a short comma-separated
+// list for EscalationSummary.
+func escalationTopics(escalations []Contradiction) string {
+	topics := make([]string, 0, len(escalations))
+	for _, e := range escalations {
+		t := e.Topic
+		if t == "" {
+			t = fmt.Sprintf("%s vs %s", e.ExpertA, e.ExpertB)
+		}
+		topics = append(topics, t)
+	}
+	return strings.Join(topics, "; ")
 }
 
 // normalizeContradictionType maps the model's raw "type" to a known value,
@@ -752,11 +794,11 @@ func (o *Orchestrator) synthesizeFallback(responses []ExpertResponse) *Synthesis
 				Type:       ContradictionTypeContextConflict,
 				Resolution: ResolutionEscalate,
 			})
-			result.NeedsEscalation = true
 		}
 	}
 
 	result.Summary = fmt.Sprintf("%d expert(s) responded. Review each response carefully.", len(responses))
+	applyEscalations(result)
 	return result
 }
 
