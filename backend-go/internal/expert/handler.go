@@ -49,7 +49,13 @@ func NewHandler(db *pgxpool.Pool, logger *zap.Logger) *Handler {
 //   Belt-and-suspenders. Existing code sets is_training=TRUE during
 //   ingestion. Both conditions must be true for public visibility.
 func (h *Handler) ListActive(c *gin.Context) {
-	rows, err := h.db.Query(c.Request.Context(), `
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	userID, _ := c.Get("user_id")
+	uid, _ := userID.(uuid.UUID)
+
+	// domain_expert: only granted experts; admin/client: full trained catalog.
+	query := `
 		SELECT id, name, slug, domain, COALESCE(description,''),
 		       total_chunks, total_topics,
 		       COALESCE(avg_depth_level,0), COALESCE(avg_rating,0), created_at
@@ -57,8 +63,17 @@ func (h *Handler) ListActive(c *gin.Context) {
 		WHERE is_active=TRUE
 		  AND is_training=FALSE
 		  AND training_status='trained'
-		  AND deleted_at IS NULL
-		ORDER BY avg_rating DESC, total_chunks DESC`)
+		  AND deleted_at IS NULL`
+	args := []interface{}{}
+	if roleStr == "domain_expert" {
+		query += `
+		  AND id IN (SELECT expert_id FROM user_expert_grants WHERE user_id = $1)`
+		args = append(args, uid)
+	}
+	query += `
+		ORDER BY avg_rating DESC, total_chunks DESC`
+
+	rows, err := h.db.Query(c.Request.Context(), query, args...)
 	if err != nil {
 		h.logger.Error("list experts failed", zap.Error(err))
 		response.InternalError(c)
@@ -88,6 +103,22 @@ func (h *Handler) GetByID(c *gin.Context) {
 		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
 		return
 	}
+
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	if roleStr == "domain_expert" {
+		userID := c.MustGet("user_id").(uuid.UUID)
+		var granted bool
+		_ = h.db.QueryRow(c.Request.Context(),
+			`SELECT EXISTS(SELECT 1 FROM user_expert_grants WHERE user_id=$1 AND expert_id=$2)`,
+			userID, id,
+		).Scan(&granted)
+		if !granted {
+			response.NotFound(c, "expert")
+			return
+		}
+	}
+
 	var e ExpertPublic
 	// WHY training_status='trained': same as ListActive — only fully trained
 	// experts are visible to clients. Draft/ingesting experts are admin-only.

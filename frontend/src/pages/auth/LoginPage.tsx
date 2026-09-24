@@ -1,7 +1,7 @@
 import { useState, type FormEvent } from 'react'
 import { Link, useNavigate, useLocation } from 'react-router-dom'
 import { motion, useReducedMotion } from 'framer-motion'
-import { login } from '@/api/auth'
+import { adminLogin, login } from '@/api/auth'
 import { useAuthStore } from '@/stores/authStore'
 import { handleAPIError } from '@/utils/errors'
 import { Button } from '@/components/ui/Button'
@@ -24,6 +24,8 @@ export default function LoginPage() {
 
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [totpCode, setTotpCode] = useState('')
+  const [adminMode, setAdminMode] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
 
@@ -34,9 +36,19 @@ export default function LoginPage() {
     if (!trimmedEmail || !password) { setError('Email and password are required.'); return }
     setIsSubmitting(true)
     try {
-      const { user, tokenPair } = await login({ email: trimmedEmail, password })
-      setAuth(user, tokenPair.accessToken)
-      navigate('/', { replace: true })
+      if (adminMode) {
+        const { user, tokenPair } = await adminLogin({
+          email: trimmedEmail,
+          password,
+          totpCode: totpCode.trim(),
+        })
+        setAuth(user, tokenPair.accessToken)
+        navigate('/admin', { replace: true })
+      } else {
+        const { user, tokenPair } = await login({ email: trimmedEmail, password })
+        setAuth(user, tokenPair.accessToken)
+        navigate(user.role === 'admin' ? '/admin' : '/', { replace: true })
+      }
     } catch (err) {
       setError(handleAPIError(err))
     } finally {
@@ -136,6 +148,29 @@ export default function LoginPage() {
               onChange={(e) => setPassword(e.target.value)}
               disabled={isSubmitting} required
             />
+
+            {adminMode && (
+              <Input
+                label="Authenticator code"
+                name="totp"
+                autoComplete="one-time-code"
+                inputMode="numeric"
+                placeholder="6-digit code"
+                value={totpCode}
+                onChange={(e) => setTotpCode(e.target.value)}
+                disabled={isSubmitting}
+              />
+            )}
+
+            <label className="flex items-center gap-2 text-xs text-text-secondary">
+              <input
+                type="checkbox"
+                checked={adminMode}
+                onChange={(e) => setAdminMode(e.target.checked)}
+                disabled={isSubmitting}
+              />
+              Admin sign-in (password + authenticator)
+            </label>
 
             {error && (
               <p className="rounded-md border border-mode-refuse/30 bg-mode-refuse/10 px-3 py-2 text-xs text-mode-refuse">

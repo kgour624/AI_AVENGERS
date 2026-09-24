@@ -11,7 +11,7 @@
  * should be treated as a regression, not a feature.
  */
 
-export type UserRole = 'admin' | 'client'
+export type UserRole = 'admin' | 'client' | 'domain_expert'
 
 export interface User {
   id: string

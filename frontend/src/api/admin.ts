@@ -460,4 +460,63 @@ export const updateEmbeddingSettings = (req: UpdateEmbeddingSettingsRequest) =>
     .post<ApiResponse<{ status: string }>>('/api/v1/admin/embedding-settings', req)
     .then((res) => res.data.data!)
 
+// ============================================================
+// MANAGED ACCOUNTS (admin + domain_expert) + expert grants
+// ============================================================
+
+export interface ManagedAccount {
+  id: string
+  email: string
+  fullName: string
+  role: 'admin' | 'domain_expert'
+  isActive: boolean
+  totpEnabled: boolean
+  lastLogin?: string
+  createdAt: string
+  expertIds: string[]
+  projectCount: number
+  messageCount: number
+}
+
+export const getManagedAccounts = () =>
+  baseAPI
+    .get<ApiResponse<ManagedAccount[]>>('/api/v1/admin/accounts')
+    .then((res) => res.data.data!)
+
+export interface CreateManagedAccountRequest {
+  email: string
+  password: string
+  fullName: string
+  role: 'admin' | 'domain_expert'
+  expertIds?: string[]
+}
+
+export const createManagedAccount = (req: CreateManagedAccountRequest) =>
+  baseAPI
+    .post<ApiResponse<ManagedAccount>>('/api/v1/admin/accounts', {
+      email: req.email,
+      password: req.password,
+      full_name: req.fullName,
+      role: req.role,
+      expert_ids: req.expertIds ?? [],
+    })
+    .then((res) => res.data.data!)
+
+export const updateManagedAccount = (accountId: string, isActive: boolean) =>
+  baseAPI
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/accounts/${accountId}`, { is_active: isActive })
+    .then((res) => res.data.data!)
+
+export const setAccountExperts = (accountId: string, expertIds: string[]) =>
+  baseAPI
+    .put<ApiResponse<{ status: string }>>(`/api/v1/admin/accounts/${accountId}/experts`, {
+      expert_ids: expertIds,
+    })
+    .then((res) => res.data.data!)
+
+export const issueBootstrapToken = () =>
+  baseAPI
+    .post<ApiResponse<{ token: string; message: string }>>('/api/v1/admin/bootstrap-tokens')
+    .then((res) => res.data.data!)
+
 

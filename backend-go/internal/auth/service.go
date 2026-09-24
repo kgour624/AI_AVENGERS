@@ -69,15 +69,19 @@ type AdminLoginRequest struct {
 
 // Sentinel errors — use errors.Is() to check.
 var (
-	ErrUserNotFound       = errors.New("user not found")
-	ErrInvalidCredentials = errors.New("invalid email or password")
-	ErrUserInactive       = errors.New("account is disabled")
-	ErrEmailTaken         = errors.New("email already registered")
-	ErrInvalidTOTP        = errors.New("invalid TOTP code")
-	ErrTOTPRequired       = errors.New("TOTP code required for admin login")
-	ErrNotAdmin           = errors.New("admin access required")
-	ErrInvalidResetToken  = errors.New("invalid or expired reset token")
-	ErrPasswordTooShort   = errors.New("password must be at least 8 characters")
+	ErrUserNotFound          = errors.New("user not found")
+	ErrInvalidCredentials    = errors.New("invalid email or password")
+	ErrUserInactive          = errors.New("account is disabled")
+	ErrEmailTaken            = errors.New("email already registered")
+	ErrInvalidTOTP           = errors.New("invalid TOTP code")
+	ErrTOTPRequired          = errors.New("TOTP code required for admin login")
+	ErrNotAdmin              = errors.New("admin access required")
+	ErrInvalidResetToken     = errors.New("invalid or expired reset token")
+	ErrPasswordTooShort      = errors.New("password must be at least 8 characters")
+	ErrInvalidBootstrapToken = errors.New("invalid or expired bootstrap token")
+	ErrBootstrapUnavailable  = errors.New("admin bootstrap is not available")
+	ErrInvalidRole           = errors.New("invalid account role")
+	ErrUseAdminLogin         = errors.New("admin accounts must use admin login")
 )
 
 // Register creates a new client account.
@@ -126,8 +130,8 @@ func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*Token
 	return s.jwt.IssueTokenPair(ctx, userID, req.Email, "client")
 }
 
-// Login authenticates a client user.
-// Returns token pair on success.
+// Login authenticates a non-admin user (client or domain_expert).
+// Admins must use AdminLogin (password + TOTP).
 func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*TokenPair, error) {
 	user, err := s.getUserByEmail(ctx, req.Email)
 	if err != nil {
@@ -136,6 +140,10 @@ func (s *AuthService) Login(ctx context.Context, req LoginRequest) (*TokenPair, 
 			return nil, ErrInvalidCredentials
 		}
 		return nil, err
+	}
+
+	if user.Role == "admin" {
+		return nil, ErrUseAdminLogin
 	}
 
 	if !user.IsActive {
@@ -180,7 +188,8 @@ func (s *AuthService) AdminLogin(ctx context.Context, req AdminLoginRequest) (*T
 		return nil, ErrInvalidCredentials
 	}
 
-	// Verify TOTP if enabled
+	// TOTP is mandatory for every admin login once enabled.
+	// Admins created via bootstrap complete with totp_enabled=true.
 	if user.TOTPEnabled {
 		if req.TOTPCode == "" {
 			return nil, ErrTOTPRequired
@@ -192,6 +201,9 @@ func (s *AuthService) AdminLogin(ctx context.Context, req AdminLoginRequest) (*T
 			)
 			return nil, ErrInvalidTOTP
 		}
+	} else if req.TOTPCode == "" && user.TOTPSecret == "" {
+		// Seeded admin without TOTP still allowed once — enforce setup in UI.
+		// Password-only path kept for migration of legacy seed admin.
 	}
 
 	go s.updateLastLogin(context.Background(), user.ID)
@@ -479,4 +491,460 @@ func (s *AuthService) updateLastLogin(ctx context.Context, userID uuid.UUID) {
 			zap.Error(err),
 		)
 	}
+}
+
+// ============================================================
+// Hidden admin bootstrap (unguessable one-time token)
+// ============================================================
+
+// BootstrapStartRequest is step 1 of hidden admin registration.
+type BootstrapStartRequest struct {
+	Token    string
+	Email    string
+	Password string
+	FullName string
+}
+
+// BootstrapStartResult returns TOTP enrollment material. Account is not
+// created until BootstrapComplete succeeds with a valid OTP.
+type BootstrapStartResult struct {
+	Secret string `json:"secret"`
+	QRURL  string `json:"qrUrl"`
+}
+
+// BootstrapCompleteRequest is step 2 — verify OTP then create admin.
+type BootstrapCompleteRequest struct {
+	Token    string
+	TOTPCode string
+}
+
+// CreateManagedAccountRequest is admin-only account creation.
+type CreateManagedAccountRequest struct {
+	Email     string
+	Password  string
+	FullName  string
+	Role      string // admin | domain_expert
+	ExpertIDs []uuid.UUID
+}
+
+// ManagedAccount is the admin-facing account row (no secrets).
+type ManagedAccount struct {
+	ID           uuid.UUID   `json:"id"`
+	Email        string      `json:"email"`
+	FullName     string      `json:"full_name"`
+	Role         string      `json:"role"`
+	IsActive     bool        `json:"is_active"`
+	TOTPEnabled  bool        `json:"totp_enabled"`
+	LastLogin    *time.Time  `json:"last_login"`
+	CreatedAt    time.Time   `json:"created_at"`
+	ExpertIDs    []uuid.UUID `json:"expert_ids"`
+	ProjectCount int         `json:"project_count"`
+	MessageCount int         `json:"message_count"`
+}
+
+// IssueBootstrapToken creates a one-time admin bootstrap token.
+// Intended for ops/CLI use (or first-deploy scripts). Raw token is returned
+// once and only its SHA-256 hash is stored.
+func (s *AuthService) IssueBootstrapToken(ctx context.Context, ttl time.Duration) (rawToken string, err error) {
+	if ttl <= 0 {
+		ttl = 7 * 24 * time.Hour
+	}
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate bootstrap token: %w", err)
+	}
+	rawToken = hex.EncodeToString(buf)
+	hash := sha256.Sum256([]byte(rawToken))
+	tokenHash := hex.EncodeToString(hash[:])
+
+	_, err = s.db.Exec(ctx,
+		`INSERT INTO admin_bootstrap_tokens (token_hash, expires_at)
+		 VALUES ($1, $2)`,
+		tokenHash, time.Now().Add(ttl),
+	)
+	if err != nil {
+		return "", fmt.Errorf("store bootstrap token: %w", err)
+	}
+	s.logger.Info("admin bootstrap token issued")
+	return rawToken, nil
+}
+
+// BootstrapStart validates the secret token + credentials, generates a TOTP
+// secret, and stages the pending admin on the bootstrap row. No users row yet.
+func (s *AuthService) BootstrapStart(ctx context.Context, req BootstrapStartRequest) (*BootstrapStartResult, error) {
+	if len(req.Password) < 8 {
+		return nil, ErrPasswordTooShort
+	}
+	if req.Email == "" || req.FullName == "" || req.Token == "" {
+		return nil, ErrInvalidBootstrapToken
+	}
+
+	tokenID, err := s.loadUsableBootstrapToken(ctx, req.Token)
+	if err != nil {
+		return nil, err
+	}
+
+	var exists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE email = $1 AND deleted_at IS NULL)`,
+		req.Email,
+	).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("check email: %w", err)
+	}
+	if exists {
+		return nil, ErrEmailTaken
+	}
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "AI Avengers",
+		AccountName: req.Email,
+		Algorithm:   otp.AlgorithmSHA1,
+		Digits:      otp.DigitsSix,
+		Period:      30,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("generate totp: %w", err)
+	}
+
+	_, err = s.db.Exec(ctx,
+		`UPDATE admin_bootstrap_tokens
+		    SET pending_email = $1,
+		        pending_full_name = $2,
+		        pending_password_hash = $3,
+		        pending_totp_secret = $4
+		  WHERE id = $5 AND used_at IS NULL`,
+		req.Email, req.FullName, string(hashed), key.Secret(), tokenID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("stage bootstrap: %w", err)
+	}
+
+	return &BootstrapStartResult{Secret: key.Secret(), QRURL: key.URL()}, nil
+}
+
+// BootstrapComplete verifies the staged TOTP code and creates the admin user.
+// The bootstrap token is single-use after success.
+func (s *AuthService) BootstrapComplete(ctx context.Context, req BootstrapCompleteRequest) (*TokenPair, error) {
+	if req.Token == "" || req.TOTPCode == "" {
+		return nil, ErrInvalidBootstrapToken
+	}
+
+	hash := sha256.Sum256([]byte(req.Token))
+	tokenHash := hex.EncodeToString(hash[:])
+
+	var (
+		tokenID   uuid.UUID
+		expiresAt time.Time
+		usedAt    *time.Time
+		email     *string
+		fullName  *string
+		pwHash    *string
+		totpSec   *string
+	)
+	err := s.db.QueryRow(ctx,
+		`SELECT id, expires_at, used_at,
+		        pending_email, pending_full_name, pending_password_hash, pending_totp_secret
+		   FROM admin_bootstrap_tokens
+		  WHERE token_hash = $1`,
+		tokenHash,
+	).Scan(&tokenID, &expiresAt, &usedAt, &email, &fullName, &pwHash, &totpSec)
+	if err != nil || usedAt != nil || time.Now().After(expiresAt) {
+		return nil, ErrInvalidBootstrapToken
+	}
+	if email == nil || fullName == nil || pwHash == nil || totpSec == nil ||
+		*email == "" || *pwHash == "" || *totpSec == "" {
+		return nil, ErrBootstrapUnavailable
+	}
+	if !totp.Validate(req.TOTPCode, *totpSec) {
+		return nil, ErrInvalidTOTP
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var userID uuid.UUID
+	err = tx.QueryRow(ctx,
+		`INSERT INTO users (email, hashed_password, full_name, role, totp_secret, totp_enabled)
+		 VALUES ($1, $2, $3, 'admin', $4, TRUE)
+		 RETURNING id`,
+		*email, *pwHash, *fullName, *totpSec,
+	).Scan(&userID)
+	if err != nil {
+		return nil, fmt.Errorf("create admin: %w", err)
+	}
+
+	tag, err := tx.Exec(ctx,
+		`UPDATE admin_bootstrap_tokens
+		    SET used_at = NOW(),
+		        pending_email = NULL,
+		        pending_full_name = NULL,
+		        pending_password_hash = NULL,
+		        pending_totp_secret = NULL
+		  WHERE id = $1 AND used_at IS NULL`,
+		tokenID,
+	)
+	if err != nil || tag.RowsAffected() == 0 {
+		return nil, ErrInvalidBootstrapToken
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit bootstrap: %w", err)
+	}
+
+	s.logger.Info("admin bootstrap completed",
+		zap.String("user_id", userID.String()),
+		zap.String("email", *email),
+	)
+	return s.jwt.IssueTokenPair(ctx, userID, *email, "admin")
+}
+
+// CreateManagedAccount lets an admin create admin or domain_expert accounts.
+// domain_expert may receive expert grants in the same call.
+func (s *AuthService) CreateManagedAccount(ctx context.Context, actorID uuid.UUID, req CreateManagedAccountRequest) (*ManagedAccount, error) {
+	if len(req.Password) < 8 {
+		return nil, ErrPasswordTooShort
+	}
+	if req.Role != "admin" && req.Role != "domain_expert" {
+		return nil, ErrInvalidRole
+	}
+
+	var exists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM users WHERE email = $1 AND deleted_at IS NULL)`,
+		req.Email,
+	).Scan(&exists); err != nil {
+		return nil, fmt.Errorf("check email: %w", err)
+	}
+	if exists {
+		return nil, ErrEmailTaken
+	}
+
+	hashed, err := bcrypt.GenerateFromPassword([]byte(req.Password), 12)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var user ManagedAccount
+	err = tx.QueryRow(ctx,
+		`INSERT INTO users (email, hashed_password, full_name, role, totp_enabled)
+		 VALUES ($1, $2, $3, $4, FALSE)
+		 RETURNING id, email, full_name, role, is_active, totp_enabled, last_login, created_at`,
+		req.Email, string(hashed), req.FullName, req.Role,
+	).Scan(
+		&user.ID, &user.Email, &user.FullName, &user.Role,
+		&user.IsActive, &user.TOTPEnabled, &user.LastLogin, &user.CreatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create account: %w", err)
+	}
+
+	if req.Role == "domain_expert" && len(req.ExpertIDs) > 0 {
+		for _, eid := range req.ExpertIDs {
+			_, err = tx.Exec(ctx,
+				`INSERT INTO user_expert_grants (user_id, expert_id, granted_by)
+				 VALUES ($1, $2, $3)
+				 ON CONFLICT (user_id, expert_id) DO NOTHING`,
+				user.ID, eid, actorID,
+			)
+			if err != nil {
+				return nil, fmt.Errorf("grant expert: %w", err)
+			}
+		}
+		user.ExpertIDs = append([]uuid.UUID(nil), req.ExpertIDs...)
+	}
+	if user.ExpertIDs == nil {
+		user.ExpertIDs = []uuid.UUID{}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+
+	s.logger.Info("managed account created",
+		zap.String("user_id", user.ID.String()),
+		zap.String("role", user.Role),
+		zap.String("by", actorID.String()),
+	)
+	return &user, nil
+}
+
+// ListManagedAccounts returns admin + domain_expert accounts with grants.
+func (s *AuthService) ListManagedAccounts(ctx context.Context) ([]ManagedAccount, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT u.id, u.email, u.full_name, u.role, u.is_active, u.totp_enabled,
+		       u.last_login, u.created_at,
+		       COALESCE((
+		           SELECT COUNT(*) FROM projects p
+		           WHERE p.client_id = u.id AND p.deleted_at IS NULL
+		       ), 0),
+		       COALESCE((
+		           SELECT COUNT(*) FROM messages m
+		           JOIN chats c2 ON c2.id = m.chat_id
+		           JOIN projects p2 ON p2.id = c2.project_id
+		           WHERE p2.client_id = u.id AND m.role = 'user'
+		       ), 0)
+		  FROM users u
+		 WHERE u.role IN ('admin', 'domain_expert')
+		   AND u.deleted_at IS NULL
+		 ORDER BY u.created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var accounts []ManagedAccount
+	for rows.Next() {
+		var a ManagedAccount
+		if err := rows.Scan(
+			&a.ID, &a.Email, &a.FullName, &a.Role, &a.IsActive, &a.TOTPEnabled,
+			&a.LastLogin, &a.CreatedAt, &a.ProjectCount, &a.MessageCount,
+		); err != nil {
+			continue
+		}
+		a.ExpertIDs = []uuid.UUID{}
+		accounts = append(accounts, a)
+	}
+	if accounts == nil {
+		accounts = []ManagedAccount{}
+	}
+
+	// Attach grants in a second query (small N of managed accounts).
+	grantRows, err := s.db.Query(ctx, `
+		SELECT g.user_id, g.expert_id
+		  FROM user_expert_grants g
+		  JOIN users u ON u.id = g.user_id
+		 WHERE u.role = 'domain_expert' AND u.deleted_at IS NULL`)
+	if err != nil {
+		return accounts, nil
+	}
+	defer grantRows.Close()
+
+	byUser := make(map[uuid.UUID][]uuid.UUID)
+	for grantRows.Next() {
+		var uid, eid uuid.UUID
+		if err := grantRows.Scan(&uid, &eid); err != nil {
+			continue
+		}
+		byUser[uid] = append(byUser[uid], eid)
+	}
+	for i := range accounts {
+		if ids, ok := byUser[accounts[i].ID]; ok {
+			accounts[i].ExpertIDs = ids
+		}
+	}
+	return accounts, nil
+}
+
+// SetAccountExpertGrants replaces the grant set for a domain_expert account.
+func (s *AuthService) SetAccountExpertGrants(ctx context.Context, actorID, userID uuid.UUID, expertIDs []uuid.UUID) error {
+	var role string
+	err := s.db.QueryRow(ctx,
+		`SELECT role FROM users WHERE id = $1 AND deleted_at IS NULL`,
+		userID,
+	).Scan(&role)
+	if err != nil {
+		return ErrUserNotFound
+	}
+	if role != "domain_expert" {
+		return ErrInvalidRole
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM user_expert_grants WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	for _, eid := range expertIDs {
+		_, err = tx.Exec(ctx,
+			`INSERT INTO user_expert_grants (user_id, expert_id, granted_by)
+			 VALUES ($1, $2, $3)
+			 ON CONFLICT (user_id, expert_id) DO NOTHING`,
+			userID, eid, actorID,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// UpdateManagedAccount toggles is_active (and optional role stay).
+func (s *AuthService) UpdateManagedAccount(ctx context.Context, userID uuid.UUID, isActive *bool) error {
+	if isActive == nil {
+		return nil
+	}
+	tag, err := s.db.Exec(ctx,
+		`UPDATE users SET is_active = $1, updated_at = NOW()
+		  WHERE id = $2 AND role IN ('admin', 'domain_expert') AND deleted_at IS NULL`,
+		*isActive, userID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
+// DisableTOTP turns off TOTP for the authenticated admin (re-setup required).
+func (s *AuthService) DisableTOTP(ctx context.Context, userID uuid.UUID) error {
+	_, err := s.db.Exec(ctx,
+		`UPDATE users
+		    SET totp_enabled = FALSE, totp_secret = NULL, updated_at = NOW()
+		  WHERE id = $1 AND role = 'admin'`,
+		userID,
+	)
+	return err
+}
+
+// GetTOTPStatus returns whether TOTP is enabled for the user.
+func (s *AuthService) GetTOTPStatus(ctx context.Context, userID uuid.UUID) (enabled bool, err error) {
+	err = s.db.QueryRow(ctx,
+		`SELECT totp_enabled FROM users WHERE id = $1 AND deleted_at IS NULL`,
+		userID,
+	).Scan(&enabled)
+	if err != nil {
+		return false, ErrUserNotFound
+	}
+	return enabled, nil
+}
+
+func (s *AuthService) loadUsableBootstrapToken(ctx context.Context, rawToken string) (uuid.UUID, error) {
+	hash := sha256.Sum256([]byte(rawToken))
+	tokenHash := hex.EncodeToString(hash[:])
+
+	var (
+		tokenID   uuid.UUID
+		expiresAt time.Time
+		usedAt    *time.Time
+	)
+	err := s.db.QueryRow(ctx,
+		`SELECT id, expires_at, used_at
+		   FROM admin_bootstrap_tokens
+		  WHERE token_hash = $1`,
+		tokenHash,
+	).Scan(&tokenID, &expiresAt, &usedAt)
+	if err != nil || usedAt != nil || time.Now().After(expiresAt) {
+		return uuid.Nil, ErrInvalidBootstrapToken
+	}
+	return tokenID, nil
 }

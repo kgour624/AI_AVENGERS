@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -375,7 +376,7 @@ func buildRouter(
 	// Initialize HTTP handlers
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
-	messageHandler := message.NewHandler(chatSvc, orch, modelGateway, embedder, memManager, logger)
+	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
@@ -535,6 +536,10 @@ func buildRouter(
 		authGroup.POST("/register", handleRegister(authService))
 		authGroup.POST("/login", handleLogin(authService))
 		authGroup.POST("/admin/login", handleAdminLogin(authService))
+		// Hidden admin bootstrap — requires unguessable one-time token.
+		// Not linked from public login/register pages.
+		authGroup.POST("/admin/bootstrap/start", handleBootstrapStart(authService))
+		authGroup.POST("/admin/bootstrap/complete", handleBootstrapComplete(authService))
 		authGroup.POST("/refresh", handleRefresh(jwtService))
 		authGroup.POST("/logout", middleware.AuthMiddleware(jwtService, logger), handleLogout(jwtService))
 		authGroup.POST("/forgot-password", handleForgotPassword(authService, logger))
@@ -586,7 +591,13 @@ func buildRouter(
 		// using the refresh token cookie.
 		protected.GET("/auth/me", handleGetMe(authService))
 
-		// Expert routes (read-only for clients)
+		// Authenticated admin self-service TOTP management
+		protected.GET("/auth/totp", handleGetTOTPStatus(authService))
+		protected.POST("/auth/totp/setup", handleSetupTOTP(authService))
+		protected.POST("/auth/totp/enable", handleEnableTOTP(authService))
+		protected.POST("/auth/totp/disable", handleDisableTOTP(authService))
+
+		// Expert routes (read-only for clients / domain experts)
 		experts := protected.Group("/experts")
 		{
 			experts.GET("", expertHandler.ListActive)
@@ -698,6 +709,12 @@ func buildRouter(
 		adminGroup.POST("/experts/:id/jobs/:jobID/retry", adminHandler.RetryIngestionJob)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
+		// Managed accounts: admin + domain_expert CRUD + expert grants
+		adminGroup.GET("/accounts", handleListManagedAccounts(authService))
+		adminGroup.POST("/accounts", handleCreateManagedAccount(authService))
+		adminGroup.PATCH("/accounts/:id", handleUpdateManagedAccount(authService))
+		adminGroup.PUT("/accounts/:id/experts", handleSetAccountExperts(authService))
+		adminGroup.POST("/bootstrap-tokens", handleIssueBootstrapToken(authService, logger))
 		adminGroup.GET("/stats", adminHandler.GetStats)
 		adminGroup.GET("/violations", adminHandler.GetViolations)
 		adminGroup.GET("/ratings", adminHandler.GetRatings)
@@ -953,10 +970,12 @@ func handleLogin(svc *auth.AuthService) gin.HandlerFunc {
 			Password: req.Password,
 		})
 		if err != nil {
-			switch err {
-			case auth.ErrInvalidCredentials, auth.ErrUserNotFound:
+			switch {
+			case errors.Is(err, auth.ErrInvalidCredentials), errors.Is(err, auth.ErrUserNotFound):
 				response.Unauthorized(c, "Invalid email or password")
-			case auth.ErrUserInactive:
+			case errors.Is(err, auth.ErrUseAdminLogin):
+				response.BadRequest(c, "USE_ADMIN_LOGIN", "Admin accounts must sign in via admin login with authenticator code")
+			case errors.Is(err, auth.ErrUserInactive):
 				response.Forbidden(c, "Account is disabled")
 			default:
 				response.InternalError(c)
@@ -1186,6 +1205,284 @@ func handleResetPassword(svc *auth.AuthService) gin.HandlerFunc {
 		response.OK(c, map[string]string{
 			"message": "Password reset successful. Please log in with your new password.",
 		})
+	}
+}
+
+// ============================================================
+// Admin bootstrap + managed accounts + TOTP self-service
+// ============================================================
+
+func handleBootstrapStart(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Token    string `json:"token" binding:"required"`
+			Email    string `json:"email" binding:"required,email"`
+			Password string `json:"password" binding:"required,min=8"`
+			FullName string `json:"full_name" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+		result, err := svc.BootstrapStart(c.Request.Context(), auth.BootstrapStartRequest{
+			Token: req.Token, Email: req.Email, Password: req.Password, FullName: req.FullName,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, auth.ErrInvalidBootstrapToken):
+				response.Unauthorized(c, "Invalid or expired bootstrap token")
+			case errors.Is(err, auth.ErrEmailTaken):
+				response.Conflict(c, "Email already registered")
+			case errors.Is(err, auth.ErrPasswordTooShort):
+				response.BadRequest(c, "PASSWORD_TOO_SHORT", err.Error())
+			default:
+				response.InternalError(c)
+			}
+			return
+		}
+		response.OK(c, result)
+	}
+}
+
+func handleBootstrapComplete(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req struct {
+			Token    string `json:"token" binding:"required"`
+			TOTPCode string `json:"totp_code" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+		tokens, err := svc.BootstrapComplete(c.Request.Context(), auth.BootstrapCompleteRequest{
+			Token: req.Token, TOTPCode: req.TOTPCode,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, auth.ErrInvalidBootstrapToken), errors.Is(err, auth.ErrBootstrapUnavailable):
+				response.Unauthorized(c, "Invalid or expired bootstrap token")
+			case errors.Is(err, auth.ErrInvalidTOTP):
+				response.Unauthorized(c, "Invalid TOTP code")
+			default:
+				response.InternalError(c)
+			}
+			return
+		}
+		user, err := svc.GetMe(c.Request.Context(), tokens.UserID)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		setRefreshCookie(c, tokens.RefreshToken, svc.RefreshExpiryDays())
+		response.Created(c, buildAuthResponse(user, tokens))
+	}
+}
+
+func handleIssueBootstrapToken(svc *auth.AuthService, logger *zap.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, err := svc.IssueBootstrapToken(c.Request.Context(), 7*24*time.Hour)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		logger.Info("admin bootstrap token issued via admin API")
+		// Raw token returned once — caller must store it securely.
+		response.Created(c, map[string]string{
+			"token":   raw,
+			"message": "One-time bootstrap token. Share out-of-band; not stored in plaintext.",
+		})
+	}
+}
+
+func handleListManagedAccounts(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		accounts, err := svc.ListManagedAccounts(c.Request.Context())
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, accounts)
+	}
+}
+
+func handleCreateManagedAccount(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		actorID := c.MustGet("user_id").(uuid.UUID)
+		var req struct {
+			Email     string   `json:"email" binding:"required,email"`
+			Password  string   `json:"password" binding:"required,min=8"`
+			FullName  string   `json:"full_name" binding:"required"`
+			Role      string   `json:"role" binding:"required"`
+			ExpertIDs []string `json:"expert_ids"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+		var expertIDs []uuid.UUID
+		for _, s := range req.ExpertIDs {
+			id, err := uuid.Parse(s)
+			if err != nil {
+				response.BadRequest(c, "INVALID_ID", "invalid expert_id")
+				return
+			}
+			expertIDs = append(expertIDs, id)
+		}
+		acct, err := svc.CreateManagedAccount(c.Request.Context(), actorID, auth.CreateManagedAccountRequest{
+			Email: req.Email, Password: req.Password, FullName: req.FullName,
+			Role: req.Role, ExpertIDs: expertIDs,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, auth.ErrEmailTaken):
+				response.Conflict(c, "Email already registered")
+			case errors.Is(err, auth.ErrInvalidRole):
+				response.BadRequest(c, "INVALID_ROLE", "role must be admin or domain_expert")
+			case errors.Is(err, auth.ErrPasswordTooShort):
+				response.BadRequest(c, "PASSWORD_TOO_SHORT", err.Error())
+			default:
+				response.InternalError(c)
+			}
+			return
+		}
+		response.Created(c, acct)
+	}
+}
+
+func handleUpdateManagedAccount(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid account ID")
+			return
+		}
+		var req struct {
+			IsActive *bool `json:"is_active"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+		if err := svc.UpdateManagedAccount(c.Request.Context(), id, req.IsActive); err != nil {
+			if errors.Is(err, auth.ErrUserNotFound) {
+				response.NotFound(c, "account")
+				return
+			}
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, map[string]string{"status": "updated"})
+	}
+}
+
+func handleSetAccountExperts(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		actorID := c.MustGet("user_id").(uuid.UUID)
+		userID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid account ID")
+			return
+		}
+		var req struct {
+			ExpertIDs []string `json:"expert_ids" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+		var expertIDs []uuid.UUID
+		for _, s := range req.ExpertIDs {
+			id, err := uuid.Parse(s)
+			if err != nil {
+				response.BadRequest(c, "INVALID_ID", "invalid expert_id")
+				return
+			}
+			expertIDs = append(expertIDs, id)
+		}
+		if err := svc.SetAccountExpertGrants(c.Request.Context(), actorID, userID, expertIDs); err != nil {
+			switch {
+			case errors.Is(err, auth.ErrUserNotFound):
+				response.NotFound(c, "account")
+			case errors.Is(err, auth.ErrInvalidRole):
+				response.BadRequest(c, "INVALID_ROLE", "expert grants only apply to domain_expert accounts")
+			default:
+				response.InternalError(c)
+			}
+			return
+		}
+		response.OK(c, map[string]string{"status": "updated"})
+	}
+}
+
+func handleGetTOTPStatus(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		userID := c.MustGet("user_id").(uuid.UUID)
+		enabled, err := svc.GetTOTPStatus(c.Request.Context(), userID)
+		if err != nil {
+			response.NotFound(c, "user")
+			return
+		}
+		response.OK(c, map[string]bool{"totpEnabled": enabled})
+	}
+}
+
+func handleSetupTOTP(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("role")
+		if role != "admin" {
+			response.Forbidden(c, "Admin access required")
+			return
+		}
+		userID := c.MustGet("user_id").(uuid.UUID)
+		secret, qrURL, err := svc.SetupTOTP(c.Request.Context(), userID)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, map[string]string{"secret": secret, "qrUrl": qrURL})
+	}
+}
+
+func handleEnableTOTP(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("role")
+		if role != "admin" {
+			response.Forbidden(c, "Admin access required")
+			return
+		}
+		userID := c.MustGet("user_id").(uuid.UUID)
+		var req struct {
+			Code string `json:"code" binding:"required"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			response.BadRequest(c, "INVALID_INPUT", err.Error())
+			return
+		}
+		if err := svc.VerifyAndEnableTOTP(c.Request.Context(), userID, req.Code); err != nil {
+			if errors.Is(err, auth.ErrInvalidTOTP) {
+				response.Unauthorized(c, "Invalid TOTP code")
+				return
+			}
+			response.BadRequest(c, "TOTP_SETUP", err.Error())
+			return
+		}
+		response.OK(c, map[string]string{"status": "enabled"})
+	}
+}
+
+func handleDisableTOTP(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		role, _ := c.Get("role")
+		if role != "admin" {
+			response.Forbidden(c, "Admin access required")
+			return
+		}
+		userID := c.MustGet("user_id").(uuid.UUID)
+		if err := svc.DisableTOTP(c.Request.Context(), userID); err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, map[string]string{"status": "disabled"})
 	}
 }
 

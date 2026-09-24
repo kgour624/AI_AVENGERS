@@ -11,6 +11,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/response"
 )
@@ -100,6 +101,12 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 	}
 
 	clientID := c.MustGet("user_id").(uuid.UUID)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	if err := auth.MustHaveExpertAccess(c.Request.Context(), h.engine.DB(), clientID, roleStr, req.SelectedExpertIDs); err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
 
 	w, err := h.engine.Create(c.Request.Context(), CreateRequest{
 		ClientID:          clientID,

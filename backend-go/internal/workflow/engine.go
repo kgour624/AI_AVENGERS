@@ -105,6 +105,11 @@ func NewEngine(db *pgxpool.Pool, logger *zap.Logger) *Engine {
 	return &Engine{db: db, logger: logger}
 }
 
+// DB exposes the pool for authorization helpers (expert grants).
+func (e *Engine) DB() *pgxpool.Pool {
+	return e.db
+}
+
 // Create creates a new workflow in 'draft' status.
 // Does NOT start it — call Start() when ready.
 func (e *Engine) Create(ctx context.Context, req CreateRequest) (*Workflow, error) {
