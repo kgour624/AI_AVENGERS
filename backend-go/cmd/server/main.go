@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -778,6 +780,13 @@ func buildRouter(
 			messages.GET("/:id/explanation", explainHandler.Get)
 		}
 
+		// Global search (#27) — cross-project. Mounted on its own prefix so it
+		// can never collide with the /chats/:id wildcard.
+		search := protected.Group("/search")
+		{
+			search.GET("/chats", handleSearchChats(chatSvc, tenantSvc))
+		}
+
 		// Workflow routes (Phase C — collaboration layer)
 		workflows := protected.Group("/workflows")
 		{
@@ -918,6 +927,52 @@ func buildRouter(
 // ============================================================
 // Inline route handlers
 // ============================================================
+
+// handleSearchChats GET /search/chats?q=&limit= (#27)
+// Global, cross-project search over the caller's own chats (title + message
+// content). Tenant-aware via the C4 scope — a tenant caller only ever sees
+// chats whose project belongs to their tenant.
+//
+// WHY a closure (not a chat.Handler method): the query needs both the chat
+// service and the tenant service, and main.go already builds every
+// cross-cutting handler this way (provenance, explanation, project memory).
+func handleSearchChats(chatSvc *chat.Service, tenantSvc *tenant.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		clientID, ok := c.MustGet("user_id").(uuid.UUID)
+		if !ok {
+			response.Unauthorized(c, "invalid session")
+			return
+		}
+		q := strings.TrimSpace(c.Query("q"))
+		if len([]rune(q)) < 2 {
+			response.BadRequest(c, "QUERY_TOO_SHORT", "q must be at least 2 characters")
+			return
+		}
+		limit := 20
+		if l := strings.TrimSpace(c.Query("limit")); l != "" {
+			if n, err := strconv.Atoi(l); err == nil {
+				limit = n
+			}
+		}
+
+		// C4: resolve the caller's tenant scope. nil tenant → global (admin
+		// or isolation disabled), in which case the SQL predicate is skipped.
+		role, _ := c.Get("role")
+		roleStr, _ := role.(string)
+		scope, err := tenantSvc.Resolve(c.Request.Context(), clientID, roleStr)
+		if err != nil {
+			response.Forbidden(c, "Tenant scope could not be resolved")
+			return
+		}
+
+		results, err := chatSvc.SearchChats(c.Request.Context(), clientID, scope.TenantID, q, limit)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, gin.H{"query": q, "results": results})
+	}
+}
 
 // handleGetProjectMemory GET /projects/:id/memory
 // Returns L2 group-memory entries (cross-expert decisions).
