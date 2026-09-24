@@ -129,17 +129,16 @@ func (e *Engine) Process(
 	}
 
 	// GATE 1: Information Sufficiency
-	if result := e.gate1(question, expert); result != nil {
+	// needsLLM is true only when the keyword path was inconclusive
+	// (vague + short + no charter match). Domain-skip and "already
+	// specific" return needsLLM=false so gate1WithLLM is never called
+	// (A13 — previously every nil from gate1 defeated Gate1Skip).
+	if result, needsLLM := e.gate1(question, expert); result != nil {
 		return result, nil
-	}
-	// Bug 3.5 fix (docs bug list): gate1WithLLM was fully implemented
-	// (zero-shot structured vagueness check) but never called from
-	// anywhere - dead code. Its own doc comment says "Called when
-	// keyword check is inconclusive", which is exactly this: gate1's
-	// keyword-based check found nothing (returned nil), so fall back to
-	// the LLM check before assuming the question is clear enough.
-	if result := e.gate1WithLLM(ctx, question, expert); result != nil {
-		return result, nil
+	} else if needsLLM {
+		if result := e.gate1WithLLM(ctx, question, expert); result != nil {
+			return result, nil
+		}
 	}
 
 	// GATE 2: Knowledge Coverage
@@ -238,16 +237,14 @@ func (e *Engine) Process(
 }
 
 // gate1 checks if we have enough information to answer.
-// Uses double-check pattern:
-// 1. Fast keyword check (free) — catches obvious vague questions
-// 2. LLM check (cheap) — only if keyword check flags vagueness
-//
-// WHY LLM for vagueness (Byte by Byte AI course):
-// Course taught: zero-shot prompting with structured output.
-// "Is this question specific enough? Return JSON: {clear: bool, missing: [...]}"
-// Keyword matching alone misses nuanced vagueness.
-// LLM double-check only runs when needed — avoids cost on clear questions.
-func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
+// Returns (result, needsLLM):
+//   - problem-solving domain  -> (nil, false)  // Gate1Skip, no LLM
+//   - already specific/long   -> (nil, false)  // no LLM
+//   - charter match           -> (ASK, false)  // keyword path settled
+//   - vague+short+no charter  -> (nil, true)   // inconclusive -> LLM
+// WHY the bool (A13): previously every nil defeated Gate1Skip because
+// Process always fell through to gate1WithLLM.
+func (e *Engine) gate1(question string, expert Expert) (*DecisionResult, bool) {
 	questionLower := strings.ToLower(question)
 
 	// Domain bypass: problem-solving domain experts (DSA, coding, etc.)
@@ -256,7 +253,7 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 	// A DSA expert answers "what is python" directly. A medical expert might
 	// need clarification on "what is python" (snake? programming language?).
 	if chinawall.IsProblemSolvingDomain(expert.Domain) {
-		return nil // Problem-solving experts skip Gate 1 entirely
+		return nil, false
 	}
 
 	// Fast check: obvious vague indicators
@@ -269,10 +266,10 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 		}
 	}
 
-	// Only proceed to LLM check if keyword check flagged AND question is short
-	// WHY length check: Long questions usually have enough context
+	// Specific/long questions skip the LLM fallback.
+	// WHY length check: Long questions usually have enough context.
 	if !isVague || len(question) >= 80 {
-		return nil // Question is specific enough
+		return nil, false
 	}
 
 	// Find relevant clarification questions from charter
@@ -292,16 +289,26 @@ func (e *Engine) gate1(question string, expert Expert) *DecisionResult {
 			Questions:   clarificationQs[:minInt(3, len(clarificationQs))],
 			GateStopped: 1,
 			Content:     "I need more information to give you an accurate answer.",
-		}
+		}, false
 	}
 
-	return nil
+	// Keyword path flagged vague + short but found no charter questions.
+	// Fall back to the cheap LLM check.
+	return nil, true
 }
 
 // gate1WithLLM is the enhanced version using LLM for vagueness detection.
-// Called when keyword check is inconclusive.
+// Called only when gate1's keyword check is inconclusive (needsLLM=true).
 // Uses zero-shot structured output (Byte by Byte AI course pattern).
+// Cheap: ModelCheap, Temperature 0.1, single-pass, no CoT (§3.1 P11).
+// Fail-safe: any LLM/parse error returns nil (do not block, §3.1 P3).
 func (e *Engine) gate1WithLLM(ctx context.Context, question string, expert Expert) *DecisionResult {
+	// Defense-in-depth: never ask clarification of problem-solving domains
+	// even if a future call site forgets the needsLLM gate (A13).
+	if chinawall.IsProblemSolvingDomain(expert.Domain) {
+		return nil
+	}
+
 	prompt := fmt.Sprintf(`Is this question specific enough to answer accurately?
 
 Question: "%s"
