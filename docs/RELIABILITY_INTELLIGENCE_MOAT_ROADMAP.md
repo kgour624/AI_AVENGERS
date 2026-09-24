@@ -482,7 +482,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B1 | LLM synthesis | B | ✅ done | (pending PR, this branch) |
 | B2 | semantic contradiction detection | B | ✅ done | (pending PR, this branch) |
 | B3 | workflow memory write-back | B | ✅ done | (pending PR, this branch) |
-| B4 | gate threshold calibration | B | ⬜ pending | — |
+| B4 | gate threshold calibration | B | ✅ done | (pending PR, this branch) |
 | B5 | self-learning hardening | B | ⬜ pending | — |
 | B6 | answer quality regeneration | B | ⬜ pending | — |
 | B7 | memory consolidation | B | ⬜ pending | — |
