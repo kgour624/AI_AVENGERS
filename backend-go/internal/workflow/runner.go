@@ -173,6 +173,17 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		return
 	}
 
+	// execMu (A17): single-flight lock shared between this Run() goroutine
+	// and the change-request watcher goroutine below. A12 already stops the
+	// watcher from acting while the workflow is paused_for_approval; this
+	// closes the remaining gap — status=running but a main-loop wave is
+	// mid-flight. Both sides Lock() around {RestartPhase/mustTransition +
+	// executeWaves}, so only one of {main phase step, CR redesign} ever
+	// touches runner_state/blackboard for this workflow at a time. Neither
+	// side holds the lock across AskClient/waitForResume (blocking on a
+	// human gate while holding it would starve the other side forever).
+	var execMu sync.Mutex
+
 	// Start the change request watcher goroutine.
 	// It runs for the lifetime of this workflow and picks up any change
 	// requests the client submits from the workflow chat.
@@ -180,7 +191,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// support — the nil check makes the feature opt-in without breaking
 	// existing callers that have not called WithChangeRequestService.
 	if r.crSvc != nil {
-		go r.watchForChangeRequest(ctx, workflowID, experts, nil, r.crSvc)
+		go r.watchForChangeRequest(ctx, workflowID, experts, nil, r.crSvc, &execMu)
 	}
 
 	// Step 3: Load checkpoint (pod-restart recovery).
@@ -360,7 +371,10 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 				}
 
 				state = seedPhase(PhaseHighLevelDesign)
-				if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+				execMu.Lock()
+				err := r.executeWaves(ctx, workflowID, waves, experts, state)
+				execMu.Unlock()
+				if err != nil {
 					log.Error("runner: HLD waves failed", zap.Error(err))
 					if len(state.CompletedExpertIDs) == 0 {
 						_ = r.engine.Fail(ctx, workflowID, "HLD phase: all tasks failed")
@@ -383,7 +397,10 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 				}
 
 				state = seedPhase(PhaseDetailedDesign)
-				if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+				execMu.Lock()
+				err := r.executeWaves(ctx, workflowID, waves, experts, state)
+				execMu.Unlock()
+				if err != nil {
 					log.Error("runner: DetailedDesign waves failed", zap.Error(err))
 					if len(state.CompletedExpertIDs) == 0 {
 						_ = r.engine.Fail(ctx, workflowID, "DetailedDesign phase: all tasks failed")
@@ -437,7 +454,10 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 			return
 		}
 		state = seedPhase(PhaseImplementation)
-		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+		execMu.Lock()
+		err := r.executeWaves(ctx, workflowID, waves, experts, state)
+		execMu.Unlock()
+		if err != nil {
 			log.Error("runner: Implementation waves failed", zap.Error(err))
 			if len(state.CompletedExpertIDs) == 0 {
 				_ = r.engine.Fail(ctx, workflowID, "Implementation phase: all tasks failed")
@@ -458,7 +478,10 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 			return
 		}
 		state = seedPhase(PhaseQA)
-		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+		execMu.Lock()
+		err := r.executeWaves(ctx, workflowID, waves, experts, state)
+		execMu.Unlock()
+		if err != nil {
 			log.Error("runner: QA waves failed", zap.Error(err))
 			// QA failure is non-fatal — code is already written
 			log.Warn("runner: QA phase had failures, continuing to handoff",
@@ -1296,12 +1319,19 @@ func buildPlanContent(tasks []TaskSpec, experts []workflowExpert) map[string]int
 //
 // waves may be nil on the first call (before planning completes). The watcher
 // guards against this and uses the full expert list as a fallback.
+//
+// execMu (A17): shared with the main Run() goroutine so redesign waves and
+// main-loop waves never run concurrently for this workflow. Locked around
+// {RestartPhase, executeWaves} only — never across AskClient/waitForResume,
+// so a client sitting on the approval gate cannot starve the main loop (and
+// vice versa).
 func (r *WorkflowRunner) watchForChangeRequest(
 	ctx context.Context,
 	workflowID uuid.UUID,
 	allExperts []workflowExpert,
 	waves []ExecutionWave,
 	crSvc *ChangeRequestService,
+	execMu *sync.Mutex,
 ) {
 	log := r.logger.With(
 		zap.String("workflow_id", workflowID.String()),
@@ -1427,7 +1457,15 @@ func (r *WorkflowRunner) watchForChangeRequest(
 		// WHY RestartPhase and not TransitionPhase: this is a backwards move.
 		// TransitionPhase's forward-only validation would reject it.
 		// RestartPhase is the named method for legitimate backwards moves.
+		//
+		// A17: execMu held across RestartPhase+executeWaves for BOTH design
+		// steps so the main Run() goroutine cannot start/continue a wave on
+		// this workflow while the redesign is in flight. Released before the
+		// AskClient/waitForResume gate below (never block the other side on
+		// a human decision).
+		execMu.Lock()
 		if err := r.engine.RestartPhase(ctx, workflowID, PhaseHighLevelDesign); err != nil {
+			execMu.Unlock()
 			log.Error("watcher: restart HLD failed", zap.Error(err))
 			_ = crSvc.MarkCompleted(ctx, cr.ID)
 			continue
@@ -1437,12 +1475,14 @@ func (r *WorkflowRunner) watchForChangeRequest(
 		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, hldState); err != nil {
 			log.Error("watcher: HLD waves failed", zap.Error(err))
 			if len(hldState.CompletedExpertIDs) == 0 {
+				execMu.Unlock()
 				_ = crSvc.MarkCompleted(ctx, cr.ID)
 				continue
 			}
 		}
 
 		if err := r.engine.RestartPhase(ctx, workflowID, PhaseDetailedDesign); err != nil {
+			execMu.Unlock()
 			log.Error("watcher: restart DetailedDesign failed", zap.Error(err))
 			_ = crSvc.MarkCompleted(ctx, cr.ID)
 			continue
@@ -1451,10 +1491,12 @@ func (r *WorkflowRunner) watchForChangeRequest(
 		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, ddState); err != nil {
 			log.Error("watcher: DetailedDesign waves failed", zap.Error(err))
 			if len(ddState.CompletedExpertIDs) == 0 {
+				execMu.Unlock()
 				_ = crSvc.MarkCompleted(ctx, cr.ID)
 				continue
 			}
 		}
+		execMu.Unlock()
 
 		// Approval gate — same as the initial design gate.
 		summary := fmt.Sprintf(

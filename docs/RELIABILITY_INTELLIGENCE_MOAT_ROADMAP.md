@@ -473,7 +473,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A14 | zero-citation check ordering | A | ✅ done | (pending PR, this branch) |
 | A15 | revision loop re-fetch artifact | A | ✅ done | (pending PR, this branch) |
 | A16 | TransitionPhase errors ignored | A | ✅ done | (pending PR, this branch) |
-| A17 | watcher/main single-flight | A | ⬜ pending | — |
+| A17 | watcher/main single-flight | A | ✅ done | (pending PR, this branch) |
 | A18 | watcher waves=nil | A | ⬜ pending | — |
 | A19 | escalation deadlock/cycle guard | A | ⬜ pending | — |
 | B1 | LLM synthesis | B | ⬜ pending | — |
