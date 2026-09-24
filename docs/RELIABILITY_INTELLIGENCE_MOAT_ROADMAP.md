@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | **Document ID** | `RIM_ROADMAP_v2` |
-| **Status** | **DESIGN LOCKED — Phase A (A1–A19) DONE on fork branch; B1+ pending** |
+| **Status** | **ALL DONE (A1–A19, B1–B9, C1–C10) on branch `reliability-a1-a12` (A1–A12 on `origin/main` via PR #5); pending PR merge** |
 | **Single source of truth for** | The locked task order from A13 → C10 and the mandatory per-task working protocol |
 | **Depends on (done)** | Phase A1–A12 (merged to `origin/main` via PR #5; roadmap doc via PR #6) |
 | **Audience** | Any engineer or AI coding agent with **no prior deep codebase knowledge** |
@@ -54,9 +54,9 @@ Phase C  MOAT          -> build what nobody can copy (provenance, eval, trust)
 
 | Phase | Theme | Tasks |
 |-------|-------|-------|
-| A | Reliability | A1–A12 **done**; A13–A19 remaining |
-| B | Intelligence | B1–B9 |
-| C | Moat | C1–C10 |
+| A | Reliability | A1–A19 **done** |
+| B | Intelligence | B1–B9 **done** |
+| C | Moat | C1–C10 **done** |
 
 ---
 
@@ -467,6 +467,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | System Design, observability, Go, DB. |
 | **Files/Risk/Rollback** | `internal/observability/*`, `internal/monitoring/*`, frontend, docs. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: status endpoint + SLO doc review. |
+| **DONE (C10)** | Mig 035 `slo_events` (append-only, audit-grade: kind/severity/component/detail). `observability.Metrics` gained typed getters (LLMCallsTotal/LLMErrorsTotal/UptimeSeconds). New `internal/reliability`: `Policy{Enabled, AvailabilityTarget(0.995), ErrorBudgetWindowDays(30), AtRiskThreshold(0.25)}`; **pure SLI math** — `Availability`/`ErrorRate`/`ErrorBudgetRemaining`/`Verdict` (no traffic → `unknown`, never a false ok) + `TransitionEvent` (healthy→unhealthy = `degraded`, reverse = `recovered`, steady state = no event); `Service` registers dependency probes (postgres/redis/ml, 3s-bounded) and writes **exactly one** audit row per status transition (in-memory last-state, mutex) + at most one `budget_breach`/hour. Surfaced via `GET /status` (public: components + published SLO snapshot; probe error strings withheld — can name internal hosts) and admin `GET /admin/reliability/status` (full detail) + `GET /admin/reliability/events?kind=&limit=`. Config `ReliabilityConfig` + `RELIABILITY_*` kill switch (false → status degrades to dependency-only, like the pre-C10 `/health`). Pure tests: SLI math, verdict thresholds, transition table, policy defaults, nil-safety. **Deferred:** latency SLO (no in-process histogram source — availability SLI only); provider-cascade/circuit-breaker wiring (P8) is gateway-phase work, untouched here; published SLO doc page + frontend status widget (user toolchain). |
 
 ---
 
@@ -511,7 +512,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C7 | adversarial debate | C | ✅ done | (pending PR, this branch) |
 | C8 | bring-your-own-expert | C | ✅ done | (pending PR, this branch) |
 | C9 | explainability surface | C | ✅ done | (pending PR, this branch) |
-| C10 | reliability-as-product | C | ⬜ pending | — |
+| C10 | reliability-as-product | C | ✅ done | (pending PR, this branch) |
 
 ---
 

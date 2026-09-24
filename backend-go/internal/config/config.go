@@ -31,7 +31,23 @@ type Config struct {
 	Freshness           FreshnessConfig
 	Debate              DebateConfig
 	ByoExpert           ByoExpertConfig
+	Reliability         ReliabilityConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// ReliabilityConfig controls C10 reliability-as-product (SLO surface + audit log).
+type ReliabilityConfig struct {
+	// Enabled: expose GET /status + write slo_events audit rows. Absent env →
+	// true (IsSet pattern, same as B6/B8/C1–C9). Explicit false is the kill
+	// switch (status degrades to dependency-only, like the pre-C10 /health).
+	Enabled bool
+	// AvailabilityTarget: published availability SLO, e.g. 0.995. Default 0.995.
+	AvailabilityTarget float64
+	// ErrorBudgetWindowDays: the window the target is published for. Default 30.
+	ErrorBudgetWindowDays int
+	// AtRiskThreshold: error-budget fraction remaining below which the verdict
+	// is "at_risk". Default 0.25.
+	AtRiskThreshold float64
 }
 
 // ByoExpertConfig controls C8 tenant self-service ("bring your own") experts.
@@ -363,6 +379,12 @@ func Load() (*Config, error) {
 			Enabled:           true, // C8 default on; overridden below if env set
 			DefaultMaxExperts: v.GetInt("BYO_EXPERT_DEFAULT_MAX"),
 		},
+		Reliability: ReliabilityConfig{
+			Enabled:               true, // C10 default on; overridden below if env set
+			AvailabilityTarget:    v.GetFloat64("RELIABILITY_AVAILABILITY_TARGET"),
+			ErrorBudgetWindowDays: v.GetInt("RELIABILITY_ERROR_BUDGET_WINDOW_DAYS"),
+			AtRiskThreshold:       v.GetFloat64("RELIABILITY_AT_RISK_THRESHOLD"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -411,6 +433,10 @@ func Load() (*Config, error) {
 	// C8: same IsSet pattern — absent → true; explicit false is the kill switch.
 	if v.IsSet("BYO_EXPERT_ENABLED") {
 		cfg.ByoExpert.Enabled = v.GetBool("BYO_EXPERT_ENABLED")
+	}
+	// C10: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("RELIABILITY_ENABLED") {
+		cfg.Reliability.Enabled = v.GetBool("RELIABILITY_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -559,6 +585,16 @@ func (c *Config) applyDefaults() {
 	// C8: per-tenant BYO expert quota default.
 	if c.ByoExpert.DefaultMaxExperts <= 0 {
 		c.ByoExpert.DefaultMaxExperts = 5
+	}
+	// C10: published SLO defaults (reliability-as-product).
+	if c.Reliability.AvailabilityTarget <= 0 || c.Reliability.AvailabilityTarget >= 1 {
+		c.Reliability.AvailabilityTarget = 0.995
+	}
+	if c.Reliability.ErrorBudgetWindowDays <= 0 {
+		c.Reliability.ErrorBudgetWindowDays = 30
+	}
+	if c.Reliability.AtRiskThreshold <= 0 || c.Reliability.AtRiskThreshold >= 1 {
+		c.Reliability.AtRiskThreshold = 0.25
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000

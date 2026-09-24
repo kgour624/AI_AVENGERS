@@ -45,6 +45,7 @@ import (
 	"ai_avengers/backend/internal/project"
 	"ai_avengers/backend/internal/provenance"
 	"ai_avengers/backend/internal/rating"
+	"ai_avengers/backend/internal/reliability"
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/selflearning"
@@ -459,6 +460,18 @@ func buildRouter(
 	byoHandler := byoexpert.NewHandler(byoSvc, logger)
 	explainSvc := explain.NewService(postgres.Pool, provSvc, tenantSvc, logger)
 	explainHandler := explain.NewHandler(explainSvc, logger)
+	// C10: reliability-as-product — published SLO surface + audit-grade event
+	// log. Probes reuse the existing dependency HealthCheck methods.
+	relSvc := reliability.NewService(postgres.Pool, reliability.Policy{
+		Enabled:               cfg.Reliability.Enabled,
+		AvailabilityTarget:    cfg.Reliability.AvailabilityTarget,
+		ErrorBudgetWindowDays: cfg.Reliability.ErrorBudgetWindowDays,
+		AtRiskThreshold:       cfg.Reliability.AtRiskThreshold,
+	}, logger)
+	relSvc.RegisterProbe("postgres", postgres.HealthCheck)
+	relSvc.RegisterProbe("redis", redisClient.HealthCheck)
+	relSvc.RegisterProbe("ml_sidecar", mlClient.HealthCheck)
+	relHandler := reliability.NewHandler(relSvc, "1.0.0", logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, logger)
 
@@ -628,6 +641,11 @@ func buildRouter(
 	router.GET("/metrics", func(c *gin.Context) {
 		response.OK(c, observability.Global.Snapshot())
 	})
+
+	// GET /status — public reliability surface (C10): dependency components +
+	// the published SLO snapshot. No auth; probe error strings are withheld
+	// publicly (the admin view carries them).
+	router.GET("/status", relHandler.PublicStatus)
 
 	v1 := router.Group("/api/v1")
 
@@ -834,6 +852,9 @@ func buildRouter(
 		// C8: tenant self-service ("bring your own") experts.
 		adminGroup.POST("/tenants/:id/entitlement", adminHandler.SetTenantEntitlement)
 		adminGroup.GET("/byo/events", adminHandler.ListByoEvents)
+		// C10: reliability-as-product (full detail + audit trail).
+		adminGroup.GET("/reliability/status", relHandler.AdminStatus)
+		adminGroup.GET("/reliability/events", relHandler.ListEvents)
 		// C5: cost & usage analytics product.
 		adminGroup.GET("/usage", adminHandler.GetUsage)
 		adminGroup.GET("/usage/budgets", adminHandler.GetUsageBudgets)
@@ -845,7 +866,8 @@ func buildRouter(
 		adminGroup.POST("/freshness/tasks/:taskId/ack", adminHandler.AcknowledgeFreshnessTask)
 		adminGroup.POST("/freshness/tasks/:taskId/resolve", adminHandler.ResolveFreshnessTask)
 		adminGroup.GET("/experts/:id/freshness", adminHandler.GetExpertFreshness)
-		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
+		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)
+		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/retry", adminHandler.RetryIngestionJob)
