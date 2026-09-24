@@ -213,7 +213,8 @@ func (s *Service) Get(ctx context.Context, messageID, userID uuid.UUID, scope te
 	var questions []string
 	if len(r.questions) > 0 {
 		_ = json.Unmarshal(r.questions, &questions)
-	}	if derefStr(r.refusal) != "" || derefStr(r.warning) != "" || len(questions) > 0 {
+	}
+	if derefStr(r.refusal) != "" || derefStr(r.warning) != "" || len(questions) > 0 {
 		exp.Refusal = &RefusalFacts{
 			Reason:              derefStr(r.refusal),
 			Warning:             derefStr(r.warning),
