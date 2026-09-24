@@ -1,0 +1,7 @@
+# C3 golden set — user-like questions. One JSON object per line.
+# expert_slug is resolved against the live experts table at run time; a
+# case whose expert is absent is reported as skipped (not failed).
+{"id":"chat-shard","suite":"chat","type":"user_like","expert_slug":"database","domain":"database","input":"How should I shard a multi-tenant Postgres database as it grows?","expect":{"keywords":["shard"],"must_cite":true,"refuse":false,"min_chars":200},"vital":true}
+{"id":"chat-index","suite":"chat","type":"user_like","expert_slug":"database","domain":"database","input":"When should I add a composite index instead of a single-column index?","expect":{"keywords":["index"],"must_cite":true,"refuse":false,"min_chars":150},"vital":true}
+{"id":"chat-cache","suite":"chat","type":"user_like","expert_slug":"system_design","domain":"system_design","input":"Explain how I would design a cache invalidation strategy for a read-heavy service.","expect":{"keywords":["cache"],"must_cite":true,"refuse":false,"min_chars":200},"vital":false}
+{"id":"chat-idempotency","suite":"chat","type":"user_like","expert_slug":"backend","domain":"backend","input":"How do I make a payment endpoint idempotent against client retries?","expect":{"keywords":["idempot"],"must_cite":true,"refuse":false,"min_chars":200},"vital":true}

@@ -16,9 +16,12 @@ import (
 
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/eval"
+	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/training"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -38,7 +41,14 @@ type AdminHandler struct {
 	// chinawall.Enforcer — writes here take effect for the very next
 	// question with zero redeploy, exactly like categoryReg above.
 	domainReg *chinawall.DomainRegistry
-	logger    *zap.Logger
+	// versions (C2): expert versioning + capability drift. Nil-safe — when
+	// unset, ingestion still runs, only snapshots/drift are skipped.
+	versions *expertversion.Service
+	// evals (C3): golden-set run store. Nil-safe — view endpoints return empty.
+	evals *eval.Store
+	// tenants (C4): enterprise isolation controls. Nil-safe — list returns empty.
+	tenants *tenant.Service
+	logger  *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -61,6 +71,9 @@ func NewAdminHandler(
 	embedder ml.Embedder,
 	categoryReg *category.Registry,
 	domainReg *chinawall.DomainRegistry,
+	versions *expertversion.Service,
+	evals *eval.Store,
+	tenants *tenant.Service,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -70,6 +83,9 @@ func NewAdminHandler(
 		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
+		versions:    versions,
+		evals:       evals,
+		tenants:     tenants,
 		logger:      logger,
 	}
 }
@@ -1065,6 +1081,17 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 				zap.Error(err),
 			)
 		}
+		// C2: on success, snapshot the new corpus/charter state and detect
+		// drift vs the prior active version. Best-effort — a versioning
+		// failure must never undo a successful ingestion.
+		if err == nil && h.versions != nil {
+			if _, sErr := h.versions.Snapshot(ctx, expertID, "ingest", header.Filename); sErr != nil {
+				h.logger.Warn("expert version snapshot failed",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(sErr),
+				)
+			}
+		}
 	}()
 
 	response.Created(c, map[string]interface{}{
@@ -1073,6 +1100,331 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 		"message":   "ingestion started in background",
 		"expert_id": expertID,
 	})
+}
+
+// ============================================================
+// EXPERT VERSIONING & DRIFT (C2)
+// ============================================================
+
+// ListExpertVersions GET /admin/experts/:id/versions
+func (h *AdminHandler) ListExpertVersions(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.versions == nil {
+		response.OK(c, []expertversion.Version{})
+		return
+	}
+	versions, err := h.versions.ListVersions(c.Request.Context(), expertID, 20)
+	if err != nil {
+		h.logger.Error("list expert versions failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, versions)
+}
+
+// SnapshotExpertVersion POST /admin/experts/:id/versions/snapshot
+// Body (optional): {"source": "manual", "notes": "..."}
+func (h *AdminHandler) SnapshotExpertVersion(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	var body struct {
+		Source string `json:"source"`
+		Notes  string `json:"notes"`
+	}
+	_ = c.ShouldBindJSON(&body) // body optional
+	if body.Source == "" {
+		body.Source = "manual"
+	}
+	v, err := h.versions.Snapshot(c.Request.Context(), expertID, body.Source, body.Notes)
+	if err != nil {
+		h.logger.Error("snapshot expert version failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if v == nil {
+		response.NotFound(c, "expert")
+		return
+	}
+	response.Created(c, v)
+}
+
+// PinExpertVersion POST /admin/experts/:id/versions/:versionId/pin
+// Marks the version canonical and rolls the expert's charter back to it.
+func (h *AdminHandler) PinExpertVersion(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	versionID, err := uuid.Parse(c.Param("versionId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid version ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	v, err := h.versions.Pin(c.Request.Context(), expertID, versionID)
+	if err != nil {
+		h.logger.Error("pin expert version failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if v == nil {
+		response.NotFound(c, "expert version")
+		return
+	}
+	response.OK(c, v)
+}
+
+// ListExpertDrift GET /admin/experts/:id/drift
+func (h *AdminHandler) ListExpertDrift(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.versions == nil {
+		response.OK(c, []expertversion.DriftEvent{})
+		return
+	}
+	events, err := h.versions.ListDrift(c.Request.Context(), expertID, 20)
+	if err != nil {
+		h.logger.Error("list expert drift failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, events)
+}
+
+// AcknowledgeExpertDrift POST /admin/experts/:id/drift/:driftId/ack
+func (h *AdminHandler) AcknowledgeExpertDrift(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	driftID, err := uuid.Parse(c.Param("driftId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid drift ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	if err := h.versions.AcknowledgeDrift(c.Request.Context(), expertID, driftID); err != nil {
+		h.logger.Error("acknowledge drift failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"acknowledged": true})
+}
+
+// ============================================================
+// EVAL HARNESS (C3)
+// ============================================================
+
+// evalSuiteView is the admin payload for one suite: latest run, baseline,
+// and the score delta (current - baseline). Pure assembly; scoring lives
+// in internal/eval.
+type evalSuiteView struct {
+	Suite    string           `json:"suite"`
+	Latest   *eval.RunSummary `json:"latest,omitempty"`
+	Baseline *eval.RunSummary `json:"baseline,omitempty"`
+	Delta    float64          `json:"delta"`
+	Suites   []string         `json:"suites,omitempty"`
+}
+
+// GetEvalRuns GET /admin/evals/runs?suite=<name>
+// Without suite: lists known suites. With suite: latest + baseline + delta.
+func (h *AdminHandler) GetEvalRuns(c *gin.Context) {
+	if h.evals == nil {
+		response.OK(c, evalSuiteView{Suites: []string{}})
+		return
+	}
+	suite := strings.TrimSpace(c.Query("suite"))
+	if suite == "" {
+		names, err := h.evals.ListSuites(c.Request.Context())
+		if err != nil {
+			h.logger.Error("list eval suites failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, evalSuiteView{Suites: names})
+		return
+	}
+	latest, err := h.evals.LatestRun(c.Request.Context(), suite)
+	if err != nil {
+		h.logger.Error("latest eval run failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	baseline, err := h.evals.LatestBaseline(c.Request.Context(), suite)
+	if err != nil {
+		h.logger.Error("latest eval baseline failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, evalSuiteView{
+		Suite:    suite,
+		Latest:   latest,
+		Baseline: baseline,
+		Delta:    eval.ScoreDelta(baseline, latest),
+	})
+}
+
+// PromoteEvalBaseline POST /admin/evals/runs/:id/baseline
+// Body: {"suite":"chat"} — promotes the given run id as the suite baseline.
+func (h *AdminHandler) PromoteEvalBaseline(c *gin.Context) {
+	if h.evals == nil {
+		response.InternalError(c)
+		return
+	}
+	runID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid run ID")
+		return
+	}
+	var body struct {
+		Suite string `json:"suite"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Suite) == "" {
+		response.BadRequest(c, "INVALID_INPUT", "suite is required")
+		return
+	}
+	if err := h.evals.PromoteBaseline(c.Request.Context(), body.Suite, runID); err != nil {
+		h.logger.Error("promote eval baseline failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"suite": body.Suite, "run_id": runID, "is_baseline": true})
+}
+
+// ============================================================
+// TENANT ISOLATION & ENTERPRISE CONTROLS (C4)
+// ============================================================
+
+// ListTenants GET /admin/tenants
+func (h *AdminHandler) ListTenants(c *gin.Context) {
+	if h.tenants == nil {
+		response.OK(c, []tenant.Tenant{})
+		return
+	}
+	tenants, err := h.tenants.List(c.Request.Context())
+	if err != nil {
+		h.logger.Error("list tenants failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, tenants)
+}
+
+// CreateTenant POST /admin/tenants
+// Body: {"name":"Acme Corp","slug":"acme"} (slug optional → derived from name)
+func (h *AdminHandler) CreateTenant(c *gin.Context) {
+	if h.tenants == nil {
+		response.InternalError(c)
+		return
+	}
+	var body struct {
+		Name string `json:"name" binding:"required"`
+		Slug string `json:"slug"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	t, err := h.tenants.Create(c.Request.Context(), body.Name, body.Slug)
+	if err != nil {
+		h.logger.Warn("create tenant failed", zap.Error(err))
+		response.BadRequest(c, "CREATE_FAILED", err.Error())
+		return
+	}
+	response.Created(c, t)
+}
+
+// AssignTenantUser POST /admin/tenants/:id/users
+// Body: {"user_id":"<uuid>"} — moves the account into the tenant.
+func (h *AdminHandler) AssignTenantUser(c *gin.Context) {
+	if h.tenants == nil {
+		response.InternalError(c)
+		return
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant ID")
+		return
+	}
+	var body struct {
+		UserID string `json:"user_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	userID, err := uuid.Parse(body.UserID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid user ID")
+		return
+	}
+	if err := h.tenants.SetUserTenant(c.Request.Context(), userID, tenantID); err != nil {
+		h.logger.Warn("assign tenant user failed", zap.Error(err))
+		response.BadRequest(c, "ASSIGN_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"user_id": userID, "tenant_id": tenantID})
+}
+
+// AssignTenantExpert POST /admin/tenants/:id/experts
+// Body: {"expert_id":"<uuid>","global":false}
+// Homes an expert into this tenant (tenant-private), or back to platform
+// (global=true → tenant_id NULL, visible to every tenant).
+func (h *AdminHandler) AssignTenantExpert(c *gin.Context) {
+	if h.tenants == nil {
+		response.InternalError(c)
+		return
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant ID")
+		return
+	}
+	var body struct {
+		ExpertID string `json:"expert_id" binding:"required"`
+		Global   bool   `json:"global"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	expertID, err := uuid.Parse(body.ExpertID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	var target *uuid.UUID
+	if !body.Global {
+		target = &tenantID
+	}
+	if err := h.tenants.SetExpertTenant(c.Request.Context(), expertID, target); err != nil {
+		h.logger.Warn("assign tenant expert failed", zap.Error(err))
+		response.BadRequest(c, "ASSIGN_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"expert_id": expertID, "tenant_id": target, "global": body.Global})
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream
@@ -1324,6 +1676,17 @@ func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
 				expertID,
 			)
 			return
+		}
+
+		// C2: snapshot the regenerated charter as a new version so the
+		// charter change is versioned and drift-detected. Best-effort.
+		if h.versions != nil {
+			if _, sErr := h.versions.Snapshot(ctx, expertID, "charter_regen", "charter regenerated"); sErr != nil {
+				h.logger.Warn("expert version snapshot failed (charter_regen)",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(sErr),
+				)
+			}
 		}
 
 		h.logger.Info("charter regeneration complete",

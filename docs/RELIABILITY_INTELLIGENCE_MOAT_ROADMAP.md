@@ -359,6 +359,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB, System Design, crypto (signing), Go. |
 | **Files/Risk/Rollback** | `internal/chat/*`, `internal/workflow/*`, `internal/memory/*`, migrations. Risk: High (schema + core paths). Rollback: additive migration + flag. |
 | **Limitation** | `go build ./...` + migration run; manual: fetch provenance for one answer. |
+| **DONE (C1)** | Mig 027 `provenance_records` (append-only, `UNIQUE(output_type,output_id)`, `chain` TEXT = exact signed bytes). New `internal/provenance` package: `Service.RecordChatAnswer` / `RecordArtifact` build a canonical `chainDoc` (output → expert → gates → model → sources → timestamp), HMAC-SHA256 sign it, insert best-effort (fail-open). `chainDoc` re-marshals claims/citations via `normalizeJSON` (byte-stable); `sign`/`contentHash`/`verifyChain` pure + tested. Reuses **B8 span anchors** in `Claims` as the provenance primitive (P9). Wiring: `message/handler.go` records each saved answer async (`model`=generation tier `ModelStrong`, matching proxy convention); `blackboard.Store` optional `SetProvenanceRecorder` records produced artifacts (allowlist = ReviewerMatrix types + design_section_written/design_amended). Config `ProvenanceConfig{Enabled(absent→true), SigningKey(→ENCRYPTION_KEY fallback)}`. Endpoints: `GET /messages/:id/provenance`, `GET /workflows/:id/artifacts/:eventId/provenance` — both return `{record, verified}` (server-side signature check). Kill switch `PROVENANCE_ENABLED=false`. Stale-refs→C6 feedback hook is the stored chunk ids. Tests: sign/verify/tamper/hash/normalize/allowlist. |
 
 ### C2 — Expert versioning & capability drift detection
 | Part | Detail |
@@ -370,6 +371,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB, AI (eval), System Design. |
 | **Files/Risk/Rollback** | `internal/training/*`, `internal/admin/*`, migrations. Risk: Medium–High. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: re-ingest, observe a drift flag. |
+| **DONE (C2)** | Mig 028 `expert_versions` (immutable snapshots: corpus/charter hashes, topics, charter text, capability snapshot, model; one `is_active` per expert) + `expert_drift_events` (append-only, typed corpus/capability/charter/model). New `internal/expertversion`: `Snapshot` (live corpus hash from `course_chunks.chunk_hash`, charter hash, topic set from `course_chunks.topic`; first version auto-active) → classifies drift vs prior active version; `DetectDrift` (no new version), `Pin` (canonical + **charter rollback** via tx), `ListVersions/ListDrift/AcknowledgeDrift`. Pure `sha256Hex`/`jaccardDistance`/`classifyDrift` (priority capability ≥ threshold → charter → corpus). Wiring: admin `IngestTranscript` snapshots on success (best-effort, fail-open); `AdminHandler` gains `*expertversion.Service`. Routes: `GET /admin/experts/:id/versions`, `POST …/versions/snapshot`, `POST …/versions/:versionId/pin`, `GET …/drift`, `POST …/drift/:driftId/ack`. Config `VersioningConfig{Enabled(absent→true), DriftThreshold(0.30)}`; kill switch `EXPERT_VERSIONING_ENABLED=false`. **Limitation:** full corpus rollback deferred (needs stored transcripts) — pin restores charter + marks canonical; model/prompt-change→C3 re-eval hook is the recorded `model` + drift event. Tests: hash/jaccard/classify. |
 
 ### C3 — Evaluation harness + golden set regression
 | Part | Detail |
@@ -381,6 +383,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI (eval), Go (test harness), CI. |
 | **Files/Risk/Rollback** | new `internal/eval/*` + CI config. Risk: Low (additive). Rollback: disable job. |
 | **Limitation** | Needs API keys/quota in CI; user decides budget. |
+| **DONE (C3)** | Mig 029 `eval_runs` (suite/model/totals/score/cost/is_baseline/results JSONB; one baseline per suite). New `internal/eval`: embedded golden JSONL (`chat` user-like + `adversarial`); pure deterministic scorer (non_empty/refusal/citation/keywords, component-wise); `Answerer` interface + `HTTPAnswerer` (chat SSE); `Runner` with skip/vital counting; `Store` SaveRun/Latest/Baseline/Promote; pure `ScoreDelta`/`Regression`. Tests: parse/load/score/runner/SSE/regression. CLI `cmd/eval` (env EVAL_BASE_URL/TOKEN/CHAT_ID + DATABASE_URL) exits 2 on vital fail or score drop > tolerance; optional `-baseline` promote. Admin: `GET /admin/evals/runs`, `POST /admin/evals/runs/:id/baseline`. **Limitation:** live HTTP runs need server + keys + known chat; missing expert slugs = SKIP not fail; LLM-as-judge layer deferred (deterministic gate first). |
 
 ### C4 — Tenant isolation & enterprise controls
 | Part | Detail |
@@ -392,6 +395,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB (RLS), System Design, Go. |
 | **Files/Risk/Rollback** | broad + migrations. Risk: High. Rollback: staged + flag. |
 | **Limitation** | `go build ./...` + migration; manual isolation test. |
+| **DONE (C4)** | Mig 030 `tenants` + `tenant_id` on users/experts/projects (default tenant; all rows backfilled; experts stay NULL=platform/global → behaviour-neutral until a 2nd tenant exists). New `internal/tenant`: `Scope{Global,TenantID}` + pure `Allows` (nil row tenant=platform-visible; unresolved scope denies — **P3 fail closed**); `Service.Resolve` (admin/disabled→global; else users.tenant_id, NULL→ErrScopeUnknown), `AssertProject`, `AssertExperts`, `List/Create/SetUserTenant/SetExpertTenant`, pure `slugify`. Config `TenantConfig{IsolationEnabled(absent→true)}`, kill switch `TENANT_ISOLATION_ENABLED=false`; metric `tenant_denied`. Wiring: `message.Send` resolves scope → asserts experts + chat's project (403 fail closed); `expert.ListActive`/`GetByID` filter `tenant_id IS NULL OR = scope`; admin `GET/POST /admin/tenants`, `POST /admin/tenants/:id/users`, `POST /admin/tenants/:id/experts` (homes an expert tenant-private or back to global). Tests: `Allows`/unresolved/slugify/nil-safe. **Deferred:** DB RLS policies + `SET LOCAL app.tenant_id` (design chose deterministic app-level pre-filter now); course_chunks/chat-level tenant columns and cost attribution per tenant (C5); per-tenant memory tables are already project-scoped and inherit isolation via project. |
 
 ### C5 — Cost & usage analytics product
 | Part | Detail |
@@ -493,10 +497,10 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B7 | memory consolidation | B | ✅ done | (pending PR, this branch) |
 | B8 | verification-first answers | B | ✅ done | (pending PR, this branch) |
 | B9 | context-budget policy | B | ✅ done | (pending PR, this branch) |
-| C1 | provenance chain | C | ⬜ pending | — |
-| C2 | expert versioning/drift | C | ⬜ pending | — |
-| C3 | eval harness + golden set | C | ⬜ pending | — |
-| C4 | tenant isolation | C | ⬜ pending | — |
+| C1 | provenance chain | C | ✅ done | (pending PR, this branch) |
+| C2 | expert versioning/drift | C | ✅ done | (pending PR, this branch) |
+| C3 | eval harness + golden set | C | ✅ done | (pending PR, this branch) |
+| C4 | tenant isolation | C | ✅ done | (pending PR, this branch) |
 | C5 | cost/usage product | C | ⬜ pending | — |
 | C6 | knowledge freshness | C | ⬜ pending | — |
 | C7 | adversarial debate | C | ⬜ pending | — |

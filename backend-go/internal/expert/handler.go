@@ -10,6 +10,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/tenant"
 )
 
 // ExpertPublic is the client-facing view of an expert.
@@ -29,12 +30,13 @@ type ExpertPublic struct {
 // Handler handles public expert endpoints.
 type Handler struct {
 	db     *pgxpool.Pool
+	tenant *tenant.Service // C4: nil-safe — unwired → global scope, no filter
 	logger *zap.Logger
 }
 
 // NewHandler creates a new expert handler.
-func NewHandler(db *pgxpool.Pool, logger *zap.Logger) *Handler {
-	return &Handler{db: db, logger: logger}
+func NewHandler(db *pgxpool.Pool, tenantSvc *tenant.Service, logger *zap.Logger) *Handler {
+	return &Handler{db: db, tenant: tenantSvc, logger: logger}
 }
 
 // ListActive GET /experts
@@ -69,6 +71,22 @@ func (h *Handler) ListActive(c *gin.Context) {
 		query += `
 		  AND id IN (SELECT expert_id FROM user_expert_grants WHERE user_id = $1)`
 		args = append(args, uid)
+	}
+	// C4: only experts visible to the caller's tenant. Platform experts
+	// (tenant_id NULL) stay visible to everyone. Fail closed on an
+	// unresolvable scope rather than leaking the whole catalog.
+	scope, scopeErr := h.tenant.Resolve(c.Request.Context(), uid, roleStr)
+	if scopeErr != nil {
+		response.Forbidden(c, "Tenant scope could not be resolved")
+		return
+	}
+	if !scope.Global {
+		if scope.TenantID == nil {
+			response.Forbidden(c, "Tenant scope could not be resolved")
+			return
+		}
+		query += fmt.Sprintf(" AND (tenant_id IS NULL OR tenant_id = $%d)", len(args)+1)
+		args = append(args, *scope.TenantID)
 	}
 	query += `
 		ORDER BY avg_rating DESC, total_chunks DESC`
@@ -119,10 +137,14 @@ func (h *Handler) GetByID(c *gin.Context) {
 		}
 	}
 
-	var e ExpertPublic
-	// WHY training_status='trained': same as ListActive — only fully trained
-	// experts are visible to clients. Draft/ingesting experts are admin-only.
-	err = h.db.QueryRow(c.Request.Context(), `
+	// C4: hide experts owned by another tenant. Fail closed / NotFound so
+	// the caller cannot probe for the existence of other tenants' experts.
+	scope, scopeErr := h.tenant.Resolve(c.Request.Context(), c.MustGet("user_id").(uuid.UUID), roleStr)
+	if scopeErr != nil {
+		response.NotFound(c, "expert")
+		return
+	}
+	q := `
 		SELECT id, name, slug, domain, COALESCE(description,''),
 		       total_chunks, total_topics,
 		       COALESCE(avg_depth_level,0), COALESCE(avg_rating,0), created_at
@@ -131,8 +153,22 @@ func (h *Handler) GetByID(c *gin.Context) {
 		  AND is_active=TRUE
 		  AND is_training=FALSE
 		  AND training_status='trained'
-		  AND deleted_at IS NULL`, id,
-	).Scan(&e.ID, &e.Name, &e.Slug, &e.Domain, &e.Description,
+		  AND deleted_at IS NULL`
+	qargs := []interface{}{id}
+	if !scope.Global {
+		if scope.TenantID == nil {
+			response.NotFound(c, "expert")
+			return
+		}
+		q += ` AND (tenant_id IS NULL OR tenant_id = $2)`
+		qargs = append(qargs, *scope.TenantID)
+	}
+
+	var e ExpertPublic
+	// WHY training_status='trained': same as ListActive — only fully trained
+	// experts are visible to clients. Draft/ingesting experts are admin-only.
+	err = h.db.QueryRow(c.Request.Context(), q, qargs...).Scan(
+		&e.ID, &e.Name, &e.Slug, &e.Domain, &e.Description,
 		&e.TotalChunks, &e.TotalTopics, &e.AvgDepthLevel, &e.AvgRating, &e.CreatedAt)
 	if err != nil {
 		response.NotFound(c, "expert")

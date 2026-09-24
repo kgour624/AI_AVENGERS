@@ -27,7 +27,9 @@ import (
 	"ai_avengers/backend/internal/db"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/entitlement"
+	"ai_avengers/backend/internal/eval"
 	"ai_avengers/backend/internal/expert"
+	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/knowledge"
 	"ai_avengers/backend/internal/memory"
@@ -39,10 +41,12 @@ import (
 	"ai_avengers/backend/internal/orchestrator"
 	"ai_avengers/backend/internal/outbox"
 	"ai_avengers/backend/internal/project"
+	"ai_avengers/backend/internal/provenance"
 	"ai_avengers/backend/internal/rating"
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/selflearning"
+	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -376,6 +380,19 @@ func buildRouter(
 
 	// Initialize core services
 	memManager := memory.NewManager(postgres.Pool, redisClient.Client, embedder, logger)
+	// C1: signed provenance chain service. Signing key falls back to the
+	// AES key (config.applyDefaults), so it is always present in deploy.
+	provSvc := provenance.NewService(
+		postgres.Pool, []byte(cfg.Provenance.SigningKey), cfg.Provenance.Enabled, logger,
+	)
+	// C2: expert versioning + capability drift service.
+	versionSvc := expertversion.NewService(
+		postgres.Pool, cfg.Versioning.DriftThreshold, logger,
+	)
+	// C3: golden-set eval run store (viewed from admin; run by cmd/eval).
+	evalStore := eval.NewStore(postgres.Pool)
+	// C4: tenant isolation + enterprise controls. Kill switch TENANT_ISOLATION_ENABLED.
+	tenantSvc := tenant.NewService(postgres.Pool, cfg.Tenant.IsolationEnabled, logger)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -413,14 +430,15 @@ func buildRouter(
 	// Initialize HTTP handlers
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
-	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, logger)
+	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
-	expertHandler := expert.NewHandler(postgres.Pool, logger)
+	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
+	bbStore.SetProvenanceRecorder(provSvc) // C1: signed chain per artifact
 	bbSubscriber := blackboard.NewSubscriber(bbStore, redisClient.Client, logger)
 	wfEngine := workflow.NewEngine(postgres.Pool, logger)
 	validationPipeline := validation.NewPipeline(modelGateway, logger)
@@ -702,6 +720,8 @@ func buildRouter(
 			messages.POST("/:id/rate", ratingHandler.Rate)
 			messages.DELETE("/:id", messageHandler.DeleteMessage)
 			messages.PATCH("/:id", messageHandler.UpdateMessage)
+			// C1: signed provenance chain for an answer.
+			messages.GET("/:id/provenance", handleGetMessageProvenance(provSvc))
 		}
 
 		// Workflow routes (Phase C — collaboration layer)
@@ -712,6 +732,8 @@ func buildRouter(
 			workflows.GET("/:id", wfHandler.GetWorkflow)
 			workflows.POST("/:id/start", wfHandler.StartWorkflow)
 			workflows.GET("/:id/blackboard", wfHandler.GetBlackboard)
+			// C1: signed provenance chain for one artifact event.
+			workflows.GET("/:id/artifacts/:eventId/provenance", handleGetArtifactProvenance(provSvc))
 			workflows.GET("/:id/kanban", wfHandler.GetKanban)
 			workflows.POST("/:id/run", wfHandler.RunWorkflow(wfRunner))
 			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
@@ -759,6 +781,20 @@ func buildRouter(
 		adminGroup.PATCH("/experts/:id", adminHandler.UpdateExpert)
 		adminGroup.POST("/experts/:id/ingest", adminHandler.IngestTranscript)
 		adminGroup.POST("/experts/:id/regenerate-charter", adminHandler.RegenerateCharter)
+		// C2: expert versioning + capability drift.
+		adminGroup.GET("/experts/:id/versions", adminHandler.ListExpertVersions)
+		adminGroup.POST("/experts/:id/versions/snapshot", adminHandler.SnapshotExpertVersion)
+		adminGroup.POST("/experts/:id/versions/:versionId/pin", adminHandler.PinExpertVersion)
+		adminGroup.GET("/experts/:id/drift", adminHandler.ListExpertDrift)
+		adminGroup.POST("/experts/:id/drift/:driftId/ack", adminHandler.AcknowledgeExpertDrift)
+		// C3: evaluation harness run view + baseline promote.
+		adminGroup.GET("/evals/runs", adminHandler.GetEvalRuns)
+		adminGroup.POST("/evals/runs/:id/baseline", adminHandler.PromoteEvalBaseline)
+		// C4: tenant isolation & enterprise controls.
+		adminGroup.GET("/tenants", adminHandler.ListTenants)
+		adminGroup.POST("/tenants", adminHandler.CreateTenant)
+		adminGroup.POST("/tenants/:id/users", adminHandler.AssignTenantUser)
+		adminGroup.POST("/tenants/:id/experts", adminHandler.AssignTenantExpert)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
@@ -850,6 +886,57 @@ func handleGetProjectTimeline(memManager *memory.Manager) gin.HandlerFunc {
 			return
 		}
 		response.OK(c, events)
+	}
+}
+
+// handleGetMessageProvenance GET /messages/:id/provenance (C1)
+// Returns the stored signed provenance chain for an answer, plus a
+// server-side signature verification result so the client can trust it.
+func handleGetMessageProvenance(provSvc *provenance.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		messageID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid message ID")
+			return
+		}
+		rec, err := provSvc.Get(c.Request.Context(), provenance.OutputChatMessage, messageID)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		if rec == nil {
+			response.NotFound(c, "provenance")
+			return
+		}
+		response.OK(c, gin.H{"record": rec, "verified": provSvc.Verify(rec)})
+	}
+}
+
+// handleGetArtifactProvenance GET /workflows/:id/artifacts/:eventId/provenance (C1)
+// Returns the stored signed provenance chain for one artifact event
+// (the :id workflow segment is validated against the record for safety).
+func handleGetArtifactProvenance(provSvc *provenance.Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		workflowID, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
+			return
+		}
+		eventID, err := uuid.Parse(c.Param("eventId"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid event ID")
+			return
+		}
+		rec, err := provSvc.Get(c.Request.Context(), provenance.OutputWorkflowArtifact, eventID)
+		if err != nil {
+			response.InternalError(c)
+			return
+		}
+		if rec == nil || rec.WorkflowID == nil || *rec.WorkflowID != workflowID {
+			response.NotFound(c, "provenance")
+			return
+		}
+		response.OK(c, gin.H{"record": rec, "verified": provSvc.Verify(rec)})
 	}
 }
 
