@@ -469,7 +469,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A10 | projector error logging | A | ✅ done | `7268332` |
 | A11 | QA proposals → real approval rows | A | ✅ done | `7268332` |
 | A12 | watcher running-only guard | A | ✅ done | `7268332` |
-| A13 | gate1WithLLM defeats Gate1Skip | A | ⬜ pending | — |
+| A13 | gate1WithLLM defeats Gate1Skip | A | ✅ done | (pending PR, this branch) |
 | A14 | zero-citation check ordering | A | ⬜ pending | — |
 | A15 | revision loop re-fetch artifact | A | ⬜ pending | — |
 | A16 | TransitionPhase errors ignored | A | ⬜ pending | — |
