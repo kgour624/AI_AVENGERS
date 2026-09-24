@@ -29,6 +29,7 @@ import (
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/entitlement"
 	"ai_avengers/backend/internal/eval"
+	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
@@ -456,6 +457,8 @@ func buildRouter(
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
 	byoHandler := byoexpert.NewHandler(byoSvc, logger)
+	explainSvc := explain.NewService(postgres.Pool, provSvc, tenantSvc, logger)
+	explainHandler := explain.NewHandler(explainSvc, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, logger)
 
@@ -753,6 +756,8 @@ func buildRouter(
 			messages.PATCH("/:id", messageHandler.UpdateMessage)
 			// C1: signed provenance chain for an answer.
 			messages.GET("/:id/provenance", handleGetMessageProvenance(provSvc))
+			// C9: unified "why this answer" view (view over stored facts).
+			messages.GET("/:id/explanation", explainHandler.Get)
 		}
 
 		// Workflow routes (Phase C — collaboration layer)

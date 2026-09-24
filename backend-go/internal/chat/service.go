@@ -61,6 +61,13 @@ type Message struct {
 	// chinawall package, so the concrete shape lives at the call site
 	// (message/handler.go) that already imports chinawall.
 	TemplateSections     interface{} `json:"template_sections,omitempty"`
+	// QualityScore (C9, migration 034): B6 judge overall [0,1]. 0 → stored
+	// NULL (the judge was off/failed-open). Explanation surface only.
+	QualityScore float64 `json:"quality_score,omitempty"`
+	// Coverage (C9): China Wall coverage verdict YES|PARTIAL|NO. "" → NULL.
+	Coverage string `json:"coverage,omitempty"`
+	// RefusalReason (C9): Gate-5 / partial refusal reason. "" → NULL.
+	RefusalReason string `json:"refusal_reason,omitempty"`
 	CreatedAt            time.Time  `json:"created_at"`
 }
 
@@ -266,18 +273,35 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 		warningText = msg.WarningText
 	}
 
+	// C9: 0 / "" mean "not produced" → store NULL, not a misleading 0/empty.
+	// A judge score of exactly 0 is documented as "judge off/failed-open"
+	// (quality_judge.go), so NULL is the honest representation.
+	var qualityScore interface{}
+	if msg.QualityScore > 0 {
+		qualityScore = msg.QualityScore
+	}
+	var coverage interface{}
+	if msg.Coverage == "YES" || msg.Coverage == "PARTIAL" || msg.Coverage == "NO" {
+		coverage = msg.Coverage
+	}
+	var refusalReason interface{}
+	if msg.RefusalReason != "" {
+		refusalReason = msg.RefusalReason
+	}
+
 	var id uuid.UUID
 	err := s.db.QueryRow(ctx,
 		`INSERT INTO messages
 			(chat_id, role, content, turn_number, expert_id, decision_mode,
 			 confidence, warning_text, clarifying_questions, citations,
-			 reply_to_message_id, template_sections)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 reply_to_message_id, template_sections,
+			 quality_score, coverage, refusal_reason)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
 		msg.ExpertID, decisionMode, msg.Confidence,
 		warningText, msg.ClarifyingQuestions, msg.Citations, msg.ReplyToMessageID,
-		msg.TemplateSections,
+		msg.TemplateSections, qualityScore, coverage, refusalReason,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)

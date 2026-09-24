@@ -534,6 +534,12 @@ func (h *Handler) saveAssistantMessage(
 		// for the JSONB column (interface{} field, same pattern already
 		// used for Citations above), never an empty-but-present JSON value.
 		TemplateSections:    resp.TemplateSections,
+		// C9: persist the B6 judge score, China Wall coverage verdict and
+		// Gate-5 refusal reason so the "why this answer" view is assembled
+		// from stored facts (never a fresh LLM narration).
+		QualityScore:  resp.QualityScore,
+		Coverage:      resp.Coverage,
+		RefusalReason: resp.Reason,
 	})
 	if err != nil {
 		h.logger.Warn("save assistant message failed",

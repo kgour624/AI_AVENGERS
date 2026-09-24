@@ -89,6 +89,15 @@ type ExpertResponse struct {
 	// off / fail-open / structured. Frontend may render labels already
 	// embedded in Content; this is the structured form for C1 provenance.
 	Claims []chinawall.ClaimReport `json:"claims,omitempty"`
+	// Coverage (C9): China Wall coverage verdict YES|PARTIAL|NO. "" when no
+	// generation happened. Surfaced by the explanation view.
+	Coverage string `json:"coverage,omitempty"`
+	// QualityScore (C9): B6 judge overall [0,1]; 0 when the judge was
+	// off/failed-open. Explanation/observability only.
+	QualityScore float64 `json:"quality_score,omitempty"`
+	// Reason (C9): Gate-5 / partial refusal explanation. "" unless a refusal
+	// carried a China Wall reason. Surfaced by the explanation view.
+	Reason string `json:"reason,omitempty"`
 	// ReplyToUserMessageID (CT-C4): set ONLY when GateStopped==-1 (this
 	// response IS a structure-permission ASK, decision/engine.go's
 	// gateStructurePermission sentinel). message/handler.go's
@@ -573,6 +582,9 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		Questions:   result.Questions,
 		TemplateSections: result.TemplateSections,
 		Claims:      result.Claims,
+		Coverage:     result.Coverage,
+		QualityScore: result.QualityScore,
+		Reason:       result.Reason,
 		// ReplyToUserMessageID (CT-C4): only set when this IS a
 		// structure-permission ASK (sentinel GateStopped==-1, see
 		// decision/engine.go's gateStructurePermission). userMsgID copy

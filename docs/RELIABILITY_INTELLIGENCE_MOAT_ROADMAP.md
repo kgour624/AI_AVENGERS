@@ -455,6 +455,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Frontend, Go, System Design. |
 | **Files/Risk/Rollback** | `frontend/*`, `internal/decision/*`, `internal/workflow/*`. Risk: Medium. Rollback: revert. |
 | **Limitation** | `npm run build` + manual; user runs frontend toolchain. |
+| **DONE (C9)** | Mig 034 persists the three explanation facts that were computed but never stored: `messages.quality_score` (B6 judge), `messages.coverage` (YES\|PARTIAL\|NO), `messages.refusal_reason` (Gate-5/partial). Plumbed `coverage`/`qualityScore`/`reason` through `chinawall.EnforceResult` → `decision.DecisionResult` → `orchestrator.ExpertResponse` → `chat.Message` → `SaveMessage` (0/""→NULL so absence is honest). New `internal/explain`: `Service.Get` **joins the stored facts** — messages row (mode, gate_stopped, coverage, judge score, refusal/warning/questions, citations) + C1 provenance record (signed chain, B8 claim→evidence reports, signature verification) + expert ref — into one DTO. **Deterministic, no LLM narration.** `GET /messages/:id/explanation` (owner-only: client_id match + C4 `AssertProject`, foreign/unknown → flat 404). Pure helpers tested: `GateTimeline` (all-passed / stopped-at-N / −1 sentinel / unknown→not_reached), `ModeLabel`/`ModeExplanation`, `parseSources` fail-closed, `derefStr`. **Deferred:** frontend panel (`npm run build`, user toolchain); synthesis-level (multi-expert) explanation; workflow-artifact explanation (provenance `output_type=workflow_artifact` already exists — this card scoped chat answers). |
 
 ### C10 — Reliability-as-product (SLOs, status, audit-grade logs)
 | Part | Detail |
@@ -509,7 +510,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C6 | knowledge freshness | C | ✅ done | (pending PR, this branch) |
 | C7 | adversarial debate | C | ✅ done | (pending PR, this branch) |
 | C8 | bring-your-own-expert | C | ✅ done | (pending PR, this branch) |
-| C9 | explainability surface | C | ⬜ pending | — |
+| C9 | explainability surface | C | ✅ done | (pending PR, this branch) |
 | C10 | reliability-as-product | C | ⬜ pending | — |
 
 ---
