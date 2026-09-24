@@ -268,6 +268,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Go, DB (nullable FK, add/upsert), AI (memory tiers). |
 | **Files/Risk/Rollback** | `internal/workflow/agent_loop.go` or `runner.go`; `internal/memory/manager.go` (signature), `internal/orchestrator/orchestrator.go` (caller). Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: run a workflow then query L2 memory for the project. |
+| **DONE (B3)** | `RecordTurn` chatID → `*uuid.UUID` (orchestrator passes `&req.ChatID`; workflow passes `nil`). `AgentLoop` gains optional `*memory.Manager`; on `Completed && ArtifactEventID != nil` calls `recordWorkflowDecision` (looks up `project_id`/`client_id` from `workflows`, writes L1+L2+L3 via `RecordTurn` with `decisionMode="workflow_design"`, importance 4, chatID/messageID nil). One record per expert-task (not per iteration). Upsert/decay deferred to B7. |
 
 ### B4 — Gate threshold calibration from feedback
 | Part | Detail |
@@ -479,7 +480,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A19 | escalation deadlock/cycle guard | A | ✅ done | (pending PR, this branch) |
 | B1 | LLM synthesis | B | ✅ done | (pending PR, this branch) |
 | B2 | semantic contradiction detection | B | ✅ done | (pending PR, this branch) |
-| B3 | workflow memory write-back | B | ⬜ pending | — |
+| B3 | workflow memory write-back | B | ✅ done | (pending PR, this branch) |
 | B4 | gate threshold calibration | B | ⬜ pending | — |
 | B5 | self-learning hardening | B | ⬜ pending | — |
 | B6 | answer quality regeneration | B | ⬜ pending | — |

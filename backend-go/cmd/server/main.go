@@ -423,7 +423,7 @@ func buildRouter(
 	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, validationPipeline, logger)
 	// WorkflowRunner: drives workflows from start to completion.
 	wfPlanner := workflow.NewPlanner(modelGateway, logger)
-	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, contextAssembler, logger)
+	wfAgentLoop := workflow.NewAgentLoop(postgres.Pool, wfTools, bbStore, modelGateway, contextAssembler, memManager, logger)
 	// AiderRunner: executes implementation/qa phases using Aider.
 	// WHY separate from AgentLoop: File system as context, git history as memory.
 	// Workspace root: configurable via AIDER_WORKSPACE_ROOT env var.

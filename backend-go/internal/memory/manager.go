@@ -100,7 +100,12 @@ func (m *Manager) RecordTurn(
 	projectID uuid.UUID,
 	expertID uuid.UUID,
 	clientID uuid.UUID,
-	chatID uuid.UUID,
+	// chatID is a POINTER (B3). Standalone chat passes &req.ChatID;
+	// the workflow path has no chat row, so it passes nil. Matches
+	// master_event_log.chat_id which is nullable (no NOT NULL) —
+	// same honest-nil pattern as messageID below. Never fabricate a
+	// chat UUID that does not exist in the chats table.
+	chatID *uuid.UUID,
 	// messageID is a POINTER, not a value - Bug 3.2 fix (docs bug list).
 	// The caller (orchestrator.updateMemory) genuinely does not know the
 	// real messages.id at this point: the assistant message is saved by
@@ -153,12 +158,11 @@ func (m *Manager) RecordTurn(
 	go func() {
 		bgCtx := context.Background()
 		expertIDPtr := &expertID
-		chatIDPtr := &chatID
 		_ = m.l3.Append(bgCtx, L3Event{
 			ProjectID: projectID,
 			ExpertID:  expertIDPtr,
 			ClientID:  clientID,
-			ChatID:    chatIDPtr,
+			ChatID:    chatID, // already *uuid.UUID, nil-safe (chat OR workflow)
 			MessageID: messageID, // already *uuid.UUID, nil-safe
 			EventType: EventResponseGenerated,
 			EventData: map[string]interface{}{
