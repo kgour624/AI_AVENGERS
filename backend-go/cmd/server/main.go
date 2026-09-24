@@ -19,6 +19,7 @@ import (
 	adminpkg "ai_avengers/backend/internal/admin"
 	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/blackboard"
+	"ai_avengers/backend/internal/byoexpert"
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
@@ -47,6 +48,7 @@ import (
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/selflearning"
 	"ai_avengers/backend/internal/tenant"
+	"ai_avengers/backend/internal/training"
 	"ai_avengers/backend/internal/usage"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
@@ -405,6 +407,14 @@ func buildRouter(
 		freshnessSvc = knowledge.NewFreshness(postgres.Pool,
 			knowledge.Policy{MaxCorpusAgeDays: cfg.Freshness.MaxCorpusAgeDays}, logger)
 	}
+	// C8: bring-your-own-expert. The training pipeline is stateless, so a
+	// second instance is safe and keeps admin/BYO wiring independent.
+	byoIngestor := training.NewIngestionPipeline(postgres.Pool, embedder, mlClient, modelGateway, logger)
+	byoSvc := byoexpert.NewService(postgres.Pool, tenantSvc, byoIngestor,
+		byoexpert.Policy{
+			Enabled:           cfg.ByoExpert.Enabled,
+			DefaultMaxExperts: cfg.ByoExpert.DefaultMaxExperts,
+		}, logger)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -445,8 +455,9 @@ func buildRouter(
 	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
+	byoHandler := byoexpert.NewHandler(byoSvc, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -693,7 +704,9 @@ func buildRouter(
 			experts.GET("/:id", expertHandler.GetByID)
 			experts.GET("/:id/topics", expertHandler.GetTopics)
 		}
-
+		// C8: bring-your-own-expert (tenant self-service). Static segments
+		// only (no wildcard) so it cannot collide with /experts/:id.
+		byoHandler.RegisterRoutes(protected)
 		// Project routes
 		projects := protected.Group("/projects")
 		{
@@ -813,6 +826,9 @@ func buildRouter(
 		adminGroup.POST("/tenants", adminHandler.CreateTenant)
 		adminGroup.POST("/tenants/:id/users", adminHandler.AssignTenantUser)
 		adminGroup.POST("/tenants/:id/experts", adminHandler.AssignTenantExpert)
+		// C8: tenant self-service ("bring your own") experts.
+		adminGroup.POST("/tenants/:id/entitlement", adminHandler.SetTenantEntitlement)
+		adminGroup.GET("/byo/events", adminHandler.ListByoEvents)
 		// C5: cost & usage analytics product.
 		adminGroup.GET("/usage", adminHandler.GetUsage)
 		adminGroup.GET("/usage/budgets", adminHandler.GetUsageBudgets)
@@ -824,8 +840,7 @@ func buildRouter(
 		adminGroup.POST("/freshness/tasks/:taskId/ack", adminHandler.AcknowledgeFreshnessTask)
 		adminGroup.POST("/freshness/tasks/:taskId/resolve", adminHandler.ResolveFreshnessTask)
 		adminGroup.GET("/experts/:id/freshness", adminHandler.GetExpertFreshness)
-		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)
-		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
+		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/retry", adminHandler.RetryIngestionJob)

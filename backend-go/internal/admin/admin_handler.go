@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/byoexpert"
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/eval"
@@ -54,7 +56,9 @@ type AdminHandler struct {
 	usage *usage.Service
 	// freshness (C6): knowledge staleness/refresh tasks. Nil-safe.
 	freshness *knowledge.Freshness
-	logger    *zap.Logger
+	// byo (C8): tenant self-service expert entitlement + audit. Nil-safe.
+	byo    *byoexpert.Service
+	logger *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -82,6 +86,7 @@ func NewAdminHandler(
 	tenants *tenant.Service,
 	usageSvc *usage.Service,
 	freshness *knowledge.Freshness,
+	byoSvc *byoexpert.Service,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -96,6 +101,7 @@ func NewAdminHandler(
 		tenants:     tenants,
 		usage:       usageSvc,
 		freshness:   freshness,
+		byo:         byoSvc,
 		logger:      logger,
 	}
 }
@@ -1720,6 +1726,70 @@ func (h *AdminHandler) ResolveFreshnessTask(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"task_id": taskID, "status": knowledge.StatusResolved})
+}
+
+// ============================================================
+// BRING-YOUR-OWN EXPERT (C8)
+// ============================================================
+
+// SetTenantEntitlement POST /admin/tenants/:id/entitlement
+// Body: {"allow_byo_expert":true,"max_experts":5}
+// Grants/revokes tenant self-service experts (C8). Merges into tenants.settings.
+func (h *AdminHandler) SetTenantEntitlement(c *gin.Context) {
+	if h.byo == nil {
+		response.ServiceUnavailable(c, "byo experts are not configured")
+		return
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant ID")
+		return
+	}
+	var body struct {
+		AllowByoExpert bool `json:"allow_byo_expert"`
+		MaxExperts     int  `json:"max_experts"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	if body.MaxExperts < 0 {
+		response.BadRequest(c, "INVALID_INPUT", "max_experts must be >= 0")
+		return
+	}
+	if err := h.byo.SetEntitlement(c.Request.Context(), tenantID, body.AllowByoExpert, body.MaxExperts); err != nil {
+		h.logger.Warn("set tenant entitlement failed", zap.Error(err))
+		response.BadRequest(c, "SET_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"tenant_id": tenantID, "allow_byo_expert": body.AllowByoExpert, "max_experts": body.MaxExperts})
+}
+
+// ListByoEvents GET /admin/byo/events?tenant_id=&limit=
+// Append-only audit of tenant BYO activity (register/ingest/denials).
+func (h *AdminHandler) ListByoEvents(c *gin.Context) {
+	if h.byo == nil {
+		response.OK(c, []byoexpert.Event{})
+		return
+	}
+	tenantID, err := parseOptionalUUID(c.Query("tenant_id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant_id")
+		return
+	}
+	limit := 100
+	if l := strings.TrimSpace(c.Query("limit")); l != "" {
+		if n, convErr := strconv.Atoi(l); convErr == nil {
+			limit = n
+		}
+	}
+	events, err := h.byo.ListEvents(c.Request.Context(), tenantID, limit)
+	if err != nil {
+		h.logger.Error("list byo events failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, events)
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream

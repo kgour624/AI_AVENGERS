@@ -443,6 +443,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | System Design, Go, DB, connectors. |
 | **Files/Risk/Rollback** | `internal/training/*`, `internal/admin/*`, connectors. Risk: High. Rollback: staged + flag. |
 | **Limitation** | `go build ./...`; manual: register + query a custom expert. |
+| **DONE (C8)** | Mig 033: `experts.origin` (admin\|byo) + `created_by_user_id` + append-only `byo_expert_events` audit. New `internal/byoexpert`: `Service` (entitlement/quota/register/list/ingest/audit) + `Handler` (tenant-facing). **Entitlement is least-privilege + fail-closed (P3):** `tenants.settings.allow_byo_expert` must be exactly true (default deny; admin grants), tenant must be `active`, quota from `byo_max_experts` else policy default (5). **Isolation reuses C4** — a byo expert is `origin='byo' AND tenant_id=scope` (no new mechanism); `Register` **requires a tenant scope** (global/admin → `ErrScopeRequired`; admins use the admin API). Routes (all static segments, no wildcard clash with `/experts/:id`): `POST /byo-experts` register, `GET /byo-experts` list mine (incl. drafts), `GET /byo-experts/entitlement`, `POST /byo-experts/ingest` (multipart `expert_id`+`transcript`, reuses the stateless `training.IngestionPipeline` via an `Ingestor` port, 2h background guard mirroring admin). Admin: `POST /admin/tenants/:id/entitlement`, `GET /admin/byo/events`. Config `ByoExpertConfig{Enabled(absent→true), DefaultMaxExperts(5)}` + `BYO_EXPERT_*` staged kill switch. Pure tests: `ValidSlug` / `parseSettings` fail-closed / `Enabled` nil-safe / default quota. **Deferred (phase 2):** external knowledge connectors (OAuth/refresh/health `/invoke` layer, per the card's connector design) — this PR ships the BYO-expert half; a byo expert becomes publicly usable only after its ingest sets `training_status='trained'` (existing A10 rule). |
 
 ### C9 — Explainability surface ("why this answer")
 | Part | Detail |
@@ -507,7 +508,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C5 | cost/usage product | C | ✅ done | (pending PR, this branch) |
 | C6 | knowledge freshness | C | ✅ done | (pending PR, this branch) |
 | C7 | adversarial debate | C | ✅ done | (pending PR, this branch) |
-| C8 | bring-your-own-expert | C | ⬜ pending | — |
+| C8 | bring-your-own-expert | C | ✅ done | (pending PR, this branch) |
 | C9 | explainability surface | C | ⬜ pending | — |
 | C10 | reliability-as-product | C | ⬜ pending | — |
 

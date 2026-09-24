@@ -30,7 +30,19 @@ type Config struct {
 	Tenant              TenantConfig
 	Freshness           FreshnessConfig
 	Debate              DebateConfig
+	ByoExpert           ByoExpertConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// ByoExpertConfig controls C8 tenant self-service ("bring your own") experts.
+type ByoExpertConfig struct {
+	// Enabled: allow tenants to register their own experts + ingest corpora.
+	// Absent env → true (IsSet pattern, same as B6/B8/C1–C7). Explicit false
+	// is the staged kill switch (rollback without a redeploy).
+	Enabled bool
+	// DefaultMaxExperts: per-tenant quota when a tenant has no explicit
+	// byo_max_experts setting. Default 5.
+	DefaultMaxExperts int
 }
 
 // DebateConfig controls C7 adversarial review on high-stakes artifacts.
@@ -347,6 +359,10 @@ func Load() (*Config, error) {
 			Enabled: true, // C7 default on; overridden below if env set
 			MaxHops: v.GetInt("DEBATE_MAX_HOPS"),
 		},
+		ByoExpert: ByoExpertConfig{
+			Enabled:           true, // C8 default on; overridden below if env set
+			DefaultMaxExperts: v.GetInt("BYO_EXPERT_DEFAULT_MAX"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -391,6 +407,10 @@ func Load() (*Config, error) {
 	// C7: same IsSet pattern — absent → true; explicit false is the kill switch.
 	if v.IsSet("DEBATE_ENABLED") {
 		cfg.Debate.Enabled = v.GetBool("DEBATE_ENABLED")
+	}
+	// C8: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("BYO_EXPERT_ENABLED") {
+		cfg.ByoExpert.Enabled = v.GetBool("BYO_EXPERT_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -535,6 +555,10 @@ func (c *Config) applyDefaults() {
 	// C7: adversarial debate hop bound default (A19-aligned).
 	if c.Debate.MaxHops <= 0 {
 		c.Debate.MaxHops = 2
+	}
+	// C8: per-tenant BYO expert quota default.
+	if c.ByoExpert.DefaultMaxExperts <= 0 {
+		c.ByoExpert.DefaultMaxExperts = 5
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000
