@@ -28,7 +28,59 @@ type Config struct {
 	Provenance          ProvenanceConfig
 	Versioning          VersioningConfig
 	Tenant              TenantConfig
+	Freshness           FreshnessConfig
+	Debate              DebateConfig
+	ByoExpert           ByoExpertConfig
+	Reliability         ReliabilityConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// ReliabilityConfig controls C10 reliability-as-product (SLO surface + audit log).
+type ReliabilityConfig struct {
+	// Enabled: expose GET /status + write slo_events audit rows. Absent env →
+	// true (IsSet pattern, same as B6/B8/C1–C9). Explicit false is the kill
+	// switch (status degrades to dependency-only, like the pre-C10 /health).
+	Enabled bool
+	// AvailabilityTarget: published availability SLO, e.g. 0.995. Default 0.995.
+	AvailabilityTarget float64
+	// ErrorBudgetWindowDays: the window the target is published for. Default 30.
+	ErrorBudgetWindowDays int
+	// AtRiskThreshold: error-budget fraction remaining below which the verdict
+	// is "at_risk". Default 0.25.
+	AtRiskThreshold float64
+}
+
+// ByoExpertConfig controls C8 tenant self-service ("bring your own") experts.
+type ByoExpertConfig struct {
+	// Enabled: allow tenants to register their own experts + ingest corpora.
+	// Absent env → true (IsSet pattern, same as B6/B8/C1–C7). Explicit false
+	// is the staged kill switch (rollback without a redeploy).
+	Enabled bool
+	// DefaultMaxExperts: per-tenant quota when a tenant has no explicit
+	// byo_max_experts setting. Default 5.
+	DefaultMaxExperts int
+}
+
+// DebateConfig controls C7 adversarial review on high-stakes artifacts.
+type DebateConfig struct {
+	// Enabled: after mandatory reviewers approve a high-stakes artifact,
+	// run attack→defend→verdict (bounded hops). Absent env → true (IsSet
+	// pattern, same as B6/B8/C1–C6). Explicit false is the kill switch.
+	Enabled bool
+	// MaxHops: max attack→defend cycles before final verdict. Default 2
+	// (A19 hop bound). Each hop costs 2 LLM calls + 1 verdict call max.
+	MaxHops int
+}
+
+// FreshnessConfig controls C6 knowledge freshness detection.
+type FreshnessConfig struct {
+	// Enabled: compute staleness/embedding-mismatch/orphan signals and expose
+	// refresh tasks. Absent env → true (IsSet pattern, same as B6/B8/C1-C5).
+	// Explicit false disables the service (admin endpoints return empty).
+	Enabled bool
+	// MaxCorpusAgeDays: newest chunk older than this → stale_corpus.
+	// Default 180.
+	MaxCorpusAgeDays int
 }
 
 // TenantConfig controls C4 tenant isolation.
@@ -315,6 +367,24 @@ func Load() (*Config, error) {
 		Tenant: TenantConfig{
 			IsolationEnabled: true, // C4 default on; overridden below if env set
 		},
+		Freshness: FreshnessConfig{
+			Enabled:          true, // C6 default on; overridden below if env set
+			MaxCorpusAgeDays: v.GetInt("FRESHNESS_MAX_CORPUS_AGE_DAYS"),
+		},
+		Debate: DebateConfig{
+			Enabled: true, // C7 default on; overridden below if env set
+			MaxHops: v.GetInt("DEBATE_MAX_HOPS"),
+		},
+		ByoExpert: ByoExpertConfig{
+			Enabled:           true, // C8 default on; overridden below if env set
+			DefaultMaxExperts: v.GetInt("BYO_EXPERT_DEFAULT_MAX"),
+		},
+		Reliability: ReliabilityConfig{
+			Enabled:               true, // C10 default on; overridden below if env set
+			AvailabilityTarget:    v.GetFloat64("RELIABILITY_AVAILABILITY_TARGET"),
+			ErrorBudgetWindowDays: v.GetInt("RELIABILITY_ERROR_BUDGET_WINDOW_DAYS"),
+			AtRiskThreshold:       v.GetFloat64("RELIABILITY_AT_RISK_THRESHOLD"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -351,6 +421,22 @@ func Load() (*Config, error) {
 	// C4: same IsSet pattern — absent → true; explicit false is the kill switch.
 	if v.IsSet("TENANT_ISOLATION_ENABLED") {
 		cfg.Tenant.IsolationEnabled = v.GetBool("TENANT_ISOLATION_ENABLED")
+	}
+	// C6: same IsSet pattern — absent → true; explicit false disables.
+	if v.IsSet("FRESHNESS_ENABLED") {
+		cfg.Freshness.Enabled = v.GetBool("FRESHNESS_ENABLED")
+	}
+	// C7: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("DEBATE_ENABLED") {
+		cfg.Debate.Enabled = v.GetBool("DEBATE_ENABLED")
+	}
+	// C8: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("BYO_EXPERT_ENABLED") {
+		cfg.ByoExpert.Enabled = v.GetBool("BYO_EXPERT_ENABLED")
+	}
+	// C10: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("RELIABILITY_ENABLED") {
+		cfg.Reliability.Enabled = v.GetBool("RELIABILITY_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -487,6 +573,28 @@ func (c *Config) applyDefaults() {
 	// C2: drift threshold default.
 	if c.Versioning.DriftThreshold <= 0 || c.Versioning.DriftThreshold > 1 {
 		c.Versioning.DriftThreshold = 0.30
+	}
+	// C6: corpus freshness window default.
+	if c.Freshness.MaxCorpusAgeDays <= 0 {
+		c.Freshness.MaxCorpusAgeDays = 180
+	}
+	// C7: adversarial debate hop bound default (A19-aligned).
+	if c.Debate.MaxHops <= 0 {
+		c.Debate.MaxHops = 2
+	}
+	// C8: per-tenant BYO expert quota default.
+	if c.ByoExpert.DefaultMaxExperts <= 0 {
+		c.ByoExpert.DefaultMaxExperts = 5
+	}
+	// C10: published SLO defaults (reliability-as-product).
+	if c.Reliability.AvailabilityTarget <= 0 || c.Reliability.AvailabilityTarget >= 1 {
+		c.Reliability.AvailabilityTarget = 0.995
+	}
+	if c.Reliability.ErrorBudgetWindowDays <= 0 {
+		c.Reliability.ErrorBudgetWindowDays = 30
+	}
+	if c.Reliability.AtRiskThreshold <= 0 || c.Reliability.AtRiskThreshold >= 1 {
+		c.Reliability.AtRiskThreshold = 0.25
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000

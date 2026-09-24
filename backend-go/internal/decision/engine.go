@@ -57,6 +57,14 @@ type DecisionResult struct {
 	Warning     string   // Set when Gate 3 triggers WARN but continues
 	Questions   []string // Set when Gate 1 triggers ASK
 	Reason      string   // Set when Gate 5 refuses (China Wall reason)
+	// Coverage (C9): China Wall coverage verdict YES|PARTIAL|NO, mirrored
+	// from EnforceResult so the explanation view can show why a partial
+	// answer was refused. "" when no generation happened (Gates 1-4).
+	Coverage string
+	// QualityScore (C9): B6 judge overall in [0,1]; 0 when the judge was
+	// off/failed-open (mirrors EnforceResult.QualityScore). Observability +
+	// explanation only — never gates a cited answer.
+	QualityScore float64
 	// TemplateSections (CT-B4): mirrors chinawall.EnforceResult.TemplateSections.
 	// nil for every flat-text expert response (CT-L2).
 	TemplateSections []chinawall.TemplateSectionResult
@@ -204,6 +212,7 @@ func (e *Engine) Process(
 			Content:     enforceResult.Answer,
 			GateStopped: 5,
 			Reason:      enforceResult.Reason,
+			Coverage:    enforceResult.Coverage,
 		}, nil
 
 	case "success":
@@ -215,6 +224,8 @@ func (e *Engine) Process(
 			Warning:          warning,
 			TemplateSections: enforceResult.TemplateSections,
 			Claims:           enforceResult.Claims,
+			Coverage:         enforceResult.Coverage,
+			QualityScore:     enforceResult.QualityScore,
 		}, nil
 
 	case "partial":
@@ -226,6 +237,7 @@ func (e *Engine) Process(
 			Content:     fmt.Sprintf("Cannot provide complete answer: %s", enforceResult.Reason),
 			GateStopped: 5,
 			Reason:      enforceResult.Reason,
+			Coverage:    enforceResult.Coverage,
 		}, nil
 
 	default:

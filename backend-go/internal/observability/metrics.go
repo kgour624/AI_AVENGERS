@@ -42,6 +42,18 @@ func (m *Metrics) IncOutboxPublished()  { m.outboxPublished.Add(1) }
 func (m *Metrics) IncEntitlementDenied() { m.entitlementDenied.Add(1) }
 func (m *Metrics) IncTenantDenied()      { m.tenantDenied.Add(1) }
 
+// Typed getters (C10): the reliability surface reads these directly instead
+// of type-asserting out of Snapshot()'s map[string]interface{}.
+
+// LLMCallsTotal returns the process-wide LLM call counter.
+func (m *Metrics) LLMCallsTotal() int64 { return m.llmCallsTotal.Load() }
+
+// LLMErrorsTotal returns the process-wide LLM error counter.
+func (m *Metrics) LLMErrorsTotal() int64 { return m.llmErrorsTotal.Load() }
+
+// UptimeSeconds returns seconds since process start.
+func (m *Metrics) UptimeSeconds() int64 { return int64(time.Since(startTime).Seconds()) }
+
 func (m *Metrics) AddLLMCost(usd float64) {
 	for {
 		old := m.llmCostUSDTotal.Load()

@@ -19,6 +19,7 @@ import (
 	adminpkg "ai_avengers/backend/internal/admin"
 	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/blackboard"
+	"ai_avengers/backend/internal/byoexpert"
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
@@ -28,6 +29,7 @@ import (
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/entitlement"
 	"ai_avengers/backend/internal/eval"
+	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
@@ -43,10 +45,13 @@ import (
 	"ai_avengers/backend/internal/project"
 	"ai_avengers/backend/internal/provenance"
 	"ai_avengers/backend/internal/rating"
+	"ai_avengers/backend/internal/reliability"
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/selflearning"
 	"ai_avengers/backend/internal/tenant"
+	"ai_avengers/backend/internal/training"
+	"ai_avengers/backend/internal/usage"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -393,6 +398,25 @@ func buildRouter(
 	evalStore := eval.NewStore(postgres.Pool)
 	// C4: tenant isolation + enterprise controls. Kill switch TENANT_ISOLATION_ENABLED.
 	tenantSvc := tenant.NewService(postgres.Pool, cfg.Tenant.IsolationEnabled, logger)
+	// C5: cost/usage analytics product. The gateway records every real LLM
+	// call here (single choke point, G5); admin reads it back grouped.
+	usageSvc := usage.NewService(postgres.Pool, logger)
+	modelGateway.SetUsageRecorder(usageSvc)
+	// C6: knowledge freshness scanner (staleness + embedding mismatch + orphan
+	// citations). nil when disabled (FRESHNESS_ENABLED=false).
+	var freshnessSvc *knowledge.Freshness
+	if cfg.Freshness.Enabled {
+		freshnessSvc = knowledge.NewFreshness(postgres.Pool,
+			knowledge.Policy{MaxCorpusAgeDays: cfg.Freshness.MaxCorpusAgeDays}, logger)
+	}
+	// C8: bring-your-own-expert. The training pipeline is stateless, so a
+	// second instance is safe and keeps admin/BYO wiring independent.
+	byoIngestor := training.NewIngestionPipeline(postgres.Pool, embedder, mlClient, modelGateway, logger)
+	byoSvc := byoexpert.NewService(postgres.Pool, tenantSvc, byoIngestor,
+		byoexpert.Policy{
+			Enabled:           cfg.ByoExpert.Enabled,
+			DefaultMaxExperts: cfg.ByoExpert.DefaultMaxExperts,
+		}, logger)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -433,8 +457,23 @@ func buildRouter(
 	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
+	byoHandler := byoexpert.NewHandler(byoSvc, logger)
+	explainSvc := explain.NewService(postgres.Pool, provSvc, tenantSvc, logger)
+	explainHandler := explain.NewHandler(explainSvc, logger)
+	// C10: reliability-as-product — published SLO surface + audit-grade event
+	// log. Probes reuse the existing dependency HealthCheck methods.
+	relSvc := reliability.NewService(postgres.Pool, reliability.Policy{
+		Enabled:               cfg.Reliability.Enabled,
+		AvailabilityTarget:    cfg.Reliability.AvailabilityTarget,
+		ErrorBudgetWindowDays: cfg.Reliability.ErrorBudgetWindowDays,
+		AtRiskThreshold:       cfg.Reliability.AtRiskThreshold,
+	}, logger)
+	relSvc.RegisterProbe("postgres", postgres.HealthCheck)
+	relSvc.RegisterProbe("redis", redisClient.HealthCheck)
+	relSvc.RegisterProbe("ml_sidecar", mlClient.HealthCheck)
+	relHandler := reliability.NewHandler(relSvc, "1.0.0", logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -464,6 +503,12 @@ func buildRouter(
 	wfWorkspaceMerger := workflow.NewWorkspaceMerger(logger)
 	logger.Info("aider workspace configured", zap.String("root", workspaceRoot))
 	wfCrossVerifier := workflow.NewCrossVerifier(bbStore, modelGateway, wfAgentLoop, wfAiderRunner, wfTools, logger)
+	// C7: adversarial debate overlay on high-stakes artifacts (attack→defend
+	// →verdict, hop-bound). Kill switch = DEBATE_ENABLED=false.
+	wfCrossVerifier.SetDebatePolicy(workflow.DebatePolicy{
+		Enabled: cfg.Debate.Enabled,
+		MaxHops: cfg.Debate.MaxHops,
+	})
 
 	// wfSections moved up from where it used to be constructed (previously only
 	// needed by the chat wiring below) because AuthoringRunner needs it too, and
@@ -597,6 +642,11 @@ func buildRouter(
 		response.OK(c, observability.Global.Snapshot())
 	})
 
+	// GET /status — public reliability surface (C10): dependency components +
+	// the published SLO snapshot. No auth; probe error strings are withheld
+	// publicly (the admin view carries them).
+	router.GET("/status", relHandler.PublicStatus)
+
 	v1 := router.Group("/api/v1")
 
 	// ============================================================
@@ -675,7 +725,9 @@ func buildRouter(
 			experts.GET("/:id", expertHandler.GetByID)
 			experts.GET("/:id/topics", expertHandler.GetTopics)
 		}
-
+		// C8: bring-your-own-expert (tenant self-service). Static segments
+		// only (no wildcard) so it cannot collide with /experts/:id.
+		byoHandler.RegisterRoutes(protected)
 		// Project routes
 		projects := protected.Group("/projects")
 		{
@@ -722,6 +774,8 @@ func buildRouter(
 			messages.PATCH("/:id", messageHandler.UpdateMessage)
 			// C1: signed provenance chain for an answer.
 			messages.GET("/:id/provenance", handleGetMessageProvenance(provSvc))
+			// C9: unified "why this answer" view (view over stored facts).
+			messages.GET("/:id/explanation", explainHandler.Get)
 		}
 
 		// Workflow routes (Phase C — collaboration layer)
@@ -795,6 +849,24 @@ func buildRouter(
 		adminGroup.POST("/tenants", adminHandler.CreateTenant)
 		adminGroup.POST("/tenants/:id/users", adminHandler.AssignTenantUser)
 		adminGroup.POST("/tenants/:id/experts", adminHandler.AssignTenantExpert)
+		// C8: tenant self-service ("bring your own") experts.
+		adminGroup.POST("/tenants/:id/entitlement", adminHandler.SetTenantEntitlement)
+		adminGroup.GET("/byo/events", adminHandler.ListByoEvents)
+		// C10: reliability-as-product (full detail + audit trail).
+		adminGroup.GET("/reliability/status", relHandler.AdminStatus)
+		adminGroup.GET("/reliability/events", relHandler.ListEvents)
+		// C5: cost & usage analytics product.
+		adminGroup.GET("/usage", adminHandler.GetUsage)
+		adminGroup.GET("/usage/budgets", adminHandler.GetUsageBudgets)
+		adminGroup.PUT("/usage/budgets", adminHandler.SetUsageBudget)
+		adminGroup.GET("/usage/alerts", adminHandler.GetUsageAlerts)
+		// C6: knowledge freshness / staleness + refresh tasks.
+		adminGroup.GET("/freshness/tasks", adminHandler.ListFreshnessTasks)
+		adminGroup.POST("/freshness/scan", adminHandler.ScanAllFreshness)
+		adminGroup.POST("/freshness/tasks/:taskId/ack", adminHandler.AcknowledgeFreshnessTask)
+		adminGroup.POST("/freshness/tasks/:taskId/resolve", adminHandler.ResolveFreshnessTask)
+		adminGroup.GET("/experts/:id/freshness", adminHandler.GetExpertFreshness)
+		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)

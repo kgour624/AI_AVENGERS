@@ -41,6 +41,10 @@ type CrossVerifier struct {
 	aiderRunner *AiderRunner // used to re-run producer on changes_requested
 	tools       *Tools
 	logger      *zap.Logger
+	// debate (C7): adversarial overlay on high-stakes artifacts after
+	// reviewers approve. Zero value = disabled (safe default until
+	// SetDebatePolicy installs the live policy from config).
+	debate DebatePolicy
 }
 
 // NewCrossVerifier creates a new CrossVerifier.
@@ -281,10 +285,27 @@ func (cv *CrossVerifier) reviewArtifact(
 		}
 
 		if allApproved {
-			// All reviewers approved — post final approval event
+			// C7: high-stakes artifacts get a bounded adversarial debate
+			// AFTER mandatory reviewers approve. Low-stakes / disabled →
+			// skip straight to approval (original A7 path).
+			if cv.debateEnabled() && IsHighStakes(artifact.EventType) {
+				verdict, debErr := cv.applyDebateVerdict(ctx, workflowID, artifact, round)
+				if debErr != nil {
+					return debErr
+				}
+				// FAIL already returned err; ESCALATE is non-fatal and must
+				// NOT mark the artifact approved (same posture as max-rounds
+				// escalation — client decides, no false green).
+				if verdict == DebateEscalate {
+					return nil
+				}
+				// DebatePass falls through to artifact_approved below.
+			}
+
+			// All reviewers approved (and debate passed / skipped) — final.
 			_, _ = cv.store.Post(ctx, blackboard.PostRequest{
-				WorkflowID: workflowID,
-				EventType:  "artifact_approved",
+				WorkflowID:     workflowID,
+				EventType:      "artifact_approved",
 				PostedByClient: true,
 				Content: map[string]interface{}{
 					"artifact_id":   artifact.ID.String(),
@@ -514,6 +535,98 @@ func (cv *CrossVerifier) runProducerRevision(
 		zap.String("producer", producer.Name),
 		zap.String("artifact_type", artifact.EventType),
 	)
+}
+
+// applyDebateVerdict runs the C7 adversarial debate and maps the verdict
+// onto the same fail-closed signals the revision loop already uses:
+//
+//	PASS     → (DebatePass, nil) — caller posts artifact_approved
+//	FAIL     → ("", ErrArtifactBlocked) after artifact_blocked
+//	ESCALATE → (DebateEscalate, nil) — caller must NOT approve
+//	error    → ("", err) after review_inconclusive
+func (cv *CrossVerifier) applyDebateVerdict(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	artifact blackboard.Event,
+	round int,
+) (verdict string, err error) {
+	verdict, debErr := cv.runAdversarialDebate(ctx, workflowID, artifact)
+	if debErr != nil {
+		cv.logger.Error("adversarial-debate failed",
+			zap.String("artifact_id", artifact.ID.String()),
+			zap.Error(debErr),
+		)
+		_, _ = cv.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:         workflowID,
+			EventType:          "review_inconclusive",
+			PostedByClient:     true,
+			ReferencesEventIDs: []uuid.UUID{artifact.ID},
+			Content: map[string]interface{}{
+				"artifact_id":   artifact.ID.String(),
+				"artifact_type": artifact.EventType,
+				"round":         round,
+				"reason":        "adversarial debate incomplete: " + debErr.Error(),
+			},
+		})
+		return "", fmt.Errorf("adversarial debate incomplete for %s: %w", artifact.EventType, debErr)
+	}
+
+	_, _ = cv.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:         workflowID,
+		EventType:          "debate_verdict",
+		PostedByClient:     true,
+		ReferencesEventIDs: []uuid.UUID{artifact.ID},
+		Content: map[string]interface{}{
+			"artifact_id":   artifact.ID.String(),
+			"artifact_type": artifact.EventType,
+			"round":         round,
+			"verdict":       verdict,
+			"max_hops":      cv.debate.MaxHops,
+		},
+	})
+
+	switch verdict {
+	case DebatePass:
+		cv.logger.Info("adversarial-debate: PASS",
+			zap.String("artifact_type", artifact.EventType),
+		)
+		return DebatePass, nil
+	case DebateEscalate:
+		cv.logger.Warn("adversarial-debate: ESCALATE to client",
+			zap.String("artifact_type", artifact.EventType),
+		)
+		_, _ = cv.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     workflowID,
+			EventType:      "review_escalated_to_client",
+			PostedByClient: true,
+			Content: map[string]interface{}{
+				"artifact_id":   artifact.ID.String(),
+				"artifact_type": artifact.EventType,
+				"reason":        "adversarial debate escalated — residual ambiguity needs client decision",
+				"verdict":       DebateEscalate,
+			},
+		})
+		// Non-fatal (same posture as max-revision escalation): no
+		// artifact_approved — client decides on Kanban.
+		return DebateEscalate, nil
+	default: // DebateFail or anything unexpected (already fail-closed by parser)
+		cv.logger.Error("adversarial-debate: FAIL — blocking artifact",
+			zap.String("artifact_type", artifact.EventType),
+			zap.String("verdict", verdict),
+		)
+		_, _ = cv.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     workflowID,
+			EventType:      "artifact_blocked",
+			PostedByClient: true,
+			Content: map[string]interface{}{
+				"artifact_id":   artifact.ID.String(),
+				"artifact_type": artifact.EventType,
+				"reason":        "adversarial debate FAIL — unresolved high-severity finding",
+				"verdict":       DebateFail,
+			},
+		})
+		return DebateFail, fmt.Errorf("%w: adversarial debate fail on %s", ErrArtifactBlocked, artifact.EventType)
+	}
 }
 
 // latestRevisedArtifact returns the newest blackboard event of the same

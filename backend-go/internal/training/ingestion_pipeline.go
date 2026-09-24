@@ -65,6 +65,31 @@ func NewIngestionPipeline(
 	}
 }
 
+// currentEmbedding reads the active embedding provider/model from
+// system_settings (same keys the admin embedding screen writes). Defaults to
+// "sidecar" with an empty model. Best-effort — a read failure yields defaults
+// so ingestion is never blocked by a missing settings row.
+func (p *IngestionPipeline) currentEmbedding(ctx context.Context) (provider, model string) {
+	provider = "sidecar"
+	readSetting := func(key string) string {
+		var raw []byte
+		if err := p.db.QueryRow(ctx,
+			`SELECT value FROM system_settings WHERE key=$1`, key).Scan(&raw); err != nil {
+			return ""
+		}
+		var v string
+		if json.Unmarshal(raw, &v) != nil {
+			return ""
+		}
+		return v
+	}
+	if v := readSetting("embedding_provider"); v != "" {
+		provider = v
+	}
+	model = readSetting("embedding_model")
+	return provider, model
+}
+
 // IngestionResult holds statistics from a completed ingestion.
 type IngestionResult struct {
 	ExpertID      uuid.UUID
@@ -666,8 +691,18 @@ func (p *IngestionPipeline) storeChunks(
 	topics []TopicResult,
 	embeddings [][]float32,
 	sourceFile string,
-) ([]uuid.UUID, error) {
+	) ([]uuid.UUID, error) {
 	chunkIDs := make([]uuid.UUID, len(chunks))
+
+	// C6: stamp each new chunk with the provider/model that produced its
+	// vector, so a later embedding-provider/model change is detectable as a
+	// re-embed requirement. Read once per ingestion (cheap). Existing
+	// duplicate chunks keep their original stamp (ON CONFLICT DO NOTHING).
+	embedProvider, embedModel := p.currentEmbedding(ctx)
+	var embedModelArg interface{} // empty model → SQL NULL (sidecar has no model name)
+	if embedModel != "" {
+		embedModelArg = embedModel
+	}
 
 	for i, chunk := range chunks {
 		topic := topics[i].Topic
@@ -688,11 +723,13 @@ func (p *IngestionPipeline) storeChunks(
 		var chunkID uuid.UUID
 		err := p.db.QueryRow(ctx,
 			`INSERT INTO course_chunks
-				(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding, chunk_hash)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding, chunk_hash,
+				 embedding_provider, embedding_model)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			 ON CONFLICT (expert_id, chunk_hash) DO NOTHING
 			 RETURNING id`,
 			expertID, chunk.Text, chunk.Index, topic, subtopic, sourceFile, embedding, chunk.ChunkHash,
+			embedProvider, embedModelArg,
 		).Scan(&chunkID)
 		if err != nil {
 			// ON CONFLICT DO NOTHING + RETURNING id yields zero rows on conflict,

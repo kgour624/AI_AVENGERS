@@ -21,6 +21,7 @@ import (
 	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/ratelimit"
 	"ai_avengers/backend/internal/selflearning"
+	"ai_avengers/backend/internal/usage"
 )
 
 // OrchestratorRequest is the input to the orchestrator.
@@ -88,6 +89,15 @@ type ExpertResponse struct {
 	// off / fail-open / structured. Frontend may render labels already
 	// embedded in Content; this is the structured form for C1 provenance.
 	Claims []chinawall.ClaimReport `json:"claims,omitempty"`
+	// Coverage (C9): China Wall coverage verdict YES|PARTIAL|NO. "" when no
+	// generation happened. Surfaced by the explanation view.
+	Coverage string `json:"coverage,omitempty"`
+	// QualityScore (C9): B6 judge overall [0,1]; 0 when the judge was
+	// off/failed-open. Explanation/observability only.
+	QualityScore float64 `json:"quality_score,omitempty"`
+	// Reason (C9): Gate-5 / partial refusal explanation. "" unless a refusal
+	// carried a China Wall reason. Surfaced by the explanation view.
+	Reason string `json:"reason,omitempty"`
 	// ReplyToUserMessageID (CT-C4): set ONLY when GateStopped==-1 (this
 	// response IS a structure-permission ASK, decision/engine.go's
 	// gateStructurePermission sentinel). message/handler.go's
@@ -345,7 +355,12 @@ collected:
 	// expert collection above is already bound to.
 	var synthesis *SynthesisResult
 	if len(expertResponses) > 1 {
-		synthesis = o.synthesize(timeoutCtx, expertResponses)
+		// C5: attribute the synthesis LLM call to this chat/project.
+		spid, scid := req.ProjectID, req.ChatID
+		synthCtx := usage.WithAttribution(timeoutCtx, usage.Attribution{
+			ProjectID: &spid, ChatID: &scid, UseCase: usage.UseCaseSynthesis,
+		})
+		synthesis = o.synthesize(synthCtx, expertResponses)
 	}
 
 	// Update memory async (non-blocking)
@@ -363,6 +378,15 @@ collected:
 // Uses PhaseTimer (Observer pattern) to record per-phase latency.
 func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRequest, expert expertRecord) ExpertResponse {
 	timer := observability.NewPhaseTimer()
+
+	// C5: attribute every downstream LLM call in this expert's pipeline
+	// (self-learning, gates, generation) to this project/chat/expert so the
+	// usage surface groups spend correctly. Per-tenant spend is derived from
+	// the project at write time.
+	pid, cid, eid := req.ProjectID, req.ChatID, expert.ID
+	ctx = usage.WithAttribution(ctx, usage.Attribution{
+		ProjectID: &pid, ChatID: &cid, ExpertID: &eid, UseCase: usage.UseCaseChat,
+	})
 
 	// Per-expert rate limiting (Strategy pattern).
 	// Prevents a single expert from being overwhelmed by concurrent requests.
@@ -558,6 +582,9 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		Questions:   result.Questions,
 		TemplateSections: result.TemplateSections,
 		Claims:      result.Claims,
+		Coverage:     result.Coverage,
+		QualityScore: result.QualityScore,
+		Reason:       result.Reason,
 		// ReplyToUserMessageID (CT-C4): only set when this IS a
 		// structure-permission ASK (sentinel GateStopped==-1, see
 		// decision/engine.go's gateStructurePermission). userMsgID copy

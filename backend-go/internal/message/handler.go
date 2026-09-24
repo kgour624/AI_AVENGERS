@@ -23,6 +23,7 @@ import (
 	"ai_avengers/backend/internal/provenance"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/tenant"
+	"ai_avengers/backend/internal/usage"
 )
 
 // SendMessageRequest is the input for sending a message.
@@ -533,6 +534,12 @@ func (h *Handler) saveAssistantMessage(
 		// for the JSONB column (interface{} field, same pattern already
 		// used for Citations above), never an empty-but-present JSON value.
 		TemplateSections:    resp.TemplateSections,
+		// C9: persist the B6 judge score, China Wall coverage verdict and
+		// Gate-5 refusal reason so the "why this answer" view is assembled
+		// from stored facts (never a fresh LLM narration).
+		QualityScore:  resp.QualityScore,
+		Coverage:      resp.Coverage,
+		RefusalReason: resp.Reason,
 	})
 	if err != nil {
 		h.logger.Warn("save assistant message failed",
@@ -585,6 +592,10 @@ func (h *Handler) indexTurn(
 	orchestratorResp *orchestrator.OrchestratorResponse,
 	turnNumber int,
 ) {
+	// C5: attribute the (cheap) index call to this chat.
+	ctx = usage.WithAttribution(ctx, usage.Attribution{
+		ChatID: &chatID, UseCase: usage.UseCaseIndex,
+	})
 	if len(orchestratorResp.ExpertResponses) == 0 {
 		return
 	}
@@ -674,6 +685,10 @@ Return JSON: {"summary": "...", "topic": "...", "importance": 1-5}`, turnText)
 // Context window is finite. Summary compresses history.
 // Prevents lost-in-middle problem for long conversations.
 func (h *Handler) generateRollingSummary(ctx context.Context, chatID uuid.UUID, turnNumber int) {
+	// C5: attribute the (cheap) summary call to this chat.
+	ctx = usage.WithAttribution(ctx, usage.Attribution{
+		ChatID: &chatID, UseCase: usage.UseCaseSummary,
+	})
 	// Get last 10 chat index entries
 	rows, err := h.chatSvc.GetDB().Query(ctx,
 		`SELECT one_line_summary, topic, turn_number

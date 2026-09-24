@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | **Document ID** | `RIM_ROADMAP_v2` |
-| **Status** | **DESIGN LOCKED — Phase A (A1–A19) DONE on fork branch; B1+ pending** |
+| **Status** | **ALL DONE (A1–A19, B1–B9, C1–C10) on branch `reliability-a1-a12` (A1–A12 on `origin/main` via PR #5); pending PR merge** |
 | **Single source of truth for** | The locked task order from A13 → C10 and the mandatory per-task working protocol |
 | **Depends on (done)** | Phase A1–A12 (merged to `origin/main` via PR #5; roadmap doc via PR #6) |
 | **Audience** | Any engineer or AI coding agent with **no prior deep codebase knowledge** |
@@ -54,9 +54,9 @@ Phase C  MOAT          -> build what nobody can copy (provenance, eval, trust)
 
 | Phase | Theme | Tasks |
 |-------|-------|-------|
-| A | Reliability | A1–A12 **done**; A13–A19 remaining |
-| B | Intelligence | B1–B9 |
-| C | Moat | C1–C10 |
+| A | Reliability | A1–A19 **done** |
+| B | Intelligence | B1–B9 **done** |
+| C | Moat | C1–C10 **done** |
 
 ---
 
@@ -407,6 +407,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB, Go, System Design. |
 | **Files/Risk/Rollback** | `internal/monitoring/*`, `internal/admin/*`, frontend. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: budget alert fires. |
+| **DONE (C5)** | Mig 031 `usage_events` (append-only per-LLM-call: tenant/project/expert/chat/workflow/account + provider/tier/model/use_case + tokens + cost) + `usage_budgets` (per-tenant + one global row via COALESCE unique index). New `internal/usage`: `Event`/`Attribution`, context-carried attribution (`WithAttribution`/`AttributionFrom`), `Recorder` seam, `Service.Record` (fail-open; resolves project←workflow and tenant←project at write), `Summary` (whitelisted group_by tenant/project/expert/model/use_case), `MonthSpend`, `GetBudget/SetBudget/BudgetStatus/Alerts`, pure `MonthStart/UsagePercent/BudgetBreached`. Gateway is the single choke point (G5): `SetUsageRecorder` + `recordUsage` on every real (non-cached) `Call`/`StreamCall`. Attribution wired via ctx at orchestrator chat+synthesis, memory consolidator, message index/summary. Admin: `GET /admin/usage`, `GET/PUT /admin/usage/budgets`, `GET /admin/usage/alerts`. Tests: MonthStart/percent/breach/ctx/group whitelist/nil-safe. **Deferred:** scheduled alert notifications (endpoint is on-demand); `messages.cost_usd` backfill; frontend dashboard (C9/C10 surface). |
 
 ### C6 — Knowledge freshness / staleness detection
 | Part | Detail |
@@ -418,6 +419,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, DB, System Design. |
 | **Files/Risk/Rollback** | `internal/training/*`, `internal/knowledge/*`. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: seed an old chunk, observe flag. |
+| **DONE (C6)** | Mig 032: `course_chunks.embedding_provider`/`embedding_model` (+ indexes) so an embedding change is detectable; `knowledge_refresh_tasks` (typed, severity, dedupe unique per expert+type+key, reopen-on-recur). `internal/knowledge/freshness.go`: `ScanExpert`/`ScanAll`/`GetExpert` (read-only)/`ListTasks`/`AcknowledgeTask`/`ResolveTask`; signals = **embedding_mismatch** (chunks stamped with a provider/model ≠ active), **stale_corpus** (newest chunk older than window), **orphan_reference** (provenance citations whose chunk_id no longer exists — P9 feedback), **empty_corpus**; pure `CorpusAgeDays`/`IsStale`/`Classify` (tested). Ingestion stamps provider/model per new chunk (read from system_settings; sidecar → NULL model). Config `FreshnessConfig{Enabled(absent→true), MaxCorpusAgeDays(180)}`. Admin: `GET /admin/experts/:id/freshness`, `POST …/freshness/scan`, `POST /admin/freshness/scan`, `GET /admin/freshness/tasks`, `POST /admin/freshness/tasks/:id/{ack,resolve}`; ingest success auto-rescans the expert (best-effort, mirrors C2). **Deferred:** corpus-wide semantic contradiction (B2 is per-answer); scheduled/background scan (admin-triggered + ingest-triggered now); chunk→document inverted index (source_file grouping suffices for refresh targeting). |
 
 ### C7 — Adversarial review / debate protocol
 | Part | Detail |
@@ -429,6 +431,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Multi-agent, AI, Go. |
 | **Files/Risk/Rollback** | `internal/workflow/cross_verifier.go` + new rounds. Risk: Medium–High (cost). Rollback: flag. |
 | **Limitation** | `go build ./...`; manual: force a contested artifact. |
+| **DONE (C7)** | `internal/workflow/adversarial_debate.go`: bounded critic–refiner overlay on A7. After mandatory reviewers approve a **high-stakes** artifact (`architecture_decision`, `data_model_proposed`, `api_contract_proposed`, `module_design_proposed`, `code_artifact_produced`), run attack → defend × `MaxHops` (default 2, A19) → verdict. Red-team catalog (injection/jailbreak, token smuggling, boundary probing, secret extraction, tool exploitation, goal hijacking, psychophancy, security, completeness). Attack uses `ModelStrong`; defend `ModelCheap`. Clean attack (`NONE`) short-circuits PASS (no verdict call). Verdict enum `PASS`/`FAIL`/`ESCALATE`; pure `ParseDebateVerdict` **fail-closed** (empty/unknown → FAIL). Blackboard events: `debate_attack`, `debate_defend`, `debate_verdict`. FAIL → `artifact_blocked` + `ErrArtifactBlocked`; ESCALATE → `review_escalated_to_client` and **no** `artifact_approved` (same posture as max-revision); PASS → falls through to `artifact_approved`. Config `DebateConfig{Enabled(absent→true), MaxHops(2)}` + `DEBATE_*` kill switch via `CrossVerifier.SetDebatePolicy`. Pure tests: AttackIsClean / ClassifyAttackSeverity / ParseDebateVerdict / IsHighStakes / SetDebatePolicy nil-safe. **Deferred:** multi-critic Mixture-of-Agents; design-artifact producer re-run via AgentLoop (still Aider-only for code); continuous simulation red-team corpus (C3 golden covers probes). |
 
 ### C8 — Bring-your-own-expert / connector knowledge
 | Part | Detail |
@@ -440,6 +443,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | System Design, Go, DB, connectors. |
 | **Files/Risk/Rollback** | `internal/training/*`, `internal/admin/*`, connectors. Risk: High. Rollback: staged + flag. |
 | **Limitation** | `go build ./...`; manual: register + query a custom expert. |
+| **DONE (C8)** | Mig 033: `experts.origin` (admin\|byo) + `created_by_user_id` + append-only `byo_expert_events` audit. New `internal/byoexpert`: `Service` (entitlement/quota/register/list/ingest/audit) + `Handler` (tenant-facing). **Entitlement is least-privilege + fail-closed (P3):** `tenants.settings.allow_byo_expert` must be exactly true (default deny; admin grants), tenant must be `active`, quota from `byo_max_experts` else policy default (5). **Isolation reuses C4** — a byo expert is `origin='byo' AND tenant_id=scope` (no new mechanism); `Register` **requires a tenant scope** (global/admin → `ErrScopeRequired`; admins use the admin API). Routes (all static segments, no wildcard clash with `/experts/:id`): `POST /byo-experts` register, `GET /byo-experts` list mine (incl. drafts), `GET /byo-experts/entitlement`, `POST /byo-experts/ingest` (multipart `expert_id`+`transcript`, reuses the stateless `training.IngestionPipeline` via an `Ingestor` port, 2h background guard mirroring admin). Admin: `POST /admin/tenants/:id/entitlement`, `GET /admin/byo/events`. Config `ByoExpertConfig{Enabled(absent→true), DefaultMaxExperts(5)}` + `BYO_EXPERT_*` staged kill switch. Pure tests: `ValidSlug` / `parseSettings` fail-closed / `Enabled` nil-safe / default quota. **Deferred (phase 2):** external knowledge connectors (OAuth/refresh/health `/invoke` layer, per the card's connector design) — this PR ships the BYO-expert half; a byo expert becomes publicly usable only after its ingest sets `training_status='trained'` (existing A10 rule). |
 
 ### C9 — Explainability surface ("why this answer")
 | Part | Detail |
@@ -451,6 +455,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | Frontend, Go, System Design. |
 | **Files/Risk/Rollback** | `frontend/*`, `internal/decision/*`, `internal/workflow/*`. Risk: Medium. Rollback: revert. |
 | **Limitation** | `npm run build` + manual; user runs frontend toolchain. |
+| **DONE (C9)** | Mig 034 persists the three explanation facts that were computed but never stored: `messages.quality_score` (B6 judge), `messages.coverage` (YES\|PARTIAL\|NO), `messages.refusal_reason` (Gate-5/partial). Plumbed `coverage`/`qualityScore`/`reason` through `chinawall.EnforceResult` → `decision.DecisionResult` → `orchestrator.ExpertResponse` → `chat.Message` → `SaveMessage` (0/""→NULL so absence is honest). New `internal/explain`: `Service.Get` **joins the stored facts** — messages row (mode, gate_stopped, coverage, judge score, refusal/warning/questions, citations) + C1 provenance record (signed chain, B8 claim→evidence reports, signature verification) + expert ref — into one DTO. **Deterministic, no LLM narration.** `GET /messages/:id/explanation` (owner-only: client_id match + C4 `AssertProject`, foreign/unknown → flat 404). Pure helpers tested: `GateTimeline` (all-passed / stopped-at-N / −1 sentinel / unknown→not_reached), `ModeLabel`/`ModeExplanation`, `parseSources` fail-closed, `derefStr`. **Deferred:** frontend panel (`npm run build`, user toolchain); synthesis-level (multi-expert) explanation; workflow-artifact explanation (provenance `output_type=workflow_artifact` already exists — this card scoped chat answers). |
 
 ### C10 — Reliability-as-product (SLOs, status, audit-grade logs)
 | Part | Detail |
@@ -462,6 +467,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | System Design, observability, Go, DB. |
 | **Files/Risk/Rollback** | `internal/observability/*`, `internal/monitoring/*`, frontend, docs. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: status endpoint + SLO doc review. |
+| **DONE (C10)** | Mig 035 `slo_events` (append-only, audit-grade: kind/severity/component/detail). `observability.Metrics` gained typed getters (LLMCallsTotal/LLMErrorsTotal/UptimeSeconds). New `internal/reliability`: `Policy{Enabled, AvailabilityTarget(0.995), ErrorBudgetWindowDays(30), AtRiskThreshold(0.25)}`; **pure SLI math** — `Availability`/`ErrorRate`/`ErrorBudgetRemaining`/`Verdict` (no traffic → `unknown`, never a false ok) + `TransitionEvent` (healthy→unhealthy = `degraded`, reverse = `recovered`, steady state = no event); `Service` registers dependency probes (postgres/redis/ml, 3s-bounded) and writes **exactly one** audit row per status transition (in-memory last-state, mutex) + at most one `budget_breach`/hour. Surfaced via `GET /status` (public: components + published SLO snapshot; probe error strings withheld — can name internal hosts) and admin `GET /admin/reliability/status` (full detail) + `GET /admin/reliability/events?kind=&limit=`. Config `ReliabilityConfig` + `RELIABILITY_*` kill switch (false → status degrades to dependency-only, like the pre-C10 `/health`). Pure tests: SLI math, verdict thresholds, transition table, policy defaults, nil-safety. **Deferred:** latency SLO (no in-process histogram source — availability SLI only); provider-cascade/circuit-breaker wiring (P8) is gateway-phase work, untouched here; published SLO doc page + frontend status widget (user toolchain). |
 
 ---
 
@@ -501,12 +507,12 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C2 | expert versioning/drift | C | ✅ done | (pending PR, this branch) |
 | C3 | eval harness + golden set | C | ✅ done | (pending PR, this branch) |
 | C4 | tenant isolation | C | ✅ done | (pending PR, this branch) |
-| C5 | cost/usage product | C | ⬜ pending | — |
-| C6 | knowledge freshness | C | ⬜ pending | — |
-| C7 | adversarial debate | C | ⬜ pending | — |
-| C8 | bring-your-own-expert | C | ⬜ pending | — |
-| C9 | explainability surface | C | ⬜ pending | — |
-| C10 | reliability-as-product | C | ⬜ pending | — |
+| C5 | cost/usage product | C | ✅ done | (pending PR, this branch) |
+| C6 | knowledge freshness | C | ✅ done | (pending PR, this branch) |
+| C7 | adversarial debate | C | ✅ done | (pending PR, this branch) |
+| C8 | bring-your-own-expert | C | ✅ done | (pending PR, this branch) |
+| C9 | explainability surface | C | ✅ done | (pending PR, this branch) |
+| C10 | reliability-as-product | C | ✅ done | (pending PR, this branch) |
 
 ---
 

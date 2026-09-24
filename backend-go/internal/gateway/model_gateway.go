@@ -18,6 +18,7 @@ import (
 	"ai_avengers/backend/internal/config"
 	"ai_avengers/backend/internal/gateway/providers"
 	"ai_avengers/backend/internal/observability"
+	"ai_avengers/backend/internal/usage"
 )
 
 // LLMRequest is the input to the model gateway.
@@ -90,6 +91,10 @@ type ModelGateway struct {
 	providerMu   sync.RWMutex
 	providerName string
 	provider     LLMProvider
+	// usageRec (C5): optional per-call usage recorder. nil = no persistence.
+	// C5 single choke point — every real (non-cached) call is recorded here,
+	// so a new caller cannot forget to attribute its cost.
+	usageRec usage.Recorder
 }
 
 // NewModelGateway creates a new model gateway.
@@ -121,6 +126,37 @@ func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 // Called from main.go after DB connects.
 func (g *ModelGateway) SetDB(db *pgxpool.Pool) {
 	g.db = db
+}
+
+// SetUsageRecorder wires C5 usage persistence. Called from main.go after the
+// usage service is built. nil = disabled (no change to existing behaviour).
+func (g *ModelGateway) SetUsageRecorder(r usage.Recorder) {
+	g.usageRec = r
+}
+
+// recordUsage persists one call's usage when a recorder is wired. Attribution
+// is read from the context (usage.WithAttribution) and the request's
+// WorkflowID; anything still unknown is resolved at write time by the usage
+// service (project←workflow, tenant←project). Best-effort and detached — the
+// spend already happened even if ctx is cancelled.
+func (g *ModelGateway) recordUsage(ctx context.Context, req LLMRequest, provider, model, tier string, in, out int, cost float64) {
+	if g.usageRec == nil || cost <= 0 {
+		return
+	}
+	a, _ := usage.AttributionFrom(ctx)
+	if req.WorkflowID != nil {
+		a.WorkflowID = req.WorkflowID
+	}
+	_ = g.usageRec.Record(context.WithoutCancel(ctx), usage.Event{
+		Attribution:  a,
+		Provider:     provider,
+		Tier:         tier,
+		Model:        model,
+		InputTokens:  in,
+		OutputTokens: out,
+		CostUSD:      cost,
+		OccurredAt:   time.Now().UTC(),
+	})
 }
 
 // buildProviderByName creates an LLMProvider for the given provider name.
@@ -330,6 +366,9 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			// Only reached on a real provider call — the cache hit above
 			// returns early, so a cached answer is never charged twice.
 			g.addWorkflowCost(ctx, req.WorkflowID, cost)
+			// C5: persist per-call usage for the analytics/budget surface.
+			g.recordUsage(ctx, req, p.Name(), provResp.ModelUsed, string(req.Model),
+				provResp.InputTokens, provResp.OutputTokens, cost)
 
 			result := &LLMResponse{
 				Content:      provResp.Content,
@@ -465,6 +504,9 @@ func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan s
 		g.callCount.Add(1)
 		observability.Global.IncLLMCall()
 		observability.Global.AddLLMCost(cost)
+		// C5: persist per-call usage for the streaming path too.
+		g.recordUsage(ctx, req, provider.Name(), provResp.ModelUsed, string(req.Model),
+			provResp.InputTokens, provResp.OutputTokens, cost)
 		g.logger.Info("LLM stream complete",
 			zap.String("provider", provider.Name()),
 			zap.String("tier", string(req.Model)),
