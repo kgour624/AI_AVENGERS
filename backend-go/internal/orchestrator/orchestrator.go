@@ -474,13 +474,16 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	timer.Start("self_learning")
 	questionForRAG := req.Message
 	if o.selfLearning != nil {
+		// B5: the dead CourseChunks argument was removed — it was
+		// retrieved with the ORIGINAL (story-noisy) question, so passing
+		// it into the extractor would reinforce wrong retrieval. The
+		// extracted question is what the decision engine re-retrieves with.
 		processed := o.selfLearning.Process(
 			ctx,
 			req.Message,
 			expert.Name,
 			expert.Domain,
 			expert.ReasoningCharter,
-			assembledCtx.CourseChunks,
 		)
 		if processed.VerificationPassed {
 			questionForRAG = processed.Extracted

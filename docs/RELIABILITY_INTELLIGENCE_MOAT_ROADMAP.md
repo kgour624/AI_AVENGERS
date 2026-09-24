@@ -292,6 +292,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, Go. |
 | **Files/Risk/Rollback** | `internal/*` self-learning package. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: DSA story problem → correct chunks. |
+| **DONE (B5)** | Removed the dead `chunks []chinawall.CourseChunk` param from `Process` (it was never used, and the chunks were retrieved with the story-noisy original question — feeding them back would reinforce wrong retrieval). Added deterministic fail-closed guards BEFORE the LLM verify: length (too short / ballooned >2×) and constraint preservation (numbers, ALL-CAPS domain terms, quoted literals from the original must survive the rewrite). Added component-wise `evaluateExtraction` (constraint-preservation 0.6 + length ratio 0.4) logged via `EvalScore`/`EvalReasons` — observability only, routing unchanged (full eval harness deferred). Token eligibility now handles space-less CJK via rune count. Pure funcs unit-tested in `processor_test.go`. |
 
 ### B6 — Answer quality scoring & regeneration
 | Part | Detail |
@@ -483,7 +484,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B2 | semantic contradiction detection | B | ✅ done | (pending PR, this branch) |
 | B3 | workflow memory write-back | B | ✅ done | (pending PR, this branch) |
 | B4 | gate threshold calibration | B | ✅ done | (pending PR, this branch) |
-| B5 | self-learning hardening | B | ⬜ pending | — |
+| B5 | self-learning hardening | B | ✅ done | (pending PR, this branch) |
 | B6 | answer quality regeneration | B | ⬜ pending | — |
 | B7 | memory consolidation | B | ⬜ pending | — |
 | B8 | verification-first answers | B | ⬜ pending | — |
