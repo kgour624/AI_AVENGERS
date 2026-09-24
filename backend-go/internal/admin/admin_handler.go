@@ -2113,38 +2113,57 @@ func (h *AdminHandler) ResumeIngestionJob(c *gin.Context) {
 		return
 	}
 
-	// Only failed jobs can be resumed
-	if job.Status != "failed" {
+	// P1: resumable from BOTH terminal states:
+	//   failed → crashed / errored mid-pipeline
+	//   paused → charter LLM failed (see RetryIngestionJob, the explicit path)
+	// Previously only 'failed' was accepted, so the UI's "Resume from
+	// checkpoint" button on a PAUSED job always returned 400 NOT_RESUMABLE and
+	// the admin had to flip the row to 'failed' by hand. Accepting paused here
+	// makes both entry points work; /retry stays the explicit paused path.
+	if job.Status != "failed" && job.Status != "paused" {
 		response.BadRequest(c, "NOT_RESUMABLE",
-			fmt.Sprintf("job status is '%s' — only failed jobs can be resumed", job.Status))
+			fmt.Sprintf("job status is '%s' — only failed or paused jobs can be resumed", job.Status))
 		return
+	}
+	if job.Status == "paused" {
+		h.logger.Info("resume called on a paused job — resuming from checkpoint",
+			zap.String("job_id", jobID.String()),
+		)
+	}
+
+	// Stage order, used only to tell whether the chunks are already in the DB.
+	// NOTE: 'paused' is intentionally absent → it reads as 0 → chunksInDB=false
+	// → transcript required. That is CORRECT: the pipeline stopped BEFORE
+	// charter extraction, which needs the transcript text (chunks alone are not
+	// enough), and the admin upload path always stores it.
+	checkpointStageOrder := map[string]int{
+		"pending": 0, "chunking": 1, "topic_extraction": 2,
+		"charter_extraction": 3, "embedding": 4, "storing": 5,
+		"smoke_test": 6, "complete": 7,
 	}
 
 	// Get expert name
 	var expertName string
 	h.db.QueryRow(ctx, `SELECT name FROM experts WHERE id=$1`, expertID).Scan(&expertName)
 
-	// Determine if we have enough to resume without re-uploading
-	// If checkpoint stage >= topic_extraction: chunks are in DB, no transcript needed
-	// If checkpoint stage < topic_extraction: need transcript text
-	checkpointStageOrder := map[string]int{
-		"pending": 0, "chunking": 1, "topic_extraction": 2,
-		"charter_extraction": 3, "embedding": 4, "storing": 5,
-		"smoke_test": 6, "complete": 7,
-	}
-	needsTranscript := checkpointStageOrder[job.CheckpointStage] < checkpointStageOrder["topic_extraction"]
+	// Are the chunks already in the DB for this job? If yes the pipeline can
+	// rebuild from them; if not, the transcript is mandatory to re-chunk.
+	chunksInDB := checkpointStageOrder[job.CheckpointStage] >= checkpointStageOrder["topic_extraction"]
 
-	var transcriptContent string
-	if needsTranscript {
-		if job.TranscriptContent == "" {
-			response.BadRequest(c, "TRANSCRIPT_REQUIRED",
-				"Job failed before chunking completed and transcript was not stored. "+
-					"Please re-upload the transcript file to restart ingestion.")
-			return
-		}
-		transcriptContent = job.TranscriptContent
+	// Prefer the stored transcript WHENEVER we have it. WHY: the step a paused
+	// job stopped at (charter extraction) needs the transcript TEXT, not just
+	// the chunks — an earlier version passed "" when chunks existed, so charter
+	// extraction ran against an empty sample. Passing it costs nothing (the
+	// pipeline only reads the first 8000 chars).
+	transcriptContent := job.TranscriptContent
+	if transcriptContent == "" && !chunksInDB {
+		response.BadRequest(c, "TRANSCRIPT_REQUIRED",
+			"Job failed before chunking completed and transcript was not stored. "+
+				"Please re-upload the transcript file to restart ingestion.")
+		return
 	}
-	// If chunks are in DB, transcript can be empty — IngestTranscript will load from DB
+	// If chunks are in DB and the transcript is missing, IngestTranscript will
+	// load them from DB and skip re-chunking.
 
 	// Reset job to resumable state
 	_, err = h.db.Exec(ctx,

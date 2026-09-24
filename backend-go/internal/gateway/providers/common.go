@@ -4,12 +4,25 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	gtypes "ai_avengers/backend/internal/gateway/types"
 )
+
+// ErrEmptyContent marks a 200 response whose content carried no usable text.
+//
+// WHY it is a sentinel: this failure is DETERMINISTIC for a given request. The
+// most common cause is a reasoning model whose completion budget was spent on
+// internal reasoning — CodeCraftAPI's own docs say: "Reasoning tokens count
+// toward completion_tokens. A tight max_tokens can be spent entirely on
+// reasoning, leaving an empty content... For hard problems, allow 16000 or
+// more." (https://codecraftapi.com/docs/reasoning). Retrying the identical
+// request cannot succeed and only burns credits, so the gateway stops after the
+// first attempt when it sees this error.
+var ErrEmptyContent = errors.New("empty content in response")
 
 // openAICompatibleResponse is the shared response struct for all
 // OpenAI-compatible providers (OpenRouter, DeepSeek, Gemini, CodeCraftAPI).
@@ -27,7 +40,15 @@ type openAICompatibleResponse struct {
 		Message struct {
 			Content          json.RawMessage `json:"content"`
 			ReasoningContent string          `json:"reasoning_content"`
+			// Reasoning: some aggregators expose the thinking trace under this
+			// shorter key instead of reasoning_content. Extra fallback only —
+			// never treated as the answer unless content is empty.
+			Reasoning string `json:"reasoning"`
 		} `json:"message"`
+		// FinishReason is "stop" | "length" | "tool_calls". Parsed so an empty
+		// content can be explained ("length" = token budget exhausted) instead
+		// of surfacing a bare "empty content in response".
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
 		PromptTokens     int `json:"prompt_tokens"`
@@ -83,12 +104,30 @@ func doOpenAICompatibleCall(
 
 	// Delegate format-specific extraction to the provider.
 	// No model-specific logic here — common.go stays format-agnostic.
-	content := provider.ExtractContent(
-		result.Choices[0].Message.Content,
-		result.Choices[0].Message.ReasoningContent,
-	)
+	// reasoning_content is the documented reasoning key; fall back to
+	// `reasoning` for aggregators that use the shorter name.
+	reasoning := result.Choices[0].Message.ReasoningContent
+	if reasoning == "" {
+		reasoning = result.Choices[0].Message.Reasoning
+	}
+	content := provider.ExtractContent(result.Choices[0].Message.Content, reasoning)
 	if content == "" {
-		return nil, fmt.Errorf("empty content in response")
+		usedModel := result.Model
+		if usedModel == "" {
+			usedModel = modelName
+		}
+		// Surface WHY it was empty so the admin can act. finish_reason=length
+		// means the completion budget (which reasoning tokens count toward)
+		// ran out before any visible text was produced — raise max_tokens.
+		hint := ""
+		if result.Choices[0].FinishReason == "length" {
+			hint = " — finish_reason=length: token budget spent before any visible text (raise max_tokens; reasoning tokens count toward completion_tokens)"
+		}
+		return nil, fmt.Errorf(
+			"%w: model=%s finish_reason=%q prompt_tokens=%d completion_tokens=%d%s",
+			ErrEmptyContent, usedModel, result.Choices[0].FinishReason,
+			result.Usage.PromptTokens, result.Usage.CompletionTokens, hint,
+		)
 	}
 
 	usedModel := result.Model

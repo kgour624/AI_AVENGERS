@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Modal } from '@/components/ui/Modal'
 import { cn } from '@/utils/cn'
 import { useIngestionStream } from '@/hooks/useIngestionStream'
-import { resumeIngestionJob } from '@/api/admin'
+import { resumeIngestionJob, retryIngestionJob } from '@/api/admin'
 
 // ============================================================
 // Stage definitions
@@ -85,6 +85,28 @@ export interface IngestionPipelineModalProps {
   expertName: string
 }
 
+// describeIngestError turns a backend ingestion error into something an admin
+// can act on. WHY: the raw strings are precise but obscure ("empty content in
+// response"); these hints name the actual fix instead of making the admin guess.
+function describeIngestError(msg: string): string {
+  if (msg.includes('TRANSCRIPT_REQUIRED')) {
+    return 'Transcript was not stored for this job. Re-upload the transcript file to restart ingestion.'
+  }
+  if (msg.includes('token budget') || msg.includes('empty content')) {
+    return 'The model returned no visible answer — its token budget was spent on internal reasoning. Raise max_tokens (or choose a non-reasoning model), then retry.'
+  }
+  if (msg.includes('NOT_RESUMABLE') || msg.includes('JOB_NOT_PAUSED')) {
+    return 'This job is not in a resumable state. Refresh the pipeline status and try again.'
+  }
+  if (msg.includes('status 402')) {
+    return 'The LLM provider reports insufficient credits. Top up the account, then retry.'
+  }
+  if (msg.includes('status 401') || msg.includes('status 403')) {
+    return 'The LLM API key was rejected. Fix the provider key in settings, then retry.'
+  }
+  return msg
+}
+
 export function IngestionPipelineModal({
   isOpen, onClose, expertId, expertName,
 }: IngestionPipelineModalProps) {
@@ -120,6 +142,24 @@ export function IngestionPipelineModal({
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: { message?: string } } } })
         ?.response?.data?.error?.message ?? 'Resume failed'
+      setResumeError(msg)
+    } finally {
+      setIsResuming(false)
+    }
+  }
+
+  // PAUSED jobs use /retry, not /resume. The backend rejects /resume for
+  // status='paused' (400 NOT_RESUMABLE), which is why the paused-state button
+  // previously did nothing. Same UX, correct endpoint.
+  const handleRetry = async () => {
+    if (!expertId || !job?.id) return
+    setIsResuming(true)
+    setResumeError(null)
+    try {
+      await retryIngestionJob(expertId, job.id)
+    } catch (err: unknown) {
+      const msg = (err as { response?: { data?: { error?: { message?: string } } } })
+        ?.response?.data?.error?.message ?? 'Retry failed'
       setResumeError(msg)
     } finally {
       setIsResuming(false)
@@ -275,9 +315,7 @@ export function IngestionPipelineModal({
               </div>
               {resumeError && (
                 <p className="mt-2 text-[10px] text-mode-refuse">
-                  {resumeError.includes('TRANSCRIPT_REQUIRED')
-                    ? '\u26a0\ufe0f Transcript not stored for this job. Please re-upload the transcript file.'
-                    : resumeError}
+                  {describeIngestError(resumeError)}
                 </p>
               )}
             </div>
@@ -288,26 +326,27 @@ export function IngestionPipelineModal({
         {isPaused && (
           <div className="flex flex-col gap-2">
             <div className="rounded-lg border border-glow-amber/40 bg-glow-amber/10 p-3">
-              <p className="text-xs font-semibold text-glow-amber">{'\u23f8'} Paused</p>
+              <p className="text-xs font-semibold text-glow-amber">{'\u23f8'} Paused — charter generation failed</p>
               <p className="mt-1 text-[11px] text-glow-amber/80 break-all">
                 {job?.errorMessage || 'Charter LLM failed. Waiting for admin action.'}
               </p>
               <p className="mt-1 text-[10px] text-text-secondary">
-                Checkpoint saved at stage:{' '}
+                Everything up to this step is saved at checkpoint:{' '}
                 <span className="font-mono text-glow-amber/80">{job?.currentStage ?? 'unknown'}</span>
-                {' '}{'\u2014'} no re-upload needed to resume.
+                {' '}{'\u2014'} no re-upload needed.
               </p>
             </div>
             <div className="rounded-lg border border-glow-amber/30 bg-glow-amber/5 p-3">
               <div className="flex items-center justify-between">
                 <div>
-                  <p className="text-xs font-semibold text-glow-amber">{'\u21ba'} Resume Available</p>
+                  <p className="text-xs font-semibold text-glow-amber">{'\u21ba'} Retry Available</p>
                   <p className="mt-0.5 text-[10px] text-text-secondary">
-                    Fix the issue (e.g. top up API credits), then resume.
+                    Fix the cause (API credits, or the model&apos;s token budget), then retry — chunking
+                    and topics are not repeated.
                   </p>
                 </div>
                 <button
-                  onClick={handleResume}
+                  onClick={handleRetry}
                   disabled={isResuming}
                   className={cn(
                     'rounded-md border border-glow-amber/40 bg-glow-amber/10 px-3 py-1.5',
@@ -317,14 +356,12 @@ export function IngestionPipelineModal({
                     'disabled:opacity-50 disabled:cursor-not-allowed',
                   )}
                 >
-                  {isResuming ? 'Resuming...' : 'Resume from checkpoint'}
+                  {isResuming ? 'Retrying...' : 'Retry now'}
                 </button>
               </div>
               {resumeError && (
                 <p className="mt-2 text-[10px] text-mode-refuse">
-                  {resumeError.includes('TRANSCRIPT_REQUIRED')
-                    ? '\u26a0\ufe0f Transcript not stored. Please re-upload the transcript file.'
-                    : resumeError}
+                  {describeIngestError(resumeError)}
                 </p>
               )}
             </div>

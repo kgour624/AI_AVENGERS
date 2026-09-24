@@ -91,10 +91,16 @@ func (p *CodeCraftAPIProvider) CostPer1K(_ gtypes.ModelType) (float64, float64) 
 	return 0, 0
 }
 
-// MaxTokens returns 8192 as a safe default.
-// CodeCraftAPI's actual per-model limits are unknown at integration time.
-// ModelGateway.Call() caps this against the request's MaxTokens anyway.
-func (p *CodeCraftAPIProvider) MaxTokens(_ gtypes.ModelType) int { return 8192 }
+// MaxTokens returns the per-call ceiling for CodeCraftAPI.
+//
+// WHY 21000: CodeCraftAPI's docs (https://codecraftapi.com/docs/reasoning) warn
+// that reasoning tokens count toward completion_tokens, so a tight budget can be
+// spent entirely on reasoning and leave `content` empty. They recommend 16000+
+// for hard problems. The previous ceiling of 8192 silently capped every caller
+// below that guidance — the gateway caps maxTokens to this value — which is why
+// charter extraction failed with "empty content in response". 21000 gives the
+// reasoning + answer room the docs ask for while staying a sane per-call bound.
+func (p *CodeCraftAPIProvider) MaxTokens(_ gtypes.ModelType) int { return 21000 }
 
 // ExtractContent: CodeCraftAPI passes through native model formats.
 // Claude thinking models return a typed array; DeepSeek uses reasoning_content.

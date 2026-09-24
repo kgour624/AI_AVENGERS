@@ -246,9 +246,6 @@ func (p *IngestionPipeline) IngestTranscript(
 	// ============================================================
 	// STEP 2: TOPIC EXTRACTION (batched, resumable)
 	// ============================================================
-	p.updateStage(ctx, jobID, StageTopicExtraction,
-		fmt.Sprintf("0/%d chunks tagged", len(chunks)))
-
 	topicResults := make([]TopicResult, len(chunks))
 	// Default fallback for all chunks
 	for i := range topicResults {
@@ -260,6 +257,32 @@ func (p *IngestionPipeline) IngestTranscript(
 	if isResume && cp != nil && cp.Stage == StageTopicExtraction {
 		resumeTopicBatch = cp.LastBatchIndex
 		p.logger.Info("resume: skipping topic batches", zap.Int("skip_to_batch", resumeTopicBatch))
+	}
+
+	// P1: if the checkpoint is already PAST topic extraction (paused at
+	// charter, or any later stage) the stored chunks are already tagged.
+	// Re-running the topic LLM on every retry is what made "Retry" look
+	// broken: N LLM calls per attempt (credits burned), then the charter call
+	// failed again and the job landed straight back in 'paused'. Reuse the
+	// stored topics and mark every batch as done so the loop below is a no-op.
+	totalTopicBatches := (len(chunks) + topicBatchSize - 1) / topicBatchSize
+	if isResume && cp != nil && StageOrder[cp.Stage] >= StageOrder[StageCharterExtraction] {
+		if stored, loadErr := p.loadTopicsFromDB(ctx, expertID, sourceFile, len(chunks)); loadErr == nil && len(stored) == len(chunks) {
+			topicResults = stored
+			p.logger.Info("resume: reused stored topics (no LLM call)", zap.Int("count", len(stored)))
+		} else if loadErr != nil {
+			p.logger.Warn("resume: could not load stored topics — keeping fallback topics",
+				zap.Error(loadErr))
+		}
+		resumeTopicBatch = totalTopicBatches
+	}
+
+	// Only announce / enter the topic stage when we are actually going to tag
+	// chunks. On a resume past this stage, current_stage must NOT be
+	// downgraded back to topic_extraction.
+	if resumeTopicBatch < totalTopicBatches {
+		p.updateStage(ctx, jobID, StageTopicExtraction,
+			fmt.Sprintf("0/%d chunks tagged", len(chunks)))
 	}
 
 	ptimer.Start("topic_extract")
@@ -1063,6 +1086,40 @@ func (p *IngestionPipeline) loadChunksFromDB(ctx context.Context, expertID uuid.
 	return chunks, rows.Err()
 }
 
+// loadTopicsFromDB reads the already-stored topic/subtopic for each chunk of
+// THIS job's source file, ordered by chunk_index so the result aligns 1:1 with
+// the chunks loaded by loadChunksFromDB.
+//
+// WHY: on resume past topic extraction we must NOT re-run the topic LLM, but
+// storeChunks/capability.Build still need the real topics (not the "general"
+// fallback). The stored rows are the source of truth.
+func (p *IngestionPipeline) loadTopicsFromDB(ctx context.Context, expertID uuid.UUID, sourceFile string, want int) ([]TopicResult, error) {
+	rows, err := p.db.Query(ctx,
+		`SELECT COALESCE(topic,''), COALESCE(subtopic,'')
+		   FROM course_chunks
+		  WHERE expert_id=$1 AND source_file=$2
+		  ORDER BY chunk_index ASC`,
+		expertID, sourceFile,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("loadTopicsFromDB: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]TopicResult, 0, want)
+	for rows.Next() {
+		t := TopicResult{Confidence: 1.0} // already accepted at first extraction
+		if err := rows.Scan(&t.Topic, &t.Subtopic); err != nil {
+			return nil, err
+		}
+		if t.Topic == "" {
+			t.Topic = "general"
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // loadCharterFromDB loads the existing charter from the experts table.
 // Used on resume to skip re-extraction.
 func (p *IngestionPipeline) loadCharterFromDB(ctx context.Context, expertID uuid.UUID) (*Charter, error) {
@@ -1410,6 +1467,16 @@ func (p *IngestionPipeline) runSmokeTest(
 //   because no relevant topic-specific chunk exists.
 //   Pausing preserves the work done so far and lets admin fix the
 //   API key/credits before resuming from the last checkpoint.
+// isFatalLLMError reports whether a topic-extraction LLM error is systemic
+// (payment / auth / provider misconfiguration) rather than transient.
+//
+// WHY empty-content is fatal too: when a reasoning model spends its whole
+// completion budget on internal reasoning, providers return an empty content
+// ("empty content in response"). Treating that as transient is exactly how we
+// ended up tagging EVERY chunk with topic="general" — the "all-general-topic
+// disaster" this function's caller exists to avoid. Pausing is the correct,
+// fail-closed outcome; the admin sees a job that needs action instead of a
+// silently degraded expert.
 func isFatalLLMError(err error) bool {
 	if err == nil {
 		return false
@@ -1417,9 +1484,21 @@ func isFatalLLMError(err error) bool {
 	msg := err.Error()
 	// Match the exact format from providers/common.go:
 	// fmt.Errorf("provider returned status %d", resp.StatusCode)
-	return strings.Contains(msg, "status 402") ||
+	if strings.Contains(msg, "status 402") ||
 		strings.Contains(msg, "status 401") ||
-		strings.Contains(msg, "status 403")
+		strings.Contains(msg, "status 403") {
+		return true
+	}
+	return isEmptyContentError(msg)
+}
+
+// isEmptyContentError reports whether an LLM error means "the provider
+// returned a 200 with no usable text" — see providers/common.go. Kept separate
+// so both topic extraction and the charter path classify it the same way.
+func isEmptyContentError(msg string) bool {
+	return strings.Contains(msg, "empty content in response") ||
+		strings.Contains(msg, "empty choices in response") ||
+		strings.Contains(msg, "token budget exhausted")
 }
 
 // updateJobProgress updates processed chunk count.
