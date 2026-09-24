@@ -10,6 +10,7 @@
 | [system_design_week3_distributed_foundations.md](system_design_week3_distributed_foundations.md) | System Design Master Class 2 | DS philosophy, load balancer LLD, remote/distributed locking (Redis/Redlock) |
 | [system_design_tiered_storage_and_s3.md](system_design_tiered_storage_and_s3.md) | System Design Master Class 3 | Hot/warm/cold tiered storage, data-engineering pipeline, full S3 design |
 | [microservices_masterclass_farley.md](microservices_masterclass_farley.md) | Microservices Masterclass | DRY vs coupling, monolith-first, coupled-modules anti-pattern, contracts, observability |
+| [byte_by_byte_ai_6_week.md](byte_by_byte_ai_6_week.md) | Byte by Byte AI — 6 week cohort | LLM foundations (pre/post-training), prompting (zero-shot/few-shot/CoT), structured output & grounding, RAG (chunking/embeddings/ANN/RAFT), evaluation (component-wise, LLM-as-judge) + A13/B1/B8/C3/B6 mapping |
 
 Related hub (product-applied rules): [`../KNOWLEDGE_HUB.md`](../KNOWLEDGE_HUB.md)
 
