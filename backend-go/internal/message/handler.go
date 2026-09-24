@@ -20,6 +20,7 @@ import (
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/orchestrator"
+	"ai_avengers/backend/internal/provenance"
 	"ai_avengers/backend/internal/response"
 )
 
@@ -62,7 +63,10 @@ type Handler struct {
 	gateway      *gateway.ModelGateway
 	embedder     ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
 	memManager   *memory.Manager
-	logger       *zap.Logger
+	// prov (C1): optional signed provenance chain recorder. Nil-safe — when
+	// unset, answers are still saved, only the provenance chain is skipped.
+	prov   *provenance.Service
+	logger *zap.Logger
 }
 
 // NewHandler creates a new message handler.
@@ -75,6 +79,7 @@ func NewHandler(
 	gw *gateway.ModelGateway,
 	embedder ml.Embedder,
 	memManager *memory.Manager,
+	prov *provenance.Service,
 	logger *zap.Logger,
 ) *Handler {
 	return &Handler{
@@ -84,6 +89,7 @@ func NewHandler(
 		gateway:      gw,
 		embedder:     embedder,
 		memManager:   memManager,
+		prov:         prov,
 		logger:       logger,
 	}
 }
@@ -509,6 +515,34 @@ func (h *Handler) saveAssistantMessage(
 		return uuid.Nil
 	}
 	_ = h.chatSvc.IncrementMessageCount(ctx, chatID)
+
+	// C1: record a signed provenance chain for this answer (async,
+	// best-effort). Reuses the B8 span anchors in resp.Claims as the
+	// provenance primitive. model = the generation tier (ModelStrong),
+	// matching gateway.proxy.go's convention of recording the tier name.
+	if h.prov != nil {
+		expertIDCopy := expertID
+		gateStopped := resp.GateStopped
+		go func() {
+			recErr := h.prov.RecordChatAnswer(context.Background(), provenance.ChatAnswer{
+				MessageID:    savedID,
+				ChatID:       chatID,
+				ExpertID:     &expertIDCopy,
+				Model:        string(gateway.ModelStrong),
+				DecisionMode: string(resp.Mode),
+				GateStopped:  &gateStopped,
+				Content:      resp.Content,
+				Claims:       resp.Claims,
+				Citations:    resp.Citations,
+			})
+			if recErr != nil {
+				h.logger.Warn("provenance record failed",
+					zap.String("message_id", savedID.String()),
+					zap.Error(recErr),
+				)
+			}
+		}()
+	}
 	return savedID
 }
 

@@ -65,10 +65,27 @@ type NotificationPayload struct {
 //   1. Dedup key is always computed consistently.
 //   2. Redis notification always follows Postgres write.
 //   3. No expert can bypass the blackboard by writing directly.
+// ArtifactProvenanceRecorder records a signed provenance chain (C1) for
+// a produced artifact. Decoupled from the provenance package by using
+// primitives so blackboard has no dependency on it. Optional: nil means
+// provenance recording is off (rollback).
+type ArtifactProvenanceRecorder interface {
+	RecordArtifactProvenance(
+		ctx context.Context,
+		workflowID, eventID uuid.UUID,
+		eventType string,
+		expertID *uuid.UUID,
+		contentHash string,
+		refs []uuid.UUID,
+	)
+}
+
 type Store struct {
 	db     *pgxpool.Pool
 	redis  *redis.Client
 	logger *zap.Logger
+	// prov is optional (C1). Set via SetProvenanceRecorder after wiring.
+	prov ArtifactProvenanceRecorder
 }
 
 // NewStore creates a new blackboard store.
@@ -78,6 +95,12 @@ func NewStore(db *pgxpool.Pool, redisClient *redis.Client, logger *zap.Logger) *
 		redis:  redisClient,
 		logger: logger,
 	}
+}
+
+// SetProvenanceRecorder wires the optional C1 provenance recorder.
+// Nil is a valid value (provenance disabled) — never required.
+func (s *Store) SetProvenanceRecorder(r ArtifactProvenanceRecorder) {
+	s.prov = r
 }
 
 // Post appends an event to the blackboard.
@@ -205,6 +228,20 @@ func (s *Store) Post(ctx context.Context, req PostRequest) (*Event, error) {
 	// the event is still in Postgres. Subscribers will replay on reconnect.
 	// A Redis failure must NOT fail the blackboard write.
 	s.publishNotification(ctx, event)
+
+	// Step 7: Provenance (C1, best-effort). Records a signed chain for
+	// produced artifacts only (the recorder filters event types). Never
+	// fails the post — provenance is an audit enhancement, not a gate.
+	if s.prov != nil {
+		// Content digest (not dedup_key): dedup_key mixes in event_type +
+		// poster, which would make the provenance content_hash depend on
+		// who posted. The digest is over the artifact content alone.
+		contentDigest := sha256.Sum256(contentJSON)
+		s.prov.RecordArtifactProvenance(
+			ctx, event.WorkflowID, event.ID, event.EventType,
+			event.PostedByExpertID, fmt.Sprintf("%x", contentDigest), event.ReferencesEventIDs,
+		)
+	}
 
 	return &event, nil
 }

@@ -359,6 +359,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB, System Design, crypto (signing), Go. |
 | **Files/Risk/Rollback** | `internal/chat/*`, `internal/workflow/*`, `internal/memory/*`, migrations. Risk: High (schema + core paths). Rollback: additive migration + flag. |
 | **Limitation** | `go build ./...` + migration run; manual: fetch provenance for one answer. |
+| **DONE (C1)** | Mig 027 `provenance_records` (append-only, `UNIQUE(output_type,output_id)`, `chain` TEXT = exact signed bytes). New `internal/provenance` package: `Service.RecordChatAnswer` / `RecordArtifact` build a canonical `chainDoc` (output → expert → gates → model → sources → timestamp), HMAC-SHA256 sign it, insert best-effort (fail-open). `chainDoc` re-marshals claims/citations via `normalizeJSON` (byte-stable); `sign`/`contentHash`/`verifyChain` pure + tested. Reuses **B8 span anchors** in `Claims` as the provenance primitive (P9). Wiring: `message/handler.go` records each saved answer async (`model`=generation tier `ModelStrong`, matching proxy convention); `blackboard.Store` optional `SetProvenanceRecorder` records produced artifacts (allowlist = ReviewerMatrix types + design_section_written/design_amended). Config `ProvenanceConfig{Enabled(absent→true), SigningKey(→ENCRYPTION_KEY fallback)}`. Endpoints: `GET /messages/:id/provenance`, `GET /workflows/:id/artifacts/:eventId/provenance` — both return `{record, verified}` (server-side signature check). Kill switch `PROVENANCE_ENABLED=false`. Stale-refs→C6 feedback hook is the stored chunk ids. Tests: sign/verify/tamper/hash/normalize/allowlist. |
 
 ### C2 — Expert versioning & capability drift detection
 | Part | Detail |
@@ -493,7 +494,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B7 | memory consolidation | B | ✅ done | (pending PR, this branch) |
 | B8 | verification-first answers | B | ✅ done | (pending PR, this branch) |
 | B9 | context-budget policy | B | ✅ done | (pending PR, this branch) |
-| C1 | provenance chain | C | ⬜ pending | — |
+| C1 | provenance chain | C | ✅ done | (pending PR, this branch) |
 | C2 | expert versioning/drift | C | ⬜ pending | — |
 | C3 | eval harness + golden set | C | ⬜ pending | — |
 | C4 | tenant isolation | C | ⬜ pending | — |

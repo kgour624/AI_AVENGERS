@@ -25,7 +25,19 @@ type Config struct {
 	Auth                AuthConfig
 	RateLimit           RateLimitConfig
 	Log                 LogConfig
+	Provenance          ProvenanceConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// ProvenanceConfig controls the C1 signed provenance chain.
+type ProvenanceConfig struct {
+	// Enabled: record a signed chain for answers/artifacts. Absent env →
+	// true (IsSet pattern, same as B6/B8). Rollback switch.
+	Enabled bool
+	// SigningKey: HMAC key (any length). Empty → falls back to
+	// Security.EncryptionKey in applyDefaults, so signing always has a
+	// server secret without a new required env var.
+	SigningKey string
 }
 
 // AuthConfig controls account-creation policy.
@@ -269,6 +281,10 @@ func Load() (*Config, error) {
 		Log: LogConfig{
 			Level: v.GetString("LOG_LEVEL"),
 		},
+		Provenance: ProvenanceConfig{
+			Enabled:    true, // C1 default on; overridden below if env set
+			SigningKey: v.GetString("PROVENANCE_SIGNING_KEY"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -293,6 +309,10 @@ func Load() (*Config, error) {
 	// B8: same IsSet pattern — absent → true; explicit false kills the gate.
 	if v.IsSet("CHINA_WALL_CLAIM_VERIFY_ENABLED") {
 		cfg.ChinaWall.ClaimVerifyEnabled = v.GetBool("CHINA_WALL_CLAIM_VERIFY_ENABLED")
+	}
+	// C1: same IsSet pattern — absent → true; explicit false disables.
+	if v.IsSet("PROVENANCE_ENABLED") {
+		cfg.Provenance.Enabled = v.GetBool("PROVENANCE_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -420,6 +440,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.ChinaWall.MaxQualityRetries < 0 {
 		c.ChinaWall.MaxQualityRetries = 1
+	}
+	// C1: signing key falls back to the AES key so provenance always has a
+	// server secret without a new required env var. Dedicated override wins.
+	if c.Provenance.SigningKey == "" {
+		c.Provenance.SigningKey = c.Security.EncryptionKey
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000
