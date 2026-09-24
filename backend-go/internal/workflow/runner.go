@@ -1415,9 +1415,33 @@ func (r *WorkflowRunner) watchForChangeRequest(
 			relevantExperts = allExperts
 		}
 
+		// A18: waves is nil on every call (the watcher is started before
+		// planning completes — see the go r.watchForChangeRequest call).
+		// Reload the real DAG from the persisted plan (same source A4's
+		// resume path uses) instead of falling through to the single flat
+		// wave below, which threw away task dependencies/ordering.
+		// Deterministic reload, not an LLM decision (§3.1 P2/P10).
+		if waves == nil {
+			if planTasks, ok := r.loadPlanTasksFromBlackboard(ctx, workflowID, allExperts); ok {
+				if rebuilt, buildErr := BuildDAG(planTasks); buildErr == nil && len(rebuilt) > 0 {
+					waves = rebuilt
+					log.Info("watcher: rebuilt DAG waves from persisted plan",
+						zap.Int("waves", len(waves)),
+					)
+				} else if buildErr != nil {
+					log.Warn("watcher: BuildDAG from persisted plan failed, falling back to flat wave",
+						zap.Error(buildErr),
+					)
+				}
+			} else {
+				log.Warn("watcher: no persisted plan found, falling back to flat wave")
+			}
+		}
+
 		// Filter waves to only include relevant experts.
-		// If waves is nil (planning not yet done) or all waves become empty,
-		// fall back to the full wave set.
+		// If waves is still nil (no persisted plan at all — e.g. change
+		// request arrived before task_plan_ready) or all waves become
+		// empty, fall back to the full wave set / flat wave below.
 		var relevantWaves []ExecutionWave
 		if waves != nil {
 			relevantWaves = filterWavesForExperts(waves, relevantIDs)

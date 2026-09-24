@@ -474,7 +474,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A15 | revision loop re-fetch artifact | A | ✅ done | (pending PR, this branch) |
 | A16 | TransitionPhase errors ignored | A | ✅ done | (pending PR, this branch) |
 | A17 | watcher/main single-flight | A | ✅ done | (pending PR, this branch) |
-| A18 | watcher waves=nil | A | ⬜ pending | — |
+| A18 | watcher waves=nil | A | ✅ done | (pending PR, this branch) |
 | A19 | escalation deadlock/cycle guard | A | ⬜ pending | — |
 | B1 | LLM synthesis | B | ⬜ pending | — |
 | B2 | semantic contradiction detection | B | ⬜ pending | — |
