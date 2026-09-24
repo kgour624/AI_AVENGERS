@@ -103,15 +103,47 @@ type SynthesisResult struct {
 	// when it was skipped/failed and the deterministic non-LLM merge ran
 	// instead (§3.1 P3 — a synthesis failure must degrade, not crash chat).
 	Method string `json:"method"`
+	// NeedsEscalation (B2): true when at least one contradiction's
+	// Resolution is escalate — the client must decide rather than just read
+	// a flagged note. Derived from Contradictions, never set independently,
+	// so it can never disagree with the per-item policies.
+	NeedsEscalation bool `json:"needs_escalation"`
 }
 
-// Contradiction is a point where two experts disagree.
+// Contradiction classification values (B2). Kept as named constants so the
+// policy is judgeable in one place, not scattered as string literals.
+const (
+	// ContradictionTypeContextConflict (Type-1): one expert's position
+	// conflicts with the provided context/evidence — catchable, so it can
+	// often be resolved deterministically against the source.
+	ContradictionTypeContextConflict = "context_conflict"
+	// ContradictionTypeFabrication (Type-2): an expert asserts something
+	// with no supporting evidence — hard to catch, so it is treated with
+	// more caution (never auto-noted away).
+	ContradictionTypeFabrication = "fabrication"
+
+	// ResolutionNoted: a real but minor difference the client can read past.
+	ResolutionNoted = "noted"
+	// ResolutionEscalate: the disagreement needs a client decision.
+	ResolutionEscalate = "escalate"
+)
+
+// Contradiction is a point where two experts disagree (B2). Beyond the two
+// positions it now carries the classification (Type) and the resolution
+// policy (Resolution) the synthesis decided for this specific disagreement.
 type Contradiction struct {
 	Topic     string `json:"topic"`
 	ExpertA   string `json:"expert_a"`
 	PositionA string `json:"position_a"`
 	ExpertB   string `json:"expert_b"`
 	PositionB string `json:"position_b"`
+	// Type is one of ContradictionType* — what kind of disagreement this is.
+	// Defaults to ContradictionTypeFabrication when the model omitted or
+	// returned an unknown value (fail-closed: treat as the harder case).
+	Type string `json:"type"`
+	// Resolution is one of Resolution* — what should happen. Defaults to
+	// ResolutionEscalate when missing/unknown (fail-closed §3.1 P3).
+	Resolution string `json:"resolution"`
 }
 
 // expertRecord holds DB data for an expert.
@@ -567,9 +599,17 @@ func (o *Orchestrator) synthesize(ctx context.Context, responses []ExpertRespons
 	sb.WriteString(
 		"Treat every expert's answer as a final verdict from their domain — do not " +
 			"discard or downweight any of them just because they differ from the majority.\n\n" +
+			"For each disagreement, classify it:\n" +
+			`  - "type": "context_conflict" if one position contradicts the provided ` +
+			"question/context, otherwise \"fabrication\" if a position has no supporting evidence.\n" +
+			`  - "resolution": "escalate" if the client must decide (the two positions are ` +
+			`materially incompatible or high-stakes), otherwise "noted" if it is a minor ` +
+			"difference the client can read past. When unsure, choose 'escalate'.\n\n" +
 			"Return JSON only, no prose outside the JSON:\n" +
 			`{"agreements": ["point experts agree on", ...], ` +
-			`"disagreements": [{"topic": "...", "expert_a": "name", "position_a": "...", "expert_b": "name", "position_b": "..."}], ` +
+			`"disagreements": [{"topic": "...", "expert_a": "name", "position_a": "...", ` +
+			`"expert_b": "name", "position_b": "...", "type": "context_conflict|fabrication", ` +
+			`"resolution": "noted|escalate"}], ` +
 			`"summary": "one paragraph synthesis for the client"}` +
 			"\nIf there are no real disagreements, disagreements must be an empty array — do not invent one.",
 	)
@@ -588,11 +628,13 @@ func (o *Orchestrator) synthesize(ctx context.Context, responses []ExpertRespons
 	var parsed struct {
 		Agreements    []string `json:"agreements"`
 		Disagreements []struct {
-			Topic     string `json:"topic"`
-			ExpertA   string `json:"expert_a"`
-			PositionA string `json:"position_a"`
-			ExpertB   string `json:"expert_b"`
-			PositionB string `json:"position_b"`
+			Topic      string `json:"topic"`
+			ExpertA    string `json:"expert_a"`
+			PositionA  string `json:"position_a"`
+			ExpertB    string `json:"expert_b"`
+			PositionB  string `json:"position_b"`
+			Type       string `json:"type"`
+			Resolution string `json:"resolution"`
 		} `json:"disagreements"`
 		Summary string `json:"summary"`
 	}
@@ -618,18 +660,58 @@ func (o *Orchestrator) synthesize(ctx context.Context, responses []ExpertRespons
 		Method:     "llm",
 	}
 	for _, d := range parsed.Disagreements {
-		result.Contradictions = append(result.Contradictions, Contradiction{
-			Topic:     d.Topic,
-			ExpertA:   d.ExpertA,
-			PositionA: d.PositionA,
-			ExpertB:   d.ExpertB,
-			PositionB: d.PositionB,
-		})
+		c := Contradiction{
+			Topic:      d.Topic,
+			ExpertA:    d.ExpertA,
+			PositionA:  d.PositionA,
+			ExpertB:    d.ExpertB,
+			PositionB:  d.PositionB,
+			Type:       normalizeContradictionType(d.Type),
+			Resolution: normalizeResolution(d.Resolution),
+		}
+		// Fail-closed (B2/§3.1 P3): a fabrication-typed disagreement is
+		// never silently "noted" away — force escalation for it even if
+		// the model said noted. context_conflict keeps the model's policy.
+		if c.Type == ContradictionTypeFabrication && c.Resolution == ResolutionNoted {
+			c.Resolution = ResolutionEscalate
+		}
+		if c.Resolution == ResolutionEscalate {
+			result.NeedsEscalation = true
+		}
+		result.Contradictions = append(result.Contradictions, c)
 	}
 	if result.Summary == "" {
 		result.Summary = fmt.Sprintf("%d expert(s) responded.", len(responses))
 	}
 	return result
+}
+
+// normalizeContradictionType maps the model's raw "type" to a known value,
+// defaulting to fabrication (the harder case) when missing or unrecognised
+// — fail-closed: never let an unknown value be treated as the mild case.
+func normalizeContradictionType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case ContradictionTypeContextConflict:
+		return ContradictionTypeContextConflict
+	case ContradictionTypeFabrication:
+		return ContradictionTypeFabrication
+	default:
+		return ContradictionTypeFabrication
+	}
+}
+
+// normalizeResolution maps the model's raw "resolution" to a known value,
+// defaulting to escalate when missing or unrecognised — fail-closed: an
+// unclassified disagreement needs a client decision, not a silent note.
+func normalizeResolution(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case ResolutionNoted:
+		return ResolutionNoted
+	case ResolutionEscalate:
+		return ResolutionEscalate
+	default:
+		return ResolutionEscalate
+	}
 }
 
 // synthesizeFallback is the original heuristic merge: notes that multiple
@@ -658,13 +740,19 @@ func (o *Orchestrator) synthesizeFallback(responses []ExpertResponse) *Synthesis
 
 	for _, w := range warnings {
 		for _, a := range advising {
+			// Fail-closed policy for the degraded path too (B2): a
+			// warn-vs-advise split is treated as an escalate-worthy
+			// context conflict rather than silently noted.
 			result.Contradictions = append(result.Contradictions, Contradiction{
-				Topic:     "approach",
-				ExpertA:   a.ExpertName,
-				PositionA: "Proceed with implementation",
-				ExpertB:   w.ExpertName,
-				PositionB: w.Warning,
+				Topic:      "approach",
+				ExpertA:    a.ExpertName,
+				PositionA:  "Proceed with implementation",
+				ExpertB:    w.ExpertName,
+				PositionB:  w.Warning,
+				Type:       ContradictionTypeContextConflict,
+				Resolution: ResolutionEscalate,
 			})
+			result.NeedsEscalation = true
 		}
 	}
 

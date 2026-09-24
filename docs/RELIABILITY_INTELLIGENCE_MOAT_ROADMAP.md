@@ -477,7 +477,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A18 | watcher waves=nil | A | ✅ done | (pending PR, this branch) |
 | A19 | escalation deadlock/cycle guard | A | ✅ done | (pending PR, this branch) |
 | B1 | LLM synthesis | B | ✅ done | (pending PR, this branch) |
-| B2 | semantic contradiction detection | B | ⬜ pending | — |
+| B2 | semantic contradiction detection | B | ✅ done | (pending PR, this branch) |
 | B3 | workflow memory write-back | B | ⬜ pending | — |
 | B4 | gate threshold calibration | B | ⬜ pending | — |
 | B5 | self-learning hardening | B | ⬜ pending | — |
