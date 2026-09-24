@@ -174,7 +174,8 @@ func (h *Handler) Send(c *gin.Context) {
 		expertIDs = append(expertIDs, id)
 	}
 
-	// Account-level expert grants (domain_expert only; admin/client unrestricted)
+	// Account-level expert grants via entitlement port (domain_expert only; admin/client unrestricted).
+	// auth.MustHaveExpertAccess delegates to entitlement.Checker — same rules, sellable-expert seam.
 	role, _ := c.Get("role")
 	roleStr, _ := role.(string)
 	if err := auth.MustHaveExpertAccess(c.Request.Context(), h.db, clientID, roleStr, expertIDs); err != nil {

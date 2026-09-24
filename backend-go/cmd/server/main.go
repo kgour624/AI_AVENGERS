@@ -26,14 +26,18 @@ import (
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/db"
 	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/entitlement"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/knowledge"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/message"
 	"ai_avengers/backend/internal/middleware"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/monitoring"
+	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/orchestrator"
+	"ai_avengers/backend/internal/outbox"
 	"ai_avengers/backend/internal/project"
 	"ai_avengers/backend/internal/rating"
 	"ai_avengers/backend/internal/repo"
@@ -66,8 +70,9 @@ func main() {
 		logger.Fatal("failed to rebuild logger", zap.Error(err))
 	}
 
-	// Background context for startup
-	ctx := context.Background()
+	// Cancellable root context — background jobs (outbox dispatcher, cleaners) stop on shutdown.
+	ctx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
 
 	// Connect to PostgreSQL
 	postgres, err := db.Connect(ctx, cfg.Database, logger)
@@ -86,6 +91,28 @@ func main() {
 	// Initialize services
 	jwtService := auth.NewJWTService(cfg.JWT, redisClient.Client, logger)
 	authService := auth.NewAuthService(postgres.Pool, jwtService, logger)
+
+	// Stage 0 seams: ports + adapters (modular monolith, extract-ready).
+	// Entitlement wraps user_expert_grants; knowledge is Expert Knowledge read port;
+	// outbox is the RDBMS event broker (SKIP LOCKED dispatcher below).
+	entitlementChecker := entitlement.NewChecker(postgres.Pool)
+	_ = entitlementChecker // composed into auth.MustHaveExpertAccess; held for future DI
+	knowledgeReader := knowledge.NewReader(postgres.Pool)
+	_ = knowledgeReader // available for incremental call-site migration
+	outboxStore := outbox.NewStore(postgres.Pool, logger)
+	authService.SetEventPublisher(outboxStore)
+	outboxDispatcher := outbox.NewDispatcher(outboxStore, func(ctx context.Context, aggregateType, eventType, aggregateID string, payload []byte) error {
+		observability.Global.IncOutboxPublished()
+		logger.Debug("outbox dispatched",
+			zap.String("aggregate_type", aggregateType),
+			zap.String("event_type", eventType),
+			zap.String("aggregate_id", aggregateID),
+			zap.Int("payload_bytes", len(payload)),
+		)
+		return nil
+	}, logger)
+	go outboxDispatcher.Run(ctx)
+
 	modelGateway := gateway.NewModelGateway(cfg.LLM, logger)
 	modelGateway.SetDB(postgres.Pool) // enables runtime provider override from admin panel
 	mlClient := ml.NewSidecarClient(cfg.ML, logger)
@@ -289,6 +316,9 @@ func main() {
 	case sig := <-quit:
 		logger.Info("shutdown signal received", zap.String("signal", sig.String()))
 	}
+
+	// Stop background jobs (outbox dispatcher, cleaners) before draining HTTP.
+	cancelRoot()
 
 	// Graceful shutdown
 	// WHY 30 seconds: Allow in-flight requests to complete
@@ -524,6 +554,12 @@ func buildRouter(
 			health["ml_sidecar"] = "healthy"
 		}
 		response.OK(c, health)
+	})
+
+	// GET /metrics — in-process counters (JSON). No Prometheus client dep.
+	// See FUTURE_UPDATES.md Item 1 + internal/observability/metrics.go.
+	router.GET("/metrics", func(c *gin.Context) {
+		response.OK(c, observability.Global.Snapshot())
 	})
 
 	v1 := router.Group("/api/v1")

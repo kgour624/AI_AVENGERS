@@ -18,7 +18,7 @@
 
 ## Item 1: Observability — Prometheus Metrics Endpoint
 
-**Status:** `TODO`
+**Status:** `DONE` (Stage 0 — see `docs/STAGE0_SCALABLE_SEAMS.md`, `internal/observability/metrics.go`, `GET /metrics`)
 **Effort:** 1 day
 **Priority:** Implement when: first production deployment ya jab "kya fail hua" ka jawab nahi milta
 

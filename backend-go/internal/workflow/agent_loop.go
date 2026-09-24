@@ -13,6 +13,7 @@ import (
 	"ai_avengers/backend/internal/blackboard"
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/observability"
 )
 
 // doneMarker: LLM outputs this as last line to signal task completion.
@@ -141,6 +142,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 	var allArtifacts []blackboard.Event
 
 	for iter := 1; iter <= maxIter; iter++ {
+		observability.Global.IncAgentLoopIter()
 		a.logger.Debug("agent loop iteration",
 			zap.String("expert", req.Expert.Name),
 			zap.Int("iter", iter),
