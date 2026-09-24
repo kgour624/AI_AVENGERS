@@ -28,6 +28,7 @@ import (
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/entitlement"
 	"ai_avengers/backend/internal/expert"
+	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/knowledge"
 	"ai_avengers/backend/internal/memory"
@@ -382,6 +383,10 @@ func buildRouter(
 	provSvc := provenance.NewService(
 		postgres.Pool, []byte(cfg.Provenance.SigningKey), cfg.Provenance.Enabled, logger,
 	)
+	// C2: expert versioning + capability drift service.
+	versionSvc := expertversion.NewService(
+		postgres.Pool, cfg.Versioning.DriftThreshold, logger,
+	)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -423,7 +428,7 @@ func buildRouter(
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -770,6 +775,12 @@ func buildRouter(
 		adminGroup.PATCH("/experts/:id", adminHandler.UpdateExpert)
 		adminGroup.POST("/experts/:id/ingest", adminHandler.IngestTranscript)
 		adminGroup.POST("/experts/:id/regenerate-charter", adminHandler.RegenerateCharter)
+		// C2: expert versioning + capability drift.
+		adminGroup.GET("/experts/:id/versions", adminHandler.ListExpertVersions)
+		adminGroup.POST("/experts/:id/versions/snapshot", adminHandler.SnapshotExpertVersion)
+		adminGroup.POST("/experts/:id/versions/:versionId/pin", adminHandler.PinExpertVersion)
+		adminGroup.GET("/experts/:id/drift", adminHandler.ListExpertDrift)
+		adminGroup.POST("/experts/:id/drift/:driftId/ack", adminHandler.AcknowledgeExpertDrift)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)

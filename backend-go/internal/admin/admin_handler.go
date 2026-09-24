@@ -16,6 +16,7 @@ import (
 
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
@@ -38,7 +39,10 @@ type AdminHandler struct {
 	// chinawall.Enforcer — writes here take effect for the very next
 	// question with zero redeploy, exactly like categoryReg above.
 	domainReg *chinawall.DomainRegistry
-	logger    *zap.Logger
+	// versions (C2): expert versioning + capability drift. Nil-safe — when
+	// unset, ingestion still runs, only snapshots/drift are skipped.
+	versions *expertversion.Service
+	logger   *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -61,6 +65,7 @@ func NewAdminHandler(
 	embedder ml.Embedder,
 	categoryReg *category.Registry,
 	domainReg *chinawall.DomainRegistry,
+	versions *expertversion.Service,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -70,6 +75,7 @@ func NewAdminHandler(
 		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
+		versions:    versions,
 		logger:      logger,
 	}
 }
@@ -1065,6 +1071,17 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 				zap.Error(err),
 			)
 		}
+		// C2: on success, snapshot the new corpus/charter state and detect
+		// drift vs the prior active version. Best-effort — a versioning
+		// failure must never undo a successful ingestion.
+		if err == nil && h.versions != nil {
+			if _, sErr := h.versions.Snapshot(ctx, expertID, "ingest", header.Filename); sErr != nil {
+				h.logger.Warn("expert version snapshot failed",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(sErr),
+				)
+			}
+		}
 	}()
 
 	response.Created(c, map[string]interface{}{
@@ -1073,6 +1090,137 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 		"message":   "ingestion started in background",
 		"expert_id": expertID,
 	})
+}
+
+// ============================================================
+// EXPERT VERSIONING & DRIFT (C2)
+// ============================================================
+
+// ListExpertVersions GET /admin/experts/:id/versions
+func (h *AdminHandler) ListExpertVersions(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.versions == nil {
+		response.OK(c, []expertversion.Version{})
+		return
+	}
+	versions, err := h.versions.ListVersions(c.Request.Context(), expertID, 20)
+	if err != nil {
+		h.logger.Error("list expert versions failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, versions)
+}
+
+// SnapshotExpertVersion POST /admin/experts/:id/versions/snapshot
+// Body (optional): {"source": "manual", "notes": "..."}
+func (h *AdminHandler) SnapshotExpertVersion(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	var body struct {
+		Source string `json:"source"`
+		Notes  string `json:"notes"`
+	}
+	_ = c.ShouldBindJSON(&body) // body optional
+	if body.Source == "" {
+		body.Source = "manual"
+	}
+	v, err := h.versions.Snapshot(c.Request.Context(), expertID, body.Source, body.Notes)
+	if err != nil {
+		h.logger.Error("snapshot expert version failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if v == nil {
+		response.NotFound(c, "expert")
+		return
+	}
+	response.Created(c, v)
+}
+
+// PinExpertVersion POST /admin/experts/:id/versions/:versionId/pin
+// Marks the version canonical and rolls the expert's charter back to it.
+func (h *AdminHandler) PinExpertVersion(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	versionID, err := uuid.Parse(c.Param("versionId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid version ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	v, err := h.versions.Pin(c.Request.Context(), expertID, versionID)
+	if err != nil {
+		h.logger.Error("pin expert version failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if v == nil {
+		response.NotFound(c, "expert version")
+		return
+	}
+	response.OK(c, v)
+}
+
+// ListExpertDrift GET /admin/experts/:id/drift
+func (h *AdminHandler) ListExpertDrift(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.versions == nil {
+		response.OK(c, []expertversion.DriftEvent{})
+		return
+	}
+	events, err := h.versions.ListDrift(c.Request.Context(), expertID, 20)
+	if err != nil {
+		h.logger.Error("list expert drift failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, events)
+}
+
+// AcknowledgeExpertDrift POST /admin/experts/:id/drift/:driftId/ack
+func (h *AdminHandler) AcknowledgeExpertDrift(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	driftID, err := uuid.Parse(c.Param("driftId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid drift ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	if err := h.versions.AcknowledgeDrift(c.Request.Context(), expertID, driftID); err != nil {
+		h.logger.Error("acknowledge drift failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"acknowledged": true})
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream
@@ -1324,6 +1472,17 @@ func (h *AdminHandler) RegenerateCharter(c *gin.Context) {
 				expertID,
 			)
 			return
+		}
+
+		// C2: snapshot the regenerated charter as a new version so the
+		// charter change is versioned and drift-detected. Best-effort.
+		if h.versions != nil {
+			if _, sErr := h.versions.Snapshot(ctx, expertID, "charter_regen", "charter regenerated"); sErr != nil {
+				h.logger.Warn("expert version snapshot failed (charter_regen)",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(sErr),
+				)
+			}
 		}
 
 		h.logger.Info("charter regeneration complete",

@@ -26,7 +26,18 @@ type Config struct {
 	RateLimit           RateLimitConfig
 	Log                 LogConfig
 	Provenance          ProvenanceConfig
+	Versioning          VersioningConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// VersioningConfig controls C2 expert versioning + drift detection.
+type VersioningConfig struct {
+	// Enabled: snapshot expert versions and detect drift. Absent env →
+	// true (IsSet pattern, same as B6/B8/C1). Rollback switch.
+	Enabled bool
+	// DriftThreshold: topic-set (capability) Jaccard distance at/above
+	// which drift is reported. Default 0.30.
+	DriftThreshold float64
 }
 
 // ProvenanceConfig controls the C1 signed provenance chain.
@@ -285,6 +296,10 @@ func Load() (*Config, error) {
 			Enabled:    true, // C1 default on; overridden below if env set
 			SigningKey: v.GetString("PROVENANCE_SIGNING_KEY"),
 		},
+		Versioning: VersioningConfig{
+			Enabled:        true, // C2 default on; overridden below if env set
+			DriftThreshold: v.GetFloat64("EXPERT_DRIFT_THRESHOLD"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -313,6 +328,10 @@ func Load() (*Config, error) {
 	// C1: same IsSet pattern — absent → true; explicit false disables.
 	if v.IsSet("PROVENANCE_ENABLED") {
 		cfg.Provenance.Enabled = v.GetBool("PROVENANCE_ENABLED")
+	}
+	// C2: same IsSet pattern — absent → true; explicit false disables.
+	if v.IsSet("EXPERT_VERSIONING_ENABLED") {
+		cfg.Versioning.Enabled = v.GetBool("EXPERT_VERSIONING_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -445,6 +464,10 @@ func (c *Config) applyDefaults() {
 	// server secret without a new required env var. Dedicated override wins.
 	if c.Provenance.SigningKey == "" {
 		c.Provenance.SigningKey = c.Security.EncryptionKey
+	}
+	// C2: drift threshold default.
+	if c.Versioning.DriftThreshold <= 0 || c.Versioning.DriftThreshold > 1 {
+		c.Versioning.DriftThreshold = 0.30
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000

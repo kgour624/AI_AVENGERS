@@ -371,6 +371,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB, AI (eval), System Design. |
 | **Files/Risk/Rollback** | `internal/training/*`, `internal/admin/*`, migrations. Risk: Medium–High. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: re-ingest, observe a drift flag. |
+| **DONE (C2)** | Mig 028 `expert_versions` (immutable snapshots: corpus/charter hashes, topics, charter text, capability snapshot, model; one `is_active` per expert) + `expert_drift_events` (append-only, typed corpus/capability/charter/model). New `internal/expertversion`: `Snapshot` (live corpus hash from `course_chunks.chunk_hash`, charter hash, topic set from `course_chunks.topic`; first version auto-active) → classifies drift vs prior active version; `DetectDrift` (no new version), `Pin` (canonical + **charter rollback** via tx), `ListVersions/ListDrift/AcknowledgeDrift`. Pure `sha256Hex`/`jaccardDistance`/`classifyDrift` (priority capability ≥ threshold → charter → corpus). Wiring: admin `IngestTranscript` snapshots on success (best-effort, fail-open); `AdminHandler` gains `*expertversion.Service`. Routes: `GET /admin/experts/:id/versions`, `POST …/versions/snapshot`, `POST …/versions/:versionId/pin`, `GET …/drift`, `POST …/drift/:driftId/ack`. Config `VersioningConfig{Enabled(absent→true), DriftThreshold(0.30)}`; kill switch `EXPERT_VERSIONING_ENABLED=false`. **Limitation:** full corpus rollback deferred (needs stored transcripts) — pin restores charter + marks canonical; model/prompt-change→C3 re-eval hook is the recorded `model` + drift event. Tests: hash/jaccard/classify. |
 
 ### C3 — Evaluation harness + golden set regression
 | Part | Detail |
@@ -495,7 +496,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B8 | verification-first answers | B | ✅ done | (pending PR, this branch) |
 | B9 | context-budget policy | B | ✅ done | (pending PR, this branch) |
 | C1 | provenance chain | C | ✅ done | (pending PR, this branch) |
-| C2 | expert versioning/drift | C | ⬜ pending | — |
+| C2 | expert versioning/drift | C | ✅ done | (pending PR, this branch) |
 | C3 | eval harness + golden set | C | ⬜ pending | — |
 | C4 | tenant isolation | C | ⬜ pending | — |
 | C5 | cost/usage product | C | ⬜ pending | — |
