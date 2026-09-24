@@ -383,6 +383,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI (eval), Go (test harness), CI. |
 | **Files/Risk/Rollback** | new `internal/eval/*` + CI config. Risk: Low (additive). Rollback: disable job. |
 | **Limitation** | Needs API keys/quota in CI; user decides budget. |
+| **DONE (C3)** | Mig 029 `eval_runs` (suite/model/totals/score/cost/is_baseline/results JSONB; one baseline per suite). New `internal/eval`: embedded golden JSONL (`chat` user-like + `adversarial`); pure deterministic scorer (non_empty/refusal/citation/keywords, component-wise); `Answerer` interface + `HTTPAnswerer` (chat SSE); `Runner` with skip/vital counting; `Store` SaveRun/Latest/Baseline/Promote; pure `ScoreDelta`/`Regression`. Tests: parse/load/score/runner/SSE/regression. CLI `cmd/eval` (env EVAL_BASE_URL/TOKEN/CHAT_ID + DATABASE_URL) exits 2 on vital fail or score drop > tolerance; optional `-baseline` promote. Admin: `GET /admin/evals/runs`, `POST /admin/evals/runs/:id/baseline`. **Limitation:** live HTTP runs need server + keys + known chat; missing expert slugs = SKIP not fail; LLM-as-judge layer deferred (deterministic gate first). |
 
 ### C4 — Tenant isolation & enterprise controls
 | Part | Detail |
@@ -497,7 +498,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B9 | context-budget policy | B | ✅ done | (pending PR, this branch) |
 | C1 | provenance chain | C | ✅ done | (pending PR, this branch) |
 | C2 | expert versioning/drift | C | ✅ done | (pending PR, this branch) |
-| C3 | eval harness + golden set | C | ⬜ pending | — |
+| C3 | eval harness + golden set | C | ✅ done | (pending PR, this branch) |
 | C4 | tenant isolation | C | ⬜ pending | — |
 | C5 | cost/usage product | C | ⬜ pending | — |
 | C6 | knowledge freshness | C | ⬜ pending | — |

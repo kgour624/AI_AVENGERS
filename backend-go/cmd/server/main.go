@@ -27,6 +27,7 @@ import (
 	"ai_avengers/backend/internal/db"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/entitlement"
+	"ai_avengers/backend/internal/eval"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
@@ -387,6 +388,8 @@ func buildRouter(
 	versionSvc := expertversion.NewService(
 		postgres.Pool, cfg.Versioning.DriftThreshold, logger,
 	)
+	// C3: golden-set eval run store (viewed from admin; run by cmd/eval).
+	evalStore := eval.NewStore(postgres.Pool)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -428,7 +431,7 @@ func buildRouter(
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -781,6 +784,9 @@ func buildRouter(
 		adminGroup.POST("/experts/:id/versions/:versionId/pin", adminHandler.PinExpertVersion)
 		adminGroup.GET("/experts/:id/drift", adminHandler.ListExpertDrift)
 		adminGroup.POST("/experts/:id/drift/:driftId/ack", adminHandler.AcknowledgeExpertDrift)
+		// C3: evaluation harness run view + baseline promote.
+		adminGroup.GET("/evals/runs", adminHandler.GetEvalRuns)
+		adminGroup.POST("/evals/runs/:id/baseline", adminHandler.PromoteEvalBaseline)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)

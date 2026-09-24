@@ -16,6 +16,7 @@ import (
 
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/eval"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
@@ -42,7 +43,9 @@ type AdminHandler struct {
 	// versions (C2): expert versioning + capability drift. Nil-safe — when
 	// unset, ingestion still runs, only snapshots/drift are skipped.
 	versions *expertversion.Service
-	logger   *zap.Logger
+	// evals (C3): golden-set run store. Nil-safe — view endpoints return empty.
+	evals  *eval.Store
+	logger *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -66,6 +69,7 @@ func NewAdminHandler(
 	categoryReg *category.Registry,
 	domainReg *chinawall.DomainRegistry,
 	versions *expertversion.Service,
+	evals *eval.Store,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -76,6 +80,7 @@ func NewAdminHandler(
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
 		versions:    versions,
+		evals:       evals,
 		logger:      logger,
 	}
 }
@@ -1221,6 +1226,86 @@ func (h *AdminHandler) AcknowledgeExpertDrift(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"acknowledged": true})
+}
+
+// ============================================================
+// EVAL HARNESS (C3)
+// ============================================================
+
+// evalSuiteView is the admin payload for one suite: latest run, baseline,
+// and the score delta (current - baseline). Pure assembly; scoring lives
+// in internal/eval.
+type evalSuiteView struct {
+	Suite    string           `json:"suite"`
+	Latest   *eval.RunSummary `json:"latest,omitempty"`
+	Baseline *eval.RunSummary `json:"baseline,omitempty"`
+	Delta    float64          `json:"delta"`
+	Suites   []string         `json:"suites,omitempty"`
+}
+
+// GetEvalRuns GET /admin/evals/runs?suite=<name>
+// Without suite: lists known suites. With suite: latest + baseline + delta.
+func (h *AdminHandler) GetEvalRuns(c *gin.Context) {
+	if h.evals == nil {
+		response.OK(c, evalSuiteView{Suites: []string{}})
+		return
+	}
+	suite := strings.TrimSpace(c.Query("suite"))
+	if suite == "" {
+		names, err := h.evals.ListSuites(c.Request.Context())
+		if err != nil {
+			h.logger.Error("list eval suites failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+		response.OK(c, evalSuiteView{Suites: names})
+		return
+	}
+	latest, err := h.evals.LatestRun(c.Request.Context(), suite)
+	if err != nil {
+		h.logger.Error("latest eval run failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	baseline, err := h.evals.LatestBaseline(c.Request.Context(), suite)
+	if err != nil {
+		h.logger.Error("latest eval baseline failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, evalSuiteView{
+		Suite:    suite,
+		Latest:   latest,
+		Baseline: baseline,
+		Delta:    eval.ScoreDelta(baseline, latest),
+	})
+}
+
+// PromoteEvalBaseline POST /admin/evals/runs/:id/baseline
+// Body: {"suite":"chat"} — promotes the given run id as the suite baseline.
+func (h *AdminHandler) PromoteEvalBaseline(c *gin.Context) {
+	if h.evals == nil {
+		response.InternalError(c)
+		return
+	}
+	runID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid run ID")
+		return
+	}
+	var body struct {
+		Suite string `json:"suite"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || strings.TrimSpace(body.Suite) == "" {
+		response.BadRequest(c, "INVALID_INPUT", "suite is required")
+		return
+	}
+	if err := h.evals.PromoteBaseline(c.Request.Context(), body.Suite, runID); err != nil {
+		h.logger.Error("promote eval baseline failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"suite": body.Suite, "run_id": runID, "is_baseline": true})
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream
