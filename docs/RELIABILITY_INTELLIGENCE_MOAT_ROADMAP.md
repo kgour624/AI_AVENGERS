@@ -328,6 +328,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, China Wall, System Design (trust). |
 | **Files/Risk/Rollback** | `internal/chinawall/*`, `internal/decision/*`. Risk: High (core answer path). Rollback: feature flag + revert. |
 | **Limitation** | `go build ./...`; manual: answer with a fabricated claim must be marked/refused. |
+| **DONE (B8)** | Flat-path only. `ClaimVerifyEnabled` (absent env → true via `IsSet`; kill switch `CHINA_WALL_CLAIM_VERIFY_ENABLED=false`). After quality gate: deterministic `extractMaterialClaims` (skip code/headings/short) → one batched `ModelCheap` verify (JSON: supported/refuted/unverifiable + confidence + justification + span + chunk_ids) → `normalizeClaimReports` (P9: no span / no chunks demotes supported→unverifiable; P3 missing index→unverifiable) → `annotateUnverified` labels `[UNVERIFIED]`/`[REFUTED]` inline + verification footer. Fail-open on LLM error. `EnforceResult.Claims` → DecisionResult → ExpertResponse → SSE `claims`. Prefer cited chunks as reference. Structured path deferred. Tests: extract/parse/normalize/annotate/chunks. |
 
 ### B9 — Context-budget policy (bound history; eviction vs summarization vs external)
 | Part | Detail |
@@ -489,7 +490,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B5 | self-learning hardening | B | ✅ done | (pending PR, this branch) |
 | B6 | answer quality regeneration | B | ✅ done | (pending PR, this branch) |
 | B7 | memory consolidation | B | ✅ done | (pending PR, this branch) |
-| B8 | verification-first answers | B | ⬜ pending | — |
+| B8 | verification-first answers | B | ✅ done | (pending PR, this branch) |
 | B9 | context-budget policy | B | ⬜ pending | — |
 | C1 | provenance chain | C | ⬜ pending | — |
 | C2 | expert versioning/drift | C | ⬜ pending | — |

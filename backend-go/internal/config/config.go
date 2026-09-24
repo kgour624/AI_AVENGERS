@@ -125,6 +125,10 @@ type ChinaWallConfig struct {
 	// MaxQualityRetries: extra generate+judge cycles after the first. 0 =
 	// score only, never regenerate. Default 1 (bounded, P10).
 	MaxQualityRetries int
+	// ClaimVerifyEnabled (B8): when true, flat-path answers run the
+	// atomic claim→evidence pipeline after quality gate. Off = zero extra
+	// calls (rollback switch). Absent env → true (same IsSet pattern as B6).
+	ClaimVerifyEnabled bool
 }
 
 type ContextConfig struct {
@@ -233,6 +237,7 @@ func Load() (*Config, error) {
 			QualityJudgeEnabled: true, // B6 default on; overridden below if env set
 			QualityFloor:        v.GetFloat64("CHINA_WALL_QUALITY_FLOOR"),
 			MaxQualityRetries:   v.GetInt("CHINA_WALL_MAX_QUALITY_RETRIES"),
+			ClaimVerifyEnabled:  true, // B8 default on; overridden below if env set
 		},
 		Context: ContextConfig{
 			MaxTokens:        v.GetInt("CONTEXT_MAX_TOKENS"),
@@ -284,6 +289,10 @@ func Load() (*Config, error) {
 	// stays 0 (score-only, no regen). Tracked via a sentinel when unset.
 	if !v.IsSet("CHINA_WALL_MAX_QUALITY_RETRIES") {
 		cfg.ChinaWall.MaxQualityRetries = -1 // sentinel: applyDefaults fills 1
+	}
+	// B8: same IsSet pattern — absent → true; explicit false kills the gate.
+	if v.IsSet("CHINA_WALL_CLAIM_VERIFY_ENABLED") {
+		cfg.ChinaWall.ClaimVerifyEnabled = v.GetBool("CHINA_WALL_CLAIM_VERIFY_ENABLED")
 	}
 
 	// Validate required fields — fail fast

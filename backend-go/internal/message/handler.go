@@ -380,6 +380,9 @@ func (h *Handler) Send(c *gin.Context) {
 				// Frontend (CT-D5, not yet built) renders this when present,
 				// falls back to "content" above otherwise.
 				"template_sections": expertResp.TemplateSections,
+				// B8: claim→evidence reports; nil/omitted when verify off.
+				// Content already carries [UNVERIFIED]/[REFUTED] labels.
+				"claims": expertResp.Claims,
 			})
 
 			// Save assistant message SYNCHRONOUSLY.
