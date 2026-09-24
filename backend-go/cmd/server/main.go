@@ -91,6 +91,9 @@ func main() {
 	// Initialize services
 	jwtService := auth.NewJWTService(cfg.JWT, redisClient.Client, logger)
 	authService := auth.NewAuthService(postgres.Pool, jwtService, logger)
+	// Self-registration is off by default (accounts are admin-provisioned).
+	// Set SELF_REGISTRATION_ENABLED=true to re-enable /auth/register.
+	authService.SetSelfRegistrationEnabled(cfg.Auth.SelfRegistrationEnabled)
 
 	// Stage 0 seams: ports + adapters (modular monolith, extract-ready).
 	// Entitlement wraps user_expert_grants; knowledge is Expert Knowledge read port;
@@ -749,6 +752,7 @@ func buildRouter(
 		adminGroup.GET("/accounts", handleListManagedAccounts(authService))
 		adminGroup.POST("/accounts", handleCreateManagedAccount(authService))
 		adminGroup.PATCH("/accounts/:id", handleUpdateManagedAccount(authService))
+		adminGroup.DELETE("/accounts/:id", handleDeleteManagedAccount(authService))
 		adminGroup.PUT("/accounts/:id/experts", handleSetAccountExperts(authService))
 		adminGroup.POST("/bootstrap-tokens", handleIssueBootstrapToken(authService, logger))
 		adminGroup.GET("/stats", adminHandler.GetStats)
@@ -950,6 +954,12 @@ func buildAuthResponse(user *auth.User, tokens *auth.TokenPair) map[string]inter
 
 func handleRegister(svc *auth.AuthService) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Self-registration disabled: respond gracefully (endpoint stays alive).
+		if !svc.SelfRegistrationEnabled() {
+			response.Forbidden(c, "Self-registration is disabled. Please contact your administrator to get an account.")
+			return
+		}
+
 		var req struct {
 			Email    string `json:"email" binding:"required,email"`
 			Password string `json:"password" binding:"required,min=8"`
@@ -966,8 +976,10 @@ func handleRegister(svc *auth.AuthService) gin.HandlerFunc {
 			FullName: req.FullName,
 		})
 		if err != nil {
-			switch err {
-			case auth.ErrEmailTaken:
+			switch {
+			case errors.Is(err, auth.ErrRegistrationDisabled):
+				response.Forbidden(c, "Self-registration is disabled. Please contact your administrator to get an account.")
+			case errors.Is(err, auth.ErrEmailTaken):
 				response.Conflict(c, "Email already registered")
 			default:
 				response.InternalError(c)
@@ -1392,22 +1404,64 @@ func handleUpdateManagedAccount(svc *auth.AuthService) gin.HandlerFunc {
 			response.BadRequest(c, "INVALID_ID", "invalid account ID")
 			return
 		}
+		// Partial update: any subset of fields. nil = unchanged.
 		var req struct {
-			IsActive *bool `json:"is_active"`
+			FullName *string `json:"full_name"`
+			Email    *string `json:"email"`
+			Role     *string `json:"role"`
+			IsActive *bool   `json:"is_active"`
+			Password *string `json:"password"`
 		}
 		if err := c.ShouldBindJSON(&req); err != nil {
 			response.BadRequest(c, "INVALID_INPUT", err.Error())
 			return
 		}
-		if err := svc.UpdateManagedAccount(c.Request.Context(), id, req.IsActive); err != nil {
-			if errors.Is(err, auth.ErrUserNotFound) {
+		err = svc.UpdateManagedAccount(c.Request.Context(), id, auth.UpdateManagedAccountRequest{
+			FullName: req.FullName,
+			Email:    req.Email,
+			Role:     req.Role,
+			IsActive: req.IsActive,
+			Password: req.Password,
+		})
+		if err != nil {
+			switch {
+			case errors.Is(err, auth.ErrUserNotFound):
 				response.NotFound(c, "account")
-				return
+			case errors.Is(err, auth.ErrEmailTaken):
+				response.Conflict(c, "Email already registered")
+			case errors.Is(err, auth.ErrInvalidRole):
+				response.BadRequest(c, "INVALID_ROLE", "role must be admin, domain_expert or client")
+			case errors.Is(err, auth.ErrPasswordTooShort):
+				response.BadRequest(c, "PASSWORD_TOO_SHORT", err.Error())
+			default:
+				response.InternalError(c)
 			}
-			response.InternalError(c)
 			return
 		}
 		response.OK(c, map[string]string{"status": "updated"})
+	}
+}
+
+func handleDeleteManagedAccount(svc *auth.AuthService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		actorID := c.MustGet("user_id").(uuid.UUID)
+		id, err := uuid.Parse(c.Param("id"))
+		if err != nil {
+			response.BadRequest(c, "INVALID_ID", "invalid account ID")
+			return
+		}
+		if err := svc.DeleteManagedAccount(c.Request.Context(), actorID, id); err != nil {
+			switch {
+			case errors.Is(err, auth.ErrUserNotFound):
+				response.NotFound(c, "account")
+			case errors.Is(err, auth.ErrCannotDeleteSelf):
+				response.BadRequest(c, "CANNOT_DELETE_SELF", err.Error())
+			default:
+				response.InternalError(c)
+			}
+			return
+		}
+		response.OK(c, map[string]string{"status": "deleted"})
 	}
 }
 

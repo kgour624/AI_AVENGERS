@@ -194,10 +194,7 @@ export default function LoginPage() {
           </p>
 
           <p className="mt-3 text-center text-xs text-text-disabled">
-            No account?{' '}
-            <Link to="/register" className="text-glow-purple/80 transition-colors hover:text-glow-purple">
-              Register
-            </Link>
+            Accounts are provisioned by an administrator. Contact your admin for access.
           </p>
         </div>
       </motion.div>

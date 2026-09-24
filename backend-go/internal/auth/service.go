@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -41,7 +42,18 @@ type AuthService struct {
 	// publisher emits domain events (entitlement.granted) after grant writes.
 	// Optional — nil means no-op (Null Object via skip). Set via SetEventPublisher.
 	publisher ports.EventPublisher
+	// selfRegistrationEnabled gates POST /auth/register.
+	// Default false — the endpoint stays in the codebase but is non-functional
+	// so accounts are provisioned by an admin. Flip SELF_REGISTRATION_ENABLED=true
+	// (or call SetSelfRegistrationEnabled) to re-enable.
+	selfRegistrationEnabled bool
 }
+
+// SetSelfRegistrationEnabled toggles the public self-registration feature.
+func (s *AuthService) SetSelfRegistrationEnabled(v bool) { s.selfRegistrationEnabled = v }
+
+// SelfRegistrationEnabled reports whether public registration is allowed.
+func (s *AuthService) SelfRegistrationEnabled() bool { return s.selfRegistrationEnabled }
 
 // NewAuthService creates a new auth service.
 func NewAuthService(db *pgxpool.Pool, jwt *JWTService, logger *zap.Logger) *AuthService {
@@ -115,6 +127,8 @@ var (
 	ErrBootstrapUnavailable  = errors.New("admin bootstrap is not available")
 	ErrInvalidRole           = errors.New("invalid account role")
 	ErrUseAdminLogin         = errors.New("admin accounts must use admin login")
+	ErrRegistrationDisabled  = errors.New("self-registration is disabled")
+	ErrCannotDeleteSelf      = errors.New("you cannot delete your own account")
 )
 
 // Register creates a new client account.
@@ -123,6 +137,12 @@ var (
 // Cost 10 = ~100ms, Cost 12 = ~400ms, Cost 14 = ~1.5s
 // 400ms is acceptable for registration, not for every request.
 func (s *AuthService) Register(ctx context.Context, req RegisterRequest) (*TokenPair, error) {
+	// Self-registration is disabled by default. The implementation below is
+	// kept intact so the feature can be re-enabled via SELF_REGISTRATION_ENABLED.
+	if !s.selfRegistrationEnabled {
+		return nil, ErrRegistrationDisabled
+	}
+
 	// Check if email already exists
 	var exists bool
 	err := s.db.QueryRow(ctx,
@@ -556,7 +576,7 @@ type CreateManagedAccountRequest struct {
 	Email     string
 	Password  string
 	FullName  string
-	Role      string // admin | domain_expert
+	Role      string // admin | domain_expert | client
 	ExpertIDs []uuid.UUID
 }
 
@@ -739,13 +759,15 @@ func (s *AuthService) BootstrapComplete(ctx context.Context, req BootstrapComple
 	return s.jwt.IssueTokenPair(ctx, userID, *email, "admin")
 }
 
-// CreateManagedAccount lets an admin create admin or domain_expert accounts.
-// domain_expert may receive expert grants in the same call.
+// CreateManagedAccount lets an admin create admin, domain_expert or client
+// accounts. domain_expert may receive expert grants in the same call.
+// WHY client here: public self-registration is disabled, so the admin panel is
+// the only account-creation path — including end-user client accounts.
 func (s *AuthService) CreateManagedAccount(ctx context.Context, actorID uuid.UUID, req CreateManagedAccountRequest) (*ManagedAccount, error) {
 	if len(req.Password) < 8 {
 		return nil, ErrPasswordTooShort
 	}
-	if req.Role != "admin" && req.Role != "domain_expert" {
+	if req.Role != "admin" && req.Role != "domain_expert" && req.Role != "client" {
 		return nil, ErrInvalidRole
 	}
 
@@ -835,7 +857,7 @@ func (s *AuthService) ListManagedAccounts(ctx context.Context) ([]ManagedAccount
 		           WHERE p2.client_id = u.id AND m.role = 'user'
 		       ), 0)
 		  FROM users u
-		 WHERE u.role IN ('admin', 'domain_expert')
+		 WHERE u.role IN ('admin', 'domain_expert', 'client')
 		   AND u.deleted_at IS NULL
 		 ORDER BY u.created_at DESC`)
 	if err != nil {
@@ -927,15 +949,120 @@ func (s *AuthService) SetAccountExpertGrants(ctx context.Context, actorID, userI
 	return nil
 }
 
-// UpdateManagedAccount toggles is_active (and optional role stay).
-func (s *AuthService) UpdateManagedAccount(ctx context.Context, userID uuid.UUID, isActive *bool) error {
-	if isActive == nil {
+// UpdateManagedAccountRequest holds optional account field updates.
+// nil pointer = leave that field unchanged (partial update).
+type UpdateManagedAccountRequest struct {
+	FullName *string
+	Email    *string
+	Role     *string
+	IsActive *bool
+	Password *string
+}
+
+// UpdateManagedAccount applies a partial update to an admin/domain_expert/client
+// account. Only non-nil fields change. Changing role away from domain_expert
+// clears expert grants (grants only apply to domain_expert).
+func (s *AuthService) UpdateManagedAccount(ctx context.Context, userID uuid.UUID, req UpdateManagedAccountRequest) error {
+	var currentRole string
+	if err := s.db.QueryRow(ctx,
+		`SELECT role FROM users WHERE id = $1 AND deleted_at IS NULL`,
+		userID,
+	).Scan(&currentRole); err != nil {
+		return ErrUserNotFound
+	}
+
+	sets := make([]string, 0, 6)
+	args := make([]interface{}, 0, 6)
+	add := func(expr string, val interface{}) {
+		args = append(args, val)
+		sets = append(sets, fmt.Sprintf(expr, len(args)))
+	}
+
+	if req.FullName != nil && *req.FullName != "" {
+		add("full_name = $%d", *req.FullName)
+	}
+	if req.Email != nil && *req.Email != "" {
+		var exists bool
+		if err := s.db.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM users WHERE email = $1 AND id <> $2 AND deleted_at IS NULL)`,
+			*req.Email, userID,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("check email: %w", err)
+		}
+		if exists {
+			return ErrEmailTaken
+		}
+		add("email = $%d", *req.Email)
+	}
+	if req.Role != nil {
+		if *req.Role != "admin" && *req.Role != "domain_expert" && *req.Role != "client" {
+			return ErrInvalidRole
+		}
+		add("role = $%d", *req.Role)
+	}
+	if req.IsActive != nil {
+		add("is_active = $%d", *req.IsActive)
+	}
+	if req.Password != nil {
+		if len(*req.Password) < 8 {
+			return ErrPasswordTooShort
+		}
+		hashed, err := bcrypt.GenerateFromPassword([]byte(*req.Password), 12)
+		if err != nil {
+			return fmt.Errorf("hash password: %w", err)
+		}
+		add("hashed_password = $%d", string(hashed))
+	}
+
+	if len(sets) == 0 {
 		return nil
 	}
-	tag, err := s.db.Exec(ctx,
-		`UPDATE users SET is_active = $1, updated_at = NOW()
-		  WHERE id = $2 AND role IN ('admin', 'domain_expert') AND deleted_at IS NULL`,
-		*isActive, userID,
+
+	args = append(args, userID)
+	q := fmt.Sprintf(
+		`UPDATE users SET %s, updated_at = NOW()
+		  WHERE id = $%d AND deleted_at IS NULL`,
+		strings.Join(sets, ", "), len(args),
+	)
+	tag, err := s.db.Exec(ctx, q, args...)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrUserNotFound
+	}
+
+	// Grants only apply to domain_expert; clear them when role moves away.
+	if req.Role != nil && *req.Role != "domain_expert" && *req.Role != currentRole {
+		if _, err := s.db.Exec(ctx, `DELETE FROM user_expert_grants WHERE user_id = $1`, userID); err != nil {
+			s.logger.Warn("clear grants after role change failed (non-fatal)", zap.Error(err))
+		}
+	}
+
+	s.logger.Info("managed account updated", zap.String("user_id", userID.String()))
+	return nil
+}
+
+// DeleteManagedAccount soft-deletes an account and removes its expert grants.
+// Refuses to delete the acting admin's own account (lockout guard).
+func (s *AuthService) DeleteManagedAccount(ctx context.Context, actorID, userID uuid.UUID) error {
+	if actorID == userID {
+		return ErrCannotDeleteSelf
+	}
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM user_expert_grants WHERE user_id = $1`, userID); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx,
+		`UPDATE users SET deleted_at = NOW(), is_active = FALSE, updated_at = NOW()
+		  WHERE id = $1 AND deleted_at IS NULL
+		    AND role IN ('admin', 'domain_expert', 'client')`,
+		userID,
 	)
 	if err != nil {
 		return err
@@ -943,6 +1070,10 @@ func (s *AuthService) UpdateManagedAccount(ctx context.Context, userID uuid.UUID
 	if tag.RowsAffected() == 0 {
 		return ErrUserNotFound
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.logger.Info("managed account deleted", zap.String("user_id", userID.String()))
 	return nil
 }
 

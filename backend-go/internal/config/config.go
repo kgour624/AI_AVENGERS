@@ -22,9 +22,17 @@ type Config struct {
 	Context             ContextConfig
 	Security            SecurityConfig
 	OAuth               OAuthConfig
+	Auth                AuthConfig
 	RateLimit           RateLimitConfig
 	Log                 LogConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// AuthConfig controls account-creation policy.
+// SelfRegistrationEnabled=false (default) keeps POST /auth/register in the
+// codebase but responds gracefully — accounts are provisioned by an admin.
+type AuthConfig struct {
+	SelfRegistrationEnabled bool
 }
 
 type ServerConfig struct {
@@ -230,6 +238,12 @@ func Load() (*Config, error) {
 			GitLabClientSecret: v.GetString("GITLAB_CLIENT_SECRET"),
 			BaseURL:            v.GetString("BASE_URL"),
 			FrontendURL:        v.GetString("FRONTEND_URL"),
+		},
+		// Default false: self-registration off unless explicitly enabled.
+		// viper.GetBool returns false when the env var is absent, which is
+		// exactly the desired default.
+		Auth: AuthConfig{
+			SelfRegistrationEnabled: v.GetBool("SELF_REGISTRATION_ENABLED"),
 		},
 		RateLimit: RateLimitConfig{
 			PerIP:   v.GetInt("RATE_LIMIT_PER_IP"),

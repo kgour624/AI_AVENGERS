@@ -45,8 +45,9 @@
 | 021 | `021_password_reset_tokens` | `password_reset_tokens` (new table) | Forgot-password / reset-password one-time hashed tokens. |
 | 022 | `022_admin_rbac_expert_grants` | `users.role` CHECK (+`domain_expert`), `user_expert_grants` (new), `admin_bootstrap_tokens` (new) | Hidden admin bootstrap + TOTP enrollment; admin-created domain_expert accounts; account→expert grants for chat/workflow scoping. |
 | 023 | `023_domain_outbox` | `domain_outbox` (new) | Transactional outbox for cross-domain events (entitlement.granted, …). SKIP LOCKED dispatcher; no new broker infra. |
+| 024 | `024_users_email_partial_unique` | `users.email` (hard UNIQUE → partial unique index on live rows) | Soft-deleted accounts release their email so it can be reused on re-create. |
 
-**Next migration number: `024`**
+**Next migration number: `025`**
 
 ---
 
