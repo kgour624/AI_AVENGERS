@@ -419,6 +419,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, DB, System Design. |
 | **Files/Risk/Rollback** | `internal/training/*`, `internal/knowledge/*`. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: seed an old chunk, observe flag. |
+| **DONE (C6)** | Mig 032: `course_chunks.embedding_provider`/`embedding_model` (+ indexes) so an embedding change is detectable; `knowledge_refresh_tasks` (typed, severity, dedupe unique per expert+type+key, reopen-on-recur). `internal/knowledge/freshness.go`: `ScanExpert`/`ScanAll`/`GetExpert` (read-only)/`ListTasks`/`AcknowledgeTask`/`ResolveTask`; signals = **embedding_mismatch** (chunks stamped with a provider/model ≠ active), **stale_corpus** (newest chunk older than window), **orphan_reference** (provenance citations whose chunk_id no longer exists — P9 feedback), **empty_corpus**; pure `CorpusAgeDays`/`IsStale`/`Classify` (tested). Ingestion stamps provider/model per new chunk (read from system_settings; sidecar → NULL model). Config `FreshnessConfig{Enabled(absent→true), MaxCorpusAgeDays(180)}`. Admin: `GET /admin/experts/:id/freshness`, `POST …/freshness/scan`, `POST /admin/freshness/scan`, `GET /admin/freshness/tasks`, `POST /admin/freshness/tasks/:id/{ack,resolve}`; ingest success auto-rescans the expert (best-effort, mirrors C2). **Deferred:** corpus-wide semantic contradiction (B2 is per-answer); scheduled/background scan (admin-triggered + ingest-triggered now); chunk→document inverted index (source_file grouping suffices for refresh targeting). |
 
 ### C7 — Adversarial review / debate protocol
 | Part | Detail |
@@ -503,7 +504,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C3 | eval harness + golden set | C | ✅ done | (pending PR, this branch) |
 | C4 | tenant isolation | C | ✅ done | (pending PR, this branch) |
 | C5 | cost/usage product | C | ✅ done | (pending PR, this branch) |
-| C6 | knowledge freshness | C | ⬜ pending | — |
+| C6 | knowledge freshness | C | ✅ done | (pending PR, this branch) |
 | C7 | adversarial debate | C | ⬜ pending | — |
 | C8 | bring-your-own-expert | C | ⬜ pending | — |
 | C9 | explainability surface | C | ⬜ pending | — |

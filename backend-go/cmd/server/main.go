@@ -398,6 +398,13 @@ func buildRouter(
 	// call here (single choke point, G5); admin reads it back grouped.
 	usageSvc := usage.NewService(postgres.Pool, logger)
 	modelGateway.SetUsageRecorder(usageSvc)
+	// C6: knowledge freshness scanner (staleness + embedding mismatch + orphan
+	// citations). nil when disabled (FRESHNESS_ENABLED=false).
+	var freshnessSvc *knowledge.Freshness
+	if cfg.Freshness.Enabled {
+		freshnessSvc = knowledge.NewFreshness(postgres.Pool,
+			knowledge.Policy{MaxCorpusAgeDays: cfg.Freshness.MaxCorpusAgeDays}, logger)
+	}
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -439,7 +446,7 @@ func buildRouter(
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -805,6 +812,13 @@ func buildRouter(
 		adminGroup.GET("/usage/budgets", adminHandler.GetUsageBudgets)
 		adminGroup.PUT("/usage/budgets", adminHandler.SetUsageBudget)
 		adminGroup.GET("/usage/alerts", adminHandler.GetUsageAlerts)
+		// C6: knowledge freshness / staleness + refresh tasks.
+		adminGroup.GET("/freshness/tasks", adminHandler.ListFreshnessTasks)
+		adminGroup.POST("/freshness/scan", adminHandler.ScanAllFreshness)
+		adminGroup.POST("/freshness/tasks/:taskId/ack", adminHandler.AcknowledgeFreshnessTask)
+		adminGroup.POST("/freshness/tasks/:taskId/resolve", adminHandler.ResolveFreshnessTask)
+		adminGroup.GET("/experts/:id/freshness", adminHandler.GetExpertFreshness)
+		adminGroup.POST("/experts/:id/freshness/scan", adminHandler.ScanExpertFreshness)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)

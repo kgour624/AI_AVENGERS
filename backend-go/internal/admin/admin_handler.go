@@ -19,6 +19,7 @@ import (
 	"ai_avengers/backend/internal/eval"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/knowledge"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/tenant"
@@ -50,8 +51,10 @@ type AdminHandler struct {
 	// tenants (C4): enterprise isolation controls. Nil-safe — list returns empty.
 	tenants *tenant.Service
 	// usage (C5): cost/usage analytics + budgets. Nil-safe — returns empty.
-	usage  *usage.Service
-	logger *zap.Logger
+	usage *usage.Service
+	// freshness (C6): knowledge staleness/refresh tasks. Nil-safe.
+	freshness *knowledge.Freshness
+	logger    *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -78,6 +81,7 @@ func NewAdminHandler(
 	evals *eval.Store,
 	tenants *tenant.Service,
 	usageSvc *usage.Service,
+	freshness *knowledge.Freshness,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -91,6 +95,7 @@ func NewAdminHandler(
 		evals:       evals,
 		tenants:     tenants,
 		usage:       usageSvc,
+		freshness:   freshness,
 		logger:      logger,
 	}
 }
@@ -1097,6 +1102,16 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 				)
 			}
 		}
+		// C6: on success, refresh the expert's freshness/refresh tasks so a
+		// fresh ingest clears stale/re-embed signals. Best-effort.
+		if err == nil && h.freshness != nil && h.freshness.Enabled() {
+			if _, fErr := h.freshness.ScanExpert(ctx, expertID); fErr != nil {
+				h.logger.Warn("freshness scan after ingest failed",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(fErr),
+				)
+			}
+		}
 	}()
 
 	response.Created(c, map[string]interface{}{
@@ -1574,6 +1589,137 @@ func parseOptionalUUID(s string) (*uuid.UUID, error) {
 		return nil, err
 	}
 	return &id, nil
+}
+
+// ============================================================
+// KNOWLEDGE FRESHNESS (C6)
+// ============================================================
+
+// GetExpertFreshness GET /admin/experts/:id/freshness
+// Read-only expert freshness summary (no tasks written).
+func (h *AdminHandler) GetExpertFreshness(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.freshness == nil || !h.freshness.Enabled() {
+		response.OK(c, map[string]interface{}{"expert_id": expertID, "freshness_enabled": false})
+		return
+	}
+	ef, err := h.freshness.GetExpert(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("get expert freshness failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	tasks, err := h.freshness.ListTasks(c.Request.Context(), "", &expertID, 100)
+	if err != nil {
+		h.logger.Warn("list expert freshness tasks failed", zap.Error(err))
+		tasks = nil
+	}
+	response.OK(c, gin.H{
+		"freshness_enabled": true,
+		"max_age_days":      h.freshness.MaxAgeDays(),
+		"status":            ef,
+		"tasks":             tasks,
+	})
+}
+
+// ScanExpertFreshness POST /admin/experts/:id/freshness/scan
+// Recomputes signals and upserts refresh tasks for this expert.
+func (h *AdminHandler) ScanExpertFreshness(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.freshness == nil || !h.freshness.Enabled() {
+		response.ServiceUnavailable(c, "knowledge freshness is disabled")
+		return
+	}
+	ef, err := h.freshness.ScanExpert(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("scan expert freshness failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, ef)
+}
+
+// ScanAllFreshness POST /admin/freshness/scan
+// Scans every expert. Returns the per-expert summaries.
+func (h *AdminHandler) ScanAllFreshness(c *gin.Context) {
+	if h.freshness == nil || !h.freshness.Enabled() {
+		response.ServiceUnavailable(c, "knowledge freshness is disabled")
+		return
+	}
+	results, err := h.freshness.ScanAll(c.Request.Context())
+	if err != nil {
+		h.logger.Error("scan all freshness failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"scanned": len(results), "experts": results})
+}
+
+// ListFreshnessTasks GET /admin/freshness/tasks?status=&expert_id=
+func (h *AdminHandler) ListFreshnessTasks(c *gin.Context) {
+	if h.freshness == nil || !h.freshness.Enabled() {
+		response.OK(c, []knowledge.Task{})
+		return
+	}
+	expertID, err := parseOptionalUUID(c.Query("expert_id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert_id")
+		return
+	}
+	tasks, err := h.freshness.ListTasks(c.Request.Context(),
+		strings.TrimSpace(c.Query("status")), expertID, 200)
+	if err != nil {
+		h.logger.Error("list freshness tasks failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, tasks)
+}
+
+// AcknowledgeFreshnessTask POST /admin/freshness/tasks/:taskId/ack
+func (h *AdminHandler) AcknowledgeFreshnessTask(c *gin.Context) {
+	if h.freshness == nil || !h.freshness.Enabled() {
+		response.ServiceUnavailable(c, "knowledge freshness is disabled")
+		return
+	}
+	taskID, err := uuid.Parse(c.Param("taskId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid task ID")
+		return
+	}
+	if err := h.freshness.AcknowledgeTask(c.Request.Context(), taskID); err != nil {
+		h.logger.Warn("acknowledge freshness task failed", zap.Error(err))
+		response.BadRequest(c, "ACK_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"task_id": taskID, "status": knowledge.StatusAcknowledged})
+}
+
+// ResolveFreshnessTask POST /admin/freshness/tasks/:taskId/resolve
+func (h *AdminHandler) ResolveFreshnessTask(c *gin.Context) {
+	if h.freshness == nil || !h.freshness.Enabled() {
+		response.ServiceUnavailable(c, "knowledge freshness is disabled")
+		return
+	}
+	taskID, err := uuid.Parse(c.Param("taskId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid task ID")
+		return
+	}
+	if err := h.freshness.ResolveTask(c.Request.Context(), taskID); err != nil {
+		h.logger.Warn("resolve freshness task failed", zap.Error(err))
+		response.BadRequest(c, "RESOLVE_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"task_id": taskID, "status": knowledge.StatusResolved})
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream

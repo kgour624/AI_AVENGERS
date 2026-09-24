@@ -28,7 +28,19 @@ type Config struct {
 	Provenance          ProvenanceConfig
 	Versioning          VersioningConfig
 	Tenant              TenantConfig
+	Freshness           FreshnessConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// FreshnessConfig controls C6 knowledge freshness detection.
+type FreshnessConfig struct {
+	// Enabled: compute staleness/embedding-mismatch/orphan signals and expose
+	// refresh tasks. Absent env → true (IsSet pattern, same as B6/B8/C1-C5).
+	// Explicit false disables the service (admin endpoints return empty).
+	Enabled bool
+	// MaxCorpusAgeDays: newest chunk older than this → stale_corpus.
+	// Default 180.
+	MaxCorpusAgeDays int
 }
 
 // TenantConfig controls C4 tenant isolation.
@@ -315,6 +327,10 @@ func Load() (*Config, error) {
 		Tenant: TenantConfig{
 			IsolationEnabled: true, // C4 default on; overridden below if env set
 		},
+		Freshness: FreshnessConfig{
+			Enabled:          true, // C6 default on; overridden below if env set
+			MaxCorpusAgeDays: v.GetInt("FRESHNESS_MAX_CORPUS_AGE_DAYS"),
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -351,6 +367,10 @@ func Load() (*Config, error) {
 	// C4: same IsSet pattern — absent → true; explicit false is the kill switch.
 	if v.IsSet("TENANT_ISOLATION_ENABLED") {
 		cfg.Tenant.IsolationEnabled = v.GetBool("TENANT_ISOLATION_ENABLED")
+	}
+	// C6: same IsSet pattern — absent → true; explicit false disables.
+	if v.IsSet("FRESHNESS_ENABLED") {
+		cfg.Freshness.Enabled = v.GetBool("FRESHNESS_ENABLED")
 	}
 
 	// Validate required fields — fail fast
@@ -487,6 +507,10 @@ func (c *Config) applyDefaults() {
 	// C2: drift threshold default.
 	if c.Versioning.DriftThreshold <= 0 || c.Versioning.DriftThreshold > 1 {
 		c.Versioning.DriftThreshold = 0.30
+	}
+	// C6: corpus freshness window default.
+	if c.Freshness.MaxCorpusAgeDays <= 0 {
+		c.Freshness.MaxCorpusAgeDays = 180
 	}
 	if c.Context.MaxTokens == 0 {
 		c.Context.MaxTokens = 10000
