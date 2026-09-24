@@ -471,7 +471,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A12 | watcher running-only guard | A | ✅ done | `7268332` |
 | A13 | gate1WithLLM defeats Gate1Skip | A | ✅ done | (pending PR, this branch) |
 | A14 | zero-citation check ordering | A | ✅ done | (pending PR, this branch) |
-| A15 | revision loop re-fetch artifact | A | ⬜ pending | — |
+| A15 | revision loop re-fetch artifact | A | ✅ done | (pending PR, this branch) |
 | A16 | TransitionPhase errors ignored | A | ⬜ pending | — |
 | A17 | watcher/main single-flight | A | ⬜ pending | — |
 | A18 | watcher waves=nil | A | ⬜ pending | — |

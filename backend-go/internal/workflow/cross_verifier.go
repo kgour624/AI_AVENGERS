@@ -332,6 +332,25 @@ func (cv *CrossVerifier) reviewArtifact(
 		//   Design artifact revision via agentLoop is future work.
 		if round < MaxRevisionRounds {
 			cv.runProducerRevision(ctx, workflowID, artifact, changeRequests, idToExpert)
+			// A15: re-fetch the latest same-type artifact (prefer same producer)
+			// so rounds 2..N review the REVISED content, not the stale original.
+			// Without this, runProducerRevision posts a new event but the loop
+			// keeps the original `artifact` value forever — guaranteed non-convergence.
+			if refreshed, ok := cv.latestRevisedArtifact(ctx, workflowID, artifact); ok {
+				cv.logger.Info("cross-verify: reviewing revised artifact next round",
+					zap.String("old_artifact_id", artifact.ID.String()),
+					zap.String("new_artifact_id", refreshed.ID.String()),
+					zap.Int64("old_seq", artifact.SequenceNumber),
+					zap.Int64("new_seq", refreshed.SequenceNumber),
+				)
+				artifact = refreshed
+			} else {
+				cv.logger.Warn("cross-verify: no revised artifact found after producer run; next round will re-review stale content",
+					zap.String("artifact_id", artifact.ID.String()),
+					zap.String("event_type", artifact.EventType),
+					zap.Int("round", round),
+				)
+			}
 		}
 	}
 
@@ -495,6 +514,49 @@ func (cv *CrossVerifier) runProducerRevision(
 		zap.String("producer", producer.Name),
 		zap.String("artifact_type", artifact.EventType),
 	)
+}
+
+// latestRevisedArtifact returns the newest blackboard event of the same
+// type posted AFTER current (preferring the same producer expert).
+// Used by the revision loop (A15) so round N+1 reviews the revised content.
+//
+// Returns ok=false when nothing newer exists (producer skipped, failed, or
+// non-code path) — caller keeps the stale artifact and logs a warning.
+func (cv *CrossVerifier) latestRevisedArtifact(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	current blackboard.Event,
+) (blackboard.Event, bool) {
+	events, err := cv.store.GetByType(ctx, workflowID, []string{current.EventType}, current.SequenceNumber)
+	if err != nil {
+		cv.logger.Warn("cross-verify: latestRevisedArtifact fetch failed",
+			zap.String("event_type", current.EventType),
+			zap.Error(err),
+		)
+		return blackboard.Event{}, false
+	}
+	if len(events) == 0 {
+		return blackboard.Event{}, false
+	}
+
+	// Prefer same producer; walk ASC so the last match is highest sequence.
+	var best *blackboard.Event
+	for i := range events {
+		e := &events[i]
+		if current.PostedByExpertID != nil && e.PostedByExpertID != nil {
+			if *e.PostedByExpertID != *current.PostedByExpertID {
+				continue
+			}
+		} else if current.PostedByExpertID != nil && e.PostedByExpertID == nil {
+			continue
+		}
+		best = e
+	}
+	if best == nil {
+		// No same-producer match — take the newest of this type after current.
+		return events[len(events)-1], true
+	}
+	return *best, true
 }
 
 // runReview asks one reviewer to review an artifact.
