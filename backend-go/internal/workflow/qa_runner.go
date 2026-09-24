@@ -44,6 +44,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/blackboard"
@@ -55,6 +56,7 @@ import (
 // A thin struct — it holds only what every method needs. No workspace
 // directory, no HTTP client, no aider-service URL: none of those are used.
 type QARunner struct {
+	db       *pgxpool.Pool
 	store    *blackboard.Store
 	gates    *GateSystem
 	gw       *gateway.ModelGateway
@@ -67,7 +69,10 @@ type QARunner struct {
 }
 
 // NewQARunner wires the QA runner.
+// db is required so parseAndPostProposals can call proposeAmendment
+// (creates the approval_requests row the client actually acts on).
 func NewQARunner(
+	db *pgxpool.Pool,
 	store *blackboard.Store,
 	gates *GateSystem,
 	gw *gateway.ModelGateway,
@@ -76,6 +81,7 @@ func NewQARunner(
 	logger *zap.Logger,
 ) *QARunner {
 	return &QARunner{
+		db:            db,
 		store:         store,
 		gates:         gates,
 		gw:            gw,
@@ -318,13 +324,14 @@ func (r *QARunner) buildQAUserPrompt(req AiderRunRequest, designContext string) 
 }
 
 // parseAndPostProposals parses PROPOSE_TEST blocks from the LLM response
-// and posts each as a propose_acceptance blackboard event.
+// and records each via proposeAmendment (design_amendment_proposed event +
+// pending approval_requests row). Nothing is written to ACCEPTANCE.md until
+// the client approves — same §7.5 path as tool_loop's propose_acceptance.
 //
-// WHY propose_acceptance and not a direct ACCEPTANCE.md write:
-// §7.5 is explicit — nothing is written to the design without client
-// approval. A testing expert proposing a test case is the same flow as a
-// chat expert proposing an amendment: the client sees it, approves it, and
-// only then does it land in the file.
+// WHY NOT a standalone qa_test_proposed event:
+// That event type had no consumer — no approval row, no list/approve handler.
+// "pending_approval: true" was a dead flag. The real approval surface is
+// gate_name='design_amendment' on approval_requests (amendment.go).
 //
 // WHY parse a structured block instead of asking for JSON:
 // The LLM is already told to write design documents in markdown. Asking it
@@ -337,6 +344,29 @@ func (r *QARunner) parseAndPostProposals(
 ) (int, error) {
 	const blockOpen = "PROPOSE_TEST"
 	const blockClose = "END_TEST"
+
+	// Section path → section number, so AC ids match toolProposeAcceptance
+	// (AC-<sectionNo>-<n>) and documentCheck's validation.
+	sectionNoByPath := map[string]int{}
+	if r.sections != nil {
+		if secs, listErr := r.sections.ListSections(ctx, req.WorkflowID); listErr == nil {
+			for _, sec := range secs {
+				sectionNoByPath[sec.SectionPath] = sec.SectionNo
+			}
+		}
+	}
+
+	// Existing ACCEPTANCE.md content (for next AC index). Best-effort:
+	// missing file → start at 01.
+	existingAcceptance := ""
+	if full, pathErr := designPath(r.workspaceRoot, req.WorkflowID, acceptanceMD); pathErr == nil {
+		if data, readErr := os.ReadFile(full); readErr == nil {
+			existingAcceptance = string(data)
+		}
+	}
+	// Track per-section next index so multiple proposals in one LLM response
+	// don't collide on the same AC id.
+	nextIdxBySection := map[int]int{}
 
 	posted := 0
 	var firstErr error
@@ -365,27 +395,49 @@ func (r *QARunner) parseAndPostProposals(
 			continue
 		}
 
-		_, postErr := r.store.Post(ctx, blackboard.PostRequest{
-			WorkflowID:       req.WorkflowID,
-			EventType:        "qa_test_proposed",
-			PostedByExpertID: &req.Expert.ID,
-			Content: map[string]interface{}{
-				"expert":      req.Expert.Name,
-				"section":     proposal.Section,
-				"statement":   proposal.Statement,
-				"verify":      proposal.Verify,
-				"done_when":   proposal.DoneWhen,
-				"phase":       PhaseQA,
-				// pending_approval: true signals the amendment handler that
-				// this needs client approval before landing in ACCEPTANCE.md.
-				// Same flag propose_amendment uses (amendment.go).
-				"pending_approval": true,
-			},
-		})
-		if postErr != nil {
-			r.logger.Warn("qa: could not post qa_test_proposed",
+		sectionNo := sectionNoByPath[proposal.Section]
+		if sectionNo == 0 {
+			// Unknown section — still propose as an appendable criterion
+			// against ACCEPTANCE.md so the client can decide; use section 0
+			// index so the id is still unique within this batch.
+			r.logger.Warn("qa: proposal section not in design roster (proposing anyway)",
 				zap.String("expert", req.Expert.Name),
 				zap.String("section", proposal.Section),
+			)
+		}
+
+		next := nextIdxBySection[sectionNo]
+		if next == 0 {
+			next = acceptanceIDsForSection(existingAcceptance, sectionNo) + 1
+		}
+		nextIdxBySection[sectionNo] = next + 1
+
+		acID := fmt.Sprintf("AC-%d-%02d", sectionNo, next)
+		owner := ownerTokenFromSectionPath(proposal.Section)
+		if owner == "" {
+			owner = req.Expert.Name
+		}
+		acBlock := formatAcceptanceBlock(
+			acID, owner, proposal.Section,
+			proposal.Statement, proposal.Verify, proposal.DoneWhen,
+		)
+
+		_, postErr := proposeAmendment(ctx, r.db, r.store, ProposeAmendmentRequest{
+			WorkflowID: req.WorkflowID,
+			ExpertID:   req.Expert.ID,
+			ExpertName: req.Expert.Name,
+			ChatID:     uuid.Nil, // QA phase, not chat-sourced
+			Kind:       amendmentKindAcceptance,
+			Target:     acceptanceMD,
+			OldText:    "", // append — nothing to replace
+			NewText:    acBlock,
+			Reason:     fmt.Sprintf("%s proposes %s for %s (QA)", req.Expert.Name, acID, proposal.Section),
+		})
+		if postErr != nil {
+			r.logger.Warn("qa: could not propose acceptance amendment",
+				zap.String("expert", req.Expert.Name),
+				zap.String("section", proposal.Section),
+				zap.String("ac_id", acID),
 				zap.Error(postErr),
 			)
 			if firstErr == nil {

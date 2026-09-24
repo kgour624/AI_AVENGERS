@@ -469,7 +469,7 @@ func buildRouter(
 	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
 
 	wfQARunner := workflow.NewQARunner(
-		bbStore, wfGateSystem, modelGateway, wfSections, workspaceRoot, logger,
+		postgres.Pool, bbStore, wfGateSystem, modelGateway, wfSections, workspaceRoot, logger,
 	)
 	wfRunner := workflow.NewWorkflowRunner(
 		postgres.Pool, wfEngine, wfPlanner, wfAgentLoop, wfAiderRunner, wfAuthoringRunner, wfQARunner, wfWorkspaceMerger, wfCrossVerifier,
@@ -504,6 +504,16 @@ func buildRouter(
 		wfToolRegistry, workspaceRoot, logger,
 	)
 	wfChatHandler := workflow.NewChatHandler(wfChatSvc, logger)
+
+	// Change requests (§6/§7 redesign): client free-text goals from workflow chat
+	// become change_requests rows + blackboard events; the runner watches and
+	// re-runs the relevant design waves. Constructed once and injected into both
+	// the chat route mount and the runner — either side alone leaves the feature
+	// half-dead (route without watcher, or watcher without a way to create).
+	// MUST be attached before ResumeOrphanWorkflows below so resumed runs also
+	// start the watcher (WithChangeRequestService sets r.crSvc).
+	wfChangeReqSvc := workflow.NewChangeRequestService(postgres.Pool, bbStore, logger)
+	wfRunner.WithChangeRequestService(wfChangeReqSvc)
 
 	// Delivery: harness git-push export (§18) and the code-feedback loop (§17).
 	//
@@ -712,10 +722,13 @@ func buildRouter(
 		// c.MustGet("user_id") and every one of them checks chat ownership
 		// against it.
 		//
-		// Mounts /workflows/:id/chats and /workflow-chats/:cid/*. The workflow
-		// paths reuse the `:id` parameter name the group above already uses, so
-		// gin's tree merges them instead of reporting a wildcard conflict.
-		wfChatHandler.RegisterRoutes(protected)
+		// Mounts /workflows/:id/chats and /workflow-chats/:cid/* plus
+		// POST /workflow-chats/:cid/propose-change (RegisterRoutesWithCR).
+		// The workflow paths reuse the `:id` parameter name the group above
+		// already uses, so gin's tree merges them instead of reporting a
+		// wildcard conflict. wfChangeReqSvc was constructed next to the chat
+		// handler above and is also attached to wfRunner.
+		wfChatHandler.RegisterRoutesWithCR(protected, wfChangeReqSvc)
 
 		// Delivery (§17, §18). Same `protected` group and the same `:id`
 		// parameter name for the same two reasons: both handlers check workflow

@@ -210,7 +210,8 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 		}
 
 		// ============================================================
-		// CONTEXT MANAGEMENT: Build context from gate result + blackboard.
+		// CONTEXT MANAGEMENT: Build context from gate result + blackboard
+		// + project memory (A6: workflow experts previously never saw L1/L2).
 		// ============================================================
 		var contextText string
 		if gateResult != nil {
@@ -228,6 +229,11 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 			if bErr != nil {
 				contextText = formatArtifacts(allArtifacts)
 			}
+		}
+		// Project memory: established decisions across this project's experts.
+		// Non-fatal — empty/missing memory just means no extra section.
+		if memText := a.loadProjectMemoryText(ctx, req); memText != "" {
+			contextText = memText + "\n" + contextText
 		}
 
 		// ============================================================
@@ -335,6 +341,30 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 // buildBlackboardContext builds context from blackboard artifacts only.
 // Summarizes old artifacts if count exceeds threshold.
 // Renamed from buildContext — gate context is now handled by FormatGateContext.
+// loadProjectMemoryText resolves the workflow's project and returns the
+// Assembler's project-memory prompt block (or "" if unavailable).
+//
+// Non-fatal by design: a missing project_id, DB hiccup, or nil assembler
+// must never abort a wave — experts just proceed without the extra section.
+func (a *AgentLoop) loadProjectMemoryText(ctx context.Context, req AgentLoopRequest) string {
+	if a == nil || a.assembler == nil || a.db == nil {
+		return ""
+	}
+	var projectID uuid.UUID
+	err := a.db.QueryRow(ctx,
+		`SELECT project_id FROM workflows WHERE id = $1`,
+		req.WorkflowID,
+	).Scan(&projectID)
+	if err != nil || projectID == uuid.Nil {
+		return ""
+	}
+	query := req.TaskDescription
+	if query == "" {
+		query = req.TaskTitle
+	}
+	return a.assembler.GetProjectMemoryText(ctx, projectID, req.Expert.ID, query)
+}
+
 func (a *AgentLoop) buildBlackboardContext(ctx context.Context, workflowID uuid.UUID, artifacts []blackboard.Event) (string, error) {
 	if len(artifacts) == 0 {
 		return "No prior artifacts from peers.", nil
@@ -477,10 +507,11 @@ func buildAgentSystemPrompt(req AgentLoopRequest) string {
 	sb.WriteString(fmt.Sprintf("YOUR TASK:\n%s\n\n", req.TaskDescription))
 	sb.WriteString(phaseFocus(req.WorkflowPhase))
 	sb.WriteString("HOW TO USE YOUR CONTEXT:\n")
-	sb.WriteString("1. TRAINING MATERIAL: Principles from your training. Apply them to the new problem.\n")
+	sb.WriteString("1. PROJECT MEMORY: Settled decisions for this project (if present). Do not contradict them silently.\n")
+	sb.WriteString("2. TRAINING MATERIAL: Principles from your training. Apply them to the new problem.\n")
 	sb.WriteString("   You do NOT need an exact match. 'consistent hashing' training applies to 'URL shortener'.\n")
 	sb.WriteString("   Think like a senior engineer: use past experience on new problems.\n")
-	sb.WriteString("2. BLACKBOARD: Work done by other experts. Build on it, don't repeat it.\n\n")
+	sb.WriteString("3. BLACKBOARD: Work done by other experts. Build on it, don't repeat it.\n\n")
 	sb.WriteString("AVAILABLE TOOLS:\n")
 	sb.WriteString("<tool_call>{\"tool\": \"PostArtifact\", \"event_type\": \"<type>\", \"content\": {<artifact>}}</tool_call>\n")
 	sb.WriteString("event_type options:\n")

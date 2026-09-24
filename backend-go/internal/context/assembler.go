@@ -528,6 +528,77 @@ func (a *Assembler) GetCourseChunksForWorkflow(
 	return a.getCourseChunks(ctx, expertID, taskDescription, topK)
 }
 
+// GetProjectMemoryText loads project L1/L2 memory for a workflow expert and
+// returns a prompt-ready block (or "" when empty / unavailable).
+//
+// Used by workflow AgentLoop so design-phase experts see the same project
+// decisions standalone chat already injects. Nil-safe: missing memManager,
+// missing project, or fetch failure → empty string (non-fatal).
+//
+// Budget: L2 entries are capped by GetProjectContext (top 8); the rendered
+// block is hard-capped at ~3000 chars so a chatty project cannot crowd out
+// training chunks / blackboard in the workflow prompt.
+func (a *Assembler) GetProjectMemoryText(
+	ctx context.Context,
+	projectID uuid.UUID,
+	expertID uuid.UUID,
+	query string,
+) string {
+	if a == nil || a.memManager == nil || projectID == uuid.Nil {
+		return ""
+	}
+	pc, err := a.memManager.GetProjectContext(ctx, projectID, expertID, query)
+	if err != nil || pc == nil {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("[PROJECT MEMORY — established decisions for this project]\n")
+	sb.WriteString("Treat these as settled context. Do not contradict them silently.\n\n")
+
+	wrote := false
+	if pc.L1Memory != nil {
+		if pc.L1Memory.ContextSummary != "" {
+			sb.WriteString("Your recent context summary:\n")
+			sb.WriteString(pc.L1Memory.ContextSummary)
+			sb.WriteString("\n\n")
+			wrote = true
+		}
+		if len(pc.L1Memory.KeyDecisions) > 0 {
+			sb.WriteString("Your recent key decisions:\n")
+			for _, d := range pc.L1Memory.KeyDecisions {
+				if d.Content == "" {
+					continue
+				}
+				sb.WriteString(fmt.Sprintf("- %s\n", d.Content))
+				wrote = true
+			}
+			sb.WriteString("\n")
+		}
+	}
+	if len(pc.L2Entries) > 0 {
+		sb.WriteString("Cross-expert project decisions:\n")
+		for _, e := range pc.L2Entries {
+			if e.Content == "" {
+				continue
+			}
+			sb.WriteString(fmt.Sprintf("- %s\n", e.Content))
+			wrote = true
+		}
+		sb.WriteString("\n")
+	}
+	if !wrote {
+		return ""
+	}
+
+	out := sb.String()
+	const maxChars = 3000
+	if len(out) > maxChars {
+		return out[:maxChars] + "\n…[project memory truncated]\n"
+	}
+	return out
+}
+
 // getReplyThreadMaxDepth reads system_settings.reply_thread_max_depth.
 // Falls back to 10 (same default migration 010 seeds) if the row is
 // missing or its value is not a valid integer — never blocks reply

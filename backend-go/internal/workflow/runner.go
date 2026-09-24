@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,13 +53,17 @@ type runnerState struct {
 //  9. AskClient for final approval
 //  10. engine.Complete()
 //
-// RECOVERY (Fix 5):
+// RECOVERY:
 //
 //	On pod restart: main.go calls ResumeOrphanWorkflows()
-//	-> finds workflows WHERE status='running'
+//	-> finds workflows WHERE status='running' (paused gates are a
+//	   different status and are not orphans)
 //	-> re-launches Run() for each
-//	-> Run() reads runner_state + current_task_cursor
-//	-> skips already-completed tasks
+//	-> Run() reads workflows.runner_state {phase, completed_expert_ids}
+//	-> reloads the original plan from the latest task_plan_ready event
+//	   (falls back to Planner if none)
+//	-> skips intake / earlier phases, and skips experts already listed
+//	   as completed in the resumed phase
 //
 // SINGLE WRITE PATH (Fix 1):
 //
@@ -178,19 +183,49 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		go r.watchForChangeRequest(ctx, workflowID, experts, nil, r.crSvc)
 	}
 
-	// Step 3: Load requirement.
-	requirementText := r.loadRequirement(ctx, workflowID, wf.Title)
-
-	// Step 4: Plan.
-	log.Info("runner: planning", zap.Int("experts", len(experts)))
-	tasks, err := r.planner.Plan(ctx, workflowID, requirementText, experts)
-	if err != nil {
-		log.Error("runner: planning failed", zap.Error(err))
-		_ = r.engine.Fail(ctx, workflowID, "planning failed: "+err.Error())
-		return
+	// Step 3: Load checkpoint (pod-restart recovery).
+	// Only status=running orphans reach here via ResumeOrphanWorkflows;
+	// paused approval gates are a different status and are not re-entered.
+	resumePhase := ""
+	var resumeCompleted []string
+	if saved, loadErr := r.loadRunnerState(ctx, workflowID); loadErr != nil {
+		log.Warn("runner: load runner_state failed (starting fresh)", zap.Error(loadErr))
+	} else if saved != nil {
+		resumePhase = saved.Phase
+		resumeCompleted = append([]string(nil), saved.CompletedExpertIDs...)
+		log.Info("runner: resuming from checkpoint",
+			zap.String("phase", resumePhase),
+			zap.Int("completed_experts", len(resumeCompleted)),
+			zap.Int("failed_experts", len(saved.FailedExpertIDs)),
+		)
 	}
 
-	// Step 5: Build DAG (topological sort + cycle check).
+	// Step 4: Load requirement.
+	requirementText := r.loadRequirement(ctx, workflowID, wf.Title)
+
+	// Step 5: Plan — on resume, reload the original plan from blackboard
+	// so waves match the checkpoint. Fall back to Planner if missing.
+	var tasks []TaskSpec
+	planFromBlackboard := false
+	if resumePhase != "" {
+		if reloaded, ok := r.loadPlanTasksFromBlackboard(ctx, workflowID, experts); ok {
+			tasks = reloaded
+			planFromBlackboard = true
+			log.Info("runner: reloaded plan from blackboard", zap.Int("tasks", len(tasks)))
+		}
+	}
+	if len(tasks) == 0 {
+		log.Info("runner: planning", zap.Int("experts", len(experts)))
+		planned, planErr := r.planner.Plan(ctx, workflowID, requirementText, experts)
+		if planErr != nil {
+			log.Error("runner: planning failed", zap.Error(planErr))
+			_ = r.engine.Fail(ctx, workflowID, "planning failed: "+planErr.Error())
+			return
+		}
+		tasks = planned
+	}
+
+	// Step 6: Build DAG (topological sort + cycle check).
 	waves, err := BuildDAG(tasks)
 	if err != nil {
 		log.Error("runner: DAG build failed", zap.Error(err))
@@ -202,43 +237,80 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		zap.Int("waves", len(waves)),
 	)
 
-	// Step 6: Post task_plan_ready event.
-	// Projector will INSERT workflow_tasks rows from this event.
-	// Runner does NOT write to workflow_tasks directly.
 	planContent := buildPlanContent(tasks, experts)
-	_, err = r.store.Post(ctx, blackboard.PostRequest{
-		WorkflowID:     workflowID,
-		EventType:      "task_plan_ready",
-		PostedByClient: true,
-		Content:        planContent,
-	})
-	if err != nil {
-		log.Error("runner: post task_plan_ready failed", zap.Error(err))
-		_ = r.engine.Fail(ctx, workflowID, "post plan failed")
-		return
+
+	// Fresh start: post plan + intake gate.
+	// Resume: skip both — plan already on blackboard and intake already approved
+	// (otherwise status would be paused_for_approval, not running).
+	if resumePhase == "" {
+		// Step 7: Post task_plan_ready event.
+		// Projector will INSERT workflow_tasks rows from this event.
+		// Runner does NOT write to workflow_tasks directly.
+		_, err = r.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     workflowID,
+			EventType:      "task_plan_ready",
+			PostedByClient: true,
+			Content:        planContent,
+		})
+		if err != nil {
+			log.Error("runner: post task_plan_ready failed", zap.Error(err))
+			_ = r.engine.Fail(ctx, workflowID, "post plan failed")
+			return
+		}
+
+		// Step 8: AskClient for plan approval.
+		_, err = r.tools.AskClient(ctx, AskClientRequest{
+			WorkflowID:      workflowID,
+			FromExpertID:    uuid.Nil,
+			GateName:        "intake",
+			Summary:         fmt.Sprintf("%d tasks planned for %d experts. Review and approve.", len(tasks), len(experts)),
+			ArtifactContent: planContent,
+		})
+		if err != nil {
+			log.Error("runner: AskClient failed", zap.Error(err))
+			_ = r.engine.Fail(ctx, workflowID, "AskClient failed")
+			return
+		}
+
+		log.Info("runner: waiting for plan approval")
+		if err := r.waitForResume(ctx, workflowID); err != nil {
+			log.Warn("runner: wait for resume failed", zap.Error(err))
+			return
+		}
+	} else {
+		log.Info("runner: skipping intake gate (resume)",
+			zap.Bool("plan_from_blackboard", planFromBlackboard),
+		)
+		// Resume path that had to re-plan (no task_plan_ready found): still
+		// publish so Projector / kanban stay consistent. Intake already done.
+		if !planFromBlackboard {
+			_, _ = r.store.Post(ctx, blackboard.PostRequest{
+				WorkflowID:     workflowID,
+				EventType:      "task_plan_ready",
+				PostedByClient: true,
+				Content:        planContent,
+			})
+		}
 	}
 
-	// Step 7: AskClient for plan approval.
-	_, err = r.tools.AskClient(ctx, AskClientRequest{
-		WorkflowID:      workflowID,
-		FromExpertID:    uuid.Nil,
-		GateName:        "intake",
-		Summary:         fmt.Sprintf("%d tasks planned for %d experts. Review and approve.", len(tasks), len(experts)),
-		ArtifactContent: planContent,
-	})
-	if err != nil {
-		log.Error("runner: AskClient failed", zap.Error(err))
-		_ = r.engine.Fail(ctx, workflowID, "AskClient failed")
-		return
+	// seedPhase builds runnerState for a phase; when resuming into that
+	// exact phase, pre-fills CompletedExpertIDs so executeWaves skips them.
+	seedPhase := func(phase string) *runnerState {
+		s := &runnerState{Phase: phase}
+		if phase == resumePhase && len(resumeCompleted) > 0 {
+			s.CompletedExpertIDs = append([]string(nil), resumeCompleted...)
+		}
+		return s
+	}
+	// pastPhase is true when the checkpoint is already beyond this phase.
+	pastPhase := func(phase string) bool {
+		if resumePhase == "" {
+			return false
+		}
+		return phaseIndex(resumePhase) > phaseIndex(phase)
 	}
 
-	log.Info("runner: waiting for plan approval")
-	if err := r.waitForResume(ctx, workflowID); err != nil {
-		log.Warn("runner: wait for resume failed", zap.Error(err))
-		return
-	}
-
-	// Step 8: Execute all phases in sequence.
+	// Step 9: Execute all phases in sequence.
 	// Each design phase runs the full wave set.
 	// After design phases, AskClient gates implementation start.
 	// Implementation and QA use AiderRunner (file system + git).
@@ -258,87 +330,139 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	//
 	// The loop cannot spin on its own — every iteration blocks on a human
 	// response at the gate. maxDesignAttempts is only a runaway-cost guard.
+	//
+	// Resume: if checkpoint is past detailed_design, skip the whole design
+	// loop (design gate already approved). On attempt==1 only, skip phases
+	// already past; later attempts (client "request changes") re-run both.
 	var state *runnerState
-	for attempt := 1; attempt <= maxDesignAttempts; attempt++ {
-		if attempt == 1 {
-			_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
-		} else {
-			// Backwards move, so TransitionPhase's forward-only validation
-			// does not apply. See Engine.RestartPhase.
-			if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseHighLevelDesign); rErr != nil {
-				log.Error("runner: restart HLD failed", zap.Error(rErr))
+	runDesign := resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseDetailedDesign)
+	if runDesign {
+		for attempt := 1; attempt <= maxDesignAttempts; attempt++ {
+			skipHLD := attempt == 1 && pastPhase(PhaseHighLevelDesign)
+			skipDLD := attempt == 1 && pastPhase(PhaseDetailedDesign)
+
+			if !skipHLD {
+				if attempt == 1 {
+					_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseHighLevelDesign, nil, 0)
+				} else {
+					// Backwards move, so TransitionPhase's forward-only validation
+					// does not apply. See Engine.RestartPhase.
+					if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseHighLevelDesign); rErr != nil {
+						log.Error("runner: restart HLD failed", zap.Error(rErr))
+						return
+					}
+					log.Info("runner: re-running design phases on client request",
+						zap.Int("attempt", attempt),
+					)
+				}
+
+				state = seedPhase(PhaseHighLevelDesign)
+				if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+					log.Error("runner: HLD waves failed", zap.Error(err))
+					if len(state.CompletedExpertIDs) == 0 {
+						_ = r.engine.Fail(ctx, workflowID, "HLD phase: all tasks failed")
+						return
+					}
+				}
+			} else {
+				log.Info("runner: skipping HLD phase (already past checkpoint)")
+			}
+
+			if !skipDLD {
+				if attempt == 1 {
+					_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseDetailedDesign, nil, 0)
+				} else if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseDetailedDesign); rErr != nil {
+					log.Error("runner: restart detailed design failed", zap.Error(rErr))
+					return
+				}
+
+				state = seedPhase(PhaseDetailedDesign)
+				if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+					log.Error("runner: DetailedDesign waves failed", zap.Error(err))
+					if len(state.CompletedExpertIDs) == 0 {
+						_ = r.engine.Fail(ctx, workflowID, "DetailedDesign phase: all tasks failed")
+						return
+					}
+				}
+			} else {
+				log.Info("runner: skipping DetailedDesign phase (already past checkpoint)")
+			}
+
+			// Gate: client reads the deliverables and decides.
+			decision, gateErr := r.askDesignGate(ctx, workflowID, attempt)
+			if gateErr != nil {
+				log.Error("runner: design gate failed", zap.Error(gateErr))
 				return
 			}
-			log.Info("runner: re-running design phases on client request",
-				zap.Int("attempt", attempt),
-			)
-		}
-
-		state = &runnerState{Phase: PhaseHighLevelDesign}
-		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-			log.Error("runner: HLD waves failed", zap.Error(err))
-			if len(state.CompletedExpertIDs) == 0 {
-				_ = r.engine.Fail(ctx, workflowID, "HLD phase: all tasks failed")
-				return
+			if decision != decisionChangesRequested {
+				break
+			}
+			if attempt == maxDesignAttempts {
+				log.Warn("runner: design re-run limit reached, proceeding",
+					zap.Int("max_attempts", maxDesignAttempts),
+				)
 			}
 		}
-
-		if attempt == 1 {
-			_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseDetailedDesign, nil, 0)
-		} else if rErr := r.engine.RestartPhase(ctx, workflowID, PhaseDetailedDesign); rErr != nil {
-			log.Error("runner: restart detailed design failed", zap.Error(rErr))
-			return
-		}
-
-		state = &runnerState{Phase: PhaseDetailedDesign}
-		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-			log.Error("runner: DetailedDesign waves failed", zap.Error(err))
-			if len(state.CompletedExpertIDs) == 0 {
-				_ = r.engine.Fail(ctx, workflowID, "DetailedDesign phase: all tasks failed")
-				return
-			}
-		}
-
-		// Gate: client reads the deliverables and decides.
-		decision, gateErr := r.askDesignGate(ctx, workflowID, attempt)
-		if gateErr != nil {
-			log.Error("runner: design gate failed", zap.Error(gateErr))
-			return
-		}
-		if decision != decisionChangesRequested {
-			break
-		}
-		if attempt == maxDesignAttempts {
-			log.Warn("runner: design re-run limit reached, proceeding",
-				zap.Int("max_attempts", maxDesignAttempts),
-			)
-		}
+	} else {
+		log.Info("runner: skipping design phases + gate (resume past design)",
+			zap.String("resume_phase", resumePhase),
+		)
 	}
 
 	// The design gate lives inside the loop above (askDesignGate), so by the
-	// time we get here the client has approved the design.
+	// time we get here the client has approved the design (or we resumed past it).
+	//
+	// Boundary checkpoint: if we just finished the design gate (not a resume
+	// past design), mark phase=implementation with empty completed set so a
+	// crash before the first implementation task skips design+gate on resume
+	// instead of re-asking the client.
+	if runDesign {
+		boundary := &runnerState{Phase: PhaseImplementation}
+		r.saveRunnerState(ctx, workflowID, boundary)
+		// Resume seeds should treat a fresh boundary write as "at start of impl"
+		// for any in-process continue (resumePhase was load-time only).
+		resumePhase = PhaseImplementation
+		resumeCompleted = nil
+	}
 
 	// --- Phase: Implementation (Aider) ---
-	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseImplementation, nil, 0)
-	state = &runnerState{Phase: PhaseImplementation}
-	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-		log.Error("runner: Implementation waves failed", zap.Error(err))
-		if len(state.CompletedExpertIDs) == 0 {
-			_ = r.engine.Fail(ctx, workflowID, "Implementation phase: all tasks failed")
-			return
+	if resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseImplementation) {
+		_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseImplementation, nil, 0)
+		state = seedPhase(PhaseImplementation)
+		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+			log.Error("runner: Implementation waves failed", zap.Error(err))
+			if len(state.CompletedExpertIDs) == 0 {
+				_ = r.engine.Fail(ctx, workflowID, "Implementation phase: all tasks failed")
+				return
+			}
 		}
+		// Boundary: design+impl done → next is QA.
+		r.saveRunnerState(ctx, workflowID, &runnerState{Phase: PhaseQA})
+		resumePhase = PhaseQA
+		resumeCompleted = nil
+	} else {
+		log.Info("runner: skipping Implementation phase (already past checkpoint)")
 	}
 
 	// --- Phase: QA (Aider - test generation) ---
-	_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseQA, nil, 0)
-	state = &runnerState{Phase: PhaseQA}
-	if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
-		log.Error("runner: QA waves failed", zap.Error(err))
-		// QA failure is non-fatal — code is already written
-		log.Warn("runner: QA phase had failures, continuing to handoff",
-			zap.Int("completed", len(state.CompletedExpertIDs)),
-			zap.Int("failed", len(state.FailedExpertIDs)),
-		)
+	if resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseQA) {
+		_, _ = r.engine.TransitionPhase(ctx, workflowID, PhaseQA, nil, 0)
+		state = seedPhase(PhaseQA)
+		if err := r.executeWaves(ctx, workflowID, waves, experts, state); err != nil {
+			log.Error("runner: QA waves failed", zap.Error(err))
+			// QA failure is non-fatal — code is already written
+			log.Warn("runner: QA phase had failures, continuing to handoff",
+				zap.Int("completed", len(state.CompletedExpertIDs)),
+				zap.Int("failed", len(state.FailedExpertIDs)),
+			)
+		}
+		r.saveRunnerState(ctx, workflowID, &runnerState{Phase: PhaseHandoff})
+	} else {
+		log.Info("runner: skipping QA phase (already past checkpoint)")
+	}
+
+	if state == nil {
+		state = &runnerState{Phase: PhaseHandoff}
 	}
 
 	// Step 9: Final approval.
@@ -421,6 +545,15 @@ func (r *WorkflowRunner) executeWaves(
 	// Structure: /workspaces/{workflow_id}/{expert_id}/
 	workflowWorkspace := fmt.Sprintf("%s/%s", r.aiderRunner.workspaceDir, workflowID.String())
 
+	// Experts already marked complete in runner_state (seeded on resume).
+	// Built once before waves; concurrent appends during this phase do not
+	// affect skip decisions for tasks in later waves of the same call —
+	// those tasks were never launched as already-done and will not reappear.
+	alreadyDone := make(map[string]struct{}, len(state.CompletedExpertIDs))
+	for _, id := range state.CompletedExpertIDs {
+		alreadyDone[id] = struct{}{}
+	}
+
 	for waveIdx, wave := range waves {
 		r.logger.Info("runner: executing wave",
 			zap.Int("wave", waveIdx),
@@ -486,6 +619,15 @@ func (r *WorkflowRunner) executeWaves(
 					return
 				}
 
+				// Pod-restart recovery: skip experts already completed in this phase.
+				if _, done := alreadyDone[expert.ID.String()]; done {
+					r.logger.Info("runner: skipping already-completed expert",
+						zap.String("expert", expert.Name),
+						zap.String("phase", state.Phase),
+					)
+					return
+				}
+
 				// Route to appropriate executor based on phase.
 				if useAider {
 					// Implementation phase now means AUTHORING (§9 of
@@ -538,7 +680,9 @@ func (r *WorkflowRunner) executeWaves(
 							waveExpertIDs = append(waveExpertIDs, expert.ID.String())
 							waveMu.Unlock()
 						}
-						r.saveRunnerState(ctx, workflowID, state)
+						// Snapshot under errMu so json.Marshal never races
+						// concurrent appends from sibling wave goroutines.
+						r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
 						return
 					}
 
@@ -617,7 +761,10 @@ func (r *WorkflowRunner) executeWaves(
 				}
 
 				// Save checkpoint after each task.
-				r.saveRunnerState(ctx, workflowID, state)
+				// Snapshot under errMu so json.Marshal never races concurrent
+				// appends to CompletedExpertIDs / FailedExpertIDs from sibling
+				// wave goroutines (data race → torn runner_state on crash resume).
+				r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
 			}(task)
 		}
 		wg.Wait()
@@ -662,11 +809,31 @@ func (r *WorkflowRunner) executeWaves(
 
 		// Post-wave cross-verification (all phases).
 		// Run after workspace merge so artifacts are on blackboard.
-		// Non-fatal: log error but continue to next wave.
+		// Non-fatal by default: log error but continue to next wave.
+		// Exception: a reviewer may mark an artifact as BLOCKED (hard stop).
 		if r.crossVerifier != nil {
 			if cvErr := r.crossVerifier.VerifyWaveArtifacts(
 				ctx, workflowID, experts, lastSeqBefore,
 			); cvErr != nil {
+				if errors.Is(cvErr, ErrArtifactBlocked) {
+					r.logger.Error("runner: cross-verification BLOCKED artifact (hard stop)",
+						zap.Int("wave", waveIdx),
+						zap.Error(cvErr),
+					)
+					// Post an explicit stop marker so the client UI can show a clear reason.
+					_, _ = r.store.Post(ctx, blackboard.PostRequest{
+						WorkflowID:     workflowID,
+						EventType:      "cross_verification_blocked",
+						PostedByClient: true,
+						Content: map[string]interface{}{
+							"wave":  waveIdx,
+							"phase": state.Phase,
+							"error": cvErr.Error(),
+						},
+					})
+					_ = r.engine.Fail(ctx, workflowID, "cross-verification blocked: "+cvErr.Error())
+					return fmt.Errorf("cross-verification blocked at wave %d: %w", waveIdx, cvErr)
+				}
 				r.logger.Error("runner: cross-verification failed (non-fatal)",
 					zap.Int("wave", waveIdx),
 					zap.Error(cvErr),
@@ -726,9 +893,35 @@ func (r *WorkflowRunner) getLastBlackboardSeq(ctx context.Context, workflowID uu
 	return seq
 }
 
-// saveRunnerState writes runner_state + current_task_cursor to workflows table.
+// snapshotRunnerState returns a deep copy of state under mu, so the caller
+// can marshal/write it without racing sibling wave goroutines that append to
+// CompletedExpertIDs / FailedExpertIDs under the same mu.
+// mu may be nil for single-threaded call sites (phase-boundary checkpoints).
+func snapshotRunnerState(state *runnerState, mu *sync.Mutex) *runnerState {
+	if state == nil {
+		return nil
+	}
+	if mu != nil {
+		mu.Lock()
+		defer mu.Unlock()
+	}
+	return &runnerState{
+		Phase:              state.Phase,
+		CompletedExpertIDs: append([]string(nil), state.CompletedExpertIDs...),
+		FailedExpertIDs:    append([]string(nil), state.FailedExpertIDs...),
+	}
+}
+
+// saveRunnerState writes runner_state to workflows table.
 // Called after each task completes for pod-restart recovery.
+// (current_task_cursor column exists from migration 014 but is unused —
+// phase + completed expert IDs are enough for skip-based resume.)
+// Callers that share state across wave goroutines MUST pass a snapshot
+// (see snapshotRunnerState) — never the live concurrent pointer.
 func (r *WorkflowRunner) saveRunnerState(ctx context.Context, workflowID uuid.UUID, state *runnerState) {
+	if state == nil {
+		return
+	}
 	stateJSON, err := json.Marshal(state)
 	if err != nil {
 		r.logger.Warn("runner: marshal state failed", zap.Error(err))
@@ -741,6 +934,102 @@ func (r *WorkflowRunner) saveRunnerState(ctx context.Context, workflowID uuid.UU
 	if err != nil {
 		r.logger.Warn("runner: save state failed", zap.Error(err))
 	}
+}
+
+// loadRunnerState reads the last checkpoint from workflows.runner_state.
+// Returns (nil, nil) when the column is NULL (fresh run / never checkpointed).
+func (r *WorkflowRunner) loadRunnerState(ctx context.Context, workflowID uuid.UUID) (*runnerState, error) {
+	var raw []byte
+	err := r.db.QueryRow(ctx,
+		`SELECT runner_state FROM workflows WHERE id = $1`,
+		workflowID,
+	).Scan(&raw)
+	if err != nil {
+		return nil, fmt.Errorf("load runner_state: %w", err)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var state runnerState
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return nil, fmt.Errorf("unmarshal runner_state: %w", err)
+	}
+	if state.Phase == "" {
+		return nil, nil
+	}
+	return &state, nil
+}
+
+// loadPlanTasksFromBlackboard rebuilds []TaskSpec from the latest
+// task_plan_ready event so a resume uses the same plan (and waves) as the
+// original run. Returns (nil, false) when no usable event exists.
+func (r *WorkflowRunner) loadPlanTasksFromBlackboard(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	experts []workflowExpert,
+) ([]TaskSpec, bool) {
+	events, err := r.store.GetByType(ctx, workflowID, []string{"task_plan_ready"}, 0)
+	if err != nil || len(events) == 0 {
+		return nil, false
+	}
+	// Latest plan wins (re-plan on resume fallback may post another).
+	ev := events[len(events)-1]
+
+	var payload struct {
+		Tasks []struct {
+			ExpertID    string   `json:"expert_id"`
+			Title       string   `json:"title"`
+			Description string   `json:"description"`
+			DependsOn   []string `json:"depends_on_expert_names"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(ev.Content, &payload); err != nil {
+		r.logger.Warn("runner: parse task_plan_ready failed", zap.Error(err))
+		return nil, false
+	}
+	if len(payload.Tasks) == 0 {
+		return nil, false
+	}
+
+	nameToID := make(map[string]uuid.UUID, len(experts))
+	for _, e := range experts {
+		nameToID[e.Name] = e.ID
+	}
+
+	tasks := make([]TaskSpec, 0, len(payload.Tasks))
+	for _, t := range payload.Tasks {
+		expertID, err := uuid.Parse(t.ExpertID)
+		if err != nil {
+			continue
+		}
+		var deps []uuid.UUID
+		for _, depName := range t.DependsOn {
+			if id, ok := nameToID[depName]; ok {
+				deps = append(deps, id)
+			}
+		}
+		tasks = append(tasks, TaskSpec{
+			ExpertID:           expertID,
+			Title:              t.Title,
+			Description:        t.Description,
+			DependsOnExpertIDs: deps,
+		})
+	}
+	if len(tasks) == 0 {
+		return nil, false
+	}
+	return tasks, true
+}
+
+// phaseIndex returns the position of phase in phaseOrder, or -1 if unknown.
+// Used only for recovery skip decisions (pastPhase / runDesign).
+func phaseIndex(phase string) int {
+	for i, p := range phaseOrder {
+		if p == phase {
+			return i
+		}
+	}
+	return -1
 }
 
 // loadWorkflowExperts loads expert records with workflow-specific fields.
@@ -1004,6 +1293,21 @@ func (r *WorkflowRunner) watchForChangeRequest(
 			log.Info("change request watcher stopped (workflow terminal)",
 				zap.String("status", wf.Status))
 			return
+		}
+
+		// Only act while the workflow is actually running.
+		//
+		// WHY: RestartPhase below sets status=running unconditionally. Acting
+		// while paused_for_approval would (a) un-pause a client approval gate
+		// early — the main Run goroutine blocked in waitForResume would wake
+		// and proceed as if approved — and (b) run a second executeWaves
+		// concurrently with the main Run goroutine on the same workflow state.
+		// A pending change request is left pending; it is picked up on the next
+		// poll once the client resolves the gate and status returns to running.
+		if wf.Status != StatusRunning {
+			log.Debug("watcher: workflow not running, deferring change request",
+				zap.String("status", wf.Status))
+			continue
 		}
 
 		// Look for a pending change request.

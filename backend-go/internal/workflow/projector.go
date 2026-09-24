@@ -143,7 +143,7 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 		if err != nil {
 			return
 		}
-		_, _ = p.db.Exec(ctx,
+		if _, err := p.db.Exec(ctx,
 			`UPDATE workflow_tasks SET
 				status = $1,
 				started_at   = CASE WHEN $1 = 'in_progress' AND started_at IS NULL THEN NOW() ELSE started_at END,
@@ -151,7 +151,14 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 				updated_at   = NOW()
 			 WHERE workflow_id = $2 AND assigned_expert_id = $3`,
 			payload.Status, workflowID, expertID,
-		)
+		); err != nil {
+			p.logger.Warn("projector: task_status_changed update failed",
+				zap.String("workflow_id", workflowID.String()),
+				zap.String("expert_id", expertID.String()),
+				zap.String("status", payload.Status),
+				zap.Error(err),
+			)
+		}
 
 	case "task_failed":
 		// UPDATE workflow_tasks.status = 'failed'
@@ -166,11 +173,17 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 		if err != nil {
 			return
 		}
-		_, _ = p.db.Exec(ctx,
+		if _, err := p.db.Exec(ctx,
 			`UPDATE workflow_tasks SET status='failed', completed_at=NOW(), updated_at=NOW()
 			 WHERE workflow_id=$1 AND assigned_expert_id=$2`,
 			workflowID, expertID,
-		)
+		); err != nil {
+			p.logger.Warn("projector: task_failed update failed",
+				zap.String("workflow_id", workflowID.String()),
+				zap.String("expert_id", expertID.String()),
+				zap.Error(err),
+			)
+		}
 
 	case "code_artifact_produced":
 		// INSERT new workflow_tasks row for each code file.
@@ -303,12 +316,20 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 		if event.PostedByExpertID == nil {
 			return
 		}
-		_, _ = p.db.Exec(ctx,
+		if _, err := p.db.Exec(ctx,
 			`UPDATE workflow_tasks
 			 SET produced_artifact_event_id = $1, updated_at = NOW()
 			 WHERE workflow_id = $2 AND assigned_expert_id = $3`,
 			event.ID, workflowID, *event.PostedByExpertID,
-		)
+		); err != nil {
+			p.logger.Warn("projector: artifact link update failed",
+				zap.String("workflow_id", workflowID.String()),
+				zap.String("event_type", event.EventType),
+				zap.String("event_id", event.ID.String()),
+				zap.String("expert_id", event.PostedByExpertID.String()),
+				zap.Error(err),
+			)
+		}
 	}
 }
 
