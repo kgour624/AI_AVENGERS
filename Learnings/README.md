@@ -11,6 +11,8 @@
 | [system_design_tiered_storage_and_s3.md](system_design_tiered_storage_and_s3.md) | System Design Master Class 3 | Hot/warm/cold tiered storage, data-engineering pipeline, full S3 design |
 | [microservices_masterclass_farley.md](microservices_masterclass_farley.md) | Microservices Masterclass | DRY vs coupling, monolith-first, coupled-modules anti-pattern, contracts, observability |
 | [byte_by_byte_ai_6_week.md](byte_by_byte_ai_6_week.md) | Byte by Byte AI — 6 week cohort | LLM foundations (pre/post-training), prompting (zero-shot/few-shot/CoT), structured output & grounding, RAG (chunking/embeddings/ANN/RAFT), evaluation (component-wise, LLM-as-judge) + A13/B1/B8/C3/B6 mapping |
+| [arpit_bhiyani_ai_masterclass.md](arpit_bhiyani_ai_masterclass.md) | AI Masterclass (Arpit Bhiyani) | Reliable prompting, structured output, tool use, agent loops (OTA/Ralph/ReAct/Plan-Execute), memory/caching, hybrid RAG + RRF, evals/LLM-as-judge/red-teaming, production (cascade/circuit breakers), AI system design + A13/A5/A7/B/C mapping |
+| [arpit_bhiyani_last_video.md](arpit_bhiyani_last_video.md) | Arpit Bhiyani — Masterclass Last Video | Memory taxonomy & context management, write/decay strategy, multi-agent patterns (orchestrator/critic/MoA) + deadlock, determinism vs intelligence, incident auto-remediation design, evals as unit tests |
 
 Related hub (product-applied rules): [`../KNOWLEDGE_HUB.md`](../KNOWLEDGE_HUB.md)
 
