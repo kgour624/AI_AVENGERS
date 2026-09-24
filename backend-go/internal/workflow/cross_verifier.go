@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -11,6 +12,10 @@ import (
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
 )
+
+// ErrArtifactBlocked is returned when any reviewer marks an artifact as BLOCKED.
+// The runner treats this as a hard stop (client must decide).
+var ErrArtifactBlocked = errors.New("artifact blocked")
 
 // CrossVerifier implements the cross-verification protocol from §8.
 //
@@ -201,6 +206,8 @@ func (cv *CrossVerifier) reviewArtifact(
 
 		allApproved := true
 		anyBlocked := false
+		reviewedCount := 0
+		var failedReviewers []string
 		var changeRequests []string
 
 		for _, reviewer := range reviewers {
@@ -210,8 +217,10 @@ func (cv *CrossVerifier) reviewArtifact(
 					zap.String("reviewer", reviewer.Name),
 					zap.Error(reviewErr),
 				)
-				continue // Skip failed reviewer, don't block
+				failedReviewers = append(failedReviewers, reviewer.Name)
+				continue // handled after loop so we never falsely approve
 			}
+			reviewedCount++
 
 			switch status {
 			case "approved":
@@ -240,13 +249,35 @@ func (cv *CrossVerifier) reviewArtifact(
 			_, _ = cv.store.Post(ctx, blackboard.PostRequest{
 				WorkflowID: workflowID,
 				EventType:  "artifact_blocked",
+				PostedByClient: true,
 				Content: map[string]interface{}{
 					"artifact_id":   artifact.ID.String(),
 					"artifact_type": artifact.EventType,
 					"reason":        "reviewer blocked artifact",
 				},
 			})
-			return fmt.Errorf("artifact %s blocked by reviewer", artifact.EventType)
+			return fmt.Errorf("%w: %s", ErrArtifactBlocked, artifact.EventType)
+		}
+
+		// Fail closed: if any reviewer failed (or all failed), the verification result is
+		// incomplete, so we must not mark the artifact as approved.
+		if reviewedCount == 0 || len(failedReviewers) > 0 {
+			_, _ = cv.store.Post(ctx, blackboard.PostRequest{
+				WorkflowID:         workflowID,
+				EventType:          "review_inconclusive",
+				PostedByClient:     true,
+				ReferencesEventIDs: []uuid.UUID{artifact.ID},
+				Content: map[string]interface{}{
+					"artifact_id":      artifact.ID.String(),
+					"artifact_type":    artifact.EventType,
+					"round":            round,
+					"reviewed_count":   reviewedCount,
+					"failed_reviewers": failedReviewers,
+					"reason":           "one or more reviewers failed; verification incomplete",
+				},
+			})
+			// Non-blocking by default at the runner-level; caller decides whether to stop.
+			return fmt.Errorf("cross-verify incomplete for %s: reviewed=%d failed=%d", artifact.EventType, reviewedCount, len(failedReviewers))
 		}
 
 		if allApproved {
@@ -254,6 +285,7 @@ func (cv *CrossVerifier) reviewArtifact(
 			_, _ = cv.store.Post(ctx, blackboard.PostRequest{
 				WorkflowID: workflowID,
 				EventType:  "artifact_approved",
+				PostedByClient: true,
 				Content: map[string]interface{}{
 					"artifact_id":   artifact.ID.String(),
 					"artifact_type": artifact.EventType,
@@ -271,6 +303,7 @@ func (cv *CrossVerifier) reviewArtifact(
 		_, _ = cv.store.Post(ctx, blackboard.PostRequest{
 			WorkflowID:         workflowID,
 			EventType:          "revision_requested",
+			PostedByClient:     true,
 			ReferencesEventIDs: []uuid.UUID{artifact.ID},
 			Content: map[string]interface{}{
 				"artifact_id":     artifact.ID.String(),
@@ -309,6 +342,7 @@ func (cv *CrossVerifier) reviewArtifact(
 	_, _ = cv.store.Post(ctx, blackboard.PostRequest{
 		WorkflowID: workflowID,
 		EventType:  "review_escalated_to_client",
+		PostedByClient: true,
 		Content: map[string]interface{}{
 			"artifact_id":   artifact.ID.String(),
 			"artifact_type": artifact.EventType,
@@ -537,6 +571,7 @@ func (cv *CrossVerifier) runReview(
 		WorkflowID:         workflowID,
 		EventType:          "review_comment",
 		PostedByExpertID:   &reviewer.ID,
+		PostedByClient:     false,
 		ReferencesEventIDs: []uuid.UUID{artifact.ID},
 		Content: map[string]interface{}{
 			"artifact_id":     artifact.ID.String(),
@@ -583,6 +618,13 @@ func parseReviewResponse(response string) (status string, comment string) {
 		return "blocked", response
 	}
 
-	// Unexpected format — default to approved (non-blocking)
-	return "approved", ""
+	// Unexpected format — fail closed.
+	// Treat as changes_requested so we never falsely approve an unreviewed artifact.
+	// This will either trigger a revision loop (code artifacts) or escalate after
+	// MaxRevisionRounds (non-code artifacts).
+	trimmed := strings.TrimSpace(response)
+	if len(trimmed) > 300 {
+		trimmed = trimmed[:300] + "..."
+	}
+	return "changes_requested", "unparseable review response: " + trimmed
 }

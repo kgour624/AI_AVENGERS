@@ -204,18 +204,25 @@ func (s *Service) UpdateMessageContent(ctx context.Context, messageID, clientID 
 }
 
 // GetNextTurnNumber returns the next turn number for a chat.
-// WHY: Turn number tracks conversation position.
-// Used by memory manager and rolling summary trigger.
+// WHY: Turn number tracks conversation position (one number per user question
+// + all expert replies in that round). Used by memory manager and the
+// rolling-summary trigger (every 10 turns).
+//
+// WHY MAX(turn_number) not message_count+1:
+//   message_count increments once per row (user + each assistant), so the
+//   old formula produced 1,3,5,7… and turnNumber%10==0 never fired —
+//   rolling summaries never ran. MAX of the turn column advances by exactly
+//   one per completed round.
 func (s *Service) GetNextTurnNumber(ctx context.Context, chatID uuid.UUID) (int, error) {
-	var count int
+	var maxTurn int
 	err := s.db.QueryRow(ctx,
-		`SELECT message_count FROM chats WHERE id=$1`,
+		`SELECT COALESCE(MAX(turn_number), 0) FROM messages WHERE chat_id=$1`,
 		chatID,
-	).Scan(&count)
+	).Scan(&maxTurn)
 	if err != nil {
 		return 0, err
 	}
-	return count + 1, nil
+	return maxTurn + 1, nil
 }
 
 // IncrementMessageCount increments the message count for a chat.

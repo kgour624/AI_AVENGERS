@@ -255,9 +255,18 @@ func (h *Handler) Send(c *gin.Context) {
 		// Multi-expert = blocking path (same as before, no regression).
 		var tokenCh chan string
 		var tokenDone chan struct{}
+		// stopForwarding: signal the SSE forwarder to exit WITHOUT closing
+		// tokenCh. Closing tokenCh while an expert goroutine may still send
+		// (orchestrator timeout path returns without waiting for wg) panics
+		// with "send on closed channel" and crashes the process — Gin recovery
+		// does not catch panics in non-Gin goroutines. Producers stop via
+		// <-ctx.Done() once the HTTP handler returns and net/http cancels the
+		// request context; the channel is then GC'd.
+		var stopForwarding chan struct{}
 		if len(expertIDs) == 1 {
 			tokenCh = make(chan string, 128)
 			tokenDone = make(chan struct{})
+			stopForwarding = make(chan struct{})
 			// Goroutine: forward tokens from channel to SSE as they arrive.
 			// Runs concurrently with orchestrator.Process().
 			// Empty string tokens are heartbeats (sent by blocking-fallback
@@ -265,14 +274,39 @@ func (h *Handler) Send(c *gin.Context) {
 			// so no fake content reaches the frontend.
 			go func() {
 				defer close(tokenDone)
-				for token := range tokenCh {
+				forward := func(token string) {
 					if token == "" {
-						continue // heartbeat — keep connection alive, no content
+						return // heartbeat — keep connection alive, no content
 					}
 					sendSSE(w, SSEChunk, map[string]interface{}{
 						"content":   token,
 						"expert_id": expertIDs[0].String(),
 					})
+				}
+				for {
+					select {
+					case token, ok := <-tokenCh:
+						if !ok {
+							return
+						}
+						forward(token)
+					case <-stopForwarding:
+						// Drain whatever is already buffered so happy-path
+						// tokens are not dropped, then exit. Do not block
+						// waiting for future sends (producers may still be
+						// alive on the orchestrator-timeout path).
+						for {
+							select {
+							case token, ok := <-tokenCh:
+								if !ok {
+									return
+								}
+								forward(token)
+							default:
+								return
+							}
+						}
+					}
 				}
 			}()
 		}
@@ -294,6 +328,11 @@ func (h *Handler) Send(c *gin.Context) {
 		}
 
 		orchestratorResp, err := h.orchestrator.Process(c.Request.Context(), orchestratorReq)
+
+		// Stop the forwarder (do NOT close tokenCh — a live producer may still send).
+		if stopForwarding != nil {
+			close(stopForwarding)
+		}
 
 		// Wait for token forwarding goroutine to finish before sending SSEComplete.
 		// This ensures all streamed tokens arrive before the complete event.
@@ -357,8 +396,20 @@ func (h *Handler) Send(c *gin.Context) {
 			sendSSE(w, SSESynthesis, orchestratorResp.Synthesis)
 		}
 
-		// Update chat index async
-		go h.indexTurn(context.Background(), chatID, fullMessage, orchestratorResp, turnNumber)
+		// Update chat index async — use a real messages.id so the FK holds.
+		// Prefer the first successfully saved assistant message; fall back to
+		// the user message (always saved before streaming). Fake uuid.New()
+		// used to FK-fail silently and leave chat_index empty forever.
+		indexMsgID := userMsgID
+		for _, expertResp := range orchestratorResp.ExpertResponses {
+			if idStr, ok := savedMessageIDs[expertResp.ExpertID.String()]; ok {
+				if parsed, perr := uuid.Parse(idStr); perr == nil && parsed != uuid.Nil {
+					indexMsgID = parsed
+					break
+				}
+			}
+		}
+		go h.indexTurn(context.Background(), chatID, indexMsgID, fullMessage, orchestratorResp, turnNumber)
 
 		// Generate rolling summary every 10 turns
 		if turnNumber%10 == 0 {
@@ -460,14 +511,23 @@ func (h *Handler) saveAssistantMessage(
 
 // indexTurn creates a chat_index entry for semantic search.
 // Uses cheap LLM to generate one-line summary and extract topic.
+// messageID must be an existing messages.id (FK on chat_index.message_id).
 func (h *Handler) indexTurn(
 	ctx context.Context,
 	chatID uuid.UUID,
+	messageID uuid.UUID,
 	userMessage string,
 	orchestratorResp *orchestrator.OrchestratorResponse,
 	turnNumber int,
 ) {
 	if len(orchestratorResp.ExpertResponses) == 0 {
+		return
+	}
+	if messageID == uuid.Nil {
+		h.logger.Warn("indexTurn skipped: nil message_id",
+			zap.String("chat_id", chatID.String()),
+			zap.Int("turn", turnNumber),
+		)
 		return
 	}
 
@@ -532,8 +592,16 @@ Return JSON: {"summary": "...", "topic": "...", "importance": 1-5}`, turnText)
 		embedding = emb
 	}
 
-	// Save to chat_index
-	_ = h.chatSvc.IndexTurn(ctx, chatID, uuid.New(), turnNumber, summary, topic, importance, embedding)
+	// Save to chat_index with a real messages.id (FK). Never swallow the error —
+	// a silent fail left semantic history + rolling summaries dead forever.
+	if err := h.chatSvc.IndexTurn(ctx, chatID, messageID, turnNumber, summary, topic, importance, embedding); err != nil {
+		h.logger.Error("indexTurn insert failed",
+			zap.String("chat_id", chatID.String()),
+			zap.String("message_id", messageID.String()),
+			zap.Int("turn", turnNumber),
+			zap.Error(err),
+		)
+	}
 }
 
 // generateRollingSummary generates a rolling summary every 10 turns.

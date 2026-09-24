@@ -51,6 +51,14 @@ import (
 // never mean "unbounded").
 const toolLoopMaxStepsDefault = 8
 
+// designConflictGate is the approval_requests.gate_name for a conflict that
+// could not be auto-resolved and must go to the client.
+//
+// Already legal: migration 018 widened approval_requests_gate_check to include
+// 'design_conflict'. No migration is needed — same reasoning as amendmentGate
+// in amendment.go (the constraint was widened for a code path that was missing).
+const designConflictGate = "design_conflict"
+
 // Tool is one capability the model may invoke (§7.2). Everything about a tool
 // is data except the Go closure that runs it: the registry is built once at
 // startup and filtered per expert from AllowedTools, so granting or withdrawing
@@ -870,21 +878,19 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 	isSpineStatement := strings.HasPrefix(strings.TrimSpace(args.StatementID), "C-")
 	if isSpineStatement {
 		// Architectural decision — always goes to the client.
-		_, _ = l.store.Post(ctx, blackboard.PostRequest{
-			WorkflowID:     l.workflowID,
-			EventType:      "design_conflict_escalated",
-			PostedByClient: false,
-			Content: map[string]any{
-				"conflict_event_id": ev.ID,
-				"statement_id":      args.StatementID,
-				"reason":            "spine statement — architectural decision requires client approval",
-			},
-		})
+		approvalID, escErr := escalateConflictToClient(ctx, l, ev.ID, args.StatementID,
+			"spine statement — architectural decision requires client approval",
+			nil,
+		)
+		if escErr != nil {
+			return nil, fmt.Errorf("raise_conflict: escalate spine: %w", escErr)
+		}
 		return map[string]any{
-			"raised":    true,
-			"event_id":  ev.ID,
-			"escalated": true,
-			"note":      "This is a spine-level architectural statement (C-NNN). It requires client approval — rank cannot override a product decision.",
+			"raised":      true,
+			"event_id":    ev.ID,
+			"escalated":   true,
+			"approval_id": approvalID.String(),
+			"note":        "This is a spine-level architectural statement (C-NNN). It requires client approval — rank cannot override a product decision.",
 		}, nil
 	}
 
@@ -920,11 +926,19 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 	)
 	if queryErr != nil {
 		// DB error — fall back to client escalation rather than failing the tool.
+		approvalID, escErr := escalateConflictToClient(ctx, l, ev.ID, args.StatementID,
+			fmt.Sprintf("could not load ranked experts (db error: %s)", queryErr.Error()),
+			nil,
+		)
+		if escErr != nil {
+			return nil, fmt.Errorf("raise_conflict: escalate after rank query fail: %w", escErr)
+		}
 		return map[string]any{
-			"raised":    true,
-			"event_id":  ev.ID,
-			"escalated": true,
-			"note":      fmt.Sprintf("Could not load ranked experts (db error: %s) — escalated to client.", queryErr.Error()),
+			"raised":      true,
+			"event_id":    ev.ID,
+			"escalated":   true,
+			"approval_id": approvalID.String(),
+			"note":        fmt.Sprintf("Could not load ranked experts (db error: %s) — escalated to client.", queryErr.Error()),
 		}, nil
 	}
 	defer rows.Close()
@@ -946,11 +960,19 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		candidates = append(candidates, re)
 	}
 	if rowsErr := rows.Err(); rowsErr != nil {
+		approvalID, escErr := escalateConflictToClient(ctx, l, ev.ID, args.StatementID,
+			fmt.Sprintf("could not read ranked experts (rows error: %s)", rowsErr.Error()),
+			nil,
+		)
+		if escErr != nil {
+			return nil, fmt.Errorf("raise_conflict: escalate after rank rows fail: %w", escErr)
+		}
 		return map[string]any{
-			"raised":    true,
-			"event_id":  ev.ID,
-			"escalated": true,
-			"note":      fmt.Sprintf("Could not read ranked experts (rows error: %s) — escalated to client.", rowsErr.Error()),
+			"raised":      true,
+			"event_id":    ev.ID,
+			"escalated":   true,
+			"approval_id": approvalID.String(),
+			"note":        fmt.Sprintf("Could not read ranked experts (rows error: %s) — escalated to client.", rowsErr.Error()),
 		}, nil
 	}
 
@@ -1028,24 +1050,106 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 	}
 
 	// Step 4: no candidate had knowledge — escalate to client.
-	_, _ = l.store.Post(ctx, blackboard.PostRequest{
-		WorkflowID:     l.workflowID,
-		EventType:      "design_conflict_escalated",
-		PostedByClient: false,
-		Content: map[string]any{
-			"conflict_event_id": ev.ID,
-			"statement_id":      args.StatementID,
-			"reason":            "no expert with sufficient training found to auto-resolve",
-			"skipped_experts":   skippedMessages,
-		},
-	})
+	approvalID, escErr := escalateConflictToClient(ctx, l, ev.ID, args.StatementID,
+		"no expert with sufficient training found to auto-resolve",
+		skippedMessages,
+	)
+	if escErr != nil {
+		return nil, fmt.Errorf("raise_conflict: escalate unresolved: %w", escErr)
+	}
 	return map[string]any{
 		"raised":          true,
 		"event_id":        ev.ID,
 		"escalated":       true,
+		"approval_id":     approvalID.String(),
 		"skipped_experts": skippedMessages,
 		"note":            "No expert with relevant training could auto-resolve this conflict. Escalated to client for manual decision.",
 	}, nil
+}
+
+// escalateConflictToClient records the escalation and opens a client decision
+// gate without pausing the workflow.
+//
+// Two bugs this closes:
+//  1. The old path posted design_conflict_escalated with PostedByClient=false
+//     and no expert ID, which violates blackboard_events_poster_check
+//     (migration 006). The insert was ignored via `_, _ =`, so the event never
+//     landed.
+//  2. No approval_requests row was created, so the frontend never received an
+//     approval_id and never rendered Approve / Request-changes buttons.
+//
+// Pattern mirrors amendment proposal (amendment.go): createApprovalRequest +
+// blackboard events, no PauseForApproval — a chat-time conflict must not freeze
+// a design wave in progress.
+func escalateConflictToClient(
+	ctx context.Context,
+	l *toolLoopContext,
+	conflictEventID uuid.UUID,
+	statementID string,
+	reason string,
+	skippedExperts []string,
+) (uuid.UUID, error) {
+	content := map[string]any{
+		"conflict_event_id": conflictEventID.String(),
+		"statement_id":      statementID,
+		"reason":            reason,
+	}
+	if len(skippedExperts) > 0 {
+		content["skipped_experts"] = skippedExperts
+	}
+
+	// System escalation → posted_by_client=true (satisfies poster CHECK).
+	escEv, err := l.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:     l.workflowID,
+		EventType:      "design_conflict_escalated",
+		PostedByClient: true,
+		Content:        content,
+		ReferencesEventIDs: []uuid.UUID{conflictEventID},
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("post escalated event: %w", err)
+	}
+
+	summary := fmt.Sprintf("Design conflict on %s needs your decision: %s", statementID, reason)
+	approvalID, err := createApprovalRequest(ctx, l.db, AskClientRequest{
+		WorkflowID: l.workflowID,
+		GateName:   designConflictGate,
+		Summary:    summary,
+		ArtifactContent: map[string]any{
+			"conflict_event_id":    conflictEventID.String(),
+			"escalation_event_id":  escEv.ID.String(),
+			"statement_id":         statementID,
+			"reason":               reason,
+			"skipped_experts":      skippedExperts,
+			"chat_id":              l.chatID.String(),
+			"raised_by_expert_id":  l.expert.ID.String(),
+			"raised_by_expert":     l.expert.Name,
+		},
+		CitedEventIDs: []uuid.UUID{conflictEventID, escEv.ID},
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("create approval: %w", err)
+	}
+
+	// question_to_client carries approval_id so the kanban SSE / frontend can
+	// set approvalGate and render the decision buttons (same contract as
+	// Tools.AskClient — without this the if(approvalId) guard never fires).
+	_, err = l.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID:     l.workflowID,
+		EventType:      "question_to_client",
+		PostedByClient: true,
+		Content: map[string]any{
+			"gate_name":   designConflictGate,
+			"summary":     summary,
+			"approval_id": approvalID.String(),
+		},
+		ReferencesEventIDs: []uuid.UUID{conflictEventID, escEv.ID},
+	})
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("post question_to_client: %w", err)
+	}
+
+	return approvalID, nil
 }
 
 // rankStr formats a nullable rank for log messages.
