@@ -45,10 +45,15 @@ type EnforceResult struct {
 	Reason      string
 	// TemplateSections is set ONLY when the expert's category has a
 	// non-empty template_schema (CT-B, CATEGORY_TEMPLATE_HANDOFF.md §4).
-	// nil/empty for every flat-text expert (CT-L2 fallback) — Answer
+	// nil/empty for every flat-text expert (CT-L2) — Answer
 	// is the only populated field in that case, exactly as before this
 	// feature existed.
 	TemplateSections []TemplateSectionResult
+	// QualityScore (B6): overall LLM-as-judge score in [0,1] for the
+	// flat-path answer. 0 when the judge is disabled, failed open, or
+	// the path is structured (structured scoring deferred). Observability
+	// only — never used to refuse a cited answer after retries are spent.
+	QualityScore float64
 }
 
 // Citation links a claim to a source chunk.
@@ -279,25 +284,139 @@ func (e *Enforcer) Enforce(
 			if strings.TrimSpace(cleanAnswer) == "" {
 				return e.buildRefusal("empty_after_strip", "Could not generate a properly cited answer"), nil
 			}
+			// BaseProfile produced the cleaned answer — keep BaseProfile for
+			// quality regen so domain strip rules can't empty it again.
+			ans, cites, qScore := e.applyQualityGate(
+				ctx, question, chunks, expertName, reasoningCharter, replyContext, BaseProfile,
+				cleanAnswer, baseGenerated.Citations,
+			)
 			return &EnforceResult{
-				Status:     "success",
-				Answer:     cleanAnswer,
-				Citations:  baseGenerated.Citations,
-				Coverage:   coverage,
-				Confidence: float64(bestScore),
+				Status:       "success",
+				Answer:       ans,
+				Citations:    cites,
+				Coverage:     coverage,
+				Confidence:   float64(bestScore),
+				QualityScore: qScore,
 			}, nil
 		} else {
 			return e.buildRefusal("empty_after_strip", "Could not generate a properly cited answer"), nil
 		}
 	}
 
+	ans, cites, qScore := e.applyQualityGate(
+		ctx, question, chunks, expertName, reasoningCharter, replyContext, profile,
+		cleanAnswer, generated.Citations,
+	)
 	return &EnforceResult{
-		Status:     "success",
-		Answer:     cleanAnswer,
-		Citations:  generated.Citations,
-		Coverage:   coverage,
-		Confidence: float64(bestScore),
+		Status:       "success",
+		Answer:       ans,
+		Citations:    cites,
+		Coverage:     coverage,
+		Confidence:   float64(bestScore),
+		QualityScore: qScore,
 	}, nil
+}
+
+// applyQualityGate (B6) scores a cleaned flat-path answer and, when
+// below floor, regenerates up to MaxQualityRetries times with the
+// judge's feedback injected into the generation prompt. tokenCh is
+// deliberately nil on regen so a second stream does not interleave
+// with the already-forwarded first stream (SSE would append a second
+// answer after the client already painted the first).
+//
+// Kill switch: QualityJudgeEnabled=false → return inputs unchanged,
+// score 0. Fail-open on judge error → return current best answer.
+func (e *Enforcer) applyQualityGate(
+	ctx context.Context,
+	question string,
+	chunks []CourseChunk,
+	expertName string,
+	reasoningCharter string,
+	replyContext string,
+	profile *DomainProfile,
+	answer string,
+	citations []Citation,
+) (string, []Citation, float64) {
+	if e == nil || !e.cfg.QualityJudgeEnabled {
+		return answer, citations, 0
+	}
+	floor := e.cfg.QualityFloor
+	if floor <= 0 || floor > 1 {
+		floor = 0.7
+	}
+	maxRetries := e.cfg.MaxQualityRetries
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	bestAnswer := answer
+	bestCites := citations
+	bestScore := 0.0
+
+	verdict := e.judgeAnswer(ctx, question, answer, chunks, floor)
+	bestScore = verdict.Overall
+	e.logger.Info("quality judge",
+		zap.Float64("overall", verdict.Overall),
+		zap.Float64("floor", floor),
+		zap.Bool("pass", verdict.Pass),
+		zap.String("method", verdict.Method),
+		zap.String("feedback", truncateForLog(verdict.Feedback, 120)),
+	)
+	// Pass, score-only mode, or fail-open (judge broke) → keep answer, no regen.
+	if verdict.Pass || maxRetries == 0 || verdict.Method == "fail_open" {
+		return bestAnswer, bestCites, bestScore
+	}
+
+	feedback := verdict.Feedback
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if strings.TrimSpace(feedback) == "" {
+			feedback = "Improve accuracy, coverage and structure against the training material."
+		}
+		e.logger.Info("quality regenerate",
+			zap.Int("attempt", attempt),
+			zap.Int("max", maxRetries),
+			zap.String("feedback", truncateForLog(feedback, 120)),
+		)
+		// tokenCh=nil: no streaming on regen (see function doc).
+		// revisionFeedback is appended to the user prompt of generateFlatText.
+		regenProfile := profile
+		if regenProfile == nil {
+			regenProfile = BaseProfile
+		}
+		regen, err := e.generateWithCitations(
+			ctx, question, chunks, expertName, reasoningCharter, replyContext,
+			regenProfile, nil, "", nil, feedback,
+		)
+		if err != nil {
+			e.logger.Warn("quality regenerate failed", zap.Int("attempt", attempt), zap.Error(err))
+			break
+		}
+		clean, _ := e.stripUncited(regen.Answer, regenProfile.StripMode)
+		clean = e.cleanChunkIDs(clean)
+		if strings.TrimSpace(clean) == "" {
+			e.logger.Warn("quality regenerate produced empty after strip", zap.Int("attempt", attempt))
+			continue
+		}
+		v2 := e.judgeAnswer(ctx, question, clean, chunks, floor)
+		e.logger.Info("quality judge after regen",
+			zap.Int("attempt", attempt),
+			zap.Float64("overall", v2.Overall),
+			zap.Bool("pass", v2.Pass),
+			zap.String("method", v2.Method),
+		)
+		if v2.Overall >= bestScore {
+			bestAnswer = clean
+			bestCites = regen.Citations
+			bestScore = v2.Overall
+		}
+		if v2.Pass {
+			return bestAnswer, bestCites, bestScore
+		}
+		feedback = v2.Feedback
+	}
+	// Retries spent: ship the best attempt. Citation wall already passed;
+	// quality is soft.
+	return bestAnswer, bestCites, bestScore
 }
 
 // enforceStructured runs Layer 4 (per-section) and the BaseProfile safety
@@ -537,7 +656,16 @@ func (e *Enforcer) generateWithCitations(
 	templateSections []category.TemplateSection,
 	defaultLanguage string,
 	tokenCh chan<- string,
+	// revisionFeedback (B6): optional judge feedback appended to the user
+	// prompt on quality-gated regenerations. Empty on the first generate.
+	// Variadic so every existing call site (Enforce / BaseProfile safety
+	// net / structured path) stays source-compatible without edits.
+	revisionFeedback ...string,
 ) (*generatedAnswer, error) {
+	feedback := ""
+	if len(revisionFeedback) > 0 {
+		feedback = strings.TrimSpace(revisionFeedback[0])
+	}
 
 	// Build context with chunk IDs
 	var contextSB strings.Builder
@@ -546,10 +674,12 @@ func (e *Enforcer) generateWithCitations(
 	}
 
 	if len(templateSections) > 0 {
+		// Structured path ignores revisionFeedback for now (B6 scope =
+		// flat only; per-section judge deferred).
 		return e.generateStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, contextSB.String(), templateSections, defaultLanguage, profile, tokenCh)
 	}
 
-	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextSB.String(), tokenCh)
+	return e.generateFlatText(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, contextSB.String(), tokenCh, feedback)
 }
 
 // generateFlatText is the ORIGINAL flat-text generation path, extracted
@@ -569,6 +699,7 @@ func (e *Enforcer) generateFlatText(
 	profile *DomainProfile,
 	contextText string,
 	tokenCh chan<- string,
+	revisionFeedback string, // B6: empty on first generate; set on quality regen
 ) (*generatedAnswer, error) {
 	var systemPrompt string
 	if profile.CitationMode == CitationModeLoose {
@@ -620,6 +751,14 @@ COURSE CONTENT:
 		systemPrompt += "\n\n" + replyContext
 	}
 
+	// User prompt: the question, plus optional REVISION FEEDBACK from the
+	// quality judge (B6). Empty feedback on the first generate keeps the
+	// prompt byte-identical to pre-B6 for the hot path.
+	userPrompt := question
+	if revisionFeedback != "" {
+		userPrompt = question + "\n\nREVISION FEEDBACK (previous draft was below quality floor — fix these points, keep all citations):\n" + revisionFeedback
+	}
+
 	// Gate 5 generation: streaming when tokenCh non-nil, blocking otherwise.
 	//
 	// WHY streaming timeout (45s):
@@ -636,7 +775,7 @@ COURSE CONTENT:
 		rawTokenCh, rawRespCh, streamErr := e.gateway.StreamCall(streamCtx, gateway.LLMRequest{
 			Model:        gateway.ModelStrong,
 			SystemPrompt: systemPrompt,
-			UserPrompt:   question,
+			UserPrompt:   userPrompt,
 			MaxTokens:    resolveMaxTokens(profile.MaxTokensFlat, DefaultMaxTokensFlat),
 			Temperature:  0.4,
 		})
@@ -703,7 +842,7 @@ COURSE CONTENT:
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelStrong,
 		SystemPrompt: systemPrompt,
-		UserPrompt:   question,
+		UserPrompt:   userPrompt,
 		MaxTokens:    resolveMaxTokens(profile.MaxTokensFlat, DefaultMaxTokensFlat),
 		Temperature:  0.4,
 	})

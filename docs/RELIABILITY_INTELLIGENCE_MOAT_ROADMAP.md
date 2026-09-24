@@ -304,6 +304,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, China Wall, Go. |
 | **Files/Risk/Rollback** | `internal/chinawall/*`, `internal/decision/*`. Risk: Medium–High (cost). Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: force a weak answer and observe one regeneration. |
+| **DONE (B6)** | Flat-path only. `ChinaWallConfig` + Load defaults: `QualityJudgeEnabled` (absent env → true via `IsSet`), `QualityFloor` 0.7, `MaxQualityRetries` 1 (absent → 1, explicit 0 = score-only). `quality_judge.go`: `judgeAnswer` via `ModelFast` (divergent from generator `ModelStrong`); strict JSON rubric accuracy/coverage/structure/overall + feedback; top-level filter `Overall >= floor` (not average); parse clamp [0,1]; fail-open on LLM/parse error (`Method=fail_open`, score 0, no regen). `applyQualityGate` after Layer 4 success; regen up to N with `REVISION FEEDBACK` on user prompt, `tokenCh=nil` (no second stream); keeps best by overall; never refuses a cited answer after retries. `generateWithCitations` variadic `revisionFeedback`; empty = first-generate byte-identical. `EnforceResult.QualityScore`. Kill switch: `CHINA_WALL_QUALITY_JUDGE_ENABLED=false`. Structured path deferred. Tests: `quality_judge_test.go` (parse/fence/clamp/top-level/cap). |
 
 ### B7 — Project memory consolidation (L2 → summaries → L3)
 | Part | Detail |
@@ -485,7 +486,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | B3 | workflow memory write-back | B | ✅ done | (pending PR, this branch) |
 | B4 | gate threshold calibration | B | ✅ done | (pending PR, this branch) |
 | B5 | self-learning hardening | B | ✅ done | (pending PR, this branch) |
-| B6 | answer quality regeneration | B | ⬜ pending | — |
+| B6 | answer quality regeneration | B | ✅ done | (pending PR, this branch) |
 | B7 | memory consolidation | B | ⬜ pending | — |
 | B8 | verification-first answers | B | ⬜ pending | — |
 | B9 | context-budget policy | B | ⬜ pending | — |
