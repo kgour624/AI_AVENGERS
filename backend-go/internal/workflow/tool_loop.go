@@ -1020,7 +1020,8 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		}
 
 		// Knowledge check: does this expert have relevant training?
-		if !l.gates.HasKnowledge(ctx, candidate.expert.ID, conflictTopic) {
+		// B4: pass domain so HasKnowledge uses the domain's usable threshold.
+		if !l.gates.HasKnowledge(ctx, candidate.expert.ID, conflictTopic, candidate.expert.Domain) {
 			msg := fmt.Sprintf("%s (rank %v): skipped — no relevant training chunks for this topic",
 				candidate.expert.Name, rankStr(candidate.rank))
 			skippedMessages = append(skippedMessages, msg)

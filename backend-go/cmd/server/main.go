@@ -466,7 +466,7 @@ func buildRouter(
 		logger,
 	)
 	// GateSystem holds no mutable state (assembler + logger only)
-	wfGateSystem := workflow.NewGateSystem(contextAssembler, logger)
+	wfGateSystem := workflow.NewGateSystem(contextAssembler, postgres.Pool, logger)
 
 	wfQARunner := workflow.NewQARunner(
 		postgres.Pool, bbStore, wfGateSystem, modelGateway, wfSections, workspaceRoot, logger,
@@ -792,6 +792,12 @@ func buildRouter(
 		adminGroup.GET("/domain-profiles", adminHandler.ListDomainProfiles)
 		adminGroup.GET("/domain-profiles/:domain", adminHandler.GetDomainProfile)
 		adminGroup.PATCH("/domain-profiles/:domain", adminHandler.UpdateDomainProfile)
+		// Gate 1 thresholds (B4) — per-domain usable/strong config.
+		// Calibrate writes proposals only; Apply / Set make them live.
+		adminGroup.GET("/gate-thresholds", adminHandler.ListGateThresholds)
+		adminGroup.POST("/gate-thresholds/calibrate", adminHandler.CalibrateGateThresholds)
+		adminGroup.POST("/gate-thresholds/:domain/apply", adminHandler.ApplyGateThreshold)
+		adminGroup.PATCH("/gate-thresholds/:domain", adminHandler.SetGateThreshold)
 	}
 
 	return router

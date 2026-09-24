@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
 	appcontext "ai_avengers/backend/internal/context"
@@ -119,14 +120,119 @@ type PeerContribution struct {
 // one it had was the coverage check, and that decision now belongs to the
 // client (workflows.generic_allowance_pct). Keeping an unused LLM dependency
 // here would misrepresent what this type does.
+// GateThresholds is the usable/strong pair Gate 1 compares rerank scores
+// against. Defaults equal the historical package constants so a missing
+// DB row produces byte-identical behaviour to pre-B4.
+type GateThresholds struct {
+	Usable float64
+	Strong float64
+	// Source is "default" when the package constants are used, otherwise
+	// the gate_thresholds.source of the applied/manual row that won.
+	Source string
+	Domain string
+}
+
+// DefaultGateThresholds returns the historical constants. Public so the
+// calibration path and admin GET can surface the baseline.
+func DefaultGateThresholds() GateThresholds {
+	return GateThresholds{
+		Usable: gate1UsableThreshold,
+		Strong: gate1StrongThreshold,
+		Source: "default",
+	}
+}
+
+// thresholdCacheTTL: how long a per-domain lookup stays hot. Admin apply
+// after a calibration becomes visible within this window without a restart.
+const thresholdCacheTTL = 30 * time.Second
+
+type cachedThresholds struct {
+	t       GateThresholds
+	expires time.Time
+}
+
 type GateSystem struct {
 	assembler *appcontext.Assembler
-	logger    *zap.Logger
+	// db (B4): optional. When set, thresholdsFor looks up gate_thresholds
+	// for applied/manual rows. Nil keeps the historical const path —
+	// AgentLoop that has no pool still works.
+	db     *pgxpool.Pool
+	logger *zap.Logger
+
+	// thrCache avoids a DB round-trip on every expert task. Keyed by
+	// domain (empty key = global default, reserved for future).
+	thrMu    sync.RWMutex
+	thrCache map[string]cachedThresholds
 }
 
 // NewGateSystem creates a new GateSystem.
-func NewGateSystem(assembler *appcontext.Assembler, logger *zap.Logger) *GateSystem {
-	return &GateSystem{assembler: assembler, logger: logger}
+// db may be nil (const-only mode); pass the pool in production so per-domain
+// applied/manual overrides from gate_thresholds are honoured (B4/P8).
+func NewGateSystem(assembler *appcontext.Assembler, db *pgxpool.Pool, logger *zap.Logger) *GateSystem {
+	return &GateSystem{
+		assembler: assembler,
+		db:        db,
+		logger:    logger,
+		thrCache:  make(map[string]cachedThresholds),
+	}
+}
+
+// thresholdsFor returns the Gate 1 usable/strong pair for a domain.
+// Order of preference: cache hit → applied/manual DB row → package defaults.
+// Never errors out to the caller — a DB hiccup falls back to defaults so a
+// config outage cannot abort a wave.
+func (g *GateSystem) thresholdsFor(ctx context.Context, domain string) GateThresholds {
+	def := DefaultGateThresholds()
+	def.Domain = domain
+	if g == nil {
+		return def
+	}
+
+	key := strings.ToLower(strings.TrimSpace(domain))
+	now := time.Now()
+	g.thrMu.RLock()
+	if hit, ok := g.thrCache[key]; ok && now.Before(hit.expires) {
+		g.thrMu.RUnlock()
+		return hit.t
+	}
+	g.thrMu.RUnlock()
+
+	t := def
+	if g.db != nil && key != "" {
+		var usable, strong float64
+		var source string
+		err := g.db.QueryRow(ctx, `
+			SELECT usable, strong, source
+			  FROM gate_thresholds
+			 WHERE lower(domain) = $1
+			   AND source IN ('applied', 'manual')
+			 LIMIT 1`, key).Scan(&usable, &strong, &source)
+		if err == nil && strong > usable && usable > 0 {
+			t = GateThresholds{
+				Usable: usable,
+				Strong: strong,
+				Source: source,
+				Domain: domain,
+			}
+		}
+		// err != nil (no row / table missing / etc.) → keep defaults.
+	}
+
+	g.thrMu.Lock()
+	g.thrCache[key] = cachedThresholds{t: t, expires: now.Add(thresholdCacheTTL)}
+	g.thrMu.Unlock()
+	return t
+}
+
+// InvalidateThresholdCache drops the in-process cache so the next
+// thresholdsFor re-reads the DB. Called by admin apply/PATCH.
+func (g *GateSystem) InvalidateThresholdCache() {
+	if g == nil {
+		return
+	}
+	g.thrMu.Lock()
+	g.thrCache = make(map[string]cachedThresholds)
+	g.thrMu.Unlock()
 }
 
 // RunGates executes Gate 1 → Gate 2 → Gate 3 decision.
@@ -176,6 +282,10 @@ func (g *GateSystem) RunGates(
 		// Non-fatal: treat as Gate 1 fail, proceed to Gate 2
 	}
 
+	// B4: per-domain thresholds (applied/manual DB row, else package
+	// defaults). Resolved once per RunGates so log + band split agree.
+	thr := g.thresholdsFor(ctx, expert.Domain)
+
 	// Split own training into the two bands. ownChunks arrive sorted by
 	// rerank score, best first.
 	var strongChunks, usableChunks []chinawall.CourseChunk
@@ -189,10 +299,10 @@ func (g *GateSystem) RunGates(
 		if s != 0.5 {
 			allExactlyHalf = false
 		}
-		if s >= gate1StrongThreshold {
+		if s >= thr.Strong {
 			strongChunks = append(strongChunks, c)
 		}
-		if s >= gate1UsableThreshold {
+		if s >= thr.Usable {
 			usableChunks = append(usableChunks, c)
 		}
 	}
@@ -209,12 +319,14 @@ func (g *GateSystem) RunGates(
 	// in the logs and need opposite fixes.
 	g.logger.Info("gate system: Gate 1 result",
 		zap.String("expert", expert.Name),
+		zap.String("domain", expert.Domain),
 		zap.Int("total_chunks", len(ownChunks)),
 		zap.Int("usable_chunks", len(usableChunks)),
 		zap.Int("strong_chunks", len(strongChunks)),
 		zap.Float64("top_score", topScore),
-		zap.Float64("usable_threshold", gate1UsableThreshold),
-		zap.Float64("strong_threshold", gate1StrongThreshold),
+		zap.Float64("usable_threshold", thr.Usable),
+		zap.Float64("strong_threshold", thr.Strong),
+		zap.String("threshold_source", thr.Source),
 		zap.Bool("rerank_fallback_suspected", allExactlyHalf),
 	)
 
@@ -358,22 +470,24 @@ func (g *GateSystem) pollPeers(
 }
 
 // HasKnowledge returns true when the expert has at least one training chunk
-// for the given topic that scores at or above gate1UsableThreshold (0.40).
+// for the given topic that scores at or above the usable threshold for its
+// domain (B4: domain override if applied, else the package default 0.40).
 //
 // Used by the conflict auto-resolver (tool_loop.go toolRaiseConflict) to
 // check whether a higher-rank expert actually knows the topic before letting
 // it decide. Rank gives authority; knowledge gives legitimacy.
 //
-// WHY reuse gate1UsableThreshold: it is the same bar Gate 1 uses to decide
+// WHY reuse the Gate 1 usable bar: it is the same bar Gate 1 uses to decide
 // "this training is relevant enough to apply as principles". A score below
 // it means the expert's training is too weak to reason from — the same
-// conclusion applies here.
-func (g *GateSystem) HasKnowledge(ctx context.Context, expertID uuid.UUID, topic string) bool {
+// conclusion applies here. domain is optional; empty → package default.
+func (g *GateSystem) HasKnowledge(ctx context.Context, expertID uuid.UUID, topic string, domain string) bool {
 	chunks, err := g.assembler.GetCourseChunksForWorkflow(ctx, expertID, topic, 1)
 	if err != nil || len(chunks) == 0 {
 		return false
 	}
-	return float64(chunks[0].RerankScore) >= gate1UsableThreshold
+	thr := g.thresholdsFor(ctx, domain)
+	return float64(chunks[0].RerankScore) >= thr.Usable
 }
 
 // FormatGateContext builds the context string from GateResult.

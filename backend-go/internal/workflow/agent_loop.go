@@ -67,7 +67,7 @@ func NewAgentLoop(db *pgxpool.Pool, tools *Tools, store *blackboard.Store, gw *g
 	var gs *GateSystem
 	var eb *ExperienceBank
 	if assembler != nil {
-		gs = NewGateSystem(assembler, logger)
+		gs = NewGateSystem(assembler, db, logger)
 		eb = NewExperienceBank(db, logger)
 	}
 	return &AgentLoop{

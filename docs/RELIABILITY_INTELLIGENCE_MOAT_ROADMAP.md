@@ -280,6 +280,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | AI, System Design, DB. |
 | **Files/Risk/Rollback** | `internal/decision/*`, `internal/rating/*`, config. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: seed ratings and observe threshold shift. |
+| **DONE (B4)** | Migration `025_gate_thresholds` (per-domain usable/strong, source calibrated/applied/manual). `GateSystem` takes `db`, `thresholdsFor(domain)` with 30s cache — only applied/manual live; missing row → package defaults (byte-identical to pre-B4). `RunGates` + `HasKnowledge(domain)` use it. `ProposeGateThresholds` from ratings (min 20 samples; high-accept loosen / high-reject tighten; never overwrites applied/manual). Admin: `GET/POST calibrate/POST apply/PATCH` under `/admin/gate-thresholds`. P7: no blind auto-apply (eval harness deferred). |
 
 ### B5 — Question pre-processing / self-learning hardening
 | Part | Detail |
