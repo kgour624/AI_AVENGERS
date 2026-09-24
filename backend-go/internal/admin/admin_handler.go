@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"ai_avengers/backend/internal/byoexpert"
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/eval"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
@@ -63,7 +65,10 @@ type AdminHandler struct {
 	// (true push, not a 1s snapshot poll) and the history endpoint. Nil-safe:
 	// when unwired, StreamIngestionJob falls back to snapshot-only updates.
 	events *jobevents.Store
-	logger *zap.Logger
+	// extractor (D3): converts an uploaded document to text (stage 0) before
+	// the pipeline runs. Nil-safe: disables office/PDF formats, keeps .txt/.md.
+	extractor *docextract.Extractor
+	logger    *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -93,13 +98,14 @@ func NewAdminHandler(
 	freshness *knowledge.Freshness,
 	byoSvc *byoexpert.Service,
 	events *jobevents.Store,
+	extractor *docextract.Extractor,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
 		db:          db,
 		gateway:     gw,
 		embedder:    embedder,
-		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, events, logger),
+		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, events, extractor, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
 		versions:    versions,
@@ -109,6 +115,7 @@ func NewAdminHandler(
 		freshness:   freshness,
 		byo:         byoSvc,
 		events:      events,
+		extractor:   extractor,
 		logger:      logger,
 	}
 }
@@ -1019,8 +1026,19 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 		return
 	}
 
+	// D3: reject unsupported formats BEFORE creating a job.
+	// WHY before: an unusable upload must not leave an orphan job row in the
+	// ingestion list, and the admin gets the supported list straight away
+	// instead of having to diagnose a failed job.
+	if !docextract.IsSupported(header.Filename) {
+		response.BadRequest(c, "UNSUPPORTED_FORMAT",
+			fmt.Sprintf(".%s is not a supported format. Supported: %s",
+				docextract.Extension(header.Filename), docextract.SupportedList()))
+		return
+	}
+
 	content := make([]byte, header.Size)
-	if _, err := file.Read(content); err != nil {
+	if _, err := io.ReadFull(file, content); err != nil {
 		response.InternalError(c)
 		return
 	}
@@ -1042,10 +1060,12 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 	// Store transcript content for resume support (migration 009)
 	// WHY: If job fails during chunking, resume needs the original text.
 	// Non-fatal if this fails — resume will require re-upload in that case.
-	_, _ = h.db.Exec(c.Request.Context(),
-		`UPDATE ingestion_jobs SET transcript_content=$1 WHERE id=$2`,
-		string(content), jobID,
-	)
+	//
+	// NOTE (D3): for non-text uploads the stored transcript is now the EXTRACTED
+	// text, written by PrepareTranscript in the goroutine below (it cannot be
+	// written here — the bytes are a PDF here, not text). For .txt/.md the
+	// extraction is a decode, so this column ends up holding the same content
+	// one step later than before.
 
 	// Mark expert as training
 	_, _ = h.db.Exec(c.Request.Context(),
@@ -1070,10 +1090,30 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 		defer cancel() // prevent context leak
 
+		// Stage 0 (D3): convert the upload to text. PDFs, office documents and
+		// spreadsheets are parsed by the ML sidecar; .txt/.md are decoded here.
+		// WHY inside the goroutine: a 40MB PDF can take seconds, and the admin
+		// should get the job id immediately. On failure the job is already
+		// marked 'failed' with an admin-readable reason on the timeline, so
+		// there is nothing left to do but log and stop.
+		transcript, prepErr := h.ingestion.PrepareTranscript(
+			ctx, jobID, expertID, header.Filename, content,
+		)
+		if prepErr != nil {
+			h.logger.Warn("ingestion: transcript preparation failed",
+				zap.String("job_id", jobID.String()),
+				zap.String("expert_id", expertID.String()),
+				zap.String("filename", header.Filename),
+				zap.Error(prepErr),
+			)
+			return
+		}
+
 		_, err := h.ingestion.IngestTranscript(
 			ctx,
 			jobID, expertID, expertName,
-			string(content), header.Filename,
+			transcript,
+			header.Filename,
 			false, // replaceExisting=false → append mode
 		)
 		if err != nil {

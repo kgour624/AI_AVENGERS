@@ -29,6 +29,50 @@ timeline** (`ingestion_job_events`, Postgres) streamed over SSE, and the
 > (`after`/`limit` cursors). `jobId` is a query param because
 > `GET /experts/:id/jobs/stream` already owns that route tree position.
 
+## Supported upload formats (D3)
+
+Uploads are no longer assumed to be plain text. Every file is converted to text
+**before** the pipeline runs, as **stage 0 (`extracting`)** — visible in the job
+row and on the timeline.
+
+| Group | Extensions | How it is converted |
+|---|---|---|
+| Plain text (decoded in the API process) | `.txt` `.text` `.md` `.markdown` `.json` `.log` `.xml` | In-process decode (BOM, UTF‑16, UTF‑8, latin‑1 fallback). **Works even if the ML sidecar is down.** |
+| PDF | `.pdf` | pypdf; repeated page headers/footers removed; `# Page N` markers |
+| Word | `.docx` `.docm` | python-docx (paragraphs + tables) |
+| Word (legacy) | `.doc` | catdoc (falls back to LibreOffice when the image is built with it) |
+| Excel | `.xlsx` `.xlsm` | openpyxl; `# Sheet: name` + `column: value \| column: value` rows |
+| Excel (legacy) | `.xls` | xlrd, then xls2csv / LibreOffice |
+| Delimited | `.csv` `.tsv` | header-aware row rendering |
+| PowerPoint | `.pptx` | python-pptx; `# Slide N` + bullets + speaker notes |
+| PowerPoint (legacy) | `.ppt` | catppt (falls back to LibreOffice) |
+| Web / ebook | `.html` `.htm` `.xhtml` `.epub` | BeautifulSoup (+ `# Chapter N`), scripts/styles/nav stripped |
+| Rich text | `.rtf` | striprtf |
+| OpenDocument | `.odt` `.ods` `.odp` | odfpy |
+| Subtitles | `.srt` `.vtt` | cue numbers and timecodes stripped, spoken text kept |
+
+**Limits & failure modes** (each is reported with a stable reason code and an
+admin-readable message on the timeline):
+`unsupported_format`, `extension_mismatch` (a `.txt` that is really a PDF),
+`pdf_encrypted`, `pdf_no_text` (scanned PDF — OCR is **not** enabled),
+`too_large` (above `DOC_MAX_EXTRACTED_CHARS`, default 5,000,000),
+`too_many_pages` (`DOC_MAX_PAGES`, default 2000), `timeout`, `corrupt`,
+`extractor_unavailable` (ML sidecar down — nothing was ingested, retry).
+
+**Where parsing happens, and why:** in the ML sidecar (`POST /extract`), never in
+the API process. Parsing untrusted documents is a hostile-input job and the
+sidecar is non-root with no DB credentials. The trade-offs:
+
+- Legacy `.doc`/`.ppt`/`.xls` use the **catdoc** tools (~2 MB, installed by
+  default). Exotic formats (`.wpd`, `.pages`, …) need LibreOffice, which is an
+  **opt-in** build arg (`--build-arg WITH_LIBREOFFICE=true`, ~500 MB).
+- The 50 MB upload limit is unchanged; extraction adds a 5M-character cap
+  because DOCX/XLSX/PPTX/EPUB are ZIP containers and a small upload can expand
+  enormously (zip bomb).
+- Extraction writes **no checkpoint**: on failure the admin uploads again.
+  Resume/retry are unaffected because they read the previously extracted text
+  from `ingestion_jobs.transcript_content`.
+
 ## Status: ✅ IMPLEMENTED
 
 Includes:

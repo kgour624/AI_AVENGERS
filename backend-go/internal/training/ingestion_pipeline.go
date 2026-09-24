@@ -15,6 +15,7 @@ import (
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/ml"
@@ -54,6 +55,10 @@ type IngestionPipeline struct {
 	// events is the durable job timeline (T1). Nil-safe: when unwired, emits
 	// are dropped and ingestion behaves exactly as before.
 	events  *jobevents.Store
+	// extractor converts an uploaded document into text (stage 0). Nil is a
+	// valid value: it disables the office/PDF formats while plain text keeps
+	// working — see docextract.Extract.
+	extractor *docextract.Extractor
 	// workers caps concurrent topic/embed batches (T3).
 	workers int
 	logger   *zap.Logger
@@ -71,12 +76,17 @@ type IngestionPipeline struct {
 // events is the durable job event log (T1). Nil is a valid value (events
 // unwired / table not yet migrated) — every emit site is nil-safe, so
 // ingestion never depends on the timeline being wired.
+//
+// extractor converts an uploaded document to text (see PrepareTranscript).
+// Nil is a valid value: it disables the PDF/office formats while .txt/.md keep
+// working, which is exactly the pre-existing behaviour.
 func NewIngestionPipeline(
 	db *pgxpool.Pool,
 	embedder ml.Embedder,
 	sidecar *ml.SidecarClient,
 	gw *gateway.ModelGateway,
 	events *jobevents.Store,
+	extractor *docextract.Extractor,
 	logger *zap.Logger,
 ) *IngestionPipeline {
 	workers := defaultIngestionWorkers
@@ -99,6 +109,7 @@ func NewIngestionPipeline(
 		charters:   NewCharterExtractor(gw, logger),
 		capability: NewCapabilityBuilder(gw, logger),
 		events:     events,
+		extractor:  extractor,
 		workers:    workers,
 		logger:     logger,
 	}

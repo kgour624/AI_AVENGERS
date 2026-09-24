@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List
@@ -6,12 +6,16 @@ import time
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
+import extractor
 from embeddings import EmbeddingService
 from reranker import RerankerService
 
 app = FastAPI(
     title="AI Avengers ML Sidecar",
-    description="Local ML inference: embeddings (bge-base-en-v1.5) + reranking (bge-reranker-base)",
+    description=(
+        "Local ML inference: embeddings (bge-base-en-v1.5) + reranking "
+        "(bge-reranker-base) + document text extraction for ingestion"
+    ),
     version="1.0.0"
 )
 
@@ -27,6 +31,17 @@ reranker_service = RerankerService()
 # WHY max_workers=2: Two models, each can run in parallel.
 # More workers = more memory, not more speed (CPU-bound).
 executor = ThreadPoolExecutor(max_workers=2)
+
+# Separate pool for document extraction.
+# WHY separate from the ML executor: extraction is a burst of CPU + memory
+# (parsing a 50MB PDF), and sharing the pool would let one big upload delay
+# embedding calls for an in-flight ingestion. Two workers = two concurrent
+# ingestions, which matches the admin workflow and bounds peak memory.
+extract_executor = ThreadPoolExecutor(max_workers=2)
+
+# Hard cap on uploaded bytes for /extract. The Go API enforces 50MB and gives a
+# friendlier error; this is the defense-in-depth backstop.
+MAX_UPLOAD_BYTES = 60 * 1024 * 1024
 
 
 class EmbedRequest(BaseModel):
@@ -54,6 +69,15 @@ class RerankResult(BaseModel):
 class RerankResponse(BaseModel):
     results: List[RerankResult]
     model: str
+    duration_ms: float
+
+
+class ExtractResponse(BaseModel):
+    text: str
+    format: str
+    chars: int
+    pages: int = 0
+    warnings: List[str] = []
     duration_ms: float
 
 
@@ -92,7 +116,10 @@ async def health():
     return {
         "status": "ok",
         "embedding_model": embedding_service.model_name,
-        "reranker_model": reranker_service.model_name
+        "reranker_model": reranker_service.model_name,
+        # Surfaced so ops can see at a glance whether document extraction is
+        # available in this deployment (it needs no model, only the parsers).
+        "extract_formats": len(extractor.SUPPORTED_EXTENSIONS),
     }
 
 
@@ -175,4 +202,63 @@ async def rerank(request: RerankRequest):
         results=[RerankResult(**r) for r in results],
         model=reranker_service.model_name,
         duration_ms=round(duration_ms, 2)
+    )
+
+
+@app.post("/extract", response_model=ExtractResponse)
+async def extract(file: UploadFile = File(...)):
+    """Turn an uploaded document into plain text for ingestion.
+
+    WHY the sidecar owns this: parsing untrusted documents is a hostile-input
+    job, and the mature parsers are Python. Doing it here keeps the file out of
+    the Go API process (which holds DB credentials) and reuses the existing
+    sidecar deployment instead of adding a service.
+
+    Mental execution:
+    Input:  multipart upload, e.g. lecture.pdf (12MB)
+    1. Read the upload, enforce the size backstop.
+    2. Extract in a worker thread (CPU-bound; must not block the event loop, or
+       embeddings for an in-flight ingestion would stall).
+    3. Return plain text + structure markers + metadata.
+
+    Error cases:
+      * 400 — no filename (cannot pick a parser)
+      * 413 — upload above MAX_UPLOAD_BYTES
+      * 422 — ExtractionError: the body carries a stable `reason` code
+              (unsupported_format, pdf_encrypted, pdf_no_text, too_large, ...)
+              and an admin-readable `message`. The Go layer shows the message
+              verbatim, so it must stay actionable.
+    """
+    data = await file.read()
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is {len(data)} bytes, above the {MAX_UPLOAD_BYTES} limit",
+        )
+
+    filename = file.filename or ""
+    if not filename:
+        raise HTTPException(status_code=400, detail="filename is required to pick a parser")
+
+    start = time.time()
+    loop = asyncio.get_event_loop()
+    try:
+        result = await loop.run_in_executor(
+            extract_executor, extractor.extract_document, filename, data
+        )
+    except extractor.ExtractionError as exc:
+        # Stable machine-readable reason + human message. 422 (not 500): the
+        # request was well-formed, the document's content is the problem.
+        raise HTTPException(
+            status_code=422, detail={"reason": exc.reason, "message": exc.message}
+        )
+
+    duration_ms = (time.time() - start) * 1000
+    return ExtractResponse(
+        text=result.text,
+        format=result.format,
+        chars=result.chars,
+        pages=result.pages,
+        warnings=result.warnings,
+        duration_ms=round(duration_ms, 2),
     )

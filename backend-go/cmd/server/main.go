@@ -34,6 +34,7 @@ import (
 	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/knowledge"
@@ -417,9 +418,15 @@ func buildRouter(
 	// the writer and the readers use exactly one implementation.
 	eventsStore := jobevents.NewStore(postgres.Pool, redisClient.Client, logger)
 
+	// D2: document extraction (stage 0). Uploads are no longer assumed to be
+	// plain text — PDF/DOCX/XLSX/PPTX/... are converted to text before the
+	// pipeline runs. Parsing happens in the ML sidecar (hostile-input isolation);
+	// .txt/.md are decoded in-process so they keep working if the sidecar is down.
+	docExtractor := docextract.NewExtractor(cfg.ML.SidecarURL, cfg.ML.TimeoutSeconds, logger)
+
 	// C8: bring-your-own-expert. The training pipeline is stateless, so a
 	// second instance is safe and keeps admin/BYO wiring independent.
-	byoIngestor := training.NewIngestionPipeline(postgres.Pool, embedder, mlClient, modelGateway, eventsStore, logger)
+	byoIngestor := training.NewIngestionPipeline(postgres.Pool, embedder, mlClient, modelGateway, eventsStore, docExtractor, logger)
 	byoSvc := byoexpert.NewService(postgres.Pool, tenantSvc, byoIngestor,
 		byoexpert.Policy{
 			Enabled:           cfg.ByoExpert.Enabled,
@@ -481,7 +488,7 @@ func buildRouter(
 	relSvc.RegisterProbe("ml_sidecar", mlClient.HealthCheck)
 	relHandler := reliability.NewHandler(relSvc, "1.0.0", logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, docExtractor, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)

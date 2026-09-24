@@ -302,6 +302,22 @@ export function IngestionPipelineModal({
           </div>
         )}
 
+        {/* Stage 0 (D3): the upload is being converted to text. It finishes
+            before chunking starts, so it is shown above the 6 pipeline cards
+            rather than as a seventh (it writes no checkpoint and is not
+            resumable — a failed document means re-uploading). */}
+        {currentStage === 'extracting' && !isDone && !isFailed && (
+          <div className="flex items-start gap-2 rounded-lg border border-brand/30 bg-brand/5 px-3 py-2">
+            <span className="mt-0.5 h-1.5 w-1.5 flex-shrink-0 animate-pulse rounded-full bg-brand" />
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-text-primary">Preparing document</p>
+              <p className="mt-0.5 break-all text-[10px] text-text-secondary">
+                {job?.stageDetail || 'Converting the uploaded file to text…'}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Stage pipeline */}
         <div className="flex flex-col gap-1.5">          {STAGES.map((stage) => {
             const status = job

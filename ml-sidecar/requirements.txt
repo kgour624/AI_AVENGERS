@@ -4,3 +4,36 @@ sentence-transformers==3.0.1
 torch==2.3.1
 numpy==1.26.4
 pydantic==2.7.4
+
+# --- Document extraction (/extract) -----------------------------------------
+# WHY these live in the sidecar: the mature document parsers are Python, and
+# parsing untrusted uploads belongs outside the Go API process. Each parser is
+# imported lazily in extractor.py, so a missing one disables a single format
+# instead of stopping the sidecar (which must keep serving embeddings).
+#
+# Required by FastAPI to parse multipart/form-data uploads at all:
+python-multipart==0.0.9
+# PDF (pure Python, no system libraries):
+pypdf==4.3.1
+# DOCX:
+python-docx==1.1.2
+# XLSX / XLSM:
+openpyxl==3.1.5
+# Legacy XLS (openpyxl cannot read it; xlrd 2.x reads .xls only):
+xlrd==2.0.1
+# PPTX:
+python-pptx==1.0.2
+# HTML/XML + EPUB (EPUB is XHTML inside a ZIP):
+beautifulsoup4==4.12.3
+lxml==5.2.2
+ebooklib==0.18
+# RTF:
+striprtf==0.0.27
+# OpenDocument (ODT/ODS/ODP) + its ZIP container:
+odfpy==1.4.1
+# Encoding detection for txt/csv/srt (windows-1252 transcripts are common):
+charset-normalizer==3.3.2
+
+# NOTE: legacy .doc / .ppt / .xls use the catdoc tools (installed in the
+# Dockerfile, ~2MB). Exotic formats (.wpd, .pages, .key, ...) need LibreOffice,
+# which is an opt-in build arg (WITH_LIBREOFFICE=true) because it adds ~500MB.
