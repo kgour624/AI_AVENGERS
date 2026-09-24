@@ -27,7 +27,19 @@ type Config struct {
 	Log                 LogConfig
 	Provenance          ProvenanceConfig
 	Versioning          VersioningConfig
+	Tenant              TenantConfig
 	CORSAllowedOrigins  []string // comma-separated in env: CORS_ALLOWED_ORIGINS
+}
+
+// TenantConfig controls C4 tenant isolation.
+type TenantConfig struct {
+	// IsolationEnabled: enforce tenant boundaries. Absent env → true
+	// (IsSet pattern, same as B6/B8/C1/C2). Explicit false is the kill
+	// switch — scopes resolve global and every assertion is a no-op, so a
+	// bad rollout can be reverted without a redeploy. Migration 030
+	// backfills all rows onto one 'default' tenant, so enabling this is
+	// behaviour-neutral until a second tenant is used.
+	IsolationEnabled bool
 }
 
 // VersioningConfig controls C2 expert versioning + drift detection.
@@ -300,6 +312,9 @@ func Load() (*Config, error) {
 			Enabled:        true, // C2 default on; overridden below if env set
 			DriftThreshold: v.GetFloat64("EXPERT_DRIFT_THRESHOLD"),
 		},
+		Tenant: TenantConfig{
+			IsolationEnabled: true, // C4 default on; overridden below if env set
+		},
 	}
 
 	// Parse CORS_ALLOWED_ORIGINS (comma-separated)
@@ -332,6 +347,10 @@ func Load() (*Config, error) {
 	// C2: same IsSet pattern — absent → true; explicit false disables.
 	if v.IsSet("EXPERT_VERSIONING_ENABLED") {
 		cfg.Versioning.Enabled = v.GetBool("EXPERT_VERSIONING_ENABLED")
+	}
+	// C4: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("TENANT_ISOLATION_ENABLED") {
+		cfg.Tenant.IsolationEnabled = v.GetBool("TENANT_ISOLATION_ENABLED")
 	}
 
 	// Validate required fields — fail fast

@@ -46,6 +46,7 @@ import (
 	"ai_avengers/backend/internal/repo"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/selflearning"
+	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -390,6 +391,8 @@ func buildRouter(
 	)
 	// C3: golden-set eval run store (viewed from admin; run by cmd/eval).
 	evalStore := eval.NewStore(postgres.Pool)
+	// C4: tenant isolation + enterprise controls. Kill switch TENANT_ISOLATION_ENABLED.
+	tenantSvc := tenant.NewService(postgres.Pool, cfg.Tenant.IsolationEnabled, logger)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -427,11 +430,11 @@ func buildRouter(
 	// Initialize HTTP handlers
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
-	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, logger)
+	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
-	expertHandler := expert.NewHandler(postgres.Pool, logger)
+	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -787,6 +790,11 @@ func buildRouter(
 		// C3: evaluation harness run view + baseline promote.
 		adminGroup.GET("/evals/runs", adminHandler.GetEvalRuns)
 		adminGroup.POST("/evals/runs/:id/baseline", adminHandler.PromoteEvalBaseline)
+		// C4: tenant isolation & enterprise controls.
+		adminGroup.GET("/tenants", adminHandler.ListTenants)
+		adminGroup.POST("/tenants", adminHandler.CreateTenant)
+		adminGroup.POST("/tenants/:id/users", adminHandler.AssignTenantUser)
+		adminGroup.POST("/tenants/:id/experts", adminHandler.AssignTenantExpert)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)

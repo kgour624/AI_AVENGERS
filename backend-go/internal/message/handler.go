@@ -22,6 +22,7 @@ import (
 	"ai_avengers/backend/internal/orchestrator"
 	"ai_avengers/backend/internal/provenance"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/tenant"
 )
 
 // SendMessageRequest is the input for sending a message.
@@ -65,7 +66,10 @@ type Handler struct {
 	memManager   *memory.Manager
 	// prov (C1): optional signed provenance chain recorder. Nil-safe — when
 	// unset, answers are still saved, only the provenance chain is skipped.
-	prov   *provenance.Service
+	prov *provenance.Service
+	// tenant (C4): isolation enforcement. Nil-safe — an unwired service is
+	// disabled and resolves a global scope, so every assertion is a no-op.
+	tenant *tenant.Service
 	logger *zap.Logger
 }
 
@@ -80,6 +84,7 @@ func NewHandler(
 	embedder ml.Embedder,
 	memManager *memory.Manager,
 	prov *provenance.Service,
+	tenantSvc *tenant.Service,
 	logger *zap.Logger,
 ) *Handler {
 	return &Handler{
@@ -90,6 +95,7 @@ func NewHandler(
 		embedder:     embedder,
 		memManager:   memManager,
 		prov:         prov,
+		tenant:       tenantSvc,
 		logger:       logger,
 	}
 }
@@ -189,6 +195,21 @@ func (h *Handler) Send(c *gin.Context) {
 		return
 	}
 
+	// C4: tenant boundary. Resolve the caller's scope, then verify the
+	// requested experts are visible to it. Fail closed — an unresolvable
+	// scope denies the request (P3). Nil-safe: an unwired service resolves
+	// a global scope and both checks are no-ops.
+	scope, err := h.tenant.Resolve(c.Request.Context(), clientID, roleStr)
+	if err != nil {
+		h.logger.Warn("tenant scope unresolved", zap.Error(err))
+		response.Forbidden(c, "Tenant scope could not be resolved")
+		return
+	}
+	if err := h.tenant.AssertExperts(c.Request.Context(), scope, expertIDs); err != nil {
+		response.Forbidden(c, err.Error())
+		return
+	}
+
 	// Parse reply_to_message_id (CT-C1). Empty string is valid (fresh
 	// question) — only parse+validate when non-empty, matching the
 	// existing expertIDs loop's error-on-malformed-input pattern above.
@@ -206,6 +227,13 @@ func (h *Handler) Send(c *gin.Context) {
 	ch, err := h.chatSvc.GetByID(c.Request.Context(), chatID, clientID)
 	if err != nil {
 		response.NotFound(c, "chat")
+		return
+	}
+
+	// C4: the chat's project must live in the caller's tenant too — a
+	// client_id match alone is not sufficient once tenants exist.
+	if err := h.tenant.AssertProject(c.Request.Context(), scope, ch.ProjectID); err != nil {
+		response.Forbidden(c, err.Error())
 		return
 	}
 

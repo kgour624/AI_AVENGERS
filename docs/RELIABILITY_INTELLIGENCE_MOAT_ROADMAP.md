@@ -395,6 +395,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB (RLS), System Design, Go. |
 | **Files/Risk/Rollback** | broad + migrations. Risk: High. Rollback: staged + flag. |
 | **Limitation** | `go build ./...` + migration; manual isolation test. |
+| **DONE (C4)** | Mig 030 `tenants` + `tenant_id` on users/experts/projects (default tenant; all rows backfilled; experts stay NULL=platform/global → behaviour-neutral until a 2nd tenant exists). New `internal/tenant`: `Scope{Global,TenantID}` + pure `Allows` (nil row tenant=platform-visible; unresolved scope denies — **P3 fail closed**); `Service.Resolve` (admin/disabled→global; else users.tenant_id, NULL→ErrScopeUnknown), `AssertProject`, `AssertExperts`, `List/Create/SetUserTenant/SetExpertTenant`, pure `slugify`. Config `TenantConfig{IsolationEnabled(absent→true)}`, kill switch `TENANT_ISOLATION_ENABLED=false`; metric `tenant_denied`. Wiring: `message.Send` resolves scope → asserts experts + chat's project (403 fail closed); `expert.ListActive`/`GetByID` filter `tenant_id IS NULL OR = scope`; admin `GET/POST /admin/tenants`, `POST /admin/tenants/:id/users`, `POST /admin/tenants/:id/experts` (homes an expert tenant-private or back to global). Tests: `Allows`/unresolved/slugify/nil-safe. **Deferred:** DB RLS policies + `SET LOCAL app.tenant_id` (design chose deterministic app-level pre-filter now); course_chunks/chat-level tenant columns and cost attribution per tenant (C5); per-tenant memory tables are already project-scoped and inherit isolation via project. |
 
 ### C5 — Cost & usage analytics product
 | Part | Detail |
@@ -499,7 +500,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C1 | provenance chain | C | ✅ done | (pending PR, this branch) |
 | C2 | expert versioning/drift | C | ✅ done | (pending PR, this branch) |
 | C3 | eval harness + golden set | C | ✅ done | (pending PR, this branch) |
-| C4 | tenant isolation | C | ⬜ pending | — |
+| C4 | tenant isolation | C | ✅ done | (pending PR, this branch) |
 | C5 | cost/usage product | C | ⬜ pending | — |
 | C6 | knowledge freshness | C | ⬜ pending | — |
 | C7 | adversarial debate | C | ⬜ pending | — |

@@ -21,6 +21,7 @@ import (
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/training"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -44,8 +45,10 @@ type AdminHandler struct {
 	// unset, ingestion still runs, only snapshots/drift are skipped.
 	versions *expertversion.Service
 	// evals (C3): golden-set run store. Nil-safe — view endpoints return empty.
-	evals  *eval.Store
-	logger *zap.Logger
+	evals *eval.Store
+	// tenants (C4): enterprise isolation controls. Nil-safe — list returns empty.
+	tenants *tenant.Service
+	logger  *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -70,6 +73,7 @@ func NewAdminHandler(
 	domainReg *chinawall.DomainRegistry,
 	versions *expertversion.Service,
 	evals *eval.Store,
+	tenants *tenant.Service,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -81,6 +85,7 @@ func NewAdminHandler(
 		domainReg:   domainReg,
 		versions:    versions,
 		evals:       evals,
+		tenants:     tenants,
 		logger:      logger,
 	}
 }
@@ -1306,6 +1311,120 @@ func (h *AdminHandler) PromoteEvalBaseline(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"suite": body.Suite, "run_id": runID, "is_baseline": true})
+}
+
+// ============================================================
+// TENANT ISOLATION & ENTERPRISE CONTROLS (C4)
+// ============================================================
+
+// ListTenants GET /admin/tenants
+func (h *AdminHandler) ListTenants(c *gin.Context) {
+	if h.tenants == nil {
+		response.OK(c, []tenant.Tenant{})
+		return
+	}
+	tenants, err := h.tenants.List(c.Request.Context())
+	if err != nil {
+		h.logger.Error("list tenants failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, tenants)
+}
+
+// CreateTenant POST /admin/tenants
+// Body: {"name":"Acme Corp","slug":"acme"} (slug optional → derived from name)
+func (h *AdminHandler) CreateTenant(c *gin.Context) {
+	if h.tenants == nil {
+		response.InternalError(c)
+		return
+	}
+	var body struct {
+		Name string `json:"name" binding:"required"`
+		Slug string `json:"slug"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	t, err := h.tenants.Create(c.Request.Context(), body.Name, body.Slug)
+	if err != nil {
+		h.logger.Warn("create tenant failed", zap.Error(err))
+		response.BadRequest(c, "CREATE_FAILED", err.Error())
+		return
+	}
+	response.Created(c, t)
+}
+
+// AssignTenantUser POST /admin/tenants/:id/users
+// Body: {"user_id":"<uuid>"} — moves the account into the tenant.
+func (h *AdminHandler) AssignTenantUser(c *gin.Context) {
+	if h.tenants == nil {
+		response.InternalError(c)
+		return
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant ID")
+		return
+	}
+	var body struct {
+		UserID string `json:"user_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	userID, err := uuid.Parse(body.UserID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid user ID")
+		return
+	}
+	if err := h.tenants.SetUserTenant(c.Request.Context(), userID, tenantID); err != nil {
+		h.logger.Warn("assign tenant user failed", zap.Error(err))
+		response.BadRequest(c, "ASSIGN_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"user_id": userID, "tenant_id": tenantID})
+}
+
+// AssignTenantExpert POST /admin/tenants/:id/experts
+// Body: {"expert_id":"<uuid>","global":false}
+// Homes an expert into this tenant (tenant-private), or back to platform
+// (global=true → tenant_id NULL, visible to every tenant).
+func (h *AdminHandler) AssignTenantExpert(c *gin.Context) {
+	if h.tenants == nil {
+		response.InternalError(c)
+		return
+	}
+	tenantID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant ID")
+		return
+	}
+	var body struct {
+		ExpertID string `json:"expert_id" binding:"required"`
+		Global   bool   `json:"global"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	expertID, err := uuid.Parse(body.ExpertID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	var target *uuid.UUID
+	if !body.Global {
+		target = &tenantID
+	}
+	if err := h.tenants.SetExpertTenant(c.Request.Context(), expertID, target); err != nil {
+		h.logger.Warn("assign tenant expert failed", zap.Error(err))
+		response.BadRequest(c, "ASSIGN_FAILED", err.Error())
+		return
+	}
+	response.OK(c, gin.H{"expert_id": expertID, "tenant_id": target, "global": body.Global})
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream

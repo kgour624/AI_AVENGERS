@@ -21,6 +21,7 @@ type Metrics struct {
 	agentLoopIter      atomic.Int64
 	outboxPublished    atomic.Int64
 	entitlementDenied  atomic.Int64
+	tenantDenied       atomic.Int64
 }
 
 // Global is the process-wide metrics instance.
@@ -39,6 +40,7 @@ func (m *Metrics) IncWorkflowFailed()   { m.workflowsFailed.Add(1) }
 func (m *Metrics) IncAgentLoopIter()    { m.agentLoopIter.Add(1) }
 func (m *Metrics) IncOutboxPublished()  { m.outboxPublished.Add(1) }
 func (m *Metrics) IncEntitlementDenied() { m.entitlementDenied.Add(1) }
+func (m *Metrics) IncTenantDenied()      { m.tenantDenied.Add(1) }
 
 func (m *Metrics) AddLLMCost(usd float64) {
 	for {
@@ -68,6 +70,7 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"agent_loop_iter":       m.agentLoopIter.Load(),
 		"outbox_published":      m.outboxPublished.Load(),
 		"entitlement_denied":    m.entitlementDenied.Load(),
+		"tenant_denied":         m.tenantDenied.Load(),
 		"uptime_seconds":        int64(time.Since(startTime).Seconds()),
 	}
 }
