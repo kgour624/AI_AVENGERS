@@ -10,8 +10,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
 	"ai_avengers/backend/internal/gateway"
@@ -54,6 +56,7 @@ const (
 // Simpler than WebSocket, works over HTTP/1.1, auto-reconnect built-in.
 // Architecture doc locked decision: SSE for streaming.
 type Handler struct {
+	db           *pgxpool.Pool
 	chatSvc      *chat.Service
 	orchestrator *orchestrator.Orchestrator
 	gateway      *gateway.ModelGateway
@@ -66,6 +69,7 @@ type Handler struct {
 // embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
 // *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
 func NewHandler(
+	db *pgxpool.Pool,
 	chatSvc *chat.Service,
 	orch *orchestrator.Orchestrator,
 	gw *gateway.ModelGateway,
@@ -74,6 +78,7 @@ func NewHandler(
 	logger *zap.Logger,
 ) *Handler {
 	return &Handler{
+		db:           db,
 		chatSvc:      chatSvc,
 		orchestrator: orch,
 		gateway:      gw,
@@ -167,6 +172,14 @@ func (h *Handler) Send(c *gin.Context) {
 			return
 		}
 		expertIDs = append(expertIDs, id)
+	}
+
+	// Account-level expert grants (domain_expert only; admin/client unrestricted)
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	if err := auth.MustHaveExpertAccess(c.Request.Context(), h.db, clientID, roleStr, expertIDs); err != nil {
+		response.Forbidden(c, err.Error())
+		return
 	}
 
 	// Parse reply_to_message_id (CT-C1). Empty string is valid (fresh

@@ -8,6 +8,7 @@ import LoginPage from '@/pages/auth/LoginPage'
 import RegisterPage from '@/pages/auth/RegisterPage'
 import ForgotPasswordPage from '@/pages/auth/ForgotPasswordPage'
 import ResetPasswordPage from '@/pages/auth/ResetPasswordPage'
+import AdminBootstrapPage from '@/pages/auth/AdminBootstrapPage'
 import { projectsRoute } from '@/pages/projects/ProjectsPage'
 import { projectRoute } from '@/pages/projects/ProjectPage'
 import { chatRoute } from '@/pages/chat/ChatPage'
@@ -30,6 +31,9 @@ const router = createBrowserRouter([
   { path: '/register', element: <RegisterPage /> },
   { path: '/forgot-password', element: <ForgotPasswordPage /> },
   { path: '/reset-password', element: <ResetPasswordPage /> },
+  // Hidden admin bootstrap — unguessable token path, not linked publicly
+  { path: '/bootstrap/:token', element: <AdminBootstrapPage /> },
+  { path: '/bootstrap', element: <AdminBootstrapPage /> },
 
   {
     element: <AuthGuard />,
@@ -71,6 +75,8 @@ const router = createBrowserRouter([
               { path: 'categories', lazy: () => import('@/pages/admin/AdminCategories') },
               { path: 'domain-profiles', lazy: () => import('@/pages/admin/AdminDomainProfiles') },
               { path: 'clients', lazy: () => import('@/pages/admin/AdminClients') },
+              { path: 'accounts', lazy: () => import('@/pages/admin/AdminAccounts') },
+              { path: 'authenticator', lazy: () => import('@/pages/admin/AdminAuthenticator') },
               { path: 'stats', lazy: () => import('@/pages/admin/AdminStats') },
               { path: 'settings', lazy: () => import('@/pages/admin/AdminSettings') },
               { path: 'llm-settings', lazy: () => import('@/pages/admin/AdminLLMSettings') },

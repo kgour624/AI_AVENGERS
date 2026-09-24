@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/response"
 )
 
@@ -265,8 +266,11 @@ func (s *Service) SoftDelete(ctx context.Context, projectID, clientID uuid.UUID)
 	return nil
 }
 
+// ErrExpertForbidden is returned when a domain_expert lacks a grant.
+var ErrExpertForbidden = errors.New("expert not assigned to this account")
+
 // AddExpert adds an expert to a project.
-func (s *Service) AddExpert(ctx context.Context, projectID, clientID, expertID uuid.UUID) error {
+func (s *Service) AddExpert(ctx context.Context, projectID, clientID, expertID uuid.UUID, role string) error {
 	// Verify project ownership
 	var exists bool
 	s.db.QueryRow(ctx,
@@ -285,6 +289,10 @@ func (s *Service) AddExpert(ctx context.Context, projectID, clientID, expertID u
 	).Scan(&expertActive)
 	if !expertActive {
 		return ErrExpertNotFound
+	}
+
+	if err := auth.MustHaveExpertAccess(ctx, s.db, clientID, role, []uuid.UUID{expertID}); err != nil {
+		return ErrExpertForbidden
 	}
 
 	_, err := s.db.Exec(ctx,
@@ -467,13 +475,19 @@ func (h *Handler) AddExpert(c *gin.Context) {
 		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
 		return
 	}
-	if err := h.svc.AddExpert(c.Request.Context(), projectID, clientID, expertID); err != nil {
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	if err := h.svc.AddExpert(c.Request.Context(), projectID, clientID, expertID, roleStr); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			response.NotFound(c, "project")
 			return
 		}
 		if errors.Is(err, ErrExpertNotFound) {
 			response.NotFound(c, "expert")
+			return
+		}
+		if errors.Is(err, ErrExpertForbidden) {
+			response.Forbidden(c, err.Error())
 			return
 		}
 		response.InternalError(c)

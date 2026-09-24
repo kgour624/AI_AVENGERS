@@ -42,8 +42,10 @@
 | 018 | `018_collaborative_design` | `workflow_design_sections` (new), `workflow_chats` (new), `workflow_chat_participants` (new), `workflow_chat_messages` (new), `expert_categories` (authoring_rank), `workflows` (integrator_auto, integrator_expert_id, generic CHECK widened 0-100), `approval_requests` (gate CHECK + design_conflict, design_amendment), `system_settings` (8 tunables) | Collaborative design architecture: dynamic section assignment, workflow-scoped chat (separate from product chat), tool-loop settings, thresholds moved out of Go. See docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md. |
 | 019 | `019_authoring_rank_seed` | `expert_categories` (authoring_rank UPDATE) | Seed initial authoring ranks for expert categories. |
 | 020 | `020_change_requests` | `change_requests` (new table) | Stores client-initiated change requests from workflow chat. |
+| 021 | `021_password_reset_tokens` | `password_reset_tokens` (new table) | Forgot-password / reset-password one-time hashed tokens. |
+| 022 | `022_admin_rbac_expert_grants` | `users.role` CHECK (+`domain_expert`), `user_expert_grants` (new), `admin_bootstrap_tokens` (new) | Hidden admin bootstrap + TOTP enrollment; admin-created domain_expert accounts; account→expert grants for chat/workflow scoping. |
 
-**Next migration number: `021`**
+**Next migration number: `023`**
 
 ---
 

@@ -14,7 +14,11 @@ export const register = (req: RegisterRequest) =>
 
 export const adminLogin = (req: AdminLoginRequest) =>
   baseAPI
-    .post<ApiResponse<{ user: User; tokenPair: TokenPair }>>('/api/v1/auth/admin/login', req)
+    .post<ApiResponse<{ user: User; tokenPair: TokenPair }>>('/api/v1/auth/admin/login', {
+      email: req.email,
+      password: req.password,
+      totp_code: req.totpCode,
+    })
     .then((res) => res.data.data!)
 
 export const logout = () => baseAPI.post('/api/v1/auth/logout').then((res) => res.data)
@@ -43,4 +47,46 @@ export const resetPassword = (token: string, newPassword: string) =>
       token,
       new_password: newPassword,
     })
+    .then((res) => res.data.data!)
+
+// Hidden admin bootstrap (unguessable token; not linked from login/register)
+export const bootstrapAdminStart = (req: {
+  token: string
+  email: string
+  password: string
+  fullName: string
+}) =>
+  baseAPI
+    .post<ApiResponse<{ secret: string; qrUrl: string }>>('/api/v1/auth/admin/bootstrap/start', {
+      token: req.token,
+      email: req.email,
+      password: req.password,
+      full_name: req.fullName,
+    })
+    .then((res) => res.data.data!)
+
+export const bootstrapAdminComplete = (req: { token: string; totpCode: string }) =>
+  baseAPI
+    .post<ApiResponse<{ user: User; tokenPair: TokenPair }>>('/api/v1/auth/admin/bootstrap/complete', {
+      token: req.token,
+      totp_code: req.totpCode,
+    })
+    .then((res) => res.data.data!)
+
+export const getTotpStatus = () =>
+  baseAPI.get<ApiResponse<{ totpEnabled: boolean }>>('/api/v1/auth/totp').then((res) => res.data.data!)
+
+export const setupTotp = () =>
+  baseAPI
+    .post<ApiResponse<{ secret: string; qrUrl: string }>>('/api/v1/auth/totp/setup')
+    .then((res) => res.data.data!)
+
+export const enableTotp = (code: string) =>
+  baseAPI
+    .post<ApiResponse<{ status: string }>>('/api/v1/auth/totp/enable', { code })
+    .then((res) => res.data.data!)
+
+export const disableTotp = () =>
+  baseAPI
+    .post<ApiResponse<{ status: string }>>('/api/v1/auth/totp/disable')
     .then((res) => res.data.data!)
