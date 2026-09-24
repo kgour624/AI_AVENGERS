@@ -3,7 +3,7 @@
 | Field | Value |
 |-------|-------|
 | **Document ID** | `RIM_ROADMAP_v2` |
-| **Status** | **DESIGN LOCKED — A1–A12 DONE; A13+ pending** |
+| **Status** | **DESIGN LOCKED — Phase A (A1–A19) DONE on fork branch; B1+ pending** |
 | **Single source of truth for** | The locked task order from A13 → C10 and the mandatory per-task working protocol |
 | **Depends on (done)** | Phase A1–A12 (merged to `origin/main` via PR #5; roadmap doc via PR #6) |
 | **Audience** | Any engineer or AI coding agent with **no prior deep codebase knowledge** |
@@ -470,12 +470,12 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | A11 | QA proposals → real approval rows | A | ✅ done | `7268332` |
 | A12 | watcher running-only guard | A | ✅ done | `7268332` |
 | A13 | gate1WithLLM defeats Gate1Skip | A | ✅ done | (pending PR, this branch) |
-| A14 | zero-citation check ordering | A | ⬜ pending | — |
-| A15 | revision loop re-fetch artifact | A | ⬜ pending | — |
-| A16 | TransitionPhase errors ignored | A | ⬜ pending | — |
-| A17 | watcher/main single-flight | A | ⬜ pending | — |
-| A18 | watcher waves=nil | A | ⬜ pending | — |
-| A19 | escalation deadlock/cycle guard | A | ⬜ pending | — |
+| A14 | zero-citation check ordering | A | ✅ done | (pending PR, this branch) |
+| A15 | revision loop re-fetch artifact | A | ✅ done | (pending PR, this branch) |
+| A16 | TransitionPhase errors ignored | A | ✅ done | (pending PR, this branch) |
+| A17 | watcher/main single-flight | A | ✅ done | (pending PR, this branch) |
+| A18 | watcher waves=nil | A | ✅ done | (pending PR, this branch) |
+| A19 | escalation deadlock/cycle guard | A | ✅ done | (pending PR, this branch) |
 | B1 | LLM synthesis | B | ⬜ pending | — |
 | B2 | semantic contradiction detection | B | ⬜ pending | — |
 | B3 | workflow memory write-back | B | ⬜ pending | — |

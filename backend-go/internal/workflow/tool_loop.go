@@ -59,6 +59,15 @@ const toolLoopMaxStepsDefault = 8
 // in amendment.go (the constraint was widened for a code path that was missing).
 const designConflictGate = "design_conflict"
 
+// maxConflictHopsPerStatement bounds how many times the SAME statement_id
+// may be raised via raise_conflict before the deterministic deadlock guard
+// (A19) fires: instead of delegating to yet another rank-based resolver
+// (which can ping-pong — expert A raises, resolver picks a side, the
+// original expert disagrees and raises again, ...), the repeat raise is
+// escalated straight to the client. A genuine first-time conflict on a
+// statement still goes through normal rank-based auto-resolve.
+const maxConflictHopsPerStatement = 2
+
 // Tool is one capability the model may invoke (§7.2). Everything about a tool
 // is data except the Go closure that runs it: the registry is built once at
 // startup and filtered per expert from AllowedTools, so granting or withdrawing
@@ -894,6 +903,31 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		}, nil
 	}
 
+	// A19 deadlock/cycle guard: if this exact statement_id has already been
+	// raised maxConflictHopsPerStatement times (this raise included), a
+	// further rank-based delegation would just repeat the same ping-pong
+	// instead of converging. Escalate straight to the client — a
+	// deterministic default action, not another LLM judgement.
+	// Fail-open on a read error: a transient blackboard read failure must
+	// not force an escalation for what may be a genuine first-time conflict.
+	if raisedCount, ok := conflictRaisedCountForStatement(ctx, l, args.StatementID); ok &&
+		raisedCount >= maxConflictHopsPerStatement {
+		approvalID, escErr := escalateConflictToClient(ctx, l, ev.ID, args.StatementID,
+			fmt.Sprintf("statement %s raised %d times without converging — deadlock guard (A19)", args.StatementID, raisedCount),
+			nil,
+		)
+		if escErr != nil {
+			return nil, fmt.Errorf("raise_conflict: escalate after hop limit: %w", escErr)
+		}
+		return map[string]any{
+			"raised":      true,
+			"event_id":    ev.ID,
+			"escalated":   true,
+			"approval_id": approvalID.String(),
+			"note":        fmt.Sprintf("This statement has been raised %d times without resolving. Escalated to client instead of delegating again (deadlock guard).", raisedCount),
+		}, nil
+	}
+
 	// Step 3: section detail — try rank-based auto-resolve.
 	// Build the skip set: the two conflicting experts.
 	skipIDs := map[uuid.UUID]bool{l.expert.ID: true}
@@ -1065,6 +1099,31 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		"skipped_experts": skippedMessages,
 		"note":            "No expert with relevant training could auto-resolve this conflict. Escalated to client for manual decision.",
 	}, nil
+}
+
+// conflictRaisedCountForStatement counts how many design_conflict_raised
+// events already exist on this workflow's blackboard for the given
+// statement_id (A19 deadlock guard). Returns ok=false on a read/parse
+// failure so the caller can fail open instead of misreading "no history"
+// as zero.
+func conflictRaisedCountForStatement(ctx context.Context, l *toolLoopContext, statementID string) (int, bool) {
+	events, err := l.store.GetByType(ctx, l.workflowID, []string{"design_conflict_raised"}, 0)
+	if err != nil {
+		return 0, false
+	}
+	count := 0
+	for _, ev := range events {
+		var c struct {
+			StatementID string `json:"statement_id"`
+		}
+		if json.Unmarshal(ev.Content, &c) != nil {
+			continue
+		}
+		if c.StatementID == statementID {
+			count++
+		}
+	}
+	return count, true
 }
 
 // escalateConflictToClient records the escalation and opens a client decision
