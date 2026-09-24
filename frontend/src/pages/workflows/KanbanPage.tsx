@@ -1,20 +1,21 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useState } from 'react'
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getBlackboard, getWorkflow, respondToApproval, cancelWorkflow, retryTask } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
 import { useFileStream } from '@/hooks/useFileStream'
-import type { FileEntry } from '@/hooks/useFileStream'
 import type { BlackboardEvent, KanbanTask } from '@/api/workflows'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
+import { Tabs, type TabItem } from '@/components/ui/Tabs'
 import { cn } from '@/utils/cn'
 import { WorkflowChatPanel } from '@/components/workflow/WorkflowChatPanel'
 import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
 import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
 import { ActivityLog } from '@/components/workflow/ActivityLog'
+import { FilesPanel } from '@/components/workflow/FilesPanel'
 
 // CancelWorkflowButton — renders a cancel button with confirmation dialog.
 // WHY confirmation: cancelling a workflow is destructive and cannot be undone.
@@ -479,78 +480,10 @@ function ArtifactsPanel({
   )
 }
 
-// FilesPanel — live file browser fed by useFileStream.
-// Shown once implementation/QA phases start producing code files.
-// WHY separate section (not a tab): KanbanPage had no tab pattern to
-// reuse; a stacked section below the board matches how ApprovalGate and
-// the completion banner are already appended below the board.
-function FilesPanel({ files, isConnected }: { files: FileEntry[]; isConnected: boolean }) {
-  const [selectedPath, setSelectedPath] = useState<string | null>(null)
-
-  if (files.length === 0) return null
-
-  const selected = selectedPath ? files.find((f) => f.filePath === selectedPath) : undefined
-
-  return (
-    <div className="mt-6">
-      <div className="mb-2 flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
-          Files
-        </span>
-        <div className="flex items-center gap-1.5">
-          <span className={cn(
-            'h-2 w-2 rounded-full',
-            isConnected ? 'bg-mode-advise animate-pulse' : 'bg-glow-amber animate-pulse'
-          )} />
-          <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
-            {isConnected ? 'Live' : 'Connecting...'}
-          </span>
-        </div>
-      </div>
-      <div className="grid grid-cols-3 gap-4">
-        <Card className="col-span-1 max-h-96 overflow-y-auto p-2">
-          {files.map((file) => (
-            <button
-              key={file.filePath}
-              onClick={() => setSelectedPath(file.filePath)}
-              className={cn(
-                'flex w-full items-center justify-between rounded px-2 py-1.5 text-left text-xs',
-                selectedPath === file.filePath
-                  ? 'bg-surface-overlay text-text-primary'
-                  : 'text-text-secondary hover:bg-surface-overlay/60'
-              )}
-            >
-              <span className="truncate">{file.filePath}</span>
-              <Badge variant={file.operation === 'create' ? 'success' : 'warn'}>
-                {file.operation}
-              </Badge>
-            </button>
-          ))}
-        </Card>
-        <Card className="col-span-2 max-h-96 overflow-y-auto p-3">
-          {selected ? (
-            <>
-              <div className="mb-2 flex items-center justify-between">
-                <p className="text-xs font-medium text-text-primary">{selected.filePath}</p>
-                <span className="text-xs text-text-disabled">{selected.linesOfCode} lines</span>
-              </div>
-              {!selected.validationPassed && selected.validationError && (
-                <p className="mb-2 text-xs text-mode-refuse">{selected.validationError}</p>
-              )}
-              <pre className="overflow-x-auto whitespace-pre text-xs text-text-secondary">
-                {selected.content}
-              </pre>
-            </>
-          ) : (
-            <p className="py-4 text-center text-xs text-text-disabled">
-              Select a file to view its content
-            </p>
-          )}
-        </Card>
-      </div>
-    </div>
-  )
-}
+// Workspace tabs (feature #28). 'board' is the default so the task board and
+// the approval gate stay front-and-centre; the other three are read-only views
+// that previously sat below the fold in one long scroll.
+type WorkspaceTab = 'board' | 'deliverables' | 'activity' | 'files'
 
 function KanbanPage() {
   const { id } = useParams<{ id: string }>()
@@ -600,6 +533,23 @@ function KanbanPage() {
   const availableExperts = Array.from(
     new Map(tasks.map((t) => [t.assignedExpertId, { id: t.assignedExpertId, name: t.expertName }])).values()
   )
+
+  // Feature #28: workspace tab strip + its counts.
+  // events is hoisted so the counts, the empty-state guard and the panels all
+  // read the same list (no three copies of `blackboard?.events ?? []`).
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>('board')
+  const events = blackboard?.events ?? []
+  // Mirrors ArtifactsPanel's filter so the tab count matches what it renders.
+  const artifactCount = events.filter(
+    (e) => ARTIFACT_TYPES.has(e.eventType) && (!filterExpertId || e.postedByExpertId === filterExpertId)
+  ).length
+  const tabs: TabItem<WorkspaceTab>[] = [
+    // alert: an approval is waiting — surfaced even when another tab is open.
+    { key: 'board', label: 'Board', count: tasks.length, alert: workflow?.status === 'paused_for_approval' },
+    { key: 'deliverables', label: 'Deliverables', count: artifactCount },
+    { key: 'activity', label: 'Activity', count: events.length },
+    { key: 'files', label: 'Files', count: fileStream.files.length },
+  ]
 
   // Root scroll container. AppShell's <main> (frontend/src/components/
   // layout/AppShell.tsx) is `overflow-hidden` by contract — every page it
@@ -657,71 +607,101 @@ function KanbanPage() {
         </div>
       </div>
 
-      {/* Kanban board */}
-      {isLoading ? (
-        <div className="grid grid-cols-5 gap-4">
-          {COLUMNS.map((col) => (
-            <Skeleton key={col.key} className="h-48" />
-          ))}
-        </div>
-      ) : (
-        <div className="grid grid-cols-5 gap-4">
-          {COLUMNS.map((col) => {
-            const colTasks = tasks.filter((t) => t.status === col.key)
-            return (
-              <div key={col.key}>
-                <div className="mb-2 flex items-center justify-between">
-                  <span className={`text-xs font-semibold uppercase tracking-wide ${col.color}`}>
-                    {col.label}
-                  </span>
-                  <span className="text-xs text-text-disabled">{colTasks.length}</span>
-                </div>
-                <div className="min-h-24 rounded-lg bg-surface-overlay p-2">
-                  {colTasks.map((task) => (
-                    <TaskCard
-                      key={task.id}
-                      task={task}
-                      onSelect={() => setFilterExpertId(task.assignedExpertId)}
-                      workflowId={id!}
-                    />
-                  ))}
-                  {colTasks.length === 0 && (
-                    <p className="py-4 text-center text-xs text-text-disabled">Empty</p>
-                  )}
-                </div>
+      {/* Workspace tabs (feature #28). Board is the default so the task board
+          and the approval gate stay front-and-centre; Deliverables/Activity/
+          Files are read-only views that used to sit below the fold. */}
+      <Tabs tabs={tabs} active={activeTab} onChange={setActiveTab} />
+
+      <div className="mt-4">
+        {activeTab === 'board' && (
+          <>
+            {/* Kanban board */}
+            {isLoading ? (
+              <div className="grid grid-cols-5 gap-4">
+                {COLUMNS.map((col) => (
+                  <Skeleton key={col.key} className="h-48" />
+                ))}
               </div>
-            )
-          })}
-        </div>
-      )}
+            ) : (
+              <div className="grid grid-cols-5 gap-4">
+                {COLUMNS.map((col) => {
+                  const colTasks = tasks.filter((t) => t.status === col.key)
+                  return (
+                    <div key={col.key}>
+                      <div className="mb-2 flex items-center justify-between">
+                        <span className={`text-xs font-semibold uppercase tracking-wide ${col.color}`}>
+                          {col.label}
+                        </span>
+                        <span className="text-xs text-text-disabled">{colTasks.length}</span>
+                      </div>
+                      <div className="min-h-24 rounded-lg bg-surface-overlay p-2">
+                        {colTasks.map((task) => (
+                          <TaskCard
+                            key={task.id}
+                            task={task}
+                            onSelect={() => setFilterExpertId(task.assignedExpertId)}
+                            workflowId={id!}
+                          />
+                        ))}
+                        {colTasks.length === 0 && (
+                          <p className="py-4 text-center text-xs text-text-disabled">Empty</p>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            )}
 
-      {/* Approval gate — interactive Approve/Request Changes controls */}
-      {workflow?.status === 'paused_for_approval' && (
-        <ApprovalGate
-          workflowId={id!}
-          approvalId={stream.approvalGate?.approvalId ?? ''}
-          gateName={stream.approvalGate?.gateName ?? 'approval'}
-          summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
-          currentGenericPct={workflow?.genericAllowancePct ?? 0}
-        />
-      )}
+            {/* Approval gate — interactive Approve/Request Changes controls */}
+            {workflow?.status === 'paused_for_approval' && (
+              <ApprovalGate
+                workflowId={id!}
+                approvalId={stream.approvalGate?.approvalId ?? ''}
+                gateName={stream.approvalGate?.gateName ?? 'approval'}
+                summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
+                currentGenericPct={workflow?.genericAllowancePct ?? 0}
+              />
+            )}
+          </>
+        )}
 
-      {/* Deliverables — what the experts actually produced (PRD, architecture, contracts) */}
-      <ArtifactsPanel
-        events={blackboard?.events ?? []}
-        expertNames={expertNames}
-        filterExpertId={filterExpertId}
-        onClearFilter={() => setFilterExpertId(null)}
-      />
+        {activeTab === 'deliverables' &&
+          (events.length === 0 ? (
+            <Card className="p-6">
+              <p className="text-center text-xs text-text-disabled">
+                No deliverables yet. They appear here as experts post their work.
+              </p>
+            </Card>
+          ) : (
+            <ArtifactsPanel
+              events={events}
+              expertNames={expertNames}
+              filterExpertId={filterExpertId}
+              onClearFilter={() => setFilterExpertId(null)}
+            />
+          ))}
 
-      {/* Activity Log — full chronological audit trail of all blackboard events */}
-      <ActivityLog
-        events={blackboard?.events ?? []}
-        expertNames={expertNames}
-      />
+        {activeTab === 'activity' &&
+          (events.length === 0 ? (
+            <Card className="p-6">
+              <p className="text-center text-xs text-text-disabled">
+                No activity yet. Every blackboard event will be listed here.
+              </p>
+            </Card>
+          ) : (
+            <ActivityLog events={events} expertNames={expertNames} />
+          ))}
 
-      {/* Live file browser — populated once experts start producing code */}
-      <FilesPanel files={fileStream.files} isConnected={fileStream.isConnected} />
+        {activeTab === 'files' && (
+          <FilesPanel
+            files={fileStream.files}
+            isConnected={fileStream.isConnected}
+            isDone={fileStream.isDone}
+            lastWave={fileStream.lastWave}
+          />
+        )}
+      </div>
 
       {/* Deliverable chat (§6) — separate from the product chat, own tables,
           own tool loop. Available once the workflow has produced at least
@@ -744,7 +724,7 @@ function KanbanPage() {
             <p className="text-sm font-medium text-mode-advise">{'\u2705'} Workflow Complete</p>
             <DownloadDesignPackageButton
               workflowTitle={workflow?.title ?? 'workflow'}
-              events={blackboard?.events ?? []}
+              events={events}
               expertNames={expertNames}
             />
           </div>
