@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/usage"
 )
 
 // Consolidation knobs (B7). Tuned for single-admin production:
@@ -147,6 +148,10 @@ func (c *Consolidator) ConsolidateProject(ctx context.Context, projectID uuid.UU
 	if c == nil || c.manager == nil || c.manager.l2 == nil {
 		return nil, fmt.Errorf("consolidator not configured")
 	}
+	// C5: attribute the (cheap) consolidation LLM call to this project.
+	ctx = usage.WithAttribution(ctx, usage.Attribution{
+		ProjectID: &projectID, UseCase: usage.UseCaseConsolidate,
+	})
 	res := &ConsolidateResult{}
 
 	// Fresh summary within cooldown → skip (end-of-phase, not per-event).

@@ -407,6 +407,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | **Knowledge** | DB, Go, System Design. |
 | **Files/Risk/Rollback** | `internal/monitoring/*`, `internal/admin/*`, frontend. Risk: Medium. Rollback: revert. |
 | **Limitation** | `go build ./...`; manual: budget alert fires. |
+| **DONE (C5)** | Mig 031 `usage_events` (append-only per-LLM-call: tenant/project/expert/chat/workflow/account + provider/tier/model/use_case + tokens + cost) + `usage_budgets` (per-tenant + one global row via COALESCE unique index). New `internal/usage`: `Event`/`Attribution`, context-carried attribution (`WithAttribution`/`AttributionFrom`), `Recorder` seam, `Service.Record` (fail-open; resolves project←workflow and tenant←project at write), `Summary` (whitelisted group_by tenant/project/expert/model/use_case), `MonthSpend`, `GetBudget/SetBudget/BudgetStatus/Alerts`, pure `MonthStart/UsagePercent/BudgetBreached`. Gateway is the single choke point (G5): `SetUsageRecorder` + `recordUsage` on every real (non-cached) `Call`/`StreamCall`. Attribution wired via ctx at orchestrator chat+synthesis, memory consolidator, message index/summary. Admin: `GET /admin/usage`, `GET/PUT /admin/usage/budgets`, `GET /admin/usage/alerts`. Tests: MonthStart/percent/breach/ctx/group whitelist/nil-safe. **Deferred:** scheduled alert notifications (endpoint is on-demand); `messages.cost_usd` backfill; frontend dashboard (C9/C10 surface). |
 
 ### C6 — Knowledge freshness / staleness detection
 | Part | Detail |
@@ -501,7 +502,7 @@ TASK #<id> (<An/Bn/Cn>) — <one-line title>
 | C2 | expert versioning/drift | C | ✅ done | (pending PR, this branch) |
 | C3 | eval harness + golden set | C | ✅ done | (pending PR, this branch) |
 | C4 | tenant isolation | C | ✅ done | (pending PR, this branch) |
-| C5 | cost/usage product | C | ⬜ pending | — |
+| C5 | cost/usage product | C | ✅ done | (pending PR, this branch) |
 | C6 | knowledge freshness | C | ⬜ pending | — |
 | C7 | adversarial debate | C | ⬜ pending | — |
 | C8 | bring-your-own-expert | C | ⬜ pending | — |

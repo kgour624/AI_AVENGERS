@@ -23,6 +23,7 @@ import (
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/training"
+	"ai_avengers/backend/internal/usage"
 	"ai_avengers/backend/internal/workflow"
 )
 
@@ -48,7 +49,9 @@ type AdminHandler struct {
 	evals *eval.Store
 	// tenants (C4): enterprise isolation controls. Nil-safe — list returns empty.
 	tenants *tenant.Service
-	logger  *zap.Logger
+	// usage (C5): cost/usage analytics + budgets. Nil-safe — returns empty.
+	usage  *usage.Service
+	logger *zap.Logger
 }
 
 // NewAdminHandler creates a new admin handler.
@@ -74,6 +77,7 @@ func NewAdminHandler(
 	versions *expertversion.Service,
 	evals *eval.Store,
 	tenants *tenant.Service,
+	usageSvc *usage.Service,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
@@ -86,6 +90,7 @@ func NewAdminHandler(
 		versions:    versions,
 		evals:       evals,
 		tenants:     tenants,
+		usage:       usageSvc,
 		logger:      logger,
 	}
 }
@@ -1425,6 +1430,150 @@ func (h *AdminHandler) AssignTenantExpert(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"expert_id": expertID, "tenant_id": target, "global": body.Global})
+}
+
+// ============================================================
+// COST & USAGE ANALYTICS (C5)
+// ============================================================
+
+// GetUsage GET /admin/usage?group_by=tenant|project|expert|model|use_case
+//              &from=RFC3339&to=RFC3339&tenant_id=&project_id=&expert_id=&use_case=
+func (h *AdminHandler) GetUsage(c *gin.Context) {
+	if h.usage == nil {
+		response.OK(c, gin.H{"group_by": "tenant", "rows": []usage.Row{}})
+		return
+	}
+	f := usage.Filter{
+		GroupBy: c.Query("group_by"),
+		UseCase: strings.TrimSpace(c.Query("use_case")),
+	}
+	if v := c.Query("from"); v != "" {
+		if ts, err := time.Parse(time.RFC3339, v); err == nil {
+			f.From = ts
+		} else {
+			response.BadRequest(c, "INVALID_INPUT", "from must be RFC3339")
+			return
+		}
+	}
+	if v := c.Query("to"); v != "" {
+		if ts, err := time.Parse(time.RFC3339, v); err == nil {
+			f.To = ts
+		} else {
+			response.BadRequest(c, "INVALID_INPUT", "to must be RFC3339")
+			return
+		}
+	}
+	var err error
+	if f.TenantID, err = parseOptionalUUID(c.Query("tenant_id")); err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant_id")
+		return
+	}
+	if f.ProjectID, err = parseOptionalUUID(c.Query("project_id")); err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid project_id")
+		return
+	}
+	if f.ExpertID, err = parseOptionalUUID(c.Query("expert_id")); err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert_id")
+		return
+	}
+	rows, err := h.usage.Summary(c.Request.Context(), f)
+	if err != nil {
+		h.logger.Error("usage summary failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"group_by": f.GroupBy, "rows": rows})
+}
+
+// GetUsageBudgets GET /admin/usage/budgets
+// Returns the global default budget + every per-tenant budget, resolved
+// against this month's spend.
+func (h *AdminHandler) GetUsageBudgets(c *gin.Context) {
+	if h.usage == nil {
+		response.OK(c, gin.H{"global": nil, "tenants": []usage.BudgetStatus{}})
+		return
+	}
+	ctx := c.Request.Context()
+	global, err := h.usage.BudgetStatus(ctx, nil)
+	if err != nil {
+		h.logger.Error("usage global budget failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	alerts, err := h.usage.Alerts(ctx)
+	if err != nil {
+		h.logger.Error("usage budgets failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"global": global, "tenants": alerts})
+}
+
+// SetUsageBudget PUT /admin/usage/budgets
+// Body: {"tenant_id":"<uuid>"?, "monthly_limit_usd":100, "alert_threshold":0.8}
+// Omit tenant_id to set the platform default.
+func (h *AdminHandler) SetUsageBudget(c *gin.Context) {
+	if h.usage == nil {
+		response.InternalError(c)
+		return
+	}
+	var body struct {
+		TenantID        string  `json:"tenant_id"`
+		MonthlyLimitUSD float64 `json:"monthly_limit_usd"`
+		AlertThreshold  float64 `json:"alert_threshold"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	tenantID, err := parseOptionalUUID(body.TenantID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid tenant_id")
+		return
+	}
+	if body.AlertThreshold == 0 {
+		body.AlertThreshold = 0.8
+	}
+	if err := h.usage.SetBudget(c.Request.Context(), tenantID, body.MonthlyLimitUSD, body.AlertThreshold); err != nil {
+		h.logger.Warn("set usage budget failed", zap.Error(err))
+		response.BadRequest(c, "SET_FAILED", err.Error())
+		return
+	}
+	st, err := h.usage.BudgetStatus(c.Request.Context(), tenantID)
+	if err != nil {
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, st)
+}
+
+// GetUsageAlerts GET /admin/usage/alerts
+// Budgets whose spend has reached the alert threshold or the limit.
+func (h *AdminHandler) GetUsageAlerts(c *gin.Context) {
+	if h.usage == nil {
+		response.OK(c, []usage.BudgetStatus{})
+		return
+	}
+	alerts, err := h.usage.Alerts(c.Request.Context())
+	if err != nil {
+		h.logger.Error("usage alerts failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, alerts)
+}
+
+// parseOptionalUUID returns nil for an empty string, a parsed UUID otherwise.
+func parseOptionalUUID(s string) (*uuid.UUID, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return nil, err
+	}
+	return &id, nil
 }
 
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream

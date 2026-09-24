@@ -47,6 +47,7 @@ import (
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/selflearning"
 	"ai_avengers/backend/internal/tenant"
+	"ai_avengers/backend/internal/usage"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 )
@@ -393,6 +394,10 @@ func buildRouter(
 	evalStore := eval.NewStore(postgres.Pool)
 	// C4: tenant isolation + enterprise controls. Kill switch TENANT_ISOLATION_ENABLED.
 	tenantSvc := tenant.NewService(postgres.Pool, cfg.Tenant.IsolationEnabled, logger)
+	// C5: cost/usage analytics product. The gateway records every real LLM
+	// call here (single choke point, G5); admin reads it back grouped.
+	usageSvc := usage.NewService(postgres.Pool, logger)
+	modelGateway.SetUsageRecorder(usageSvc)
 	// B7: background L2 consolidation + preference decay. Stops on root ctx cancel.
 	// Cheap model, 6h interval, phase-end (cooldown) not per-event.
 	go memory.NewConsolidator(memManager, modelGateway, logger).Run(ctx)
@@ -434,7 +439,7 @@ func buildRouter(
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
 	repoHandler := repo.NewHandler(repoSvc, logger)
-	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, logger)
+	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, logger)
 
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
@@ -795,6 +800,11 @@ func buildRouter(
 		adminGroup.POST("/tenants", adminHandler.CreateTenant)
 		adminGroup.POST("/tenants/:id/users", adminHandler.AssignTenantUser)
 		adminGroup.POST("/tenants/:id/experts", adminHandler.AssignTenantExpert)
+		// C5: cost & usage analytics product.
+		adminGroup.GET("/usage", adminHandler.GetUsage)
+		adminGroup.GET("/usage/budgets", adminHandler.GetUsageBudgets)
+		adminGroup.PUT("/usage/budgets", adminHandler.SetUsageBudget)
+		adminGroup.GET("/usage/alerts", adminHandler.GetUsageAlerts)
 		adminGroup.GET("/experts/:id/jobs", adminHandler.GetIngestionJobs)
 		adminGroup.GET("/experts/:id/jobs/stream", adminHandler.StreamIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
