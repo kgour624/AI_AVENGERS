@@ -206,22 +206,30 @@ func (e *Enforcer) Enforce(
 		return nil, fmt.Errorf("generation failed: %w", err)
 	}
 
-	if len(generated.Citations) == 0 {
-		e.logger.Warn("Layer 3: no citations in response")
-		if attempt >= e.cfg.MaxRetries {
-			return e.buildRefusal("citation_failure", "Could not generate properly cited answer"), nil
-		}
-		return &EnforceResult{Status: "retry", LayerFailed: 3}, nil
-	}
-
 	// STRUCTURED PATH (CT-B1/B2): category had a non-empty template_schema,
 	// so generateWithCitations took the structured branch and returned
 	// per-section results instead of one flat Answer. Handled entirely
 	// separately from the flat path below so the flat path's existing
 	// logic (including its BaseProfile safety net) stays byte-for-byte
 	// unchanged for every non-categorized expert (CT-L2).
+	//
+	// A14: run this BEFORE the flat zero-citation check. Structured
+	// answers can legitimately have empty top-level Citations when
+	// sections are code/test-only (citation-exempt). enforceStructured
+	// owns citation policy for those sections; the flat check below
+	// must not refuse them first.
 	if len(generated.TemplateSections) > 0 {
 		return e.enforceStructured(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, generated, coverage, bestScore, templateSections, defaultLanguage)
+	}
+
+	// FLAT PATH only: zero citations => retry/refuse. Structured path
+	// already returned above (A14).
+	if len(generated.Citations) == 0 {
+		e.logger.Warn("Layer 3: no citations in response")
+		if attempt >= e.cfg.MaxRetries {
+			return e.buildRefusal("citation_failure", "Could not generate properly cited answer"), nil
+		}
+		return &EnforceResult{Status: "retry", LayerFailed: 3}, nil
 	}
 
 	// LAYER 4: Strip uncited claims
