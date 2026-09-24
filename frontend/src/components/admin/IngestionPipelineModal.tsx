@@ -131,6 +131,7 @@ export function IngestionPipelineModal({
   const isFailed = job?.status === 'failed'
   // FIX: paused was not handled — UI showed "Extracting..." frozen for 30+ min
   const isPaused = job?.status === 'paused'
+  const isRunning = !!job && !isDone && !isFailed && !isPaused
 
   const handleResume = async () => {
     if (!expertId || !job?.id) return
@@ -230,9 +231,79 @@ export function IngestionPipelineModal({
           </div>
         )}
 
+        {/* T2: DB verification — the pipeline's claim checked against the
+            actual rows in course_chunks (recorded as a `verified` event). */}
+        {stream.verification && (
+          <div
+            className={cn(
+              'rounded-lg border px-3 py-2',
+              stream.verification.ok
+                ? 'border-mode-advise/30 bg-mode-advise/5'
+                : 'border-glow-amber/40 bg-glow-amber/10',
+            )}
+          >
+            <div className="flex items-center justify-between">
+              <p className={cn(
+                'text-xs font-semibold',
+                stream.verification.ok ? 'text-mode-advise' : 'text-glow-amber',
+              )}>
+                {stream.verification.ok ? '\u2705 Database verified' : '\u26a0\ufe0f Database mismatch'}
+              </p>
+              <span className="text-[10px] text-text-disabled">
+                counted in course_chunks
+              </span>
+            </div>
+            <div className="mt-1 grid grid-cols-3 gap-2 text-[10px] text-text-secondary">
+              <span>
+                chunks{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.reality.chunks ?? 0}
+                </span>
+                {typeof stream.verification.claim.chunks === 'number' &&
+                  stream.verification.claim.chunks !== stream.verification.reality.chunks && (
+                    <span className="text-glow-amber"> (claimed {stream.verification.claim.chunks})</span>
+                  )}
+              </span>
+              <span>
+                topics{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.reality.topics ?? 0}
+                </span>
+              </span>
+              <span>
+                general{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.reality.general_chunks ?? 0}
+                </span>
+              </span>
+            </div>
+            {stream.verification.corpusTotalChunks > 0 && (
+              <p className="mt-1 text-[10px] text-text-disabled">
+                corpus total after this run:{' '}
+                <span className="font-mono">{stream.verification.corpusTotalChunks}</span> chunks
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* T3: live batch progress for the parallel stage. The stage cards below
+            show WHICH step is active; this shows how many batches are in flight. */}
+        {stream.progress && isRunning && (
+          <div className="flex items-center justify-between rounded-lg border border-brand/25 bg-brand/5 px-3 py-2">
+            <span className="text-[11px] text-text-secondary">
+              {stream.progress.stage} {'\u2014'} batch{' '}
+              <span className="font-mono text-text-primary">
+                {stream.progress.batchesDone}/{stream.progress.batchesTotal}
+              </span>
+            </span>
+            <span className="text-[10px] text-text-disabled">
+              {stream.progress.workers} workers
+            </span>
+          </div>
+        )}
+
         {/* Stage pipeline */}
-        <div className="flex flex-col gap-1.5">
-          {STAGES.map((stage) => {
+        <div className="flex flex-col gap-1.5">          {STAGES.map((stage) => {
             const status = job
               ? getStageStatus(stage.key, currentStage, job.status)
               : 'waiting'
@@ -269,6 +340,12 @@ export function IngestionPipelineModal({
                   </div>
                   {(isActive || isFailedStage) && job?.stageDetail && (
                     <p className="mt-0.5 text-[10px] text-text-secondary">{job.stageDetail}</p>
+                  )}
+                  {isActive && stream.progress && stream.progress.stage === stage.key && (
+                    <p className="mt-0.5 text-[10px] text-text-disabled">
+                      batch {stream.progress.batchesDone}/{stream.progress.batchesTotal}
+                      {' '}{'\u00b7'} {stream.progress.workers} workers
+                    </p>
                   )}
                 </div>
               </div>
@@ -375,26 +452,32 @@ export function IngestionPipelineModal({
           </div>
         )}
 
-        {/* Event log */}
+        {/* Event log — sourced from ingestion_job_events (Postgres), so it is
+            identical for every viewer and survives a refresh. */}
         <div>
-          <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
-            Live Event Log
-          </p>
+          <div className="mb-1.5 flex items-center justify-between">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
+              Ingestion Timeline
+            </p>
+            <span className="text-[10px] text-text-disabled">
+              {stream.events.length} events {'\u00b7'} from database
+            </span>
+          </div>
           <div
             ref={logRef}
-            className="h-40 overflow-y-auto rounded-lg border border-surface-border bg-surface-void p-2 font-mono text-[10px]"
+            className="h-44 overflow-y-auto rounded-lg border border-surface-border bg-surface-void p-2 font-mono text-[10px]"
           >
             {stream.eventLog.length === 0 ? (
-              <p className="text-text-disabled">Connecting...</p>
+              <p className="text-text-disabled">Waiting for the first event…</p>
             ) : (
-              stream.eventLog.map((entry, i) => (
-                <div key={i} className="flex gap-2 py-0.5">
+              stream.eventLog.map((entry) => (
+                <div key={entry.seq} className="flex gap-2 py-0.5">
                   <span className="flex-shrink-0 text-text-disabled">{fmtTs(entry.ts)}</span>
                   <span className={cn(
                     'break-all',
                     entry.type === 'failed' || entry.type === 'error' ? 'text-mode-refuse'
-                    : entry.type === 'complete' ? 'text-mode-advise'
-                    : entry.type === 'connected' ? 'text-glow-cyan'
+                    : entry.type === 'complete' || entry.type === 'verified' ? 'text-mode-advise'
+                    : entry.type === 'paused' || entry.type === 'mismatch' ? 'text-glow-amber'
                     : 'text-text-secondary',
                   )}>
                     {entry.message}

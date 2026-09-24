@@ -21,6 +21,7 @@ import (
 	"ai_avengers/backend/internal/eval"
 	"ai_avengers/backend/internal/expertversion"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/knowledge"
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
@@ -58,6 +59,10 @@ type AdminHandler struct {
 	freshness *knowledge.Freshness
 	// byo (C8): tenant self-service expert entitlement + audit. Nil-safe.
 	byo    *byoexpert.Service
+	// events (T1): durable ingestion timeline. Powers the live SSE stream
+	// (true push, not a 1s snapshot poll) and the history endpoint. Nil-safe:
+	// when unwired, StreamIngestionJob falls back to snapshot-only updates.
+	events *jobevents.Store
 	logger *zap.Logger
 }
 
@@ -87,13 +92,14 @@ func NewAdminHandler(
 	usageSvc *usage.Service,
 	freshness *knowledge.Freshness,
 	byoSvc *byoexpert.Service,
+	events *jobevents.Store,
 	logger *zap.Logger,
 ) *AdminHandler {
 	return &AdminHandler{
 		db:          db,
 		gateway:     gw,
 		embedder:    embedder,
-		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, logger),
+		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, events, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
 		versions:    versions,
@@ -102,6 +108,7 @@ func NewAdminHandler(
 		usage:       usageSvc,
 		freshness:   freshness,
 		byo:         byoSvc,
+		events:      events,
 		logger:      logger,
 	}
 }
@@ -1792,10 +1799,100 @@ func (h *AdminHandler) ListByoEvents(c *gin.Context) {
 	response.OK(c, events)
 }
 
+// ============================================================
+// INGESTION TRANSPARENCY (T1)
+// ============================================================
+
+// ingestionJobSnapshot is the mutable "hot" row the UI renders (progress bar,
+// stage cards, ETA, cost, resume button). The fine-grained "what happened"
+// detail lives in ingestion_job_events and is streamed alongside it.
+type ingestionJobSnapshot struct {
+	ID                        uuid.UUID  `json:"id"`
+	Status                    string     `json:"status"`
+	SourcePath                string     `json:"source_path"`
+	TotalChunks               int        `json:"total_chunks"`
+	ProcessedChunks           int        `json:"processed_chunks"`
+	ErrorMessage              string     `json:"error_message"`
+	StartedAt                 *time.Time `json:"started_at"`
+	CompletedAt               *time.Time `json:"completed_at"`
+	CreatedAt                 time.Time  `json:"created_at"`
+	CurrentStage              string     `json:"current_stage"`
+	StageDetail               string     `json:"stage_detail"`
+	CostUsd                   float64    `json:"cost_usd"`
+	EstimatedSecondsRemaining *int       `json:"estimated_seconds_remaining"`
+	ResumedFromCheckpoint     bool       `json:"resumed_from_checkpoint"`
+}
+
+// loadLatestJobSnapshot reads the most recent ingestion job for an expert.
+func (h *AdminHandler) loadLatestJobSnapshot(ctx context.Context, expertID uuid.UUID) (*ingestionJobSnapshot, error) {
+	var job ingestionJobSnapshot
+	err := h.db.QueryRow(ctx, `
+		SELECT id, status, COALESCE(source_path,''),
+		       total_chunks, processed_chunks,
+		       COALESCE(error_message,''), started_at, completed_at, created_at,
+		       COALESCE(current_stage,'pending'), COALESCE(stage_detail,''),
+		       COALESCE(cost_usd,0), estimated_seconds_remaining,
+		       COALESCE(resumed_from_checkpoint,false)
+		FROM ingestion_jobs
+		WHERE expert_id=$1
+		ORDER BY created_at DESC LIMIT 1`,
+		expertID,
+	).Scan(
+		&job.ID, &job.Status, &job.SourcePath,
+		&job.TotalChunks, &job.ProcessedChunks,
+		&job.ErrorMessage, &job.StartedAt, &job.CompletedAt, &job.CreatedAt,
+		&job.CurrentStage, &job.StageDetail,
+		&job.CostUsd, &job.EstimatedSecondsRemaining,
+		&job.ResumedFromCheckpoint,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+// replayEvents pages the durable timeline from `since` and writes each row as an
+// SSE `event` frame, advancing *since.
+//
+// WHY read the DB instead of trusting the live stream: events are append-only,
+// so a viewer that refreshes, reconnects, or joins mid-run reconstructs the
+// identical timeline. That is what makes the log survive a page reload — the
+// previous implementation kept it in browser memory only.
+func (h *AdminHandler) replayEvents(ctx context.Context, jobID uuid.UUID, since *int64, send func(string, interface{})) {
+	if !h.events.Enabled() || jobID == uuid.Nil {
+		return
+	}
+	for {
+		events, err := h.events.GetSince(ctx, jobID, *since, 200)
+		if err != nil {
+			h.logger.Warn("ingestion stream: timeline replay failed",
+				zap.String("job_id", jobID.String()), zap.Error(err))
+			return
+		}
+		for _, ev := range events {
+			send("event", ev)
+			*since = ev.SequenceNumber
+		}
+		if len(events) < 200 {
+			return
+		}
+	}
+}
+
 // StreamIngestionJob GET /admin/experts/:id/jobs/stream
-// SSE endpoint — pushes live job state every 1 second.
-// Closes automatically when job reaches complete or failed.
-// No polling needed on the frontend.
+//
+// SSE endpoint with two cooperating feeds:
+//  1. `event` frames — the durable timeline (ingestion_job_events), pushed as
+//     soon as the pipeline writes it (Redis pub/sub is the wake-up; Postgres is
+//     the source of truth). This is the real-time transparency feed.
+//  2. `update` / `complete` / `failed` / `llm_failure_decision_required` frames
+//     — the job row, re-read every 2s. WHY still needed: events carry history,
+//     the snapshot carries current ETA/cost and reconciles anything that could
+//     not be written as an event. (It is deliberately slower than the events so
+//     the events, not the poll, are what the admin reads.)
+//
+// Closes on a terminal state after flushing the tail of the timeline, so the
+// final events (verified / complete / paused) are never cut off by the close.
 func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 	expertID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -1803,28 +1900,79 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 		return
 	}
 
-	// SSE headers
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no") // disable nginx buffering
 
 	ctx := c.Request.Context()
-	ticker := time.NewTicker(time.Second)
-	heartbeat := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	defer heartbeat.Stop()
 
-	sendEvent := func(eventType string, job interface{}) {
-		payload := map[string]interface{}{
+	sendEvent := func(eventType string, payload interface{}) {
+		envelope := map[string]interface{}{
 			"type": eventType,
-			"job":  job,
 			"ts":   time.Now().UTC().Format(time.RFC3339Nano),
 		}
-		data, _ := json.Marshal(payload)
+		// The frontend has read {type, job} since the first version — keep that
+		// shape for snapshots, and add {type:"event", event:{...}} for timeline
+		// rows so old clients simply ignore the new frames.
+		if eventType == "event" {
+			envelope["event"] = payload
+		} else {
+			envelope["job"] = payload
+		}
+		data, _ := json.Marshal(envelope)
 		fmt.Fprintf(c.Writer, "data: %s\n\n", data)
 		c.Writer.Flush()
 	}
+
+	// Force headers out immediately (Go writes them only on first write) so the
+	// browser leaves CONNECTING even when nothing happens for a while.
+	fmt.Fprint(c.Writer, ": connected\n\n")
+	c.Writer.Flush()
+
+	var (
+		lastSeq       int64
+		eventCh       <-chan jobevents.Event
+		subscribedFor uuid.UUID
+	)
+
+	// subscribe attaches a live timeline feed for a job (idempotent).
+	subscribe := func(jobID uuid.UUID) {
+		if !h.events.Enabled() || jobID == uuid.Nil || jobID == subscribedFor {
+			return
+		}
+		subscribedFor = jobID
+		lastSeq = 0
+		h.replayEvents(ctx, jobID, &lastSeq, sendEvent)
+
+		ch, errCh := h.events.Subscriber(h.logger).Subscribe(ctx, jobID, lastSeq)
+		eventCh = ch
+		// Drain the error channel: the subscriber reports non-fatal problems
+		// there (initial catch-up failure) and keeps streaming. Not draining
+		// it would be a silent drop; the timeline is what the admin trusts.
+		go func() {
+			for subErr := range errCh {
+				if subErr != nil {
+					h.logger.Warn("ingestion stream: subscriber error (non-fatal)",
+						zap.String("job_id", jobID.String()),
+						zap.Error(subErr),
+					)
+				}
+			}
+		}()
+	}
+
+	// A job can appear shortly AFTER the client connects (upload is async), so
+	// a missing snapshot is not an error — the ticker picks it up below.
+	if snapshot, snapErr := h.loadLatestJobSnapshot(ctx, expertID); snapErr == nil {
+		sendEvent("hello", snapshot)
+		subscribe(snapshot.ID)
+	}
+
+	ticker := time.NewTicker(2 * time.Second)
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	defer heartbeat.Stop()
 
 	for {
 		select {
@@ -1832,77 +1980,144 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 			return
 
 		case <-heartbeat.C:
-			// Keep connection alive through proxies
+			// Keep the connection alive through proxies (nginx idle timeout).
 			fmt.Fprintf(c.Writer, "data: {\"type\":\"heartbeat\",\"ts\":\"%s\"}\n\n",
 				time.Now().UTC().Format(time.RFC3339Nano))
 			c.Writer.Flush()
 
-		case <-ticker.C:
-			// Read latest job state from DB
-			var job struct {
-				ID                        uuid.UUID  `json:"id"`
-				Status                    string     `json:"status"`
-				SourcePath                string     `json:"source_path"`
-				TotalChunks               int        `json:"total_chunks"`
-				ProcessedChunks           int        `json:"processed_chunks"`
-				ErrorMessage              string     `json:"error_message"`
-				StartedAt                 *time.Time `json:"started_at"`
-				CompletedAt               *time.Time `json:"completed_at"`
-				CreatedAt                 time.Time  `json:"created_at"`
-				CurrentStage              string     `json:"current_stage"`
-				StageDetail               string     `json:"stage_detail"`
-				CostUsd                   float64    `json:"cost_usd"`
-				EstimatedSecondsRemaining *int       `json:"estimated_seconds_remaining"`
-				ResumedFromCheckpoint     bool       `json:"resumed_from_checkpoint"`
+		case ev, ok := <-eventCh:
+			if !ok {
+				// Feed closed (context cancelled). Stop selecting on it rather
+				// than spinning on a closed channel.
+				eventCh = nil
+				continue
+			}
+			sendEvent("event", ev)
+			if ev.SequenceNumber > lastSeq {
+				lastSeq = ev.SequenceNumber
 			}
 
-			err := h.db.QueryRow(ctx, `
-				SELECT id, status, COALESCE(source_path,''),
-				       total_chunks, processed_chunks,
-				       COALESCE(error_message,''), started_at, completed_at, created_at,
-				       COALESCE(current_stage,'pending'), COALESCE(stage_detail,''),
-				       COALESCE(cost_usd,0), estimated_seconds_remaining,
-				       COALESCE(resumed_from_checkpoint,false)
-				FROM ingestion_jobs
-				WHERE expert_id=$1
-				ORDER BY created_at DESC LIMIT 1`,
-				expertID,
-			).Scan(
-				&job.ID, &job.Status, &job.SourcePath,
-				&job.TotalChunks, &job.ProcessedChunks,
-				&job.ErrorMessage, &job.StartedAt, &job.CompletedAt, &job.CreatedAt,
-				&job.CurrentStage, &job.StageDetail,
-				&job.CostUsd, &job.EstimatedSecondsRemaining,
-				&job.ResumedFromCheckpoint,
-			)
-			if err != nil {
-				// No job yet — send waiting event
+		case <-ticker.C:
+			job, loadErr := h.loadLatestJobSnapshot(ctx, expertID)
+			if loadErr != nil {
 				fmt.Fprintf(c.Writer, "data: {\"type\":\"waiting\",\"ts\":\"%s\"}\n\n",
 					time.Now().UTC().Format(time.RFC3339Nano))
 				c.Writer.Flush()
 				continue
 			}
+			// Late-arriving job: attach the timeline feed now.
+			subscribe(job.ID)
 
-			// Determine event type
 			eventType := "update"
-			if job.Status == "complete" {
-				eventType = "complete"
-			} else if job.Status == "failed" {
-				eventType = "failed"
-			} else if job.Status == "paused" {
-				// Charter LLM failed — pipeline stopped, waiting for admin.
-				// Frontend shows Retry Now button on this event type.
-				eventType = "llm_failure_decision_required"
+			terminal := false
+			switch job.Status {
+			case "complete":
+				eventType, terminal = "complete", true
+			case "failed":
+				eventType, terminal = "failed", true
+			case "paused":
+				// Pipeline stopped for admin action (charter LLM failure).
+				// Frontend shows the Retry button on this event type.
+				eventType, terminal = "llm_failure_decision_required", true
 			}
 
+			if terminal {
+				// Flush the tail of the timeline BEFORE closing, otherwise the
+				// final events race the close and can be lost.
+				h.replayEvents(ctx, job.ID, &lastSeq, sendEvent)
+			}
 			sendEvent(eventType, job)
 
-			// Close stream when job is terminal
-			if job.Status == "complete" || job.Status == "failed" || job.Status == "paused" {
+			if terminal {
 				return
 			}
 		}
 	}
+}
+
+// GetIngestionJobEvents GET /admin/experts/:id/jobs/events?jobId=<uuid>
+//
+// Returns the durable timeline for one job — used by the modal to render the
+// "what happened" log when it opens on an already-finished job (the SSE stream
+// closes at terminal state, so a completed run has no live feed).
+//
+// WHY jobId is a query param and not a path segment: the sibling route
+// GET /experts/:id/jobs/stream already occupies that tree position, and mixing
+// a static segment with a :jobID wildcard there is exactly the kind of route
+// registration that panics at startup. A query param cannot conflict.
+//
+// Query params: jobId (required), after (sequence_number cursor, default 0),
+// limit (default 200, max 1000). Response includes last_sequence so the client
+// can continue without re-reading rows it already has.
+func (h *AdminHandler) GetIngestionJobEvents(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	rawJobID := c.Query("jobId")
+	if rawJobID == "" {
+		rawJobID = c.Query("job_id")
+	}
+	jobID, err := uuid.Parse(rawJobID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_JOB_ID", "valid jobId query parameter is required")
+		return
+	}
+
+	if !h.events.Enabled() {
+		response.OK(c, map[string]interface{}{
+			"events":        []interface{}{},
+			"last_sequence": 0,
+			"timeline":      false,
+		})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Ownership check: the job must belong to this expert. Prevents an admin
+	// from reading another expert's timeline with a guessed job id.
+	var ownerID uuid.UUID
+	if err := h.db.QueryRow(ctx,
+		`SELECT expert_id FROM ingestion_jobs WHERE id=$1`, jobID,
+	).Scan(&ownerID); err != nil || ownerID != expertID {
+		response.NotFound(c, "ingestion job")
+		return
+	}
+
+	after := int64(0)
+	if raw := c.Query("after"); raw != "" {
+		if parsed, parseErr := strconv.ParseInt(raw, 10, 64); parseErr == nil && parsed >= 0 {
+			after = parsed
+		}
+	}
+	limit := 200
+	if raw := c.Query("limit"); raw != "" {
+		if parsed, parseErr := strconv.Atoi(raw); parseErr == nil && parsed > 0 && parsed <= 1000 {
+			limit = parsed
+		}
+	}
+
+	events, err := h.events.GetSince(ctx, jobID, after, limit)
+	if err != nil {
+		h.logger.Error("get ingestion job events failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if events == nil {
+		events = []jobevents.Event{}
+	}
+	lastSeq := after
+	if len(events) > 0 {
+		lastSeq = events[len(events)-1].SequenceNumber
+	}
+
+	response.OK(c, map[string]interface{}{
+		"events":        events,
+		"last_sequence": lastSeq,
+		"timeline":      true,
+	})
 }
 
 // RegenerateCharter POST /admin/experts/:id/regenerate-charter

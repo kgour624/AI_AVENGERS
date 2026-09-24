@@ -1,25 +1,54 @@
-# Feature #8: Real-time Ingestion Progress with SSE
+# Feature #8: Real-time Ingestion Progress
 
 ## Overview
-The ingestion progress feature is **already fully implemented** with Server-Sent Events (SSE) for real-time updates. This document describes the existing implementation.
+Ingestion progress has two cooperating layers: a **durable, append-only event
+timeline** (`ingestion_job_events`, Postgres) streamed over SSE, and the
+**hot job row** (`ingestion_jobs`) used for the progress bar / ETA / cost.
 
-## Status: ✅ ALREADY IMPLEMENTED
+> **UPDATE (T1–T4, training transparency).** The original implementation below
+> described a 1-second DB **poll** inside the SSE handler, a browser-memory-only
+> event log, fully sequential batch processing, and per-chunk INSERTs. All four
+> were replaced:
+>
+> | Concern | Before | Now |
+> |---|---|---|
+> | Event log | Built client-side from snapshots; **lost on refresh**, different per viewer | Appended to `ingestion_job_events`; SSE replays from Postgres, so every viewer sees the identical history |
+> | SSE transport | 1s poll of `ingestion_jobs`, re-sent even when unchanged | Redis pub/sub wake-up + Postgres read; the 2s snapshot is only for ETA/cost reconciliation |
+> | Double confirmation | Admin had to run SQL to check the claimed counts | `verified` event compares the pipeline's claim against real `course_chunks` aggregates (claim vs reality in the UI) |
+> | Topic + embed batches | Sequential (one batch at a time) | Worker pool, `INGESTION_WORKERS` (default 3) with a semaphore |
+> | Chunk storage | 1 INSERT + up to 2 link UPDATEs **per chunk** (~45k round trips for 15k chunks) | 200-row batched INSERT + one id-resolution query per batch + batched `unnest` link UPDATE |
+>
+> Two latent resume bugs were also fixed while in there: topic/embed batches
+> were being *skipped* on resume even though their results only ever lived in
+> memory until the store step — which silently produced `topic="general"`
+> chunks (topic stage) and nil embeddings (embed stage). Resume now reuses
+> stored topics only when they are actually in the DB, and always recomputes
+> embeddings (local sidecar, so it is cheap).
+>
+> New endpoint for history: `GET /admin/experts/:id/jobs/events?jobId=<uuid>`
+> (`after`/`limit` cursors). `jobId` is a query param because
+> `GET /experts/:id/jobs/stream` already owns that route tree position.
 
-This feature was implemented in the initial codebase and includes:
-- Real-time SSE-based progress updates
+## Status: ✅ IMPLEMENTED
+
+Includes:
+- Durable event timeline + true-push SSE
 - Step-by-step stage visualization
 - Error details and recovery options
 - Resume from checkpoint functionality
-- Live event log
+- Live event log backed by the database
 
 ## Architecture
 
 ### Backend
-- **File**: `backend-go/internal/admin/admin_handler.go`
+- **File**: `backend-go/internal/admin/admin_handler.go` (stream + history)
+- **Timeline**: `backend-go/internal/jobevents/` (store + subscriber)
 - **Endpoint**: `GET /api/v1/admin/experts/:id/jobs/stream`
+- **History**: `GET /api/v1/admin/experts/:id/jobs/events?jobId=<uuid>`
 - **Protocol**: Server-Sent Events (SSE)
-- **Update Frequency**: Every 1 second
-- **Heartbeat**: Every 5 seconds
+- **Event push**: immediate (Redis pub/sub wake-up → Postgres read)
+- **Snapshot reconciliation**: every 2 seconds (ETA / cost / status)
+- **Heartbeat**: every 15 seconds
 
 ### Frontend
 - **Hook**: `frontend/src/hooks/useIngestionStream.ts`
@@ -29,10 +58,43 @@ This feature was implemented in the initial codebase and includes:
 ## Features
 
 ### 1. Real-time Progress Updates
-- **No polling required**: SSE pushes updates automatically
+- **Event push, not polling**: timeline events arrive as soon as the pipeline writes them
 - **Live connection indicator**: Shows "Live" or "Reconnecting..."
 - **Progress bar**: Updates in real-time with percentage
 - **Chunk counter**: Shows processed/total chunks
+
+### 1a. Timeline event kinds (`ingestion_job_events.kind`)
+| kind | Meaning |
+|---|---|
+| `run_started` | A run (or resume) began — includes worker count |
+| `stage_started` / `stage_done` | Stage boundary; `stage_done` carries `duration_ms` |
+| `batch_done` | One topic/embed batch finished (batches done/total, chunks, workers) |
+| `chunk_stored` | A block of chunks was committed to `course_chunks` |
+| `verified` | **Double confirmation** — claim vs real DB aggregates |
+| `paused` / `failed` / `complete` | Terminal states, with reason/ledger |
+
+### 1b. Double confirmation (T2)
+After storing, the pipeline re-reads the database and compares it with what it
+claims it produced, then records a `verified` event:
+
+```json
+{ "ok": true,
+  "claim":   { "chunks": 873, "topics": 37, "general_chunks": 0 },
+  "reality": { "chunks": 873, "topics": 37, "general_chunks": 0, "null_embeddings": 0 },
+  "corpus_total_chunks": 1741 }
+```
+
+`ok=false` means the numbers disagree — surfaced in the UI in amber instead of
+being silently wrong.
+
+### 1c. Concurrency (T3)
+Topic extraction and embedding run batches in a bounded worker pool
+(`INGESTION_WORKERS`, default 3 — mirrors `orchestrator.expertMaxConcurrency`).
+Checkpoints persist the **contiguous completed prefix**, so resume stays correct
+when batches finish out of order. Chunk storage is batched (T4) but its
+`prev/next` link pass is a separate sequential step because linking is
+order-dependent; the waves-sequential / tasks-parallel shape mirrors
+`workflow/runner.go`.
 
 ### 2. Stage Pipeline Visualization
 
@@ -141,6 +203,32 @@ This feature was implemented in the initial codebase and includes:
 ```
 
 ## SSE Event Types
+
+### 0. `hello` (initial frame)
+```json
+{ "type": "hello", "job": { "id": "...", "status": "running", "currentStage": "embedding" }, "ts": "..." }
+```
+- Sent once on connect with the current job snapshot, immediately followed by a
+  replay of the whole timeline as `event` frames.
+
+### 0b. `event` (durable timeline row)
+```json
+{
+  "type": "event",
+  "event": {
+    "id": "...", "jobId": "...", "expertId": "...",
+    "sequenceNumber": 42, "stage": "embedding", "kind": "batch_done",
+    "detail": { "batch_index": 7, "batches_done": 8, "batches_total": 40,
+                "chunks_done": 200, "chunks_total": 873, "workers": 3 },
+    "createdAt": "2026-09-25T14:23:43.567Z"
+  },
+  "ts": "..."
+}
+```
+- The authoritative timeline. Delivered live and replayed on connect/reconnect
+  from Postgres, so it survives a refresh and is identical for every viewer.
+- Old clients that only understand `update`/`complete`/`failed` simply ignore
+  these frames — the protocol stayed backward compatible.
 
 ### 1. `heartbeat`
 ```json
@@ -441,8 +529,18 @@ $0.0234 / ₹1.97
 
 ## Known Issues
 
-### None
-The implementation is complete and production-ready.
+- `INGESTION_WORKERS` higher than the provider's rate limit (topic extraction)
+  or the sidecar's CPU (embedding) does not add throughput — it just moves the
+  queue to the provider. 3 is the tuned default.
+- Batch-level concurrency means `processed_chunks` in the job row advances in
+  *chunk* batches, not strictly one batch at a time; the timeline is the
+  accurate per-batch record.
+
+## Rollback
+
+Migration `036_ingestion_job_events.down.sql` drops the timeline. Every emit
+site is nil-safe and the SSE handler falls back to snapshot-only updates, so
+dropping the table degrades the feature instead of breaking ingestion.
 
 ## Future Enhancements
 
