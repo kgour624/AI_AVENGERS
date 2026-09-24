@@ -464,11 +464,13 @@ export const updateEmbeddingSettings = (req: UpdateEmbeddingSettingsRequest) =>
 // MANAGED ACCOUNTS (admin + domain_expert) + expert grants
 // ============================================================
 
+export type ManagedRole = 'admin' | 'domain_expert' | 'client'
+
 export interface ManagedAccount {
   id: string
   email: string
   fullName: string
-  role: 'admin' | 'domain_expert'
+  role: ManagedRole
   isActive: boolean
   totpEnabled: boolean
   lastLogin?: string
@@ -487,7 +489,7 @@ export interface CreateManagedAccountRequest {
   email: string
   password: string
   fullName: string
-  role: 'admin' | 'domain_expert'
+  role: ManagedRole
   expertIds?: string[]
 }
 
@@ -502,9 +504,31 @@ export const createManagedAccount = (req: CreateManagedAccountRequest) =>
     })
     .then((res) => res.data.data!)
 
-export const updateManagedAccount = (accountId: string, isActive: boolean) =>
+// Partial update — only provided fields change. Mirrors the backend's
+// UpdateManagedAccountRequest (nil = unchanged).
+export interface UpdateManagedAccountFields {
+  fullName?: string
+  email?: string
+  role?: ManagedRole
+  isActive?: boolean
+  password?: string
+}
+
+export const updateManagedAccount = (accountId: string, fields: UpdateManagedAccountFields) =>
   baseAPI
-    .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/accounts/${accountId}`, { is_active: isActive })
+    .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/accounts/${accountId}`, {
+      full_name: fields.fullName,
+      email: fields.email,
+      role: fields.role,
+      is_active: fields.isActive,
+      password: fields.password,
+    })
+    .then((res) => res.data.data!)
+
+// Soft-deletes (and disables) an account; removes its expert grants.
+export const deleteManagedAccount = (accountId: string) =>
+  baseAPI
+    .delete<ApiResponse<{ status: string }>>(`/api/v1/admin/accounts/${accountId}`)
     .then((res) => res.data.data!)
 
 export const setAccountExperts = (accountId: string, expertIds: string[]) =>

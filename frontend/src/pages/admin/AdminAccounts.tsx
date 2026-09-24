@@ -2,12 +2,14 @@ import { useMemo, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   createManagedAccount,
+  deleteManagedAccount,
   getAdminExperts,
   getManagedAccounts,
   issueBootstrapToken,
   setAccountExperts,
   updateManagedAccount,
   type ManagedAccount,
+  type ManagedRole,
 } from '@/api/admin'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
@@ -31,14 +33,22 @@ function AdminAccounts() {
 
   const [createOpen, setCreateOpen] = useState(false)
   const [assignAccount, setAssignAccount] = useState<ManagedAccount | null>(null)
+  const [editAccount, setEditAccount] = useState<ManagedAccount | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [bootstrapToken, setBootstrapToken] = useState<string | null>(null)
 
+  // Create form
   const [fullName, setFullName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [role, setRole] = useState<'admin' | 'domain_expert'>('domain_expert')
+  const [role, setRole] = useState<ManagedRole>('domain_expert')
   const [selectedExperts, setSelectedExperts] = useState<string[]>([])
+
+  // Edit form
+  const [editFullName, setEditFullName] = useState('')
+  const [editEmail, setEditEmail] = useState('')
+  const [editRole, setEditRole] = useState<ManagedRole>('domain_expert')
+  const [editPassword, setEditPassword] = useState('')
 
   const createMutation = useMutation({
     mutationFn: createManagedAccount,
@@ -57,7 +67,7 @@ function AdminAccounts() {
 
   const toggleMutation = useMutation({
     mutationFn: ({ id, isActive }: { id: string; isActive: boolean }) =>
-      updateManagedAccount(id, isActive),
+      updateManagedAccount(id, { isActive }),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['admin', 'accounts'] }),
   })
 
@@ -67,6 +77,32 @@ function AdminAccounts() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['admin', 'accounts'] })
       setAssignAccount(null)
+    },
+    onError: (err) => setError(handleAPIError(err)),
+  })
+
+  const editMutation = useMutation({
+    mutationFn: ({ id }: { id: string }) =>
+      updateManagedAccount(id, {
+        fullName: editFullName.trim() || undefined,
+        email: editEmail.trim() || undefined,
+        role: editRole,
+        password: editPassword ? editPassword : undefined,
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'accounts'] })
+      setEditAccount(null)
+      setEditPassword('')
+      setError(null)
+    },
+    onError: (err) => setError(handleAPIError(err)),
+  })
+
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteManagedAccount(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'accounts'] })
+      setError(null)
     },
     onError: (err) => setError(handleAPIError(err)),
   })
@@ -101,6 +137,21 @@ function AdminAccounts() {
     )
   }
 
+  function openEdit(account: ManagedAccount) {
+    setEditAccount(account)
+    setEditFullName(account.fullName)
+    setEditEmail(account.email)
+    setEditRole(account.role)
+    setEditPassword('')
+    setError(null)
+  }
+
+  function confirmDelete(account: ManagedAccount) {
+    if (window.confirm(`Delete ${account.fullName} (${account.email})? This cannot be undone.`)) {
+      deleteMutation.mutate(account.id)
+    }
+  }
+
   if (isLoading) {
     return (
       <div className="space-y-3 p-6">
@@ -117,7 +168,7 @@ function AdminAccounts() {
         <div>
           <h1 className="text-xl font-semibold">Accounts</h1>
           <p className="text-xs text-text-secondary">
-            Create admins and domain-expert accounts; assign AI experts per account.
+            Create and manage admin, domain-expert and client accounts; assign AI experts per account.
           </p>
         </div>
         <div className="flex gap-2">
@@ -184,6 +235,9 @@ function AdminAccounts() {
                 {account.isActive ? 'Active' : 'Disabled'}
               </Badge>
               {account.totpEnabled && <Badge variant="brand">TOTP</Badge>}
+              <Button variant="secondary" size="sm" onClick={() => openEdit(account)}>
+                Edit
+              </Button>
               {account.role === 'domain_expert' && (
                 <Button
                   variant="secondary"
@@ -206,6 +260,14 @@ function AdminAccounts() {
                 }
               >
                 {account.isActive ? 'Disable' : 'Enable'}
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                isLoading={deleteMutation.isPending && deleteMutation.variables === account.id}
+                onClick={() => confirmDelete(account)}
+              >
+                Delete
               </Button>
             </div>
           </Card>
@@ -243,9 +305,10 @@ function AdminAccounts() {
             <select
               className="mt-1 w-full rounded-md border border-glass-border bg-surface-base px-2 py-2 text-sm text-text-primary"
               value={role}
-              onChange={(e) => setRole(e.target.value as 'admin' | 'domain_expert')}
+              onChange={(e) => setRole(e.target.value as ManagedRole)}
             >
               <option value="domain_expert">Domain expert</option>
+              <option value="client">Client</option>
               <option value="admin">Admin</option>
             </select>
           </label>
@@ -271,6 +334,48 @@ function AdminAccounts() {
             Create
           </Button>
         </form>
+      </Modal>
+
+      <Modal isOpen={!!editAccount} onClose={() => setEditAccount(null)}>
+        <div className="flex w-full max-w-md flex-col gap-3 p-4">
+          <h2 className="text-lg font-semibold">Edit account</h2>
+          <Input
+            label="Full name"
+            value={editFullName}
+            onChange={(e) => setEditFullName(e.target.value)}
+          />
+          <Input
+            label="Email"
+            type="email"
+            value={editEmail}
+            onChange={(e) => setEditEmail(e.target.value)}
+          />
+          <label className="text-xs text-text-secondary">
+            Role
+            <select
+              className="mt-1 w-full rounded-md border border-glass-border bg-surface-base px-2 py-2 text-sm text-text-primary"
+              value={editRole}
+              onChange={(e) => setEditRole(e.target.value as ManagedRole)}
+            >
+              <option value="domain_expert">Domain expert</option>
+              <option value="client">Client</option>
+              <option value="admin">Admin</option>
+            </select>
+          </label>
+          <Input
+            label="New password (leave blank to keep current)"
+            type="password"
+            value={editPassword}
+            onChange={(e) => setEditPassword(e.target.value)}
+          />
+          {error && <p className="text-xs text-mode-refuse">{error}</p>}
+          <Button
+            isLoading={editMutation.isPending}
+            onClick={() => editAccount && editMutation.mutate({ id: editAccount.id })}
+          >
+            Save changes
+          </Button>
+        </div>
       </Modal>
 
       <Modal isOpen={!!assignAccount} onClose={() => setAssignAccount(null)}>

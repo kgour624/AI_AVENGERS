@@ -50,6 +50,8 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - LOG_LEVEL=info
+      # Self-registration: false (default) = accounts provisioned by admin only.
+      - SELF_REGISTRATION_ENABLED=${SELF_REGISTRATION_ENABLED:-false}
       # OAuth (optional — PAT-based connect works without these)
       - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
       - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
