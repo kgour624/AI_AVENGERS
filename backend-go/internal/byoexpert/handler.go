@@ -2,11 +2,14 @@ package byoexpert
 
 import (
 	"errors"
+	"fmt"
+	"io"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/tenant"
 )
@@ -134,8 +137,16 @@ func (h *Handler) StartIngest(c *gin.Context) {
 		response.BadRequest(c, "FILE_TOO_LARGE", "file must be under 50MB")
 		return
 	}
+	// D3: same format allowlist as the admin path — reject before creating a job
+	// so an unusable upload cannot leave an orphan job row.
+	if !docextract.IsSupported(header.Filename) {
+		response.BadRequest(c, "UNSUPPORTED_FORMAT",
+			fmt.Sprintf(".%s is not a supported format. Supported: %s",
+				docextract.Extension(header.Filename), docextract.SupportedList()))
+		return
+	}
 	content := make([]byte, header.Size)
-	if _, err := file.Read(content); err != nil {
+	if _, err := io.ReadFull(file, content); err != nil {
 		response.InternalError(c)
 		return
 	}

@@ -112,6 +112,11 @@ type RegisterInput struct {
 // dependency one-way and mockable.
 type Ingestor interface {
 	IngestTranscript(ctx context.Context, jobID, expertID uuid.UUID, expertName, transcript, sourceFile string, replaceExisting bool) (*training.IngestionResult, error)
+	// PrepareTranscript converts an uploaded document into ingestion-ready text
+	// (stage 0) and persists it for resume. WHY part of this interface: BYO
+	// uploads accept the same formats as the admin path, so the conversion must
+	// not be duplicated (or forgotten) in this second entry point.
+	PrepareTranscript(ctx context.Context, jobID, expertID uuid.UUID, filename string, data []byte) (string, error)
 }
 
 // Service resolves entitlement + owns byo-expert lifecycle.
@@ -340,9 +345,11 @@ func (s *Service) StartIngest(ctx context.Context, scope tenant.Scope, userID uu
 		return uuid.Nil, fmt.Errorf("create ingestion job: %w", err)
 	}
 
-	// Store transcript for resume (migration 009); non-fatal if it fails.
-	_, _ = s.db.Exec(ctx,
-		`UPDATE ingestion_jobs SET transcript_content=$1 WHERE id=$2`, string(content), jobID)
+	// NOTE (D3): transcript_content is no longer written here. For non-text
+	// uploads (PDF/DOCX/XLSX/...) the stored transcript is the EXTRACTED text,
+	// which PrepareTranscript writes in the goroutine below — the bytes at this
+	// point may not be text at all. The write is no longer best-effort either:
+	// resume depends on it, so a failure fails the job instead of being ignored.
 	_, _ = s.db.Exec(ctx,
 		`UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
 
@@ -354,7 +361,23 @@ func (s *Service) StartIngest(ctx context.Context, scope tenant.Scope, userID uu
 	go func() {
 		bg, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 		defer cancel()
-		_, runErr := s.ingestor.IngestTranscript(bg, jobID, expertID, e.Name, string(content), filename, false)
+
+		// Stage 0 (D3): convert the upload to text. PrepareTranscript marks the
+		// job failed with an admin-readable reason if the document cannot be read.
+		transcript, prepErr := s.ingestor.PrepareTranscript(bg, jobID, expertID, filename, content)
+		if prepErr != nil {
+			s.logger.Warn("byo ingest: transcript preparation failed",
+				zap.String("job_id", jobID.String()),
+				zap.String("expert_id", expertID.String()),
+				zap.String("filename", filename),
+				zap.Error(prepErr),
+			)
+			s.recordEvent(bg, scope, &userID, &expertID, "ingest_failed",
+				map[string]interface{}{"job_id": jobID.String(), "error": prepErr.Error()})
+			return
+		}
+
+		_, runErr := s.ingestor.IngestTranscript(bg, jobID, expertID, e.Name, transcript, filename, false)
 		if runErr != nil {
 			s.logger.Error("byo ingest failed",
 				zap.String("job_id", jobID.String()),
