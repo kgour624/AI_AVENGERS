@@ -65,6 +65,9 @@ type RepoCodeSource interface {
 	// here (rather than in the runner) because the blob store is the repository
 	// package's business; the runner should not know how file content is kept.
 	CopyFilesToWorkspace(ctx context.Context, projectID uuid.UUID, paths []string, destRoot string) (int, error)
+	// BaseCommitSHA reports the revision the approved files were taken from, so
+	// a generated patch can say what it is a patch against.
+	BaseCommitSHA(ctx context.Context, projectID uuid.UUID) (string, error)
 }
 
 // CodebaseFile is one entry in a workflow's working set.
@@ -87,10 +90,22 @@ type CodebaseService struct {
 	store  *blackboard.Store
 	repo   RepoCodeSource
 	logger *zap.Logger
+	// workspaceRoot is the base directory holding every workflow workspace.
+	// Set via SetWorkspaceRoot; empty disables delivery (patch) generation,
+	// which is the correct degradation for a deployment without a workspace
+	// volume.
+	workspaceRoot string
 }
 
 func NewCodebaseService(db *pgxpool.Pool, store *blackboard.Store, repoSource RepoCodeSource, logger *zap.Logger) *CodebaseService {
 	return &CodebaseService{db: db, store: store, repo: repoSource, logger: logger}
+}
+
+// SetWorkspaceRoot tells the service where workflow workspaces live, enabling
+// patch generation (3F). Mirrors the other optional setters: not calling it
+// leaves delivery unavailable rather than broken.
+func (s *CodebaseService) SetWorkspaceRoot(root string) {
+	s.workspaceRoot = root
 }
 
 // workflowProject returns the project a workflow belongs to, and refuses if the
@@ -168,6 +183,14 @@ func (s *CodebaseService) SeedWorkspace(ctx context.Context, workflowID uuid.UUI
 	if err != nil {
 		return written, fmt.Errorf("seed codebase workspace: %w", err)
 	}
+
+	// Capture the seeded state as a git baseline (3F). Without this commit the
+	// later "what changed?" diff would be relative to an empty tree, so the
+	// client's own code would show up as the workflow's changes.
+	if err := s.captureBaseline(ctx, workflowID, projectID, workspaceRoot); err != nil {
+		return written, fmt.Errorf("capture workspace baseline: %w", err)
+	}
+
 	s.logger.Info("codebase workspace seeded",
 		zap.String("workflow_id", workflowID.String()),
 		zap.Int("approved_paths", len(paths)),

@@ -1,5 +1,6 @@
 import { baseAPI } from './base'
 import type { ApiResponse } from '@/types/api'
+import { useAuthStore } from '@/stores/authStore'
 
 // ============================================================
 // Workflow types — match backend workflow.Workflow struct
@@ -228,3 +229,54 @@ export const getCodebaseManifest = (workflowId: string) =>
       `/api/v1/workflows/${workflowId}/codebase/manifest`
     )
     .then((res) => res.data.data!)
+
+/**
+ * Phase 3F — delivery as a patch against the pinned base revision.
+ *
+ * The client's repository is never written to. The patch is generated against
+ * the exact commit the work was based on, so it can be reviewed and applied (or
+ * rejected) by the client themselves.
+ */
+export interface CodebaseChangedFile {
+  /** git name-status code: A, M, D, or R with a similarity score. */
+  status: string
+  path: string
+}
+
+export interface CodebaseDelivery {
+  workflowId: string
+  baseCommitSha: string
+  baselineRef: string
+  changedFiles: CodebaseChangedFile[]
+  patchBytes: number
+  generatedAt: string | null
+}
+
+export const getCodebasePatch = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<CodebaseDelivery>>(`/api/v1/workflows/${workflowId}/codebase/patch`)
+    .then((res) => res.data.data!)
+
+export const generateCodebasePatch = (workflowId: string) =>
+  baseAPI
+    .post<ApiResponse<CodebaseDelivery>>(`/api/v1/workflows/${workflowId}/codebase/patch`)
+    .then((res) => res.data.data!)
+
+/**
+ * Downloads the patch as a file.
+ *
+ * WHY fetch rather than baseAPI: this is a binary-ish attachment, and routing it
+ * through the shared axios instance would push it through the camelCase response
+ * transform. Auth still goes through the same access token.
+ */
+export async function downloadCodebasePatch(workflowId: string): Promise<Blob> {
+  const token = useAuthStore.getState().accessToken
+  const base = import.meta.env.VITE_API_URL ?? ''
+  const res = await fetch(`${base}/api/v1/workflows/${workflowId}/codebase/patch/download`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!res.ok) {
+    throw new Error('patch download failed')
+  }
+  return res.blob()
+}

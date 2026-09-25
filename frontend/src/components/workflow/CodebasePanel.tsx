@@ -4,7 +4,10 @@ import {
   addCodebaseFile,
   decideCodebaseFile,
   decideCodebaseFilesBulk,
+  downloadCodebasePatch,
+  generateCodebasePatch,
   getCodebaseFiles,
+  getCodebasePatch,
   suggestCodebaseFiles,
   type CodebaseFile,
 } from '@/api/workflows'
@@ -73,6 +76,38 @@ export function CodebasePanel({ workflowId }: { workflowId: string }) {
       decideCodebaseFilesBulk(workflowId, ids, decision),
     onSuccess: invalidate,
     onError: () => setActionError('Could not record those decisions.'),
+  })
+
+  // Delivery (3F). Kept on the same tab as the approvals because a patch is the
+  // consequence of that working set, and a reviewer needs both in one place.
+  const { data: delivery } = useQuery({
+    queryKey: ['workflow', workflowId, 'codebase', 'patch'],
+    queryFn: () => getCodebasePatch(workflowId),
+    retry: false,
+  })
+
+  const patchMutation = useMutation({
+    mutationFn: () => generateCodebasePatch(workflowId),
+    onSuccess: () => {
+      setActionError(null)
+      queryClient.invalidateQueries({ queryKey: ['workflow', workflowId, 'codebase', 'patch'] })
+    },
+    onError: () => setActionError('Could not generate a patch yet. Start the workflow first.'),
+  })
+
+  const downloadMutation = useMutation({
+    mutationFn: async () => {
+      const blob = await downloadCodebasePatch(workflowId)
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `workflow-${workflowId.slice(0, 8)}.patch`
+      anchor.click()
+      // Revoke on the next tick: revoking immediately can cancel the download
+      // in some browsers before it has read the blob.
+      setTimeout(() => URL.revokeObjectURL(url), 0)
+    },
+    onError: () => setActionError('Could not download the patch.'),
   })
 
   if (isLoading) {
@@ -238,6 +273,64 @@ export function CodebasePanel({ workflowId }: { workflowId: string }) {
           </p>
         </Card>
       )}
+
+      <Card className="p-4">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <span className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
+              Delivery
+            </span>
+            <p className="mt-0.5 text-[11px] text-text-disabled">
+              {delivery?.baseCommitSha
+                ? `Patch against commit ${delivery.baseCommitSha.slice(0, 7)}`
+                : 'A patch is generated against the commit your work started from.'}
+            </p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => patchMutation.mutate()}
+              isLoading={patchMutation.isPending}
+            >
+              {delivery?.generatedAt ? 'Regenerate patch' : 'Generate patch'}
+            </Button>
+            <Button
+              size="sm"
+              disabled={!delivery?.generatedAt || delivery.patchBytes === 0}
+              onClick={() => downloadMutation.mutate()}
+              isLoading={downloadMutation.isPending}
+            >
+              Download .patch
+            </Button>
+          </div>
+        </div>
+
+        {delivery?.generatedAt && (
+          <div className="mt-3">
+            <p className="text-[11px] text-text-disabled">
+              {delivery.changedFiles.length} file{delivery.changedFiles.length === 1 ? '' : 's'} changed
+              {' · '}
+              {delivery.patchBytes} bytes
+            </p>
+            {delivery.changedFiles.length > 0 && (
+              <ul className="mt-2 max-h-40 overflow-y-auto rounded border border-glass-border">
+                {delivery.changedFiles.map((file) => (
+                  <li
+                    key={`${file.status}-${file.path}`}
+                    className="flex items-center gap-2 border-b border-glass-border px-2 py-1 last:border-b-0"
+                  >
+                    <span className="w-6 shrink-0 text-[10px] font-semibold uppercase text-text-disabled">
+                      {file.status}
+                    </span>
+                    <span className="truncate text-xs text-text-secondary">{file.path}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </Card>
     </div>
   )
 }

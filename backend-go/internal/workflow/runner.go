@@ -628,7 +628,11 @@ func (r *WorkflowRunner) executeWaves(
 	// simply absent. A scratch workflow is a documented no-op here, so this
 	// needs no mode check of its own.
 	if r.codebase != nil {
-		written, err := r.codebase.SeedWorkspace(ctx, workflowID, workflowWorkspace)
+		// Seed into main/, not the workflow root: main/ is the directory every
+		// expert workspace is seeded from and every merge lands in, so this is
+		// the only place the approved files are actually visible to an expert.
+		mainWorkspace := filepath.Join(workflowWorkspace, "main")
+		written, err := r.codebase.SeedWorkspace(ctx, workflowID, mainWorkspace)
 		if err != nil {
 			// Fail the phase rather than continue: running experts against an
 			// empty or partial codebase would produce confident answers about
@@ -638,10 +642,10 @@ func (r *WorkflowRunner) executeWaves(
 		if written > 0 {
 			r.logger.Info("runner: codebase workspace seeded",
 				zap.Int("files", written),
-				zap.String("workspace", workflowWorkspace),
+				zap.String("workspace", mainWorkspace),
 			)
 		}
-		checker, err := r.codebase.ProtectedPathChecker(ctx, workflowID, workflowWorkspace)
+		checker, err := r.codebase.ProtectedPathChecker(ctx, workflowID, mainWorkspace)
 		if err != nil {
 			r.logger.Warn("runner: protected-path checker unavailable (non-fatal)", zap.Error(err))
 		} else if checker != nil {

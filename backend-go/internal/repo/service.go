@@ -1039,6 +1039,19 @@ func (s *Service) RepoFileExists(ctx context.Context, projectID uuid.UUID, path 
 	return exists, nil
 }
 
+// BaseCommitSHA returns the commit the stored tree was pinned to, or "" when no
+// connection or no pin exists yet.
+//
+// WHY callers need it: a patch is only meaningful relative to a revision, and
+// this is the revision the client's approval was based on.
+func (s *Service) BaseCommitSHA(ctx context.Context, projectID uuid.UUID) (string, error) {
+	_, commitSHA, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	return commitSHA, nil
+}
+
 // CopyFilesToWorkspace writes the stored content of the given repository paths
 // into destRoot, preserving their repository layout. It returns how many files
 // it wrote.
