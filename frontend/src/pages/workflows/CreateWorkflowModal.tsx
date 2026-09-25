@@ -19,6 +19,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   const queryClient = useQueryClient()
 
   const [title, setTitle] = useState('')
+  const [requirement, setRequirement] = useState('')
   const [projectId, setProjectId] = useState('')
   const [selectedExpertIds, setSelectedExpertIds] = useState<string[]>([])
   const [budget, setBudget] = useState('10')
@@ -46,6 +47,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
         title: title.trim(),
         selectedExpertIds,
         costBudgetUsd: parseFloat(budget) || 10,
+        requirementText: requirement.trim() || undefined,
       })
       await startWorkflow(wf.id)
       await runWorkflow(wf.id)
@@ -68,6 +70,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
 
   const handleClose = () => {
     setTitle('')
+    setRequirement('')
     setProjectId('')
     setSelectedExpertIds([])
     setBudget('10')
@@ -88,6 +91,20 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
             onChange={(e) => setTitle(e.target.value)}
             placeholder="e.g. Build URL shortener"
             className="w-full rounded-md border border-glass-border bg-surface-overlay px-3 py-2 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
+          />
+        </div>
+
+        <div>
+          <label className="mb-1 block text-xs font-medium text-text-secondary">
+            Requirement
+            <span className="ml-1 text-text-disabled">(optional — the details behind the title)</span>
+          </label>
+          <textarea
+            value={requirement}
+            onChange={(e) => setRequirement(e.target.value)}
+            rows={4}
+            placeholder="Paste or type the full requirement. Experts work from this instead of the title alone."
+            className="w-full resize-y rounded-md border border-glass-border bg-surface-overlay px-3 py-2 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
           />
         </div>
 

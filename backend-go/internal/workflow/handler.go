@@ -87,13 +87,18 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 }
 
 // CreateWorkflow POST /api/v1/workflows
-// Body: {project_id, title, selected_expert_ids, cost_budget_usd?}
+// Body: {project_id, title, selected_expert_ids, cost_budget_usd?, requirement_text?}
 func (h *Handler) CreateWorkflow(c *gin.Context) {
 	var req struct {
 		ProjectID         uuid.UUID   `json:"project_id" binding:"required"`
 		Title             string      `json:"title" binding:"required"`
 		SelectedExpertIDs []uuid.UUID `json:"selected_expert_ids" binding:"required"`
 		CostBudgetUSD     float64     `json:"cost_budget_usd"`
+		// RequirementText is the client's actual requirement. Optional so old
+		// callers keep working: when empty, the runner still falls back to the
+		// title (runner.loadRequirement), but a real requirement now reaches
+		// the planner instead of being discarded (A7).
+		RequirementText string `json:"requirement_text"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -120,6 +125,27 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 		response.InternalError(c)
 		return
 	}
+
+	// A7: persist the requirement as the first blackboard artifact. WHY:
+	// runner.loadRequirement reads the latest `requirement_captured` event and
+	// falls back to the title, but nothing in the codebase ever posted one —
+	// so every expert worked from a title. Content shape {"text": ...} is what
+	// loadRequirement unmarshals. Best-effort: a post failure must not fail an
+	// otherwise-created workflow (it degrades to the old title fallback).
+	if req.RequirementText != "" {
+		if _, err := h.store.Post(c.Request.Context(), blackboard.PostRequest{
+			WorkflowID:     w.ID,
+			EventType:      "requirement_captured",
+			PostedByClient: true, // the client provided it; no expert authored it
+			Content:        map[string]string{"text": req.RequirementText},
+		}); err != nil {
+			h.logger.Warn("create workflow: requirement_captured post failed",
+				zap.String("workflow_id", w.ID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
 	response.Created(c, w)
 }
 

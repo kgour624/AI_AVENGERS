@@ -25,6 +25,7 @@ import (
 
 	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/response"
+	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/training"
 )
 
@@ -818,12 +819,42 @@ func getLanguage(path string) string {
 // Handler handles HTTP requests for repo integration.
 type Handler struct {
 	svc    *Service
+	tenant *tenant.Service
 	logger *zap.Logger
 }
 
 // NewHandler creates a new repo handler.
-func NewHandler(svc *Service, logger *zap.Logger) *Handler {
-	return &Handler{svc: svc, logger: logger}
+//
+// WHY tenant is injected: every repo endpoint takes a project_id from the
+// request. Without an ownership/tenant check a caller who knows (or guesses)
+// another project's UUID can read its repo status — the same IDOR class the
+// message handler closed with AssertProject (A2).
+func NewHandler(svc *Service, tenantSvc *tenant.Service, logger *zap.Logger) *Handler {
+	return &Handler{svc: svc, tenant: tenantSvc, logger: logger}
+}
+
+// assertProjectAccess resolves the caller's tenant scope and verifies the
+// project is visible to them. It writes the HTTP error itself and returns
+// false so every caller reads as `if !h.assertProjectAccess(...) { return }`.
+// Mirrors message.Handler's C4 ownership check.
+func (h *Handler) assertProjectAccess(c *gin.Context, projectID uuid.UUID) bool {
+	clientID, ok := c.MustGet("user_id").(uuid.UUID)
+	if !ok {
+		response.Unauthorized(c, "invalid session")
+		return false
+	}
+	role, _ := c.Get("role")
+	roleStr, _ := role.(string)
+	scope, err := h.tenant.Resolve(c.Request.Context(), clientID, roleStr)
+	if err != nil {
+		response.Forbidden(c, "Tenant scope could not be resolved")
+		return false
+	}
+	if err := h.tenant.AssertProject(c.Request.Context(), scope, projectID); err != nil {
+		response.Forbidden(c, err.Error())
+		return false
+	}
+	return true
 }
 
 // GetOAuthURL GET /repo/oauth/:provider?project_id=<uuid>
@@ -842,8 +873,15 @@ func (h *Handler) GetOAuthURL(c *gin.Context) {
 		response.BadRequest(c, "MISSING_PROJECT_ID", "project_id query param required")
 		return
 	}
-	if _, err := uuid.Parse(projectID); err != nil {
+	parsedProjectID, err := uuid.Parse(projectID)
+	if err != nil {
 		response.BadRequest(c, "INVALID_PROJECT_ID", "project_id must be a valid UUID")
+		return
+	}
+	// A2: only the project's owner may start an OAuth handshake. This also
+	// bounds OAuthCallback (public, no JWT): its state can only have been
+	// minted here, by an authenticated caller who already passed this check.
+	if !h.assertProjectAccess(c, parsedProjectID) {
 		return
 	}
 
@@ -964,6 +1002,9 @@ func (h *Handler) ConnectRepo(c *gin.Context) {
 		response.BadRequest(c, "INVALID_ID", "invalid project ID")
 		return
 	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
 	var req struct {
 		Provider     string `json:"provider" binding:"required"`
 		RepoURL      string `json:"repo_url" binding:"required"`
@@ -999,6 +1040,9 @@ func (h *Handler) SyncRepo(c *gin.Context) {
 		response.BadRequest(c, "INVALID_ID", "invalid project ID")
 		return
 	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
 	// Get connection ID
 	var connID uuid.UUID
 	err = h.svc.db.QueryRow(c.Request.Context(),
@@ -1021,6 +1065,9 @@ func (h *Handler) GetSyncStatus(c *gin.Context) {
 	projectID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		response.BadRequest(c, "INVALID_ID", "invalid project ID")
+		return
+	}
+	if !h.assertProjectAccess(c, projectID) {
 		return
 	}
 	status, err := h.svc.GetSyncStatus(c.Request.Context(), projectID)

@@ -487,7 +487,7 @@ func buildRouter(
 	relSvc.RegisterProbe("redis", redisClient.HealthCheck)
 	relSvc.RegisterProbe("ml_sidecar", mlClient.HealthCheck)
 	relHandler := reliability.NewHandler(relSvc, "1.0.0", logger)
-	repoHandler := repo.NewHandler(repoSvc, logger)
+	repoHandler := repo.NewHandler(repoSvc, tenantSvc, logger)
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, docExtractor, logger)
 
 	// Collaboration layer (Phase C + D)
@@ -495,6 +495,9 @@ func buildRouter(
 	bbStore.SetProvenanceRecorder(provSvc) // C1: signed chain per artifact
 	bbSubscriber := blackboard.NewSubscriber(bbStore, redisClient.Client, logger)
 	wfEngine := workflow.NewEngine(postgres.Pool, logger)
+	// A8: let the engine announce terminal states on the blackboard, which is
+	// what unlocks the kanban/files SSE "done" events (kanban_sse.go:90).
+	wfEngine.SetEventPoster(bbStore)
 	validationPipeline := validation.NewPipeline(modelGateway, logger)
 	wfTools := workflow.NewTools(bbStore, wfEngine, bbSubscriber, validationPipeline, logger)
 	// WorkflowRunner: drives workflows from start to completion.
