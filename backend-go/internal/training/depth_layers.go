@@ -83,7 +83,7 @@ func DepthLayerName(layer int) string {
 // DepthClassifyResult reports one classification pass.
 type DepthClassifyResult struct {
 	// Total is the bounded batch selected by this pass, not the whole corpus.
-	Total     int `json:"total"`
+	Total      int `json:"total"`
 	Classified int `json:"classified"`
 	// Remaining is how many chunks still have no layer, so the caller knows whether to
 	// run again rather than guessing.
@@ -101,26 +101,26 @@ type DepthClassifyResult struct {
 // DepthClassifyProgress is written after every model batch, so the UI can show
 // that work is advancing instead of displaying an eternal spinner.
 type DepthClassifyProgress struct {
-	Total     int
+	Total      int
 	Classified int
-	Calls     int
-	Rejected  int
+	Calls      int
+	Rejected   int
 }
 
 // DepthClassificationJob is the durable status of one background pass.
 type DepthClassificationJob struct {
-	ID          uuid.UUID  `json:"id"`
-	ExpertID    uuid.UUID  `json:"expert_id"`
-	Status      string     `json:"status"`
-	Total       int        `json:"total"`
-	Classified  int        `json:"classified"`
-	Remaining   int        `json:"remaining"`
-	Calls       int        `json:"calls"`
-	Rejected    int        `json:"rejected"`
-	ErrorMessage string    `json:"error_message,omitempty"`
-	CreatedAt   time.Time  `json:"created_at"`
-	UpdatedAt   time.Time  `json:"updated_at"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	ID           uuid.UUID  `json:"id"`
+	ExpertID     uuid.UUID  `json:"expert_id"`
+	Status       string     `json:"status"`
+	Total        int        `json:"total"`
+	Classified   int        `json:"classified"`
+	Remaining    int        `json:"remaining"`
+	Calls        int        `json:"calls"`
+	Rejected     int        `json:"rejected"`
+	ErrorMessage string     `json:"error_message,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	CompletedAt  *time.Time `json:"completed_at,omitempty"`
 }
 
 // TopicLayerCoverage is one topic's content kinds.
@@ -407,9 +407,22 @@ func pendingCount(ctx context.Context, db interface {
 func (c *DepthClassifier) finishBackgroundWithResult(jobID uuid.UUID, result DepthClassifyResult, message string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// ClassifyWithProgress can time out before its final COUNT query. On failure, read
+	// the real remainder here; a timed-out job that shows "0 left" would hide the work
+	// the Retry button needs to resume.
+	var expertID uuid.UUID
+	if err := c.db.QueryRow(ctx,
+		`SELECT expert_id FROM expert_depth_classification_jobs WHERE id = $1`, jobID,
+	).Scan(&expertID); err == nil {
+		if remaining := pendingCount(ctx, c.db, expertID); remaining >= 0 {
+			result.Remaining = remaining
+		}
+	}
 	if _, err := c.db.Exec(ctx, `
 		UPDATE expert_depth_classification_jobs
-		   SET status = 'failed', total = $1, classified = $2, remaining = $3,
+		   SET status = 'failed',
+		       total = CASE WHEN $1 > 0 THEN GREATEST(total, $1) ELSE total END,
+		       classified = GREATEST(classified, $2), remaining = $3,
 		       calls = $4, rejected = $5, error_message = $6,
 		       completed_at = now(), updated_at = now()
 		 WHERE id = $7`,
