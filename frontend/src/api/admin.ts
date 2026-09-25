@@ -742,6 +742,15 @@ export interface CapabilityEvalTopicReport {
   cannotHandle: string[]
 }
 
+/** How well retrieval did across one pass's questions. */
+export interface RetrievalMetrics {
+  cases: number
+  /** Questions whose source chunk was retrieved in the top k. */
+  hits: number
+  /** Mean reciprocal rank of those hits. */
+  mrr: number
+}
+
 /** A whole evaluation pass. */
 export interface CapabilityEvalReport {
   runId: string
@@ -761,6 +770,15 @@ export interface CapabilityEvalReport {
   completedAt: string | null
   topics: CapabilityEvalTopicReport[]
   findings: string[]
+  /**
+   * This pass's retrieval metrics, and the previous pass's.
+   *
+   * WHY both: the findings already state the change in words, but the raw numbers
+   * are here so a retrieval change can be judged rather than taken on trust. Absent
+   * previous = this is the first pass, not "no change".
+   */
+  metrics: RetrievalMetrics
+  previousMetrics?: RetrievalMetrics
 }
 
 export interface CapabilityEvalResponse {

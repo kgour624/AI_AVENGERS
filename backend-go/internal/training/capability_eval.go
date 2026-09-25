@@ -174,6 +174,25 @@ type TopicCapabilityReport struct {
 	CannotHandle   []string `json:"cannot_handle"`
 }
 
+// RetrievalMetrics is how well retrieval did across one run's questions.
+//
+// WHY this exists: changing retrieval without measuring it is how a "fix" becomes a
+// regression nobody notices. The per-case evidence was already stored, so these
+// numbers are derived from it rather than recorded separately — one source, no drift.
+type RetrievalMetrics struct {
+	Cases int     `json:"cases"`
+	Hits  int     `json:"hits"`
+	MRR   float64 `json:"mrr"`
+}
+
+// HitRate is the share of questions whose source chunk was retrieved in the top k.
+func (m RetrievalMetrics) HitRate() float64 {
+	if m.Cases == 0 {
+		return 0
+	}
+	return float64(m.Hits) / float64(m.Cases)
+}
+
 // CapabilityEvalReport is a whole pass, ready for the admin screen.
 type CapabilityEvalReport struct {
 	RunID         uuid.UUID               `json:"run_id"`
@@ -190,6 +209,11 @@ type CapabilityEvalReport struct {
 	CompletedAt   *time.Time              `json:"completed_at"`
 	TopicReports  []TopicCapabilityReport `json:"topics"`
 	Findings      []string                `json:"findings"`
+
+	// Metrics for this run, and the previous run's, so a retrieval change can be
+	// proven or rolled back instead of believed.
+	Metrics  RetrievalMetrics  `json:"metrics"`
+	Previous *RetrievalMetrics `json:"previous_metrics,omitempty"`
 }
 
 // RunEval performs one pass: ensure the question set, then ask every question and
@@ -351,6 +375,25 @@ func (e *CapabilityEvaluator) topicCoverage(ctx context.Context, expertID uuid.U
 		out[topic] = count
 	}
 	return out, rows.Err()
+}
+
+// runMetrics derives retrieval metrics from one run's stored per-case evidence.
+//
+// WHY derived rather than stored on the run row: the per-case evidence is already
+// durable, and a second copy could disagree with it. MRR comes from the stored rank of
+// each hit, so every number here is reproducible from the rows the report shows.
+func (e *CapabilityEvaluator) runMetrics(ctx context.Context, runID uuid.UUID) (RetrievalMetrics, error) {
+	var m RetrievalMetrics
+	if err := e.db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE hit_rank > 0),
+		       COALESCE(AVG(CASE WHEN hit_rank > 0 THEN 1.0 / hit_rank END), 0)
+		  FROM expert_capability_results
+		 WHERE run_id = $1`, runID,
+	).Scan(&m.Cases, &m.Hits, &m.MRR); err != nil {
+		return m, fmt.Errorf("capability eval: read run metrics: %w", err)
+	}
+	return m, nil
 }
 
 // topicPassage is a chunk selected to host a question.
@@ -965,6 +1008,26 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 		coverage = loaded
 	}
 
+	if metrics, mErr := e.runMetrics(ctx, report.RunID); mErr == nil {
+		report.Metrics = metrics
+	} else {
+		e.logger.Warn("capability eval: could not derive run metrics",
+			zap.String("run_id", report.RunID.String()), zap.Error(mErr))
+	}
+
+	// The previous completed run is the baseline this one is compared against, so a
+	// retrieval change can be seen rather than argued about.
+	var previousRunID uuid.UUID
+	if prevErr := e.db.QueryRow(ctx, `
+		SELECT id FROM expert_capability_eval_runs
+		 WHERE expert_id = $1 AND id <> $2 AND status = 'complete'
+		 ORDER BY started_at DESC
+		 LIMIT 1`, expertID, report.RunID).Scan(&previousRunID); prevErr == nil {
+		if previous, mErr := e.runMetrics(ctx, previousRunID); mErr == nil {
+			report.Previous = &previous
+		}
+	}
+
 	for _, topic := range order {
 		report.TopicReports = append(report.TopicReports, buildTopicReport(topic, coverage[topic], byTopic[topic]))
 	}
@@ -983,6 +1046,30 @@ func evalFindings(r *CapabilityEvalReport) []string {
 	passRate := r.CasesPassed * 100 / r.CasesTotal
 	findings = append(findings, fmt.Sprintf("%d%% of questions answered (%d/%d), measured against the top %d retrieved chunks.",
 		passRate, r.CasesPassed, r.CasesTotal, r.TopK))
+
+	// The comparison against the previous pass, stated plainly and with the
+	// direction spelled out. This is what makes a retrieval change provable: without
+	// it, "the retrieval fix helped" is an opinion, and a regression looks the same
+	// as an improvement.
+	if r.Previous != nil && r.Previous.Cases > 0 {
+		nowPct := r.Metrics.HitRate() * 100
+		wasPct := r.Previous.HitRate() * 100
+		delta := nowPct - wasPct
+		switch {
+		case delta >= 1:
+			findings = append(findings, fmt.Sprintf(
+				"Source-chunk retrieval improved: %.0f%% of questions (was %.0f%%), MRR %.2f (was %.2f).",
+				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
+		case delta <= -1:
+			findings = append(findings, fmt.Sprintf(
+				"Source-chunk retrieval REGRESSED: %.0f%% of questions (was %.0f%%), MRR %.2f (was %.2f) — check what changed in retrieval before trusting this corpus.",
+				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
+		default:
+			findings = append(findings, fmt.Sprintf(
+				"Source-chunk retrieval unchanged: %.0f%% (was %.0f%%), MRR %.2f (was %.2f).",
+				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
+		}
+	}
 
 	missed := r.CasesTotal - r.RetrievalHits
 	if missed > 0 {

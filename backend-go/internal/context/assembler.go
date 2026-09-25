@@ -850,15 +850,14 @@ func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, que
 // Step 3: Merge + deduplicate
 // Step 4: Rerank merged set -> top K
 func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int) ([]chinawall.CourseChunk, error) {
-	// Step 1: Vector search
+	// Step 1: Vector search — one RANKED list.
 	embedding, err := a.embedder.EmbedSingle(ctx, question)
 	if err != nil {
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}
 
-	// Feature #23: Added source_file and chunk_index to SELECT
-	// WHY: Citation modal needs to show which transcript a citation came from
-	// and the chunk's position in that transcript.
+	// Feature #23: source_file and chunk_index are selected so the citation modal can
+	// name the transcript and the position.
 	vectorRows, err := a.db.Query(ctx,
 		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
 		 FROM course_chunks
@@ -880,49 +879,75 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		ChunkIndex int    // Feature #23: position in transcript
 	}
 
-	seen := make(map[uuid.UUID]bool)
-	var candidates []rawChunk
+	byID := make(map[uuid.UUID]rawChunk)
+	var vectorIDs []uuid.UUID
 
 	for vectorRows.Next() {
 		var c rawChunk
 		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
 			continue
 		}
-		if !seen[c.ID] {
-			seen[c.ID] = true
+		if _, dup := byID[c.ID]; dup {
+			continue
+		}
+		byID[c.ID] = c
+		vectorIDs = append(vectorIDs, c.ID)
+	}
+
+	// Step 2: Keyword search — the second RANKED list.
+	//
+	// WHY the terms are extracted instead of passing the question: plainto_tsquery
+	// ANDs every lexeme, so a natural-language question required every one of its
+	// words to appear in the same chunk and usually matched nothing. The terms are
+	// whitelisted to [a-z0-9_] before they reach the tsquery, which is what makes
+	// joining them with ' | ' safe.
+	//
+	// ORDER BY ts_rank is the other half of the fix: without it, LIMIT 10 returned ten
+	// arbitrary matching rows rather than the ten best.
+	var keywordIDs []uuid.UUID
+	terms := salientTerms(question)
+	if len(terms) > 0 {
+		const keywordSQL = `
+			SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
+			  FROM course_chunks
+			 WHERE expert_id = $1
+			   AND chunk_text_tsv @@ to_tsquery('english', array_to_string($2::text[], ' | '))
+			 ORDER BY ts_rank(chunk_text_tsv, to_tsquery('english', array_to_string($2::text[], ' | '))) DESC
+			 LIMIT 10`
+		keywordRows, keywordErr := a.db.Query(ctx, keywordSQL, expertID, terms)
+		if keywordErr == nil {
+			defer keywordRows.Close()
+			for keywordRows.Next() {
+				var c rawChunk
+				if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
+					continue
+				}
+				if _, dup := byID[c.ID]; !dup {
+					byID[c.ID] = c
+				}
+				keywordIDs = append(keywordIDs, c.ID)
+			}
+		}
+		// Keyword search failure is non-fatal — the vector list still stands.
+	}
+
+	if len(byID) == 0 {
+		return nil, nil
+	}
+
+	// Step 3: Fuse the two ranked lists.
+	//
+	// WHY fusion rather than concatenation (what this used to do): appending keyword
+	// results after vector results meant the keyword hits sat at the end of the
+	// candidate list, so on the reranker-unavailable path — which returns the first
+	// `limit` candidates and scores them all 0.5 — they were discarded entirely. With
+	// RRF the fused order is the real order, and that path inherits it.
+	order := reciprocalRankFusion([][]uuid.UUID{vectorIDs, keywordIDs})
+	candidates := make([]rawChunk, 0, len(order))
+	for _, id := range order {
+		if c, ok := byID[id]; ok {
 			candidates = append(candidates, c)
 		}
-	}
-
-	// Step 2: Keyword search (full-text)
-	// WHY: Exact terms like "PostgreSQL", "Kafka", "Redis" may not be
-	// captured well by semantic search alone.
-	// Feature #23: Also fetch source_file and chunk_index here
-	keywordRows, err := a.db.Query(ctx,
-		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
-		 FROM course_chunks
-		 WHERE expert_id=$1
-		   AND chunk_text_tsv @@ plainto_tsquery('english', $2)
-		 LIMIT 10`,
-		expertID, question,
-	)
-	if err == nil {
-		defer keywordRows.Close()
-		for keywordRows.Next() {
-			var c rawChunk
-			if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
-				continue
-			}
-			if !seen[c.ID] {
-				seen[c.ID] = true
-				candidates = append(candidates, c)
-			}
-		}
-	}
-	// Keyword search failure is non-fatal — vector results still usable
-
-	if len(candidates) == 0 {
-		return nil, nil
 	}
 
 	// Step 3: Rerank merged candidates
