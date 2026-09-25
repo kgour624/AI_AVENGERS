@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useRepoSyncStatus } from '@/hooks/useRepoSyncStatus'
-import { getRepoFile, getRepoTree, type RepoTreeEntry } from '@/api/repo'
+import { getRepoFile, getRepoGraph, getRepoTree, type RepoTreeEntry } from '@/api/repo'
 import { Card } from '@/components/ui/Card'
 import { cn } from '@/utils/cn'
 
@@ -145,6 +145,38 @@ function TreeRow({ node, depth, collapsed, onToggle, selectedPath, onSelect }: T
   )
 }
 
+function DependencyList({
+  label,
+  paths,
+  onSelect,
+}: {
+  label: string
+  paths: string[]
+  onSelect: (path: string) => void
+}) {
+  if (paths.length === 0) return null
+  return (
+    <div className="mt-1">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
+        {label} ({paths.length})
+      </p>
+      <div className="mt-0.5 flex flex-wrap gap-1">
+        {paths.map((p) => (
+          <button
+            key={p}
+            type="button"
+            onClick={() => onSelect(p)}
+            title={p}
+            className="max-w-full truncate rounded border border-glass-border px-1.5 py-0.5 text-[10px] text-text-secondary hover:bg-surface-overlay/60"
+          >
+            {p}
+          </button>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export function RepoTreePanel({ projectId }: { projectId: string }) {
   const { data: status } = useRepoSyncStatus(projectId)
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
@@ -166,7 +198,26 @@ export function RepoTreePanel({ projectId }: { projectId: string }) {
     retry: false,
   })
 
+  // One hop out and one hop in, enough to offer "what does this use" and
+  // "what uses this" without dragging the whole repository into view.
+  const { data: graph } = useQuery({
+    queryKey: ['projects', projectId, 'repo', 'graph', selectedPath],
+    queryFn: () => getRepoGraph(projectId, selectedPath as string, 1),
+    enabled: isSynced && !!selectedPath,
+    retry: false,
+  })
+
   const nodes = useMemo(() => buildRepoTree(tree?.files ?? []), [tree])
+
+  // `direction` records which side of the root a node sits on: 'out' is a file
+  // the root imports, 'in' is a file that imports the root. Only files with a
+  // stored body are offered as links, because the viewer would refuse the rest.
+  const dependsOn = (graph?.nodes ?? [])
+    .filter((node) => node.direction === 'out' && node.has_content)
+    .map((node) => node.path)
+  const usedBy = (graph?.nodes ?? [])
+    .filter((node) => node.direction === 'in' && node.has_content)
+    .map((node) => node.path)
 
   if (!isSynced) return null
 
@@ -247,6 +298,22 @@ export function RepoTreePanel({ projectId }: { projectId: string }) {
                 <pre className="overflow-x-auto whitespace-pre text-xs text-text-secondary">
                   {file.content}
                 </pre>
+
+                {(dependsOn.length > 0 || usedBy.length > 0) && (
+                  <div className="mt-3 border-t border-glass-border pt-2">
+                    <DependencyList
+                      label="Depends on"
+                      paths={dependsOn}
+                      onSelect={setSelectedPath}
+                    />
+                    <DependencyList label="Used by" paths={usedBy} onSelect={setSelectedPath} />
+                    {graph?.truncated && (
+                      <p className="mt-1 text-[10px] uppercase tracking-wider text-text-disabled">
+                        Neighbourhood truncated at the node limit
+                      </p>
+                    )}
+                  </div>
+                )}
               </>
             )}
           </Card>
