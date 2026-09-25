@@ -490,6 +490,13 @@ func buildRouter(
 	repoHandler := repo.NewHandler(repoSvc, tenantSvc, logger)
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, docExtractor, logger)
 
+	// I2: capability measurement. The retriever is the SAME assembler the chat and
+	// workflow paths use, so the score reflects production retrieval rather than a
+	// private copy that could drift away from it.
+	adminHandler.SetCapabilityEvaluator(
+		training.NewCapabilityEvaluator(postgres.Pool, modelGateway, contextAssembler, logger),
+	)
+
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
 	bbStore.SetProvenanceRecorder(provSvc) // C1: signed chain per artifact
@@ -935,6 +942,12 @@ func buildRouter(
 		adminGroup.GET("/experts/:id/ingestion/audit", adminHandler.GetIngestionAudit)
 		adminGroup.GET("/experts/:id/ingestion/diagnostics", adminHandler.GetIngestionDiagnostics)
 		adminGroup.POST("/experts/:id/ingestion/reconcile", adminHandler.ReconcileIngestion)
+
+		// I2: measure what an expert can actually answer, instead of reporting a
+		// depth derived from chunk counts. POST starts a background pass; GET reads
+		// the latest one.
+		adminGroup.POST("/experts/:id/capability-eval", adminHandler.MeasureExpertCapability)
+		adminGroup.GET("/experts/:id/capability-eval", adminHandler.GetExpertCapabilityEval)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
 		// Managed accounts: admin + domain_expert CRUD + expert grants

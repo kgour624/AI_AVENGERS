@@ -723,3 +723,77 @@ export const reconcileIngestion = (
       { actions, dry_run: dryRun, job_id: jobId },
     )
     .then((res) => res.data.data!)
+
+// ============================================================
+// Capability measurement (I2)
+// ============================================================
+
+/** One topic's measured verdict from an evaluation pass. */
+export interface CapabilityEvalTopicReport {
+  topic: string
+  /** Chunks covering the topic — coverage, not difficulty. */
+  coverageChunks: number
+  cases: number
+  passed: number
+  /** 1 definitions, 2 mechanics/trade-offs, 3 failure modes. 0 = not achieved. */
+  measuredLevel: number
+  failureReasons: string[]
+  canHandle: string[]
+  cannotHandle: string[]
+}
+
+/** A whole evaluation pass. */
+export interface CapabilityEvalReport {
+  runId: string
+  expertId: string
+  status: 'running' | 'complete' | 'failed'
+  topicsTotal: number
+  casesTotal: number
+  casesPassed: number
+  /** Cases whose source chunk was actually retrieved. */
+  retrievalHits: number
+  /** Cases the judge found supported by the retrieved context. */
+  grounded: number
+  /** Answerable questions the expert declined. */
+  refused: number
+  topK: number
+  startedAt: string
+  completedAt: string | null
+  topics: CapabilityEvalTopicReport[]
+  findings: string[]
+}
+
+export interface CapabilityEvalResponse {
+  expertId: string
+  /** false = never measured, which is a different state from measured-and-empty. */
+  measured: boolean
+  report?: CapabilityEvalReport
+}
+
+export interface CapabilityEvalStartOptions {
+  topics?: number
+  topK?: number
+  regenerate?: boolean
+}
+
+/** Reads the latest pass. Returns measured:false when there has never been one. */
+export const getCapabilityEval = (expertId: string) =>
+  baseAPI
+    .get<ApiResponse<CapabilityEvalResponse>>(`/api/v1/admin/experts/${expertId}/capability-eval`)
+    .then((res) => res.data.data!)
+
+/**
+ * Starts a measurement pass. Returns immediately — the pass costs one generation
+ * call per topic plus two per question, so it runs in the background and the caller
+ * polls getCapabilityEval.
+ *
+ * dry-run has no equivalent here: measuring is read-only for the corpus, but it
+ * does overwrite can_handle / cannot_handle with the measured result.
+ */
+export const startCapabilityEval = (expertId: string, options: CapabilityEvalStartOptions = {}) =>
+  baseAPI
+    .post<ApiResponse<{ expertId: string; status: string }>>(
+      `/api/v1/admin/experts/${expertId}/capability-eval`,
+      { topics: options.topics ?? 0, top_k: options.topK ?? 0, regenerate: options.regenerate ?? false },
+    )
+    .then((res) => res.data.data!)

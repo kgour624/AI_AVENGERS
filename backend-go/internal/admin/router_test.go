@@ -44,9 +44,13 @@ func TestExpertRouteTreeRegistersWithoutConflict(t *testing.T) {
 	group.GET("/experts/:id/ingestion/diagnostics", noop)
 	group.POST("/experts/:id/ingestion/reconcile", noop)
 
+	// I2 additions: the same static segment on two verbs.
+	group.POST("/experts/:id/capability-eval", noop)
+	group.GET("/experts/:id/capability-eval", noop)
+
 	// Route count is asserted too: a silently dropped registration would not
-	// panic, and "no panic" must not be mistaken for "all three registered".
-	if got := len(engine.Routes()); got != 11 {
-		t.Fatalf("registered routes = %d, want 11", got)
+	// panic, and "no panic" must not be mistaken for "all of them registered".
+	if got := len(engine.Routes()); got != 13 {
+		t.Fatalf("registered routes = %d, want 13", got)
 	}
 }
