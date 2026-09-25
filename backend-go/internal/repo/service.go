@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"container/heap"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -14,6 +15,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -156,6 +159,47 @@ type RepoFileContent struct {
 	Language  string `json:"language,omitempty"`
 	SizeBytes int    `json:"size_bytes"`
 	Content   string `json:"content"`
+}
+
+// RepoGraphNode is one file inside a dependency neighbourhood.
+//
+// Direction records how the node was reached, because "this file imports the
+// one you are looking at" and "this file is imported by it" mean different
+// things to a reader deciding what to open next.
+type RepoGraphNode struct {
+	Path       string `json:"path"`
+	Depth      int    `json:"depth"`
+	Direction  string `json:"direction"` // root | out | in
+	HasContent bool   `json:"has_content"`
+}
+
+// RepoGraphEdge is one directed dependency between two stored files.
+type RepoGraphEdge struct {
+	Src  string `json:"src"`
+	Dst  string `json:"dst"`
+	Kind string `json:"kind"`
+}
+
+// RepoGraph is a bounded neighbourhood around a root file.
+type RepoGraph struct {
+	Root      string          `json:"root"`
+	Depth     int             `json:"depth"`
+	CommitSHA string          `json:"commit_sha"`
+	Nodes     []RepoGraphNode `json:"nodes"`
+	Edges     []RepoGraphEdge `json:"edges"`
+	// Truncated reports that the expansion hit its node budget. Without it an
+	// incomplete neighbourhood is indistinguishable from a complete one.
+	Truncated bool `json:"truncated"`
+}
+
+// RepoFileSuggestion is a ranked guess at a file a requirement touches, with
+// the reason it was ranked, so a human can judge the suggestion instead of
+// trusting a bare score.
+type RepoFileSuggestion struct {
+	Path       string  `json:"path"`
+	Score      float64 `json:"score"`
+	Reason     string  `json:"reason"`
+	HasContent bool    `json:"has_content"`
 }
 
 // gitBlobSHA returns the SHA-1 git would assign this blob:
@@ -629,11 +673,25 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 		}
 	}
 
-	// Persist the tree (metadata for all, content for what was fetched).
-	// Non-fatal: the chunk corpus above is already committed, and failing the
-	// whole sync because an index write failed would throw that work away.
+	// Derive the dependency graph from the files whose content we actually hold.
+	// A metadata-only file cannot be parsed, so it contributes no outgoing edges
+	// — the graph is exactly as complete as the stored corpus, no more.
+	treeContents := make(map[string]string, len(rows))
+	treeLanguages := make(map[string]string, len(rows))
+	for _, row := range rows {
+		if row.HasContent {
+			treeContents[row.Path] = row.Content
+			treeLanguages[row.Path] = row.Language
+		}
+	}
+	edges := buildRepoEdges(treeContents, treeLanguages)
+
+	// Persist the tree and its graph (metadata for all, content for what was
+	// fetched). Non-fatal: the chunk corpus above is already committed, and
+	// failing the whole sync because an index write failed would throw that
+	// work away.
 	if commitSHA != "" {
-		if err := s.persistRepoTree(ctx, projectID, connectionID, commitSHA, rows); err != nil {
+		if err := s.persistRepoTree(ctx, projectID, connectionID, commitSHA, rows, edges); err != nil {
 			s.logger.Warn("persist repo tree failed (non-fatal)",
 				zap.String("connection_id", connectionID.String()),
 				zap.Error(err),
@@ -653,22 +711,29 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 	s.logger.Info("repo sync complete",
 		zap.Int("total_chunks", totalChunks),
 		zap.Int("tree_entries", len(rows)),
+		zap.Int("edges", len(edges)),
 		zap.String("connection_id", connectionID.String()),
 	)
 }
 
-// persistRepoTree replaces the stored tree for a connection in one transaction.
+// persistRepoTree replaces the stored tree, its blobs and its dependency graph
+// for a connection in one transaction.
 //
 // WHY replace rather than merge: the tree is fetched wholesale, so the rows for
 // this connection are exactly the truth at commitSHA. Deleting first means a
-// file deleted upstream cannot linger in the index. Blobs are keyed by content
-// hash and inserted with DO NOTHING, so identical bytes are written once even
-// when they repeat across paths or commits.
+// file (or an import) deleted upstream cannot linger in the index. Blobs are
+// keyed by content hash and inserted with DO NOTHING, so identical bytes are
+// written once even when they repeat across paths or commits.
+//
+// WHY one transaction for tree and edges: an edge that points at a file row
+// that is not there (or a file with no edges when its imports were parsed)
+// describes a repository state that never existed. Readers must never see that.
 func (s *Service) persistRepoTree(
 	ctx context.Context,
 	projectID, connectionID uuid.UUID,
 	commitSHA string,
 	rows []repoTreeRow,
+	edges []repoEdge,
 ) error {
 	tx, err := s.db.Begin(ctx)
 	if err != nil {
@@ -680,6 +745,11 @@ func (s *Service) persistRepoTree(
 		`DELETE FROM repo_files WHERE repo_connection_id=$1`, connectionID,
 	); err != nil {
 		return fmt.Errorf("clear previous repo tree: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM repo_file_edges WHERE repo_connection_id=$1`, connectionID,
+	); err != nil {
+		return fmt.Errorf("clear previous repo edges: %w", err)
 	}
 
 	batch := &pgx.Batch{}
@@ -696,7 +766,7 @@ func (s *Service) persistRepoTree(
 		)
 	}
 
-	queued := batch.Len()
+	blobInserted := batch.Len()
 	for _, row := range rows {
 		var blobSHA, size interface{}
 		if row.HasContent {
@@ -717,17 +787,38 @@ func (s *Service) persistRepoTree(
 			projectID, connectionID, commitSHA, row.Path, blobSHA, row.Language, size,
 		)
 	}
+	fileInserted := batch.Len()
+
+	seenEdge := make(map[string]bool, len(edges))
+	for _, edge := range edges {
+		key := edge.Src + "\x00" + edge.Dst + "\x00" + edge.Kind
+		if seenEdge[key] {
+			continue
+		}
+		seenEdge[key] = true
+		batch.Queue(
+			`INSERT INTO repo_file_edges
+				(project_id, repo_connection_id, commit_sha, src_path, dst_path, kind)
+			 VALUES ($1, $2, $3, $4, $5, $6)
+			 ON CONFLICT (repo_connection_id, commit_sha, src_path, dst_path, kind) DO NOTHING`,
+			projectID, connectionID, commitSHA, edge.Src, edge.Dst, edge.Kind,
+		)
+	}
 
 	results := tx.SendBatch(ctx, batch)
 	for i := 0; i < batch.Len(); i++ {
 		if _, err := results.Exec(); err != nil {
 			results.Close()
-			// The blob inserts are queued before the file inserts; report which
-			// half failed so a partial write is diagnosable from the log alone.
-			if i < queued {
+			// Blobs, then files, then edges are queued in that order; naming the
+			// failing section makes a partial write diagnosable from the log.
+			switch {
+			case i < blobInserted:
 				return fmt.Errorf("store repo blob: %w", err)
+			case i < fileInserted:
+				return fmt.Errorf("store repo file row: %w", err)
+			default:
+				return fmt.Errorf("store repo edge: %w", err)
 			}
-			return fmt.Errorf("store repo file row: %w", err)
 		}
 	}
 	if err := results.Close(); err != nil {
@@ -748,20 +839,9 @@ func (s *Service) persistRepoTree(
 // anyway (FilesPanel.buildTree), so a single call avoids N round-trips for a
 // hierarchy the client reconstructs in one pass.
 func (s *Service) ListRepoTree(ctx context.Context, projectID uuid.UUID) ([]RepoTreeEntry, string, error) {
-	var connectionID uuid.UUID
-	var lastCommit *string
-	err := s.db.QueryRow(ctx,
-		`SELECT id, last_commit_sha
-		   FROM repo_connections
-		  WHERE project_id=$1
-		  ORDER BY created_at DESC LIMIT 1`,
-		projectID,
-	).Scan(&connectionID, &lastCommit)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, "", ErrNoRepoConnection
-	}
+	connectionID, commitSHA, err := s.repoConnection(ctx, projectID)
 	if err != nil {
-		return nil, "", fmt.Errorf("load repo connection: %w", err)
+		return nil, "", err
 	}
 
 	rows, err := s.db.Query(ctx,
@@ -793,10 +873,6 @@ func (s *Service) ListRepoTree(ctx context.Context, projectID uuid.UUID) ([]Repo
 		return nil, "", ErrRepoTreeEmpty
 	}
 
-	commitSHA := ""
-	if lastCommit != nil {
-		commitSHA = *lastCommit
-	}
 	return entries, commitSHA, nil
 }
 
@@ -838,6 +914,408 @@ func (s *Service) GetRepoFileContent(ctx context.Context, projectID uuid.UUID, p
 		SizeBytes: size,
 		Content:   content,
 	}, nil
+}
+
+// maxGraphNodes bounds one neighbourhood expansion. A large repository's graph
+// is far bigger than any UI can render or any expert will read, so the walk is
+// capped and the caller is told when the cap was hit.
+const maxGraphNodes = 300
+
+// repoConnection resolves a project's connection id and pinned commit. Every
+// tree/graph read starts here, so the "which connection?" rule lives once.
+func (s *Service) repoConnection(ctx context.Context, projectID uuid.UUID) (uuid.UUID, string, error) {
+	var connectionID uuid.UUID
+	var lastCommit *string
+	err := s.db.QueryRow(ctx,
+		`SELECT id, last_commit_sha
+		   FROM repo_connections
+		  WHERE project_id=$1
+		  ORDER BY created_at DESC LIMIT 1`,
+		projectID,
+	).Scan(&connectionID, &lastCommit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, "", ErrNoRepoConnection
+	}
+	if err != nil {
+		return uuid.Nil, "", fmt.Errorf("load repo connection: %w", err)
+	}
+	commitSHA := ""
+	if lastCommit != nil {
+		commitSHA = *lastCommit
+	}
+	return connectionID, commitSHA, nil
+}
+
+// repoFilesWithContent reports, for the given paths, which ones have a stored
+// body. One query instead of one per node.
+func (s *Service) repoFilesWithContent(ctx context.Context, connectionID uuid.UUID, paths []string) (map[string]bool, error) {
+	out := make(map[string]bool, len(paths))
+	if len(paths) == 0 {
+		return out, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT path FROM repo_files
+		  WHERE repo_connection_id=$1 AND path = ANY($2) AND blob_sha IS NOT NULL`,
+		connectionID, paths,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load repo content availability: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, fmt.Errorf("scan repo content availability: %w", err)
+		}
+		out[p] = true
+	}
+	return out, rows.Err()
+}
+
+// repoAdjacency loads every edge touching the given paths, in either direction.
+func (s *Service) repoAdjacency(ctx context.Context, connectionID uuid.UUID, paths []string) ([]RepoGraphEdge, error) {
+	if len(paths) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT src_path, dst_path, kind
+		   FROM repo_file_edges
+		  WHERE repo_connection_id=$1
+		    AND (src_path = ANY($2) OR dst_path = ANY($2))`,
+		connectionID, paths,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load repo adjacency: %w", err)
+	}
+	defer rows.Close()
+
+	var edges []RepoGraphEdge
+	for rows.Next() {
+		var edge RepoGraphEdge
+		if err := rows.Scan(&edge.Src, &edge.Dst, &edge.Kind); err != nil {
+			return nil, fmt.Errorf("scan repo edge: %w", err)
+		}
+		edges = append(edges, edge)
+	}
+	return edges, rows.Err()
+}
+
+// RepoGraph walks outwards from a root file, in both directions, up to depth
+// hops.
+//
+// CYCLE SAFETY: the visited set is what makes this terminate. Real repositories
+// contain import cycles (A imports B, B imports A), so a walk that relied on
+// depth alone would re-expand the same files level after level. Depth bounds
+// how far the walk reaches; the visited set guarantees each file is emitted
+// once.
+func (s *Service) RepoGraph(ctx context.Context, projectID uuid.UUID, rootPath string, depth int) (*RepoGraph, error) {
+	if depth < 0 {
+		depth = 0
+	}
+	if depth > 5 {
+		// Beyond a few hops the neighbourhood is the whole repository, which is
+		// precisely the unbounded read this feature exists to avoid.
+		depth = 5
+	}
+
+	connectionID, commitSHA, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	var rootExists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM repo_files WHERE repo_connection_id=$1 AND path=$2)`,
+		connectionID, rootPath,
+	).Scan(&rootExists); err != nil {
+		return nil, fmt.Errorf("check repo file: %w", err)
+	}
+	if !rootExists {
+		return nil, ErrRepoFileNotFound
+	}
+
+	graph := &RepoGraph{
+		Root: rootPath, Depth: depth, CommitSHA: commitSHA,
+		Nodes: []RepoGraphNode{}, Edges: []RepoGraphEdge{},
+	}
+	graph.Nodes = append(graph.Nodes, RepoGraphNode{Path: rootPath, Depth: 0, Direction: "root"})
+
+	visited := map[string]bool{rootPath: true}
+	seenEdge := map[string]bool{}
+	frontier := []string{rootPath}
+
+	for level := 1; level <= depth && len(frontier) > 0; level++ {
+		edges, err := s.repoAdjacency(ctx, connectionID, frontier)
+		if err != nil {
+			return nil, err
+		}
+
+		frontierSet := make(map[string]bool, len(frontier))
+		for _, p := range frontier {
+			frontierSet[p] = true
+		}
+
+		var next []string
+		for _, edge := range edges {
+			key := edge.Src + "\x00" + edge.Dst + "\x00" + edge.Kind
+			if !seenEdge[key] {
+				seenEdge[key] = true
+				graph.Edges = append(graph.Edges, edge)
+			}
+
+			var neighbour, direction string
+			switch {
+			case frontierSet[edge.Src]:
+				neighbour, direction = edge.Dst, "out"
+			case frontierSet[edge.Dst]:
+				neighbour, direction = edge.Src, "in"
+			default:
+				continue
+			}
+			if visited[neighbour] {
+				continue
+			}
+			if len(graph.Nodes) >= maxGraphNodes {
+				graph.Truncated = true
+				break
+			}
+			visited[neighbour] = true
+			graph.Nodes = append(graph.Nodes, RepoGraphNode{Path: neighbour, Depth: level, Direction: direction})
+			next = append(next, neighbour)
+		}
+		frontier = next
+	}
+
+	paths := make([]string, 0, len(graph.Nodes))
+	for _, node := range graph.Nodes {
+		paths = append(paths, node.Path)
+	}
+	withContent, err := s.repoFilesWithContent(ctx, connectionID, paths)
+	if err != nil {
+		return nil, err
+	}
+	for i := range graph.Nodes {
+		graph.Nodes[i].HasContent = withContent[graph.Nodes[i].Path]
+	}
+	return graph, nil
+}
+
+// Scoring weights for SuggestRepoFiles, kept together so the heuristic can be
+// reasoned about (and tuned) in one place.
+const (
+	suggestWeightExactName  = 3.0 // requirement word equals a file's base name
+	suggestWeightPathToken  = 1.5 // requirement word appears in the path
+	suggestWeightDirectory  = 0.5 // requirement word names a directory
+	suggestWeightHub        = 1.0 // max bonus for being widely imported
+	suggestMaxHubIncoming   = 25
+	suggestDefaultLimitSize = 10
+	suggestMaxLimitSize     = 50
+)
+
+// stopWords are ignored when matching a requirement against paths: they appear
+// in almost every requirement and in almost every path, so they carry no signal.
+var stopWords = map[string]bool{
+	"the": true, "and": true, "for": true, "with": true, "from": true,
+	"this": true, "that": true, "into": true, "when": true, "then": true,
+	"must": true, "should": true, "have": true, "will": true, "user": true,
+	"code": true, "file": true, "files": true, "using": true, "use": true,
+}
+
+// requirementTokens lowercases free text and keeps the words that can match a
+// path. Deterministic ordering keeps candidate scoring stable across runs.
+func requirementTokens(text string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, raw := range strings.FieldsFunc(strings.ToLower(text), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z') && !(r >= '0' && r <= '9')
+	}) {
+		if len(raw) < 3 || seen[raw] || stopWords[raw] {
+			continue
+		}
+		seen[raw] = true
+		out = append(out, raw)
+	}
+	return out
+}
+
+// pathTokens splits a repository path into the words a requirement could match.
+func pathTokens(p string) []string {
+	return strings.FieldsFunc(strings.ToLower(p), func(r rune) bool {
+		return r == '/' || r == '.' || r == '-' || r == '_' || r == ' '
+	})
+}
+
+// suggestionHeap is a fixed-size min-heap: the smallest score sits at the root,
+// so a better candidate replaces it and the heap never grows past the limit.
+// This is the top-K-by-heap pattern: O(n log k) instead of sorting every file.
+type suggestionHeap []RepoFileSuggestion
+
+func (h suggestionHeap) Len() int            { return len(h) }
+func (h suggestionHeap) Less(i, j int) bool  { return h[i].Score < h[j].Score }
+func (h suggestionHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
+func (h *suggestionHeap) Push(x interface{}) { *h = append(*h, x.(RepoFileSuggestion)) }
+func (h *suggestionHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
+
+// SuggestRepoFiles ranks stored files against a requirement.
+//
+// HONEST SCOPE: this is a transparent heuristic — path/name term overlap plus a
+// small bonus for files many others import. It is NOT a graph-random-walk
+// ranking (Personalized PageRank), which needs its own design review before it
+// goes in. The score and the reason are both returned so a human can see why a
+// file was suggested and reject it, which is the point of the approval loop.
+func (s *Service) SuggestRepoFiles(ctx context.Context, projectID uuid.UUID, requirement string, limit int) ([]RepoFileSuggestion, error) {
+	if limit <= 0 {
+		limit = suggestDefaultLimitSize
+	}
+	if limit > suggestMaxLimitSize {
+		limit = suggestMaxLimitSize
+	}
+
+	tokens := requirementTokens(requirement)
+	if len(tokens) == 0 {
+		return []RepoFileSuggestion{}, nil
+	}
+
+	connectionID, _, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Incoming-edge counts: a file imported by many others is more likely to be
+	// a structural entry point than a leaf.
+	incoming := map[string]int{}
+	edgeRows, err := s.db.Query(ctx,
+		`SELECT dst_path, COUNT(*) FROM repo_file_edges
+		  WHERE repo_connection_id=$1 GROUP BY dst_path`,
+		connectionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load repo degrees: %w", err)
+	}
+	maxIncoming := 0
+	for edgeRows.Next() {
+		var p string
+		var count int
+		if err := edgeRows.Scan(&p, &count); err != nil {
+			edgeRows.Close()
+			return nil, fmt.Errorf("scan repo degree: %w", err)
+		}
+		incoming[p] = count
+		if count > maxIncoming {
+			maxIncoming = count
+		}
+	}
+	edgeRows.Close()
+	if err := edgeRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate repo degrees: %w", err)
+	}
+
+	fileRows, err := s.db.Query(ctx,
+		`SELECT path, COALESCE(language, ''), (blob_sha IS NOT NULL)
+		   FROM repo_files WHERE repo_connection_id=$1`,
+		connectionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load repo files for suggestion: %w", err)
+	}
+	defer fileRows.Close()
+
+	heapSize := limit
+	best := &suggestionHeap{}
+
+	for fileRows.Next() {
+		var p, language string
+		var hasContent bool
+		if err := fileRows.Scan(&p, &language, &hasContent); err != nil {
+			return nil, fmt.Errorf("scan repo file for suggestion: %w", err)
+		}
+		if !hasContent {
+			// Content is what an expert would actually read; suggesting a file
+			// whose body was never stored would send them to a dead end.
+			continue
+		}
+
+		score, reason := scoreRepoFile(p, tokens, incoming[p], maxIncoming)
+		if score <= 0 {
+			continue
+		}
+		candidate := RepoFileSuggestion{Path: p, Score: score, Reason: reason, HasContent: true}
+
+		if best.Len() < heapSize {
+			heap.Push(best, candidate)
+			continue
+		}
+		if (*best)[0].Score < candidate.Score {
+			heap.Pop(best)
+			heap.Push(best, candidate)
+		}
+	}
+	if err := fileRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate repo files for suggestion: %w", err)
+	}
+
+	out := make([]RepoFileSuggestion, best.Len())
+	for i := len(out) - 1; i >= 0; i-- {
+		out[i] = heap.Pop(best).(RepoFileSuggestion)
+	}
+	return out, nil
+}
+
+// scoreRepoFile is pure: same inputs, same score and reason. That is what makes
+// the suggestion list explainable and testable rather than a black box.
+func scoreRepoFile(filePath string, tokens []string, incomingEdges, maxIncoming int) (float64, string) {
+	lowerPath := strings.ToLower(filePath)
+	base := strings.ToLower(path.Base(filePath))
+	baseNoExt := strings.TrimSuffix(base, path.Ext(base))
+	fileTokens := pathTokens(filePath)
+
+	var score float64
+	var matched []string
+
+	for _, token := range tokens {
+		switch {
+		case baseNoExt == token:
+			score += suggestWeightExactName
+			matched = append(matched, token)
+		case containsToken(fileTokens, token):
+			score += suggestWeightPathToken
+			matched = append(matched, token)
+		case strings.Contains(lowerPath, token):
+			score += suggestWeightDirectory
+			matched = append(matched, token)
+		}
+	}
+
+	if maxIncoming > 0 && incomingEdges > 0 {
+		hub := float64(incomingEdges) / float64(maxIncoming)
+		if hub > 1 {
+			hub = 1
+		}
+		score += hub * suggestWeightHub
+	}
+
+	if len(matched) == 0 {
+		if incomingEdges == 0 {
+			return 0, ""
+		}
+		return score, fmt.Sprintf("imported by %d file(s)", incomingEdges)
+	}
+	return score, fmt.Sprintf("matches %s", strings.Join(matched, ", "))
+}
+
+func containsToken(haystack []string, needle string) bool {
+	for _, item := range haystack {
+		if item == needle {
+			return true
+		}
+	}
+	return false
 }
 
 // fetchFileTree fetches every blob in the repo's tree.
@@ -1861,13 +2339,16 @@ func (h *Handler) GetRepoFile(c *gin.Context) {
 		return
 	}
 
-	path := c.Query("path")
-	if strings.TrimSpace(path) == "" {
+	// Named filePath rather than path: `path` is an imported package in this
+	// file, and shadowing it inside a handler is how a later edit silently
+	// breaks path.Dir/path.Base calls.
+	filePath := c.Query("path")
+	if strings.TrimSpace(filePath) == "" {
 		response.BadRequest(c, "MISSING_PATH", "path query param required")
 		return
 	}
 
-	file, err := h.svc.GetRepoFileContent(c.Request.Context(), projectID, path)
+	file, err := h.svc.GetRepoFileContent(c.Request.Context(), projectID, filePath)
 	switch {
 	case errors.Is(err, ErrRepoFileContentUnavailable):
 		response.Conflict(c, "this file's content was not stored (binary, unsupported type, or larger than the size limit)")
@@ -1878,7 +2359,7 @@ func (h *Handler) GetRepoFile(c *gin.Context) {
 	case err != nil:
 		h.logger.Error("load repo file failed",
 			zap.String("project_id", projectID.String()),
-			zap.String("path", path),
+			zap.String("path", filePath),
 			zap.Error(err),
 		)
 		response.InternalError(c)
@@ -1886,4 +2367,100 @@ func (h *Handler) GetRepoFile(c *gin.Context) {
 	}
 
 	response.OK(c, file)
+}
+
+// GetRepoGraph GET /projects/:id/repo/graph?path=...&depth=2
+//
+// Returns the bounded dependency neighbourhood around one file. Read-only.
+func (h *Handler) GetRepoGraph(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid project ID")
+		return
+	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
+
+	rootPath := strings.TrimSpace(c.Query("path"))
+	if rootPath == "" {
+		response.BadRequest(c, "MISSING_PATH", "path query param required")
+		return
+	}
+	depth := 2
+	if raw := strings.TrimSpace(c.Query("depth")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed < 0 {
+			response.BadRequest(c, "INVALID_DEPTH", "depth must be a non-negative integer")
+			return
+		}
+		depth = parsed
+	}
+
+	graph, err := h.svc.RepoGraph(c.Request.Context(), projectID, rootPath, depth)
+	switch {
+	case errors.Is(err, ErrNoRepoConnection):
+		response.NotFound(c, "repo connection")
+		return
+	case errors.Is(err, ErrRepoFileNotFound):
+		response.NotFound(c, "repo file")
+		return
+	case err != nil:
+		h.logger.Error("load repo graph failed",
+			zap.String("project_id", projectID.String()),
+			zap.String("path", rootPath),
+			zap.Error(err),
+		)
+		response.InternalError(c)
+		return
+	}
+
+	response.OK(c, graph)
+}
+
+// SuggestRepoFiles GET /projects/:id/repo/suggest?q=...&limit=10
+//
+// Ranks stored files against a free-text requirement. Every suggestion carries
+// the reason it was ranked, because a human decides what actually enters the
+// working set — this endpoint proposes, it never approves.
+func (h *Handler) SuggestRepoFiles(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid project ID")
+		return
+	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
+
+	requirement := strings.TrimSpace(c.Query("q"))
+	if requirement == "" {
+		response.BadRequest(c, "MISSING_QUERY", "q query param required")
+		return
+	}
+	limit := suggestDefaultLimitSize
+	if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			response.BadRequest(c, "INVALID_LIMIT", "limit must be a positive integer")
+			return
+		}
+		limit = parsed
+	}
+
+	suggestions, err := h.svc.SuggestRepoFiles(c.Request.Context(), projectID, requirement, limit)
+	switch {
+	case errors.Is(err, ErrNoRepoConnection):
+		response.NotFound(c, "repo connection")
+		return
+	case err != nil:
+		h.logger.Error("suggest repo files failed",
+			zap.String("project_id", projectID.String()),
+			zap.Error(err),
+		)
+		response.InternalError(c)
+		return
+	}
+
+	response.OK(c, gin.H{"suggestions": suggestions, "count": len(suggestions)})
 }

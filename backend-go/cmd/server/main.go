@@ -769,6 +769,9 @@ func buildRouter(
 			// Phase 3A: read-only access to the stored file tree + file bodies.
 			projects.GET("/:id/repo/tree", repoHandler.ListRepoTree)
 			projects.GET("/:id/repo/file", repoHandler.GetRepoFile)
+			// Phase 3B: dependency neighbourhood + requirement-driven file ranking.
+			projects.GET("/:id/repo/graph", repoHandler.GetRepoGraph)
+			projects.GET("/:id/repo/suggest", repoHandler.SuggestRepoFiles)
 		}
 
 		// OAuth initiation — protected so we know which user is connecting

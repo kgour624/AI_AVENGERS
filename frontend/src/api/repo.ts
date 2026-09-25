@@ -135,3 +135,62 @@ export const getRepoFile = (projectId: string, path: string) =>
       params: { path },
     })
     .then((res) => res.data.data!)
+
+/**
+ * Phase 3B — the file dependency neighbourhood.
+ *
+ * `direction` explains how a node was reached: `root` is the file asked about,
+ * `out` means it is imported BY the root, `in` means it imports the root. The
+ * two are shown separately because "what does this file use" and "what would
+ * break if this file changed" lead to different next files.
+ *
+ * `truncated: true` means the walk hit its node budget, so the neighbourhood is
+ * incomplete — the UI says so rather than implying the list is exhaustive.
+ */
+export interface RepoGraphNode {
+  path: string
+  depth: number
+  direction: 'root' | 'out' | 'in'
+  has_content: boolean
+}
+
+export interface RepoGraphEdge {
+  src: string
+  dst: string
+  kind: string
+}
+
+export interface RepoGraph {
+  root: string
+  depth: number
+  commit_sha: string
+  nodes: RepoGraphNode[]
+  edges: RepoGraphEdge[]
+  truncated: boolean
+}
+
+export const getRepoGraph = (projectId: string, path: string, depth = 1) =>
+  baseAPI
+    .get<ApiResponse<RepoGraph>>(`/api/v1/projects/${projectId}/repo/graph`, {
+      params: { path, depth },
+    })
+    .then((res) => res.data.data!)
+
+export interface RepoFileSuggestion {
+  path: string
+  score: number
+  reason: string
+  has_content: boolean
+}
+
+/**
+ * Ranks stored files against a free-text requirement. Read-only: this proposes
+ * candidates, it never adds them to a working set — a human approves those.
+ */
+export const suggestRepoFiles = (projectId: string, q: string, limit = 10) =>
+  baseAPI
+    .get<ApiResponse<{ suggestions: RepoFileSuggestion[]; count: number }>>(
+      `/api/v1/projects/${projectId}/repo/suggest`,
+      { params: { q, limit } }
+    )
+    .then((res) => res.data.data!)
