@@ -103,15 +103,33 @@ const (
 // Assembler builds smart context for LLM calls.
 // Respects token budget: never exceeds MaxTokens.
 type Assembler struct {
-	db          *pgxpool.Pool
-	embedder    ml.Embedder       // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
-	sidecar     *ml.SidecarClient // kept separately for Rerank() — Rerank is sidecar-only, not in Embedder interface
-	memManager  *memory.Manager
-	maxTokens   int
-	recentMsgs  int
+	db           *pgxpool.Pool
+	embedder     ml.Embedder       // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	sidecar      *ml.SidecarClient // kept separately for Rerank() — Rerank is sidecar-only, not in Embedder interface
+	memManager   *memory.Manager
+	maxTokens    int
+	recentMsgs   int
 	semanticTopK int
-	chunksTopK  int
-	logger      *zap.Logger
+	chunksTopK   int
+	// concepts supplies graph neighbours for retrieval expansion (I4). Nil-safe: when
+	// unset, expansion is unavailable and retrieval behaves exactly as before.
+	concepts ConceptNeighbourFinder
+	logger   *zap.Logger
+}
+
+// ConceptNeighbourFinder supplies the concept-graph neighbours of a set of chunks.
+//
+// WHY an interface declared here rather than importing the package that implements it:
+// retrieval must not depend on the training package, and declaring the one method it
+// needs keeps the dependency visible and the expansion testable with a fake.
+type ConceptNeighbourFinder interface {
+	NeighboursForChunks(ctx context.Context, expertID uuid.UUID, chunkIDs []uuid.UUID) ([]string, error)
+}
+
+// SetConceptNeighbourFinder wires graph expansion. Not wiring it is supported:
+// expansion is then simply unavailable, and every caller behaves as it did before.
+func (a *Assembler) SetConceptNeighbourFinder(f ConceptNeighbourFinder) {
+	a.concepts = f
 }
 
 // NewAssembler creates a new context assembler.
@@ -234,7 +252,10 @@ func (a *Assembler) Assemble(
 		historyCh <- historyResult{h, err}
 	}()
 	go func() {
-		c, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK)
+		// Production chat retrieval: the unexpanded path, deliberately. Graph expansion
+		// is opt-in (GetCourseChunksExpanded) so it can be measured against this path
+		// before it becomes the default.
+		c, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK, false)
 		chunksCh <- chunksResult{c, err}
 	}()
 	go func() {
@@ -646,7 +667,26 @@ func (a *Assembler) GetCourseChunksForWorkflow(
 	if topK <= 0 {
 		topK = 5
 	}
-	return a.getCourseChunks(ctx, expertID, taskDescription, topK)
+	return a.getCourseChunks(ctx, expertID, taskDescription, topK, false)
+}
+
+// GetCourseChunksExpanded is GetCourseChunksForWorkflow with concept-graph expansion
+// enabled: after the vector and keyword lists, one representative chunk is added for
+// each neighbouring concept of the topics the question already matched.
+//
+// It exists as a separate method so the expanded path is opt-in and measurable. The
+// production retrieval path uses the unexpanded version until a measurement says the
+// expansion helps — see the capability-evaluation comparison.
+func (a *Assembler) GetCourseChunksExpanded(
+	ctx context.Context,
+	expertID uuid.UUID,
+	taskDescription string,
+	topK int,
+) ([]chinawall.CourseChunk, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	return a.getCourseChunks(ctx, expertID, taskDescription, topK, true)
 }
 
 // GetProjectMemoryText loads project L1/L2 memory for a workflow expert and
@@ -849,16 +889,15 @@ func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, que
 // Step 2: Keyword search -> top 10 candidates (exact)
 // Step 3: Merge + deduplicate
 // Step 4: Rerank merged set -> top K
-func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int) ([]chinawall.CourseChunk, error) {
-	// Step 1: Vector search
+func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int, expand bool) ([]chinawall.CourseChunk, error) {
+	// Step 1: Vector search — one RANKED list.
 	embedding, err := a.embedder.EmbedSingle(ctx, question)
 	if err != nil {
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}
 
-	// Feature #23: Added source_file and chunk_index to SELECT
-	// WHY: Citation modal needs to show which transcript a citation came from
-	// and the chunk's position in that transcript.
+	// Feature #23: source_file and chunk_index are selected so the citation modal can
+	// name the transcript and the position.
 	vectorRows, err := a.db.Query(ctx,
 		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
 		 FROM course_chunks
@@ -880,49 +919,125 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		ChunkIndex int    // Feature #23: position in transcript
 	}
 
-	seen := make(map[uuid.UUID]bool)
-	var candidates []rawChunk
+	byID := make(map[uuid.UUID]rawChunk)
+	var vectorIDs []uuid.UUID
 
 	for vectorRows.Next() {
 		var c rawChunk
 		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
 			continue
 		}
-		if !seen[c.ID] {
-			seen[c.ID] = true
+		if _, dup := byID[c.ID]; dup {
+			continue
+		}
+		byID[c.ID] = c
+		vectorIDs = append(vectorIDs, c.ID)
+	}
+
+	// Step 2: Keyword search — the second RANKED list.
+	//
+	// WHY the terms are extracted instead of passing the question: plainto_tsquery
+	// ANDs every lexeme, so a natural-language question required every one of its
+	// words to appear in the same chunk and usually matched nothing. The terms are
+	// whitelisted to [a-z0-9_] before they reach the tsquery, which is what makes
+	// joining them with ' | ' safe.
+	//
+	// ORDER BY ts_rank is the other half of the fix: without it, LIMIT 10 returned ten
+	// arbitrary matching rows rather than the ten best.
+	var keywordIDs []uuid.UUID
+	terms := salientTerms(question)
+	if len(terms) > 0 {
+		const keywordSQL = `
+			SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
+			  FROM course_chunks
+			 WHERE expert_id = $1
+			   AND chunk_text_tsv @@ to_tsquery('english', array_to_string($2::text[], ' | '))
+			 ORDER BY ts_rank(chunk_text_tsv, to_tsquery('english', array_to_string($2::text[], ' | '))) DESC
+			 LIMIT 10`
+		keywordRows, keywordErr := a.db.Query(ctx, keywordSQL, expertID, terms)
+		if keywordErr == nil {
+			defer keywordRows.Close()
+			for keywordRows.Next() {
+				var c rawChunk
+				if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
+					continue
+				}
+				if _, dup := byID[c.ID]; !dup {
+					byID[c.ID] = c
+				}
+				keywordIDs = append(keywordIDs, c.ID)
+			}
+		}
+		// Keyword search failure is non-fatal — the vector list still stands.
+	}
+
+	// Step 2b: Concept-graph expansion — the third ranked list.
+	//
+	// WHY this is opt-in per call rather than always on: it changes what retrieval
+	// returns, and a change nobody measured is a change nobody can defend. The caller
+	// that cares (the capability evaluation) asks for it explicitly, so the plain and
+	// expanded paths can be compared and the difference attributed to expansion alone.
+	//
+	// The seed is the topics of the best vector hits: the question's own wording
+	// already surfaced them, and their neighbours are the concepts the question did not
+	// name but probably means.
+	var neighbourIDs []uuid.UUID
+	if expand && a.concepts != nil && len(vectorIDs) > 0 {
+		neighbours, nErr := a.concepts.NeighboursForChunks(ctx, expertID, vectorIDs)
+		if nErr != nil {
+			a.logger.Warn("concept expansion unavailable — continuing without it",
+				zap.Error(nErr))
+		} else if len(neighbours) > 0 {
+			// One representative chunk per neighbouring concept, chosen by similarity to
+			// the question: DISTINCT ON (topic) keeps the set bounded at one row per
+			// neighbour, so expansion adds recall without flooding the reranker.
+			const neighbourSQL = `
+				SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
+				  FROM (
+				      SELECT DISTINCT ON (topic)
+				             id, chunk_text, topic, source_file, chunk_index,
+				             embedding <=> $2 AS dist
+				        FROM course_chunks
+				       WHERE expert_id = $1
+				         AND topic = ANY($3)
+				       ORDER BY topic, dist
+				  ) per_topic
+				 ORDER BY dist
+				 LIMIT 10`
+			neighbourRows, nqErr := a.db.Query(ctx, neighbourSQL, expertID, pgvector.NewVector(embedding), neighbours)
+			if nqErr == nil {
+				defer neighbourRows.Close()
+				for neighbourRows.Next() {
+					var c rawChunk
+					if err := neighbourRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
+						continue
+					}
+					if _, dup := byID[c.ID]; !dup {
+						byID[c.ID] = c
+					}
+					neighbourIDs = append(neighbourIDs, c.ID)
+				}
+			}
+		}
+	}
+
+	if len(byID) == 0 {
+		return nil, nil
+	}
+
+	// Step 3: Fuse the ranked lists.
+	//
+	// WHY fusion rather than concatenation (what this used to do): appending keyword
+	// results after vector results meant the keyword hits sat at the end of the
+	// candidate list, so on the reranker-unavailable path — which returns the first
+	// `limit` candidates and scores them all 0.5 — they were discarded entirely. With
+	// RRF the fused order is the real order, and that path inherits it.
+	order := reciprocalRankFusion([][]uuid.UUID{vectorIDs, keywordIDs, neighbourIDs})
+	candidates := make([]rawChunk, 0, len(order))
+	for _, id := range order {
+		if c, ok := byID[id]; ok {
 			candidates = append(candidates, c)
 		}
-	}
-
-	// Step 2: Keyword search (full-text)
-	// WHY: Exact terms like "PostgreSQL", "Kafka", "Redis" may not be
-	// captured well by semantic search alone.
-	// Feature #23: Also fetch source_file and chunk_index here
-	keywordRows, err := a.db.Query(ctx,
-		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
-		 FROM course_chunks
-		 WHERE expert_id=$1
-		   AND chunk_text_tsv @@ plainto_tsquery('english', $2)
-		 LIMIT 10`,
-		expertID, question,
-	)
-	if err == nil {
-		defer keywordRows.Close()
-		for keywordRows.Next() {
-			var c rawChunk
-			if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
-				continue
-			}
-			if !seen[c.ID] {
-				seen[c.ID] = true
-				candidates = append(candidates, c)
-			}
-		}
-	}
-	// Keyword search failure is non-fatal — vector results still usable
-
-	if len(candidates) == 0 {
-		return nil, nil
 	}
 
 	// Step 3: Rerank merged candidates

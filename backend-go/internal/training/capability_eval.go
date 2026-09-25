@@ -103,6 +103,10 @@ const (
 // also lets the scoring be tested without a database or a model.
 type CapabilityRetriever interface {
 	GetCourseChunksForWorkflow(ctx context.Context, expertID uuid.UUID, taskDescription string, topK int) ([]chinawall.CourseChunk, error)
+	// GetCourseChunksExpanded is the same retrieval with concept-graph expansion. It is
+	// a separate method so a pass can measure each path, and so the difference between
+	// two runs can be attributed to expansion alone.
+	GetCourseChunksExpanded(ctx context.Context, expertID uuid.UUID, taskDescription string, topK int) ([]chinawall.CourseChunk, error)
 }
 
 // CapabilityEvaluator generates capability questions from a corpus, asks them, and
@@ -111,13 +115,17 @@ type CapabilityEvaluator struct {
 	db        *pgxpool.Pool
 	gateway   *gateway.ModelGateway
 	retriever CapabilityRetriever
+	answerer  *groundedAnswerer
 	logger    *zap.Logger
 }
 
 // NewCapabilityEvaluator builds an evaluator. retriever may be nil, in which case
 // RunEval fails loudly rather than reporting a retrieval score it never measured.
 func NewCapabilityEvaluator(db *pgxpool.Pool, gw *gateway.ModelGateway, retriever CapabilityRetriever, logger *zap.Logger) *CapabilityEvaluator {
-	return &CapabilityEvaluator{db: db, gateway: gw, retriever: retriever, logger: logger}
+	return &CapabilityEvaluator{
+		db: db, gateway: gw, retriever: retriever,
+		answerer: newGroundedAnswerer(gw, logger), logger: logger,
+	}
 }
 
 // CapabilityEvalRequest is one evaluation pass's budget.
@@ -130,6 +138,11 @@ type CapabilityEvalRequest struct {
 	// question set is the golden set, and silently regenerating it would destroy
 	// the baseline that makes two runs comparable.
 	Regenerate bool
+
+	// GraphExpansion retrieves with concept-graph expansion. Recorded on the run, and
+	// comparisons are only made against a run with the SAME value — otherwise the
+	// difference would be attributed to whichever change was made last.
+	GraphExpansion bool
 }
 
 // CapabilityCase is one stored question with its ground truth.
@@ -170,6 +183,25 @@ type TopicCapabilityReport struct {
 	CannotHandle   []string `json:"cannot_handle"`
 }
 
+// RetrievalMetrics is how well retrieval did across one run's questions.
+//
+// WHY this exists: changing retrieval without measuring it is how a "fix" becomes a
+// regression nobody notices. The per-case evidence was already stored, so these
+// numbers are derived from it rather than recorded separately — one source, no drift.
+type RetrievalMetrics struct {
+	Cases int     `json:"cases"`
+	Hits  int     `json:"hits"`
+	MRR   float64 `json:"mrr"`
+}
+
+// HitRate is the share of questions whose source chunk was retrieved in the top k.
+func (m RetrievalMetrics) HitRate() float64 {
+	if m.Cases == 0 {
+		return 0
+	}
+	return float64(m.Hits) / float64(m.Cases)
+}
+
 // CapabilityEvalReport is a whole pass, ready for the admin screen.
 type CapabilityEvalReport struct {
 	RunID         uuid.UUID               `json:"run_id"`
@@ -186,6 +218,14 @@ type CapabilityEvalReport struct {
 	CompletedAt   *time.Time              `json:"completed_at"`
 	TopicReports  []TopicCapabilityReport `json:"topics"`
 	Findings      []string                `json:"findings"`
+
+	// Metrics for this run, and the previous run's, so a retrieval change can be
+	// proven or rolled back instead of believed.
+	Metrics  RetrievalMetrics  `json:"metrics"`
+	Previous *RetrievalMetrics `json:"previous_metrics,omitempty"`
+	// GraphExpansion records which retrieval path this pass used. The baseline above
+	// is only ever the previous pass with the same value.
+	GraphExpansion bool `json:"graph_expansion"`
 }
 
 // RunEval performs one pass: ensure the question set, then ask every question and
@@ -205,7 +245,7 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 		req.TopK = defaultEvalTopK
 	}
 
-	runID, err := e.createRun(ctx, expertID, req.TopK)
+	runID, err := e.createRun(ctx, expertID, req.TopK, req.GraphExpansion)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -219,12 +259,12 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 	return runID, nil
 }
 
-func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int) (uuid.UUID, error) {
+func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int, graphExpansion bool) (uuid.UUID, error) {
 	var runID uuid.UUID
 	if err := e.db.QueryRow(ctx, `
-		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k)
-		VALUES ($1, 'running', $2)
-		RETURNING id`, expertID, topK).Scan(&runID); err != nil {
+		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k, graph_expansion)
+		VALUES ($1, 'running', $2, $3)
+		RETURNING id`, expertID, topK, graphExpansion).Scan(&runID); err != nil {
 		return uuid.Nil, fmt.Errorf("capability eval: create run: %w", err)
 	}
 	return runID, nil
@@ -282,7 +322,7 @@ func (e *CapabilityEvaluator) executeRun(ctx context.Context, runID, expertID uu
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		result := e.evaluateCase(ctx, expertID, c, req.TopK)
+		result := e.evaluateCase(ctx, expertID, c, req.TopK, req.GraphExpansion)
 		if err := e.storeResult(ctx, runID, expertID, c, result); err != nil {
 			return err
 		}
@@ -347,6 +387,25 @@ func (e *CapabilityEvaluator) topicCoverage(ctx context.Context, expertID uuid.U
 		out[topic] = count
 	}
 	return out, rows.Err()
+}
+
+// runMetrics derives retrieval metrics from one run's stored per-case evidence.
+//
+// WHY derived rather than stored on the run row: the per-case evidence is already
+// durable, and a second copy could disagree with it. MRR comes from the stored rank of
+// each hit, so every number here is reproducible from the rows the report shows.
+func (e *CapabilityEvaluator) runMetrics(ctx context.Context, runID uuid.UUID) (RetrievalMetrics, error) {
+	var m RetrievalMetrics
+	if err := e.db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COUNT(*) FILTER (WHERE hit_rank > 0),
+		       COALESCE(AVG(CASE WHEN hit_rank > 0 THEN 1.0 / hit_rank END), 0)
+		  FROM expert_capability_results
+		 WHERE run_id = $1`, runID,
+	).Scan(&m.Cases, &m.Hits, &m.MRR); err != nil {
+		return m, fmt.Errorf("capability eval: read run metrics: %w", err)
+	}
+	return m, nil
 }
 
 // topicPassage is a chunk selected to host a question.
@@ -575,10 +634,18 @@ func (e *CapabilityEvaluator) loadCases(ctx context.Context, expertID uuid.UUID)
 }
 
 // evaluateCase asks one question and scores the three components.
-func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UUID, c CapabilityCase, topK int) CapabilityCaseResult {
+func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UUID, c CapabilityCase, topK int, graphExpansion bool) CapabilityCaseResult {
 	result := CapabilityCaseResult{CaseID: c.ID, Question: c.Question, Topic: c.Topic, Level: c.Level}
 
-	chunks, err := e.retriever.GetCourseChunksForWorkflow(ctx, expertID, c.Question, topK)
+	var (
+		chunks []chinawall.CourseChunk
+		err    error
+	)
+	if graphExpansion {
+		chunks, err = e.retriever.GetCourseChunksExpanded(ctx, expertID, c.Question, topK)
+	} else {
+		chunks, err = e.retriever.GetCourseChunksForWorkflow(ctx, expertID, c.Question, topK)
+	}
 	if err != nil {
 		result.FailureReason = FailureRetrievalMissed
 		e.logger.Warn("capability eval: retrieval failed for case (recorded as a miss)",
@@ -594,19 +661,19 @@ func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UU
 		}
 	}
 
-	// Build the context with [n] markers, in the order retrieval returned it, so
-	// the citation check and the judge see the same numbering the answer does.
-	var sb strings.Builder
-	for i, chunk := range chunks {
-		sb.WriteString(fmt.Sprintf("[%d] %s\n\n", i+1, clipPromptText(chunk.Text, promptPassageChars)))
+	// Build the context with [n] markers, in the order retrieval returned it, so the
+	// citation check and the judge see the same numbering the answer does.
+	texts := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		texts = append(texts, chunk.Text)
 	}
-	contextBlock := sb.String()
+	contextBlock := buildNumberedContext(texts, promptPassageChars)
 	if strings.TrimSpace(contextBlock) == "" {
 		result.FailureReason = FailureRetrievalMissed
 		return result
 	}
 
-	answer, err := e.answerQuestion(ctx, c.Question, contextBlock)
+	answer, err := e.answerer.Answer(ctx, c.Question, contextBlock)
 	if err != nil {
 		result.FailureReason = FailureEmpty
 		e.logger.Warn("capability eval: answering failed",
@@ -617,22 +684,14 @@ func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UU
 	result.Cited = countCitationMarkers(answer) > 0
 	result.Refused = strings.Contains(answer, insufficientContextMarker)
 
-	if result.Refused {
-		// A refusal is a capability failure for these cases: every question was
-		// written from a passage the expert's own corpus contains.
-		result.FailureReason = FailureRefused
-		return result
-	}
-	if strings.TrimSpace(answer) == "" {
-		result.FailureReason = FailureEmpty
-		return result
-	}
-	if !result.Cited {
-		result.FailureReason = FailureNotCited
+	// One definition of "well-formed enough to judge", shared with the ingest smoke
+	// test so a weaker copy cannot let a weaker expert through a training gate.
+	if reason := refusalOrCitationFailure(answer); reason != "" {
+		result.FailureReason = reason
 		return result
 	}
 
-	result.Grounded = e.judgeAnswer(ctx, c.Question, contextBlock, answer)
+	result.Grounded = e.answerer.Judge(ctx, c.Question, contextBlock, answer)
 	if result.Grounded != "supported" {
 		result.FailureReason = FailureUngrounded
 		return result
@@ -648,80 +707,6 @@ func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UU
 
 	result.Passed = true
 	return result
-}
-
-// answerQuestion asks with the corpus as the only permitted source.
-func (e *CapabilityEvaluator) answerQuestion(ctx context.Context, question, contextBlock string) (string, error) {
-	prompt := fmt.Sprintf(`Answer the question using ONLY the context below.
-
-Question: %s
-
-Context:
-%s
-
-Rules:
-- Cite the context you used with [n] markers matching the numbers above.
-- If the context does not contain the answer, reply with exactly %s and nothing else.`,
-		question, contextBlock, insufficientContextMarker)
-
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
-		Model:       gateway.ModelStrong,
-		UserPrompt:  prompt,
-		MaxTokens:   2048,
-		Temperature: 0.2,
-	})
-	if err != nil {
-		return "", err
-	}
-	return resp.Content, nil
-}
-
-// judgeAnswer asks a second call whether the answer is actually supported.
-//
-// WHY a separate call and not the answering call grading itself: the pipeline is
-// not trusted to grade its own homework — the same reason storage verification
-// re-reads the database instead of trusting the store's own count.
-func (e *CapabilityEvaluator) judgeAnswer(ctx context.Context, question, contextBlock, answer string) string {
-	prompt := fmt.Sprintf(`Question: %s
-
-Context:
-%s
-
-Answer:
-%s
-
-Is the answer fully supported by the context above? Judge only whether the context
-supports it, not whether the style is good.
-
-Return ONLY JSON: {"verdict":"supported"|"refuted"|"unverifiable","reason":"..."}`,
-		question, contextBlock, answer)
-
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
-		// A different tier from the answering call: an LLM judge is subject to
-		// egocentric bias when it grades its own model's output.
-		Model:       gateway.ModelCheap,
-		UserPrompt:  prompt,
-		MaxTokens:   1024,
-		Temperature: 0,
-	})
-	if err != nil {
-		// An unjudged case cannot be called supported; treat it as unverifiable
-		// rather than as a pass.
-		e.logger.Warn("capability eval: judge call failed (case recorded as unverifiable)",
-			zap.Error(err))
-		return "unverifiable"
-	}
-
-	verdict := parseJudgeVerdict(resp.Content)
-	if verdict == "unverifiable" {
-		// WHY this is logged: an unparseable judge is indistinguishable from a
-		// genuinely unsupported answer in the results table, and a silent judge
-		// failure would look like a capability problem. The raw response is
-		// clipped so one bad reply cannot flood the log.
-		e.logger.Warn("capability eval: judge verdict unparseable (case recorded as unverifiable)",
-			zap.String("raw_response", clipPromptText(resp.Content, 200)))
-	}
-	return verdict
 }
 
 // parseJudgeVerdict reads the judge's JSON, defaulting to unverifiable.
@@ -992,14 +977,16 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 
 	err := e.db.QueryRow(ctx, `
 		SELECT id, status, topics_total, cases_total, cases_passed,
-		       retrieval_hits, grounded, refused, top_k, started_at, completed_at
+		       retrieval_hits, grounded, refused, top_k, started_at, completed_at,
+		       graph_expansion
 		  FROM expert_capability_eval_runs
 		 WHERE expert_id = $1
 		 ORDER BY started_at DESC
 		 LIMIT 1`, expertID,
 	).Scan(&report.RunID, &report.Status, &report.TopicsTotal, &report.CasesTotal,
 		&report.CasesPassed, &report.RetrievalHits, &report.Grounded, &report.Refused,
-		&report.TopK, &report.StartedAt, &report.CompletedAt)
+		&report.TopK, &report.StartedAt, &report.CompletedAt,
+		&report.GraphExpansion)
 	if err != nil {
 		// No run yet is not an error for the caller: the screen shows "never
 		// measured", which is a different state from "measured and empty".
@@ -1043,6 +1030,29 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 		coverage = loaded
 	}
 
+	if metrics, mErr := e.runMetrics(ctx, report.RunID); mErr == nil {
+		report.Metrics = metrics
+	} else {
+		e.logger.Warn("capability eval: could not derive run metrics",
+			zap.String("run_id", report.RunID.String()), zap.Error(mErr))
+	}
+
+	// The baseline is the previous completed run IN THE SAME RETRIEVAL MODE. Comparing
+	// a graph-expanded pass against a plain one would attribute the difference to
+	// whichever change happened to be made last, which is exactly the mistake this
+	// whole measurement exists to prevent.
+	var previousRunID uuid.UUID
+	if prevErr := e.db.QueryRow(ctx, `
+		SELECT id FROM expert_capability_eval_runs
+		 WHERE expert_id = $1 AND id <> $2 AND status = 'complete'
+		   AND graph_expansion = $3
+		 ORDER BY started_at DESC
+		 LIMIT 1`, expertID, report.RunID, report.GraphExpansion).Scan(&previousRunID); prevErr == nil {
+		if previous, mErr := e.runMetrics(ctx, previousRunID); mErr == nil {
+			report.Previous = &previous
+		}
+	}
+
 	for _, topic := range order {
 		report.TopicReports = append(report.TopicReports, buildTopicReport(topic, coverage[topic], byTopic[topic]))
 	}
@@ -1061,6 +1071,30 @@ func evalFindings(r *CapabilityEvalReport) []string {
 	passRate := r.CasesPassed * 100 / r.CasesTotal
 	findings = append(findings, fmt.Sprintf("%d%% of questions answered (%d/%d), measured against the top %d retrieved chunks.",
 		passRate, r.CasesPassed, r.CasesTotal, r.TopK))
+
+	// The comparison against the previous pass, stated plainly and with the
+	// direction spelled out. This is what makes a retrieval change provable: without
+	// it, "the retrieval fix helped" is an opinion, and a regression looks the same
+	// as an improvement.
+	if r.Previous != nil && r.Previous.Cases > 0 {
+		nowPct := r.Metrics.HitRate() * 100
+		wasPct := r.Previous.HitRate() * 100
+		delta := nowPct - wasPct
+		switch {
+		case delta >= 1:
+			findings = append(findings, fmt.Sprintf(
+				"Source-chunk retrieval improved: %.0f%% of questions (was %.0f%%), MRR %.2f (was %.2f).",
+				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
+		case delta <= -1:
+			findings = append(findings, fmt.Sprintf(
+				"Source-chunk retrieval REGRESSED: %.0f%% of questions (was %.0f%%), MRR %.2f (was %.2f) — check what changed in retrieval before trusting this corpus.",
+				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
+		default:
+			findings = append(findings, fmt.Sprintf(
+				"Source-chunk retrieval unchanged: %.0f%% (was %.0f%%), MRR %.2f (was %.2f).",
+				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
+		}
+	}
 
 	missed := r.CasesTotal - r.RetrievalHits
 	if missed > 0 {

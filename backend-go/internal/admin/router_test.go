@@ -48,9 +48,17 @@ func TestExpertRouteTreeRegistersWithoutConflict(t *testing.T) {
 	group.POST("/experts/:id/capability-eval", noop)
 	group.GET("/experts/:id/capability-eval", noop)
 
+	// I4 additions.
+	group.POST("/experts/:id/concepts", noop)
+	group.GET("/experts/:id/concepts", noop)
+
+	// I5 additions.
+	group.POST("/experts/:id/depth-layers", noop)
+	group.GET("/experts/:id/depth-layers", noop)
+
 	// Route count is asserted too: a silently dropped registration would not
 	// panic, and "no panic" must not be mistaken for "all of them registered".
-	if got := len(engine.Routes()); got != 13 {
-		t.Fatalf("registered routes = %d, want 13", got)
+	if got := len(engine.Routes()); got != 17 {
+		t.Fatalf("registered routes = %d, want 17", got)
 	}
 }

@@ -742,6 +742,15 @@ export interface CapabilityEvalTopicReport {
   cannotHandle: string[]
 }
 
+/** How well retrieval did across one pass's questions. */
+export interface RetrievalMetrics {
+  cases: number
+  /** Questions whose source chunk was retrieved in the top k. */
+  hits: number
+  /** Mean reciprocal rank of those hits. */
+  mrr: number
+}
+
 /** A whole evaluation pass. */
 export interface CapabilityEvalReport {
   runId: string
@@ -761,6 +770,21 @@ export interface CapabilityEvalReport {
   completedAt: string | null
   topics: CapabilityEvalTopicReport[]
   findings: string[]
+  /**
+   * This pass's retrieval metrics, and the previous pass's.
+   *
+   * WHY both: the findings already state the change in words, but the raw numbers
+   * are here so a retrieval change can be judged rather than taken on trust. Absent
+   * previous = this is the first pass, not "no change".
+   */
+  metrics: RetrievalMetrics
+  previousMetrics?: RetrievalMetrics
+  /**
+   * Which retrieval path this pass used. Shown on screen because the comparison above
+   * is only ever against a pass with the same value — a reader who does not know the
+   * mode cannot judge the delta.
+   */
+  graphExpansion: boolean
 }
 
 export interface CapabilityEvalResponse {
@@ -774,6 +798,12 @@ export interface CapabilityEvalStartOptions {
   topics?: number
   topK?: number
   regenerate?: boolean
+  /**
+   * Retrieve with concept links. Off = the path production chat uses. The two are
+   * recorded separately on each pass, so running both is what makes the comparison
+   * attributable instead of a guess.
+   */
+  graphExpansion?: boolean
 }
 
 /** Reads the latest pass. Returns measured:false when there has never been one. */
@@ -794,6 +824,113 @@ export const startCapabilityEval = (expertId: string, options: CapabilityEvalSta
   baseAPI
     .post<ApiResponse<{ expertId: string; status: string }>>(
       `/api/v1/admin/experts/${expertId}/capability-eval`,
-      { topics: options.topics ?? 0, top_k: options.topK ?? 0, regenerate: options.regenerate ?? false },
+      {
+        topics: options.topics ?? 0,
+        top_k: options.topK ?? 0,
+        regenerate: options.regenerate ?? false,
+        graph_expansion: options.graphExpansion ?? false,
+      },
     )
     .then((res) => res.data.data!)
+
+// ============================================================
+// Concept links (I4)
+// ============================================================
+
+/** How two of an expert's topics relate. */
+export interface ConceptEdge {
+  from: string
+  to: string
+  relation: string
+  rationale: string
+}
+
+export interface ConceptGraphResponse {
+  expertId: string
+  count: number
+  edges: ConceptEdge[]
+  relations: string[]
+}
+
+export interface ConceptExtractResult {
+  topics: number
+  edges: number
+  calls: number
+  /** Links the model produced that named a topic or relation that does not exist. */
+  rejected: number
+}
+
+/** Reads the stored concept links. Cheap and read-only. */
+export const getExpertConcepts = (expertId: string) =>
+  baseAPI
+    .get<ApiResponse<ConceptGraphResponse>>(`/api/v1/admin/experts/${expertId}/concepts`)
+    .then((res) => res.data.data!)
+
+/**
+ * Asks the model how this expert's topics relate and stores the answer. Bounded (a
+ * handful of calls over the topic list), so unlike the capability measurement it
+ * returns a result directly.
+ */
+export const extractExpertConcepts = (expertId: string) =>
+  baseAPI
+    .post<ApiResponse<{ expertId: string; result: ConceptExtractResult }>>(
+      `/api/v1/admin/experts/${expertId}/concepts`,
+    )
+    .then((res) => res.data.data!.result)
+
+// ============================================================
+// Depth layers (I5)
+// ============================================================
+
+/**
+ * What KIND of content each chunk is. Derived from the course, never generated:
+ * 1 what/why, 2 how/trade-offs, 3 failure/edge. A topic with no layer-3 chunks will
+ * explain it but cannot answer "what breaks under load".
+ */
+export interface TopicLayerCoverage {
+  topic: string
+  definition: number
+  mechanics: number
+  failure: number
+  total: number
+}
+
+export interface DepthLayerReport {
+  expertId: string
+  totalChunks: number
+  classified: number
+  unclassified: number
+  definition: number
+  mechanics: number
+  failure: number
+  topicsWithoutFailure: number
+  topicsWithoutMechanics: number
+  topics: TopicLayerCoverage[]
+  findings: string[]
+}
+
+export interface DepthClassifyResult {
+  classified: number
+  /** How many chunks still have no layer — run again to continue. */
+  remaining: number
+  calls: number
+  /** Answers that named a passage or layer that does not exist. */
+  rejected: number
+}
+
+export const getExpertDepthLayers = (expertId: string) =>
+  baseAPI
+    .get<ApiResponse<DepthLayerReport>>(`/api/v1/admin/experts/${expertId}/depth-layers`)
+    .then((res) => res.data.data!)
+
+/**
+ * Classifies one bounded batch and reports what is left. Resumable on purpose: it costs
+ * model calls, so the admin decides how far to go rather than one click launching an
+ * unbounded pass over the whole corpus.
+ */
+export const classifyExpertDepthLayers = (expertId: string) =>
+  baseAPI
+    .post<ApiResponse<{ expertId: string; result: DepthClassifyResult }>>(
+      `/api/v1/admin/experts/${expertId}/depth-layers`,
+    )
+    .then((res) => res.data.data!.result)

@@ -48,7 +48,13 @@ type AdminHandler struct {
 	// capabilityEval (I2) measures what an expert can actually answer. Nil-safe:
 	// when unwired the endpoints report that measurement is unavailable rather
 	// than pretending a score exists.
-	capEval     *training.CapabilityEvaluator
+	capEval *training.CapabilityEvaluator
+	// concepts (I4) stores the typed relationships between an expert's topics. Nil-safe:
+	// when unwired the concept endpoints report that the graph is unavailable.
+	concepts *training.ConceptGraph
+	// depthLayers (I5) classifies chunks by content kind and reports coverage. Nil-safe:
+	// when unwired the depth endpoints report that it is unavailable.
+	depthLayers *training.DepthClassifier
 	categoryReg *category.Registry
 	// domainReg backs the domain-profile admin endpoints (max tokens,
 	// coverage/citation/strip modes, etc — see ListDomainProfiles /
@@ -138,6 +144,28 @@ func NewAdminHandler(
 // positional argument that every caller has to keep in order.
 func (h *AdminHandler) SetCapabilityEvaluator(e *training.CapabilityEvaluator) {
 	h.capEval = e
+
+	// I3: the ingest gate reads a MEASURED capability, so the pipeline needs a way to
+	// trigger a pass. It is handed in as a single function rather than as the
+	// evaluator itself, so the pipeline never learns about the context assembler the
+	// measurement depends on. Not wiring it is a supported state: the gate then
+	// reports the capability as unmeasured and the expert stays in draft.
+	if h.ingestion != nil {
+		h.ingestion.SetCapabilityMeasurer(func(ctx context.Context, expertID uuid.UUID, topics int) error {
+			_, err := e.RunEval(ctx, expertID, training.CapabilityEvalRequest{Topics: topics})
+			return err
+		})
+	}
+}
+
+// SetConceptGraph wires the concept-relationship store (I4).
+func (h *AdminHandler) SetConceptGraph(g *training.ConceptGraph) {
+	h.concepts = g
+}
+
+// SetDepthClassifier wires the content-kind classifier (I5).
+func (h *AdminHandler) SetDepthClassifier(c *training.DepthClassifier) {
+	h.depthLayers = c
 }
 
 // ============================================================
@@ -2326,6 +2354,11 @@ type capabilityEvalRequestDTO struct {
 	// set IS the baseline: regenerating it silently would make two runs
 	// incomparable while still looking like a fair comparison.
 	Regenerate bool `json:"regenerate"`
+
+	// GraphExpansion retrieves with concept-graph expansion. Off by default: the plain
+	// path is what production uses until a measurement says otherwise, and a pass
+	// records which path it used so the two are never compared against each other.
+	GraphExpansion bool `json:"graph_expansion"`
 }
 
 // MeasureExpertCapability POST /admin/experts/:id/capability-eval
@@ -2384,9 +2417,10 @@ func (h *AdminHandler) MeasureExpertCapability(c *gin.Context) {
 	}
 
 	request := training.CapabilityEvalRequest{
-		Topics:     dto.Topics,
-		TopK:       dto.TopK,
-		Regenerate: dto.Regenerate,
+		Topics:         dto.Topics,
+		TopK:           dto.TopK,
+		Regenerate:     dto.Regenerate,
+		GraphExpansion: dto.GraphExpansion,
 	}
 
 	// Detached context with a deadline: the pass must outlive this request, and a
@@ -2444,6 +2478,132 @@ func (h *AdminHandler) GetExpertCapabilityEval(c *gin.Context) {
 		"measured":  true,
 		"report":    report,
 	})
+}
+
+// ============================================================
+// CONCEPT RELATIONSHIPS (I4)
+// ============================================================
+
+// ExtractExpertConcepts POST /admin/experts/:id/concepts
+//
+// Asks the model how this expert's topics relate and stores the answer. Synchronous
+// and bounded (a handful of calls over the topic list), unlike the capability
+// measurement: the topic list is small, and the result is a handful of edges rather
+// than per-question evidence.
+func (h *AdminHandler) ExtractExpertConcepts(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.concepts == nil {
+		response.ServiceUnavailable(c, "concept graph is not wired in this deployment")
+		return
+	}
+
+	result, err := h.concepts.Extract(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("concept extraction failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"result":    result,
+	})
+}
+
+// GetExpertConcepts GET /admin/experts/:id/concepts
+//
+// Reads the stored relationships. Read-only and cheap, so the screen can show the
+// structure without triggering an extraction.
+func (h *AdminHandler) GetExpertConcepts(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.concepts == nil {
+		response.ServiceUnavailable(c, "concept graph is not wired in this deployment")
+		return
+	}
+
+	edges, err := h.concepts.Load(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("concept load failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if edges == nil {
+		edges = []training.ConceptEdge{}
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"count":     len(edges),
+		"edges":     edges,
+		"relations": training.ConceptRelations(),
+	})
+}
+
+// ============================================================
+// DEPTH LAYERS (I5)
+// ============================================================
+
+// ClassifyExpertDepthLayers POST /admin/experts/:id/depth-layers
+//
+// Labels a bounded batch of chunks by content kind (what/why, how/trade-offs,
+// failure/edge) and reports how many are still unclassified. Deliberately per-call
+// bounded and resumable: it costs model calls, so the admin decides how far to go and
+// the corpus says how much is left.
+func (h *AdminHandler) ClassifyExpertDepthLayers(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.depthLayers == nil {
+		response.ServiceUnavailable(c, "depth classification is not wired in this deployment")
+		return
+	}
+
+	result, err := h.depthLayers.Classify(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("depth classification failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"result":    result,
+	})
+}
+
+// GetExpertDepthLayers GET /admin/experts/:id/depth-layers
+//
+// Reads the content-kind coverage. This is the answer to "is this expert deep or does
+// it only know what things are?", derived from the course rather than declared.
+func (h *AdminHandler) GetExpertDepthLayers(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.depthLayers == nil {
+		response.ServiceUnavailable(c, "depth classification is not wired in this deployment")
+		return
+	}
+
+	report, err := h.depthLayers.Report(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("depth coverage read failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, report)
 }
 
 // RegenerateCharter POST /admin/experts/:id/regenerate-charter

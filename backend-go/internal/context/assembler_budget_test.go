@@ -9,8 +9,14 @@ import (
 
 func TestTrimChunksToBudget_KeepsBestFirst(t *testing.T) {
 	// Each chunk ~ text len/4 tokens. Make 10 chunks of 40 chars = 10 tokens each.
+	//
+	// float64(i) is deliberate: with a bare int the untyped 0.01 is converted to int,
+	// which does not compile ("0.01 truncated to int") — and if it compiled the way it
+	// reads, every score would be 1 and the ordering this test asserts would be
+	// meaningless. Found while adding tests to this package; the file did not build on
+	// main, so nothing here had ever run.
 	mk := func(i int) chinawall.CourseChunk {
-		return chinawall.CourseChunk{Text: string(make([]byte, 40)), RerankScore: float32(1 - i*0.01)}
+		return chinawall.CourseChunk{Text: string(make([]byte, 40)), RerankScore: float32(1 - float64(i)*0.01)}
 	}
 	var chunks []chinawall.CourseChunk
 	for i := 0; i < 10; i++ {
@@ -81,8 +87,13 @@ func TestEnforceHardCeiling_KeepsReplyThreadDropsSummaryLastResort(t *testing.T)
 	// evicted, so the summary is dropped as the last resort.
 	budget := 10
 	asm := &AssembledContext{
-		RollingSummary: longText(40), // 10 tokens
-		ReplyThread:    []ReplyThreadEntry{{Content: longText(80)}}, // 20 tokens
+		// RollingSummary is 10 tokens and the reply thread 20, matching how
+		// tokensUsed is declared below. The original values here were longText(40)
+		// and longText(80) while the comment and tokensUsed assumed 10 and 20, so the
+		// function was asked to account for 30 tokens of content it could see as 120
+		// and returned a negative count.
+		RollingSummary: longText(10),
+		ReplyThread:    []ReplyThreadEntry{{Content: longText(20)}},
 	}
 	tokensUsed := 10 + 20
 	got := enforceHardCeiling(asm, budget, tokensUsed, nil)
