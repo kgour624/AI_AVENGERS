@@ -48,7 +48,10 @@ type AdminHandler struct {
 	// capabilityEval (I2) measures what an expert can actually answer. Nil-safe:
 	// when unwired the endpoints report that measurement is unavailable rather
 	// than pretending a score exists.
-	capEval     *training.CapabilityEvaluator
+	capEval *training.CapabilityEvaluator
+	// concepts (I4) stores the typed relationships between an expert's topics. Nil-safe:
+	// when unwired the concept endpoints report that the graph is unavailable.
+	concepts    *training.ConceptGraph
 	categoryReg *category.Registry
 	// domainReg backs the domain-profile admin endpoints (max tokens,
 	// coverage/citation/strip modes, etc — see ListDomainProfiles /
@@ -150,6 +153,11 @@ func (h *AdminHandler) SetCapabilityEvaluator(e *training.CapabilityEvaluator) {
 			return err
 		})
 	}
+}
+
+// SetConceptGraph wires the concept-relationship store (I4).
+func (h *AdminHandler) SetConceptGraph(g *training.ConceptGraph) {
+	h.concepts = g
 }
 
 // ============================================================
@@ -2338,6 +2346,11 @@ type capabilityEvalRequestDTO struct {
 	// set IS the baseline: regenerating it silently would make two runs
 	// incomparable while still looking like a fair comparison.
 	Regenerate bool `json:"regenerate"`
+
+	// GraphExpansion retrieves with concept-graph expansion. Off by default: the plain
+	// path is what production uses until a measurement says otherwise, and a pass
+	// records which path it used so the two are never compared against each other.
+	GraphExpansion bool `json:"graph_expansion"`
 }
 
 // MeasureExpertCapability POST /admin/experts/:id/capability-eval
@@ -2396,9 +2409,10 @@ func (h *AdminHandler) MeasureExpertCapability(c *gin.Context) {
 	}
 
 	request := training.CapabilityEvalRequest{
-		Topics:     dto.Topics,
-		TopK:       dto.TopK,
-		Regenerate: dto.Regenerate,
+		Topics:         dto.Topics,
+		TopK:           dto.TopK,
+		Regenerate:     dto.Regenerate,
+		GraphExpansion: dto.GraphExpansion,
 	}
 
 	// Detached context with a deadline: the pass must outlive this request, and a
@@ -2455,6 +2469,73 @@ func (h *AdminHandler) GetExpertCapabilityEval(c *gin.Context) {
 		"expert_id": expertID,
 		"measured":  true,
 		"report":    report,
+	})
+}
+
+// ============================================================
+// CONCEPT RELATIONSHIPS (I4)
+// ============================================================
+
+// ExtractExpertConcepts POST /admin/experts/:id/concepts
+//
+// Asks the model how this expert's topics relate and stores the answer. Synchronous
+// and bounded (a handful of calls over the topic list), unlike the capability
+// measurement: the topic list is small, and the result is a handful of edges rather
+// than per-question evidence.
+func (h *AdminHandler) ExtractExpertConcepts(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.concepts == nil {
+		response.ServiceUnavailable(c, "concept graph is not wired in this deployment")
+		return
+	}
+
+	result, err := h.concepts.Extract(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("concept extraction failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"result":    result,
+	})
+}
+
+// GetExpertConcepts GET /admin/experts/:id/concepts
+//
+// Reads the stored relationships. Read-only and cheap, so the screen can show the
+// structure without triggering an extraction.
+func (h *AdminHandler) GetExpertConcepts(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.concepts == nil {
+		response.ServiceUnavailable(c, "concept graph is not wired in this deployment")
+		return
+	}
+
+	edges, err := h.concepts.Load(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("concept load failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if edges == nil {
+		edges = []training.ConceptEdge{}
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"count":     len(edges),
+		"edges":     edges,
+		"relations": training.ConceptRelations(),
 	})
 }
 

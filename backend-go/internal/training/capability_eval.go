@@ -103,6 +103,10 @@ const (
 // also lets the scoring be tested without a database or a model.
 type CapabilityRetriever interface {
 	GetCourseChunksForWorkflow(ctx context.Context, expertID uuid.UUID, taskDescription string, topK int) ([]chinawall.CourseChunk, error)
+	// GetCourseChunksExpanded is the same retrieval with concept-graph expansion. It is
+	// a separate method so a pass can measure each path, and so the difference between
+	// two runs can be attributed to expansion alone.
+	GetCourseChunksExpanded(ctx context.Context, expertID uuid.UUID, taskDescription string, topK int) ([]chinawall.CourseChunk, error)
 }
 
 // CapabilityEvaluator generates capability questions from a corpus, asks them, and
@@ -134,6 +138,11 @@ type CapabilityEvalRequest struct {
 	// question set is the golden set, and silently regenerating it would destroy
 	// the baseline that makes two runs comparable.
 	Regenerate bool
+
+	// GraphExpansion retrieves with concept-graph expansion. Recorded on the run, and
+	// comparisons are only made against a run with the SAME value — otherwise the
+	// difference would be attributed to whichever change was made last.
+	GraphExpansion bool
 }
 
 // CapabilityCase is one stored question with its ground truth.
@@ -214,6 +223,9 @@ type CapabilityEvalReport struct {
 	// proven or rolled back instead of believed.
 	Metrics  RetrievalMetrics  `json:"metrics"`
 	Previous *RetrievalMetrics `json:"previous_metrics,omitempty"`
+	// GraphExpansion records which retrieval path this pass used. The baseline above
+	// is only ever the previous pass with the same value.
+	GraphExpansion bool `json:"graph_expansion"`
 }
 
 // RunEval performs one pass: ensure the question set, then ask every question and
@@ -233,7 +245,7 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 		req.TopK = defaultEvalTopK
 	}
 
-	runID, err := e.createRun(ctx, expertID, req.TopK)
+	runID, err := e.createRun(ctx, expertID, req.TopK, req.GraphExpansion)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -247,12 +259,12 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 	return runID, nil
 }
 
-func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int) (uuid.UUID, error) {
+func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int, graphExpansion bool) (uuid.UUID, error) {
 	var runID uuid.UUID
 	if err := e.db.QueryRow(ctx, `
-		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k)
-		VALUES ($1, 'running', $2)
-		RETURNING id`, expertID, topK).Scan(&runID); err != nil {
+		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k, graph_expansion)
+		VALUES ($1, 'running', $2, $3)
+		RETURNING id`, expertID, topK, graphExpansion).Scan(&runID); err != nil {
 		return uuid.Nil, fmt.Errorf("capability eval: create run: %w", err)
 	}
 	return runID, nil
@@ -310,7 +322,7 @@ func (e *CapabilityEvaluator) executeRun(ctx context.Context, runID, expertID uu
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		result := e.evaluateCase(ctx, expertID, c, req.TopK)
+		result := e.evaluateCase(ctx, expertID, c, req.TopK, req.GraphExpansion)
 		if err := e.storeResult(ctx, runID, expertID, c, result); err != nil {
 			return err
 		}
@@ -622,10 +634,18 @@ func (e *CapabilityEvaluator) loadCases(ctx context.Context, expertID uuid.UUID)
 }
 
 // evaluateCase asks one question and scores the three components.
-func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UUID, c CapabilityCase, topK int) CapabilityCaseResult {
+func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UUID, c CapabilityCase, topK int, graphExpansion bool) CapabilityCaseResult {
 	result := CapabilityCaseResult{CaseID: c.ID, Question: c.Question, Topic: c.Topic, Level: c.Level}
 
-	chunks, err := e.retriever.GetCourseChunksForWorkflow(ctx, expertID, c.Question, topK)
+	var (
+		chunks []chinawall.CourseChunk
+		err    error
+	)
+	if graphExpansion {
+		chunks, err = e.retriever.GetCourseChunksExpanded(ctx, expertID, c.Question, topK)
+	} else {
+		chunks, err = e.retriever.GetCourseChunksForWorkflow(ctx, expertID, c.Question, topK)
+	}
 	if err != nil {
 		result.FailureReason = FailureRetrievalMissed
 		e.logger.Warn("capability eval: retrieval failed for case (recorded as a miss)",
@@ -957,14 +977,16 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 
 	err := e.db.QueryRow(ctx, `
 		SELECT id, status, topics_total, cases_total, cases_passed,
-		       retrieval_hits, grounded, refused, top_k, started_at, completed_at
+		       retrieval_hits, grounded, refused, top_k, started_at, completed_at,
+		       graph_expansion
 		  FROM expert_capability_eval_runs
 		 WHERE expert_id = $1
 		 ORDER BY started_at DESC
 		 LIMIT 1`, expertID,
 	).Scan(&report.RunID, &report.Status, &report.TopicsTotal, &report.CasesTotal,
 		&report.CasesPassed, &report.RetrievalHits, &report.Grounded, &report.Refused,
-		&report.TopK, &report.StartedAt, &report.CompletedAt)
+		&report.TopK, &report.StartedAt, &report.CompletedAt,
+		&report.GraphExpansion)
 	if err != nil {
 		// No run yet is not an error for the caller: the screen shows "never
 		// measured", which is a different state from "measured and empty".
@@ -1015,14 +1037,17 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 			zap.String("run_id", report.RunID.String()), zap.Error(mErr))
 	}
 
-	// The previous completed run is the baseline this one is compared against, so a
-	// retrieval change can be seen rather than argued about.
+	// The baseline is the previous completed run IN THE SAME RETRIEVAL MODE. Comparing
+	// a graph-expanded pass against a plain one would attribute the difference to
+	// whichever change happened to be made last, which is exactly the mistake this
+	// whole measurement exists to prevent.
 	var previousRunID uuid.UUID
 	if prevErr := e.db.QueryRow(ctx, `
 		SELECT id FROM expert_capability_eval_runs
 		 WHERE expert_id = $1 AND id <> $2 AND status = 'complete'
+		   AND graph_expansion = $3
 		 ORDER BY started_at DESC
-		 LIMIT 1`, expertID, report.RunID).Scan(&previousRunID); prevErr == nil {
+		 LIMIT 1`, expertID, report.RunID, report.GraphExpansion).Scan(&previousRunID); prevErr == nil {
 		if previous, mErr := e.runMetrics(ctx, previousRunID); mErr == nil {
 			report.Previous = &previous
 		}
