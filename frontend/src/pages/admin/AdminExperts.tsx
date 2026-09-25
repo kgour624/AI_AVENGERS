@@ -69,12 +69,20 @@ function ExpertRow({
 
   // FIX: paused added — was missing, so "View Progress" never showed for paused jobs
   const isActive = latestJob.status === 'running' || latestJob.status === 'pending' || latestJob.status === 'paused'
-  const stageLabel = STAGE_LABELS[latestJob.currentStage ?? latestJob.status] ?? latestJob.status
+  // A run that finished with warnings is NOT pending — it is over, and the admin
+  // needs the modal to see why. Falling through to the hourglass glyph made it
+  // look like work was still happening.
+  const isWarning = latestJob.status === 'complete_with_warnings'
+  // currentStage is 'complete' for a warning job, so the stage label alone would
+  // read as a clean success. State the outcome explicitly instead.
+  const stageLabel = isWarning
+    ? 'Complete with warnings'
+    : STAGE_LABELS[latestJob.currentStage ?? latestJob.status] ?? latestJob.status
 
   return (
     <div className="mt-1 flex items-center justify-between">
       <p className="text-xs text-text-secondary">
-        {latestJob.status === 'complete' ? '\u2705' : latestJob.status === 'failed' ? '\u274c' : latestJob.status === 'paused' ? '\u23f8' : '\u23f3'}{' '}
+        {latestJob.status === 'complete' ? '\u2705' : isWarning ? '\u26a0\ufe0f' : latestJob.status === 'failed' ? '\u274c' : latestJob.status === 'paused' ? '\u23f8' : '\u23f3'}{' '}
         {stageLabel}
         {latestJob.processedChunks > 0 && (
           <span className="ml-1 text-text-disabled">
@@ -85,7 +93,7 @@ function ExpertRow({
           <span className="ml-2 text-glow-amber/70">${(latestJob.costUsd ?? 0).toFixed(3)}</span>
         )}
       </p>
-      {(isActive || latestJob.status === 'failed') && (
+      {(isActive || isWarning || latestJob.status === 'failed') && (
         <Button
           variant="ghost"
           size="sm"

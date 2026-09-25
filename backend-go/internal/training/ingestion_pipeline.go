@@ -993,7 +993,39 @@ func (p *IngestionPipeline) IngestTranscript(
 		"error":        errorString(smokeErr),
 	})
 
-	if smokeTestPassed {
+	// Phase C: "complete" is a claim about the CORPUS, so it has to be earned.
+	// Both gates the pipeline already computed were being discarded: the storage
+	// verdict from verifyStoredCorpus and the smoke test result. The run was
+	// marked complete regardless, which is how a corpus holding 277 of 395 chunks
+	// came to be reported as a clean success. The run still finished, so it is not
+	// a failure — but the status now says so out loud.
+	verificationOK := ledger.VerificationStatus == VerificationVerified
+	warnReasons := make([]string, 0, 2)
+	if !verificationOK {
+		reason := ledger.MismatchReason
+		if reason == "" {
+			reason = "corpus verification could not be completed"
+		}
+		warnReasons = append(warnReasons, "corpus verification: "+reason)
+	}
+	if !smokeTestPassed {
+		warnReasons = append(warnReasons, fmt.Sprintf(
+			"smoke test failed (%d/%d probes passed)", smokePassCount, smokeTestProbeCount))
+	}
+	finalStatus := "complete"
+	warningText := ""
+	if len(warnReasons) > 0 {
+		finalStatus = "complete_with_warnings"
+		warningText = "completed with warnings — " + strings.Join(warnReasons, "; ")
+	}
+
+	// training_status='trained' is what makes an expert publicly usable, so it
+	// now requires BOTH gates. WHY both: the smoke test probes a handful of
+	// topics and can pass on the rows that survived a partial store or a dedup —
+	// it is evidence that retrieval works for some topics, not that the whole
+	// corpus landed. Fail closed: an expert that is not fully retrievable must
+	// not be handed to users.
+	if smokeTestPassed && verificationOK {
 		// Mark expert as trained and publicly visible.
 		_, err = p.db.Exec(ctx,
 			`UPDATE experts SET
@@ -1006,12 +1038,12 @@ func (p *IngestionPipeline) IngestTranscript(
 		if err != nil {
 			p.logger.Warn("failed to set training_status=trained", zap.Error(err))
 		}
-		p.logger.Info("smoke test PASSED — expert is trained",
+		p.logger.Info("smoke test PASSED and corpus verified — expert is trained",
 			zap.String("expert_id", expertID.String()),
 			zap.Int("probes_passed", smokePassCount),
 		)
 	} else {
-		// Keep expert in draft — ingestion succeeded but retrieval is weak.
+		// Keep expert in draft — the corpus is not fully usable yet.
 		// Admin should upload more transcripts and re-ingest.
 		_, err = p.db.Exec(ctx,
 			`UPDATE experts SET
@@ -1024,14 +1056,17 @@ func (p *IngestionPipeline) IngestTranscript(
 		if err != nil {
 			p.logger.Warn("failed to reset training_status=draft", zap.Error(err))
 		}
-		p.logger.Warn("smoke test FAILED — expert stays in draft, upload more transcripts",
+		p.logger.Warn("expert stays in draft — corpus not usable",
 			zap.String("expert_id", expertID.String()),
 			zap.Int("probes_passed", smokePassCount),
+			zap.Bool("smoke_test_passed", smokeTestPassed),
+			zap.Bool("verification_ok", verificationOK),
+			zap.String("warnings", warningText),
 		)
 	}
 
 	duration := time.Since(start).Milliseconds()
-	p.updateJobStatus(ctx, jobID, "complete", "", len(chunks), len(chunks))
+	p.updateJobStatus(ctx, jobID, finalStatus, warningText, len(chunks), len(chunks))
 
 	p.logger.Info("ingestion complete",
 		zap.String("expert_id", expertID.String()),
@@ -1068,6 +1103,8 @@ func (p *IngestionPipeline) IngestTranscript(
 		"chunks_inserted":   storeStats.Inserted,
 		"chunks_reused":     storeStats.Reused,
 		"verification":      ledger.VerificationStatus,
+		"status":            finalStatus,
+		"warnings":          warningText,
 		"topics":            uniqueTopics,
 		"corpus_total":      actualTotalChunks,
 		"corpus_topics":     actualTotalTopics,
@@ -1835,7 +1872,7 @@ func (p *IngestionPipeline) updateJobStatus(
 	total int,
 ) {
 	var completedAt interface{}
-	if status == "complete" || status == "failed" {
+	if status == "complete" || status == "complete_with_warnings" || status == "failed" {
 		completedAt = time.Now()
 	}
 
@@ -1864,7 +1901,7 @@ func (p *IngestionPipeline) updateJobStatus(
 			total_chunks = $4,
 			completed_at = $5,
 			started_at = CASE WHEN $1::varchar = 'running' THEN NOW() ELSE started_at END,
-			current_stage = CASE WHEN $1::varchar = 'complete' THEN 'complete'
+			current_stage = CASE WHEN $1::varchar IN ('complete', 'complete_with_warnings') THEN 'complete'
 			                     WHEN $1::varchar = 'failed'   THEN current_stage
 			                     ELSE current_stage END
 		 WHERE id = $6`,
