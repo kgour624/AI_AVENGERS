@@ -929,6 +929,12 @@ func buildRouter(
 		adminGroup.GET("/experts/:id/jobs/events", adminHandler.GetIngestionJobEvents)
 		adminGroup.POST("/experts/:id/jobs/:jobID/resume", adminHandler.ResumeIngestionJob)
 		adminGroup.POST("/experts/:id/jobs/:jobID/retry", adminHandler.RetryIngestionJob)
+
+		// Phase D: audit the corpus against the run ledger, explain one job file by
+		// file, and repair derived state. The repair defaults to a dry run.
+		adminGroup.GET("/experts/:id/ingestion/audit", adminHandler.GetIngestionAudit)
+		adminGroup.GET("/experts/:id/ingestion/diagnostics", adminHandler.GetIngestionDiagnostics)
+		adminGroup.POST("/experts/:id/ingestion/reconcile", adminHandler.ReconcileIngestion)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
 		// Managed accounts: admin + domain_expert CRUD + expert grants

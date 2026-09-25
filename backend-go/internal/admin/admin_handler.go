@@ -40,6 +40,11 @@ type AdminHandler struct {
 	gateway     *gateway.ModelGateway
 	embedder    ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
 	ingestion   *training.IngestionPipeline
+	// reconcile audits an expert's corpus against the run ledger and repairs the
+	// derived state (Phase D). Built here from the same pool + embedder the
+	// pipeline uses, so a repair cannot embed with a different model than
+	// ingestion used.
+	reconcile   *training.Reconciler
 	categoryReg *category.Registry
 	// domainReg backs the domain-profile admin endpoints (max tokens,
 	// coverage/citation/strip modes, etc — see ListDomainProfiles /
@@ -106,6 +111,7 @@ func NewAdminHandler(
 		gateway:     gw,
 		embedder:    embedder,
 		ingestion:   training.NewIngestionPipeline(db, embedder, mlClient, gw, events, extractor, logger),
+		reconcile:   training.NewReconciler(db, embedder, logger),
 		categoryReg: categoryReg,
 		domainReg:   domainReg,
 		versions:    versions,
@@ -2164,6 +2170,131 @@ func (h *AdminHandler) GetIngestionJobEvents(c *gin.Context) {
 		"events":        events,
 		"last_sequence": lastSeq,
 		"timeline":      true,
+	})
+}
+
+// ============================================================
+// INGESTION RECONCILE (Phase D)
+// ============================================================
+
+// GetIngestionAudit GET /admin/experts/:id/ingestion/audit
+//
+// Answers "is this expert's corpus what it claims to be?": the corpus read from
+// course_chunks, the totals cached on the experts row, the capability table, and
+// the per-run ledger. Read-only — every finding is reported, none is acted on.
+func (h *AdminHandler) GetIngestionAudit(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+
+	audit, err := h.reconcile.Audit(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("ingestion audit failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, audit)
+}
+
+// GetIngestionDiagnostics GET /admin/experts/:id/ingestion/diagnostics?job=<uuid>
+//
+// Explains one job file by file. WHY a query param: the sibling route
+// /experts/:id/jobs/:jobID/... already owns that tree position, and the ingestion
+// tree is a separate static prefix — a query param cannot collide with either.
+func (h *AdminHandler) GetIngestionDiagnostics(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	rawJobID := c.Query("job")
+	if rawJobID == "" {
+		rawJobID = c.Query("job_id")
+	}
+	jobID, err := uuid.Parse(rawJobID)
+	if err != nil {
+		response.BadRequest(c, "INVALID_JOB_ID", "valid job query parameter is required")
+		return
+	}
+
+	diagnostics, err := h.reconcile.Diagnose(c.Request.Context(), expertID, jobID)
+	if err != nil {
+		h.logger.Error("ingestion diagnostics failed",
+			zap.String("expert_id", expertID.String()),
+			zap.String("job_id", jobID.String()),
+			zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, diagnostics)
+}
+
+// reconcileRequestDTO is the wire shape. DryRun is a pointer so "absent" is
+// distinguishable from "false": an omitted field must not authorise a write, so
+// the default below is true and a caller has to say dry_run=false explicitly.
+type reconcileRequestDTO struct {
+	Actions    []string   `json:"actions"`
+	DryRun     *bool      `json:"dry_run"`
+	JobID      *uuid.UUID `json:"job_id"`
+	SourceFile string     `json:"source_file"`
+}
+
+// ReconcileIngestion POST /admin/experts/:id/ingestion/reconcile
+//
+// Runs the requested repairs. Defaults to a dry run: it reports what it would
+// change, and only writes when dry_run is explicitly false. Every action here
+// writes derived state that is reconstructible from course_chunks, except
+// resolve_run, which records an admin decision and touches no chunk.
+//
+// It cannot recreate chunks that were never stored — a short store is reported
+// (see diagnostics), and the remedy is a re-ingest.
+func (h *AdminHandler) ReconcileIngestion(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+
+	var dto reconcileRequestDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		response.BadRequest(c, "INVALID_BODY", "expected {\"actions\": [...], \"dry_run\": true|false}")
+		return
+	}
+	if err := training.ValidateActions(dto.Actions); err != nil {
+		response.BadRequest(c, "INVALID_ACTION", err.Error())
+		return
+	}
+
+	dryRun := true
+	if dto.DryRun != nil {
+		dryRun = *dto.DryRun
+	}
+
+	results, err := h.reconcile.Reconcile(c.Request.Context(), expertID, training.ReconcileRequest{
+		Actions:    dto.Actions,
+		DryRun:     dryRun,
+		JobID:      dto.JobID,
+		SourceFile: dto.SourceFile,
+	})
+	if err != nil {
+		h.logger.Error("ingestion reconcile failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	// applied lets the UI keep the confirmation prompt up until the admin has
+	// actually committed, instead of assuming the click wrote anything.
+	applied := !dryRun
+	response.OK(c, map[string]interface{}{
+		"expert_id":         expertID,
+		"dry_run":           dryRun,
+		"applied":           applied,
+		"results":           results,
+		"available_actions": training.ReconcileActions(),
 	})
 }
 
