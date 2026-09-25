@@ -145,12 +145,15 @@ func TestResolvePythonRelativeLevels(t *testing.T) {
 }
 
 func TestBuildRepoEdgesSkipsSelfImportsAndFindsCycles(t *testing.T) {
+	// Files live in package DIRECTORIES, because that is the granularity a Go
+	// import actually resolves to: "example/pkgb" names a package, and the
+	// resolver matches the longest path suffix that exists (here "pkgb").
 	contents := map[string]string{
-		"a.go": "package a\n\nimport \"example/b\"\n",
-		"b.go": "package b\n\nimport \"example/a\"\n",
-		"c.go": "package c\n\nimport \"example/c\"\n", // self-import: must be dropped
+		"pkga/a.go": "package pkga\n\nimport \"example/pkgb\"\n",
+		"pkgb/b.go": "package pkgb\n\nimport \"example/pkga\"\n",
+		"pkgc/c.go": "package pkgc\n\nimport \"example/pkgc\"\n", // self-import: must be dropped
 	}
-	languages := map[string]string{"a.go": "go", "b.go": "go", "c.go": "go"}
+	languages := map[string]string{"pkga/a.go": "go", "pkgb/b.go": "go", "pkgc/c.go": "go"}
 
 	edges := buildRepoEdges(contents, languages)
 
@@ -161,11 +164,21 @@ func TestBuildRepoEdgesSkipsSelfImportsAndFindsCycles(t *testing.T) {
 			t.Fatalf("self-import retained: %s", edge.Src)
 		}
 	}
-	// a<->b is the cycle the graph walk must survive; the file-level resolver
-	// maps each import to the other file's package directory, which here is the
-	// repository root, so both directions exist.
-	if !sameStrings(pairs, []string{"a.go->b.go", "b.go->a.go"}) {
-		t.Fatalf("edges = %v, want a<->b only", pairs)
+	// a<->b is the cycle the graph walk must survive.
+	if !sameStrings(pairs, []string{"pkga/a.go->pkgb/b.go", "pkgb/b.go->pkga/a.go"}) {
+		t.Fatalf("edges = %v, want the a<->b cycle only", pairs)
+	}
+}
+
+func TestBuildRepoEdgesCannotResolveUnknownModulePrefix(t *testing.T) {
+	// Honest limitation, pinned as a test: a specifier whose leading module
+	// prefix matches nothing in the tree yields no edge rather than a guessed
+	// one. Guessing here would invent dependencies that do not exist.
+	contents := map[string]string{"pkga/a.go": "package pkga\n\nimport \"github.com/other/lib\"\n"}
+	languages := map[string]string{"pkga/a.go": "go"}
+
+	if edges := buildRepoEdges(contents, languages); len(edges) != 0 {
+		t.Fatalf("edges = %v, want none for an external module", edges)
 	}
 }
 

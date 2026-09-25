@@ -1015,6 +1015,28 @@ func (s *Service) persistRepoTree(
 	return nil
 }
 
+// RepoFileExists reports whether a path is part of the stored tree for a
+// project's connected repository.
+//
+// WHY this exists as its own query rather than a tree read: callers use it to
+// reject a working-set entry that points at nothing. Sending an expert to a
+// path the repository does not contain would waste a full read cycle and make
+// the approval record claim something untrue.
+func (s *Service) RepoFileExists(ctx context.Context, projectID uuid.UUID, path string) (bool, error) {
+	connectionID, _, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return false, err
+	}
+	var exists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM repo_files WHERE repo_connection_id=$1 AND path=$2)`,
+		connectionID, path,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check repo file: %w", err)
+	}
+	return exists, nil
+}
+
 // ListRepoTree returns the stored file tree for a project's connected repo,
 // plus the commit it was taken from.
 //

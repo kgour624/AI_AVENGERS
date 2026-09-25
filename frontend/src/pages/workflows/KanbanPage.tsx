@@ -16,6 +16,7 @@ import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
 import { ActivityLog } from '@/components/workflow/ActivityLog'
 import { FilesPanel } from '@/components/workflow/FilesPanel'
+import { CodebasePanel } from '@/components/workflow/CodebasePanel'
 
 // CancelWorkflowButton — renders a cancel button with confirmation dialog.
 // WHY confirmation: cancelling a workflow is destructive and cannot be undone.
@@ -483,7 +484,7 @@ function ArtifactsPanel({
 // Workspace tabs (feature #28). 'board' is the default so the task board and
 // the approval gate stay front-and-centre; the other three are read-only views
 // that previously sat below the fold in one long scroll.
-type WorkspaceTab = 'board' | 'deliverables' | 'activity' | 'files'
+type WorkspaceTab = 'board' | 'deliverables' | 'activity' | 'files' | 'codebase'
 
 function KanbanPage() {
   const { id } = useParams<{ id: string }>()
@@ -550,6 +551,12 @@ function KanbanPage() {
     { key: 'activity', label: 'Activity', count: events.length },
     { key: 'files', label: 'Files', count: fileStream.files.length },
   ]
+
+  // The Codebase tab exists only for existing-codebase workflows: a scratch
+  // workflow has no repository, so an approval queue would be meaningless.
+  if (workflow?.mode === 'existing_codebase') {
+    tabs.push({ key: 'codebase', label: 'Codebase' })
+  }
 
   // Root scroll container. AppShell's <main> (frontend/src/components/
   // layout/AppShell.tsx) is `overflow-hidden` by contract — every page it
@@ -701,6 +708,8 @@ function KanbanPage() {
             lastWave={fileStream.lastWave}
           />
         )}
+
+        {activeTab === 'codebase' && id && <CodebasePanel workflowId={id} />}
       </div>
 
       {/* Deliverable chat (§6) — separate from the product chat, own tables,

@@ -19,6 +19,10 @@ export interface Workflow {
   costHardLimitPct: number
   // genericAllowancePct: 0-30. 0 = experts use trained + peer knowledge only.
   genericAllowancePct: number
+  // mode (phase 3D): 'scratch' builds something new; 'existing_codebase' works
+  // inside a connected client repository, where the readable files are a
+  // human-approved working set.
+  mode: 'scratch' | 'existing_codebase'
   createdAt: string
   updatedAt: string
 }
@@ -79,6 +83,8 @@ export const createWorkflow = (req: {
   selectedExpertIds: string[]
   costBudgetUsd?: number
   requirementText?: string
+  /** Omitted or 'scratch' keeps the original behaviour. */
+  mode?: 'scratch' | 'existing_codebase'
 }) =>
   baseAPI
     .post<ApiResponse<Workflow>>('/api/v1/workflows', req)
@@ -140,4 +146,85 @@ export const cancelWorkflow = (workflowId: string) =>
 export const retryTask = (workflowId: string, taskId: string) =>
   baseAPI
     .post<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}/tasks/${taskId}/retry`)
+    .then((res) => res.data.data!)
+
+/**
+ * Phase 3D — the human-approved working set for an existing-codebase workflow.
+ *
+ * The backend stores suggestions and approvals in ONE table with three states,
+ * so "the manifest" is simply the approved rows rather than a second list that
+ * could drift out of step. Nothing here lets an expert's suggestion become
+ * readable on its own: only a decision does that.
+ */
+export type CodebaseFileStatus = 'pending' | 'approved' | 'rejected'
+
+export interface CodebaseFile {
+  id: string
+  workflowId: string
+  path: string
+  status: CodebaseFileStatus
+  /** 'expert' = the system proposed it; 'client' = the client added it directly. */
+  source: 'expert' | 'client'
+  reason: string
+  score: number
+  hopDepth: number
+  decidedAt: string | null
+  createdAt: string
+}
+
+export const getCodebaseFiles = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<{ files: CodebaseFile[]; count: number; approved: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/files`
+    )
+    .then((res) => res.data.data!)
+
+/**
+ * Asks the repository ranker for candidate files. Existing rows are left alone
+ * whatever their status, so a file the client already rejected cannot be
+ * silently re-proposed by a later run.
+ */
+export const suggestCodebaseFiles = (workflowId: string, limit?: number) =>
+  baseAPI
+    .post<ApiResponse<{ suggestions: CodebaseFile[]; count: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/suggest`,
+      { limit }
+    )
+    .then((res) => res.data.data!)
+
+export const addCodebaseFile = (workflowId: string, path: string) =>
+  baseAPI
+    .post<ApiResponse<CodebaseFile>>(`/api/v1/workflows/${workflowId}/codebase/files`, { path })
+    .then((res) => res.data.data!)
+
+export const decideCodebaseFile = (
+  workflowId: string,
+  fileId: string,
+  decision: 'approve' | 'reject'
+) =>
+  baseAPI
+    .post<ApiResponse<CodebaseFile>>(
+      `/api/v1/workflows/${workflowId}/codebase/files/${fileId}/decide`,
+      { decision }
+    )
+    .then((res) => res.data.data!)
+
+export const decideCodebaseFilesBulk = (
+  workflowId: string,
+  fileIds: string[],
+  decision: 'approve' | 'reject'
+) =>
+  baseAPI
+    .post<ApiResponse<{ changed: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/files/decide-bulk`,
+      { fileIds, decision }
+    )
+    .then((res) => res.data.data!)
+
+/** The approved paths only — the set an expert is allowed to read. */
+export const getCodebaseManifest = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<{ paths: string[]; count: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/manifest`
+    )
     .then((res) => res.data.data!)

@@ -21,6 +21,10 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   const [title, setTitle] = useState('')
   const [requirement, setRequirement] = useState('')
   const [projectId, setProjectId] = useState('')
+  // Environment (phase 3D). 'existing_codebase' makes the workflow work inside
+  // the project's connected repository, where the readable files are a set the
+  // client approves — not the whole repo.
+  const [mode, setMode] = useState<'scratch' | 'existing_codebase'>('scratch')
   const [selectedExpertIds, setSelectedExpertIds] = useState<string[]>([])
   const [budget, setBudget] = useState('10')
   const [error, setError] = useState<string | null>(null)
@@ -48,6 +52,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
         selectedExpertIds,
         costBudgetUsd: parseFloat(budget) || 10,
         requirementText: requirement.trim() || undefined,
+        mode,
       })
       await startWorkflow(wf.id)
       await runWorkflow(wf.id)
@@ -72,6 +77,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
     setTitle('')
     setRequirement('')
     setProjectId('')
+    setMode('scratch')
     setSelectedExpertIds([])
     setBudget('10')
     setError(null)
@@ -106,6 +112,44 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
             placeholder="Paste or type the full requirement. Experts work from this instead of the title alone."
             className="w-full resize-y rounded-md border border-glass-border bg-surface-overlay px-3 py-2 text-sm text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
           />
+        </div>
+
+        <div>
+          <label className="mb-1 block text-xs font-medium text-text-secondary">Environment</label>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setMode('scratch')}
+              className={
+                mode === 'scratch'
+                  ? 'rounded-md border border-brand/60 bg-surface-overlay px-3 py-2 text-left text-xs text-text-primary'
+                  : 'rounded-md border border-glass-border px-3 py-2 text-left text-xs text-text-secondary hover:bg-surface-overlay/60'
+              }
+            >
+              <span className="block font-medium">From scratch</span>
+              <span className="block text-[10px] text-text-disabled">Build something new</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('existing_codebase')}
+              className={
+                mode === 'existing_codebase'
+                  ? 'rounded-md border border-brand/60 bg-surface-overlay px-3 py-2 text-left text-xs text-text-primary'
+                  : 'rounded-md border border-glass-border px-3 py-2 text-left text-xs text-text-secondary hover:bg-surface-overlay/60'
+              }
+            >
+              <span className="block font-medium">Existing codebase</span>
+              <span className="block text-[10px] text-text-disabled">
+                Work inside the project's connected repository
+              </span>
+            </button>
+          </div>
+          {mode === 'existing_codebase' && (
+            <p className="mt-1 text-[10px] text-text-disabled">
+              Requires a synced repository on this project. You will approve which files the
+              experts may read before any work starts.
+            </p>
+          )}
         </div>
 
         <div>
