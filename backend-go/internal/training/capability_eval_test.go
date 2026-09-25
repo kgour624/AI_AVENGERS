@@ -257,3 +257,48 @@ func TestBuildTopicReportCapsTheClaimLists(t *testing.T) {
 		t.Fatalf("cannot_handle = %d entries, want the cap of %d", len(report.CannotHandle), cannotHandleLimit)
 	}
 }
+
+// The link comparison decides whether an expensive feature earns its place, so the
+// verdict rule and its refusal to judge a tiny sample are pinned here.
+func TestLinkVerdict(t *testing.T) {
+	tests := []struct {
+		name        string
+		commonCodes int
+		withoutHits int
+		withHits    int
+		want        string
+	}{
+		{name: "links found more sources", commonCodes: 9, withoutHits: 6, withHits: 9, want: "improved"},
+		{name: "links found fewer sources", commonCodes: 9, withoutHits: 9, withHits: 7, want: "regressed"},
+		{name: "identical result", commonCodes: 15, withoutHits: 15, withHits: 15, want: "unchanged"},
+		{
+			// The case that produced this work: one mode answered 9 questions and the
+			// other 15, and the totals looked equal. A verdict needs shared questions.
+			name:        "too few shared questions",
+			commonCodes: 2,
+			withoutHits: 2,
+			withHits:    1,
+			want:        "inconclusive",
+		},
+		{name: "no shared questions", commonCodes: 0, withoutHits: 0, withHits: 0, want: "inconclusive"},
+		{name: "exactly at the minimum", commonCodes: 3, withoutHits: 2, withHits: 3, want: "improved"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := linkVerdict(tc.commonCodes, tc.withoutHits, tc.withHits); got != tc.want {
+				t.Fatalf("linkVerdict(%d, %d, %d) = %q, want %q",
+					tc.commonCodes, tc.withoutHits, tc.withHits, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestMinimumComparableCasesIsMeaningful(t *testing.T) {
+	// A guard on the constant itself: a comparison judged from fewer than three
+	// questions is a coin toss, and lowering this silently would let it be presented
+	// as evidence.
+	if minimumComparableCases < 3 {
+		t.Fatalf("minimumComparableCases = %d, want at least 3", minimumComparableCases)
+	}
+}

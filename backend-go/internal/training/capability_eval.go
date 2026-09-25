@@ -204,6 +204,34 @@ func (m RetrievalMetrics) HitRate() float64 {
 	return float64(m.Hits) / float64(m.Cases)
 }
 
+// minimumComparableCases is how many shared questions a mode comparison needs before
+// it will state a verdict. Below this the sample is too small to attribute a
+// difference to retrieval rather than to luck.
+const minimumComparableCases = 3
+
+// ModeComparison compares the SAME questions asked under both retrieval modes.
+//
+// WHY the intersection and not the two runs' totals: the question set grows as more
+// topics get cases, so two passes can legitimately score a different number of
+// questions. Comparing totals would then attribute the difference to retrieval when it
+// is really a different exam. Joining on case_id asks the only question that can
+// justify changing a default: for the questions BOTH passes asked, did following the
+// concept links find more of the sources?
+type ModeComparison struct {
+	CommonCases   int     `json:"common_cases"`
+	WithoutHits   int     `json:"without_hits"`
+	WithHits      int     `json:"with_hits"`
+	WithoutPassed int     `json:"without_passed"`
+	WithPassed    int     `json:"with_passed"`
+	WithoutMRR    float64 `json:"without_mrr"`
+	WithMRR       float64 `json:"with_mrr"`
+	// Verdict is improved, unchanged, regressed or inconclusive.
+	Verdict      string    `json:"verdict"`
+	Detail       string    `json:"detail"`
+	WithoutRunID uuid.UUID `json:"without_run_id,omitempty"`
+	WithRunID    uuid.UUID `json:"with_run_id,omitempty"`
+}
+
 // CapabilityEvalReport is a whole pass, ready for the admin screen.
 type CapabilityEvalReport struct {
 	RunID         uuid.UUID               `json:"run_id"`
@@ -231,6 +259,9 @@ type CapabilityEvalReport struct {
 	// ErrorMessage is why a failed pass failed, so an admin who cannot read server logs
 	// still learns the reason from the screen that offered the button.
 	ErrorMessage string `json:"error_message"`
+	// Comparison answers "did following the concept links help?" on the questions both
+	// modes actually asked. Nil until both modes have a completed pass.
+	Comparison *ModeComparison `json:"comparison,omitempty"`
 }
 
 // RunEval performs one pass: ensure the question set, then ask every question and
@@ -1071,11 +1102,95 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 		}
 	}
 
+	if comparison, cmpErr := e.compareModes(ctx, expertID); cmpErr == nil {
+		report.Comparison = comparison
+	} else {
+		e.logger.Warn("capability eval: could not compare retrieval modes",
+			zap.String("expert_id", expertID.String()), zap.Error(cmpErr))
+	}
+
 	for _, topic := range order {
 		report.TopicReports = append(report.TopicReports, buildTopicReport(topic, coverage[topic], byTopic[topic]))
 	}
 	report.Findings = evalFindings(report)
 	return report, nil
+}
+
+// linkVerdict decides whether following the concept links helped, from counts alone.
+//
+// Pure — unit-tested. Below the minimum sample the answer is "inconclusive" rather than
+// a verdict: with one or two shared questions a difference is as likely to be luck as
+// retrieval, and stating a winner from that would be the same overclaiming this whole
+// measurement exists to replace.
+func linkVerdict(commonCases, withoutHits, withHits int) string {
+	if commonCases < minimumComparableCases {
+		return "inconclusive"
+	}
+	switch {
+	case withHits > withoutHits:
+		return "improved"
+	case withHits < withoutHits:
+		return "regressed"
+	default:
+		return "unchanged"
+	}
+}
+
+// compareModes joins the latest completed pass of each mode on the questions they
+// share, and states whether following the links found more sources.
+func (e *CapabilityEvaluator) compareModes(ctx context.Context, expertID uuid.UUID) (*ModeComparison, error) {
+	var plainRunID, graphRunID *uuid.UUID
+	if err := e.db.QueryRow(ctx, `
+		SELECT
+		  (SELECT id FROM expert_capability_eval_runs
+		    WHERE expert_id = $1 AND status = 'complete' AND graph_expansion = FALSE
+		    ORDER BY started_at DESC LIMIT 1),
+		  (SELECT id FROM expert_capability_eval_runs
+		    WHERE expert_id = $1 AND status = 'complete' AND graph_expansion = TRUE
+		    ORDER BY started_at DESC LIMIT 1)`, expertID,
+	).Scan(&plainRunID, &graphRunID); err != nil {
+		return nil, fmt.Errorf("capability eval: find comparable runs: %w", err)
+	}
+	if plainRunID == nil || graphRunID == nil {
+		// One mode has never been run: nothing to compare, and inventing a verdict from
+		// a single mode is the mistake this comparison exists to prevent.
+		return nil, nil
+	}
+
+	comparison := &ModeComparison{WithoutRunID: *plainRunID, WithRunID: *graphRunID}
+	if err := e.db.QueryRow(ctx, `
+		SELECT COUNT(*),
+		       COALESCE(SUM(CASE WHEN p.hit_rank > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN g.hit_rank > 0 THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN p.passed THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN g.passed THEN 1 ELSE 0 END), 0),
+		       COALESCE(AVG(CASE WHEN p.hit_rank > 0 THEN 1.0 / p.hit_rank END), 0),
+		       COALESCE(AVG(CASE WHEN g.hit_rank > 0 THEN 1.0 / g.hit_rank END), 0)
+		  FROM expert_capability_results p
+		  JOIN expert_capability_results g
+		    ON g.case_id = p.case_id AND g.run_id = $2
+		 WHERE p.run_id = $1`, *plainRunID, *graphRunID,
+	).Scan(&comparison.CommonCases, &comparison.WithoutHits, &comparison.WithHits,
+		&comparison.WithoutPassed, &comparison.WithPassed,
+		&comparison.WithoutMRR, &comparison.WithMRR); err != nil {
+		return nil, fmt.Errorf("capability eval: compare modes: %w", err)
+	}
+
+	comparison.Verdict = linkVerdict(comparison.CommonCases, comparison.WithoutHits, comparison.WithHits)
+	if comparison.Verdict == "inconclusive" {
+		comparison.Detail = fmt.Sprintf(
+			"Concept links are not comparable yet: the two passes share only %d question(s). Run Measure and Measure with links once each so they answer the same questions.",
+			comparison.CommonCases)
+		return comparison, nil
+	}
+
+	comparison.Detail = fmt.Sprintf(
+		"Concept links (%s) on the same %d question(s): source found %d/%d without links, %d/%d with links; MRR %.2f -> %.2f; answered %d/%d -> %d/%d.",
+		comparison.Verdict, comparison.CommonCases,
+		comparison.WithoutHits, comparison.CommonCases, comparison.WithHits, comparison.CommonCases,
+		comparison.WithoutMRR, comparison.WithMRR,
+		comparison.WithoutPassed, comparison.CommonCases, comparison.WithPassed, comparison.CommonCases)
+	return comparison, nil
 }
 
 // evalFindings states what the numbers mean and what to do — an eval that only
@@ -1112,6 +1227,19 @@ func evalFindings(r *CapabilityEvalReport) []string {
 				"Source-chunk retrieval unchanged: %.0f%% (was %.0f%%), MRR %.2f (was %.2f).",
 				nowPct, wasPct, r.Metrics.MRR, r.Previous.MRR))
 		}
+		// Two passes that asked different numbers of questions are not a like-for-like
+		// comparison, and saying so is cheaper than letting the reader assume they are.
+		if r.Previous.Cases != r.Metrics.Cases {
+			findings = append(findings, fmt.Sprintf(
+				"Note: the previous pass asked %d questions and this one %d, so the change above is not strictly like-for-like. The concept-link comparison below uses only the shared questions.",
+				r.Previous.Cases, r.Metrics.Cases))
+		}
+	}
+
+	// The links verdict, on the questions both modes actually asked. Absent means one
+	// mode has never been run, so the answer is unknown rather than "no difference".
+	if r.Comparison != nil {
+		findings = append(findings, r.Comparison.Detail)
 	}
 
 	missed := r.CasesTotal - r.RetrievalHits
