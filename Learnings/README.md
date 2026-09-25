@@ -13,6 +13,9 @@
 | [byte_by_byte_ai_6_week.md](byte_by_byte_ai_6_week.md) | Byte by Byte AI — 6 week cohort | LLM foundations (pre/post-training), prompting (zero-shot/few-shot/CoT), structured output & grounding, RAG (chunking/embeddings/ANN/RAFT), evaluation (component-wise, LLM-as-judge) + A13/B1/B8/C3/B6 mapping |
 | [arpit_bhiyani_ai_masterclass.md](arpit_bhiyani_ai_masterclass.md) | AI Masterclass (Arpit Bhiyani) | Reliable prompting, structured output, tool use, agent loops (OTA/Ralph/ReAct/Plan-Execute), memory/caching, hybrid RAG + RRF, evals/LLM-as-judge/red-teaming, production (cascade/circuit breakers), AI system design + A13/A5/A7/B/C mapping |
 | [arpit_bhiyani_last_video.md](arpit_bhiyani_last_video.md) | Arpit Bhiyani — Masterclass Last Video | Memory taxonomy & context management, write/decay strategy, multi-agent patterns (orchestrator/critic/MoA) + deadlock, determinism vs intelligence, incident auto-remediation design, evals as unit tests |
+| [taught-knowledge.md](taught-knowledge.md) | Scaler Edge DSA Intermediate + Advance transcripts | Problem-contract discipline, brute-force-first, DP state/dependency, binary-search-on-answer, BFS/bipartite, heaps/BST/two pointers, complexity and dry-run rules; source citations included |
+
+Learned-knowledge workflow files: [`codebase-patterns.md`](codebase-patterns.md) records observed repository conventions; raw Scaler DSA source files are preserved in [`sources/scaler-dsa/`](sources/scaler-dsa/).
 
 Related hub (product-applied rules): [`../KNOWLEDGE_HUB.md`](../KNOWLEDGE_HUB.md)
 
