@@ -44,7 +44,11 @@ type AdminHandler struct {
 	// derived state (Phase D). Built here from the same pool + embedder the
 	// pipeline uses, so a repair cannot embed with a different model than
 	// ingestion used.
-	reconcile   *training.Reconciler
+	reconcile *training.Reconciler
+	// capabilityEval (I2) measures what an expert can actually answer. Nil-safe:
+	// when unwired the endpoints report that measurement is unavailable rather
+	// than pretending a score exists.
+	capEval     *training.CapabilityEvaluator
 	categoryReg *category.Registry
 	// domainReg backs the domain-profile admin endpoints (max tokens,
 	// coverage/citation/strip modes, etc — see ListDomainProfiles /
@@ -124,6 +128,16 @@ func NewAdminHandler(
 		extractor:   extractor,
 		logger:      logger,
 	}
+}
+
+// SetCapabilityEvaluator wires capability measurement (I2).
+//
+// WHY a setter and not a constructor parameter: the evaluator needs the context
+// assembler, which is built after this handler in cmd/server/main.go. A setter
+// keeps the dependency explicit at the wiring site instead of adding a sixteenth
+// positional argument that every caller has to keep in order.
+func (h *AdminHandler) SetCapabilityEvaluator(e *training.CapabilityEvaluator) {
+	h.capEval = e
 }
 
 // ============================================================
@@ -2295,6 +2309,140 @@ func (h *AdminHandler) ReconcileIngestion(c *gin.Context) {
 		"applied":           applied,
 		"results":           results,
 		"available_actions": training.ReconcileActions(),
+	})
+}
+
+// ============================================================
+// CAPABILITY MEASUREMENT (I2)
+// ============================================================
+
+// capabilityEvalRequestDTO is the wire shape for one measurement pass.
+type capabilityEvalRequestDTO struct {
+	// Topics caps how many topics are measured. Zero = the backend default.
+	Topics int `json:"topics"`
+	// TopK is the retrieval depth scored against. Zero = the production default.
+	TopK int `json:"top_k"`
+	// Regenerate replaces the stored question set. Off by default because that
+	// set IS the baseline: regenerating it silently would make two runs
+	// incomparable while still looking like a fair comparison.
+	Regenerate bool `json:"regenerate"`
+}
+
+// MeasureExpertCapability POST /admin/experts/:id/capability-eval
+//
+// Starts one measurement pass: write questions from the expert's own corpus, ask
+// them through the production retrieval path, judge the answers, and record the
+// evidence. Returns immediately with the run id; the pass costs one generation
+// call per topic plus two calls per case, which is far longer than an HTTP request
+// should live.
+func (h *AdminHandler) MeasureExpertCapability(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.capEval == nil {
+		response.ServiceUnavailable(c, "capability measurement is not wired in this deployment")
+		return
+	}
+
+	var dto capabilityEvalRequestDTO
+	// An empty body is a valid "use the defaults" request, so a bind error is only
+	// fatal when there was a body at all.
+	if c.Request.ContentLength > 0 {
+		if bindErr := c.ShouldBindJSON(&dto); bindErr != nil {
+			response.BadRequest(c, "INVALID_BODY", "expected {\"topics\": 10, \"top_k\": 5, \"regenerate\": false}")
+			return
+		}
+	}
+
+	ctx := c.Request.Context()
+
+	// The expert must exist: failing here returns a 404 the admin can act on,
+	// whereas letting the background pass fail would report nothing until later.
+	var exists bool
+	if err := h.db.QueryRow(ctx,
+		`SELECT TRUE FROM experts WHERE id = $1`, expertID).Scan(&exists); err != nil {
+		response.NotFound(c, "expert")
+		return
+	}
+
+	// One pass at a time. WHY: two concurrent passes would both write results and
+	// both write back the measured capability, so the last writer would silently
+	// win, and the cost would be paid twice.
+	var running int
+	if err := h.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM expert_capability_eval_runs WHERE expert_id = $1 AND status = 'running'`,
+		expertID).Scan(&running); err != nil {
+		h.logger.Error("capability eval: could not check for a running pass", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if running > 0 {
+		response.Conflict(c, "a capability measurement is already running for this expert")
+		return
+	}
+
+	request := training.CapabilityEvalRequest{
+		Topics:     dto.Topics,
+		TopK:       dto.TopK,
+		Regenerate: dto.Regenerate,
+	}
+
+	// Detached context with a deadline: the pass must outlive this request, and a
+	// pass that hangs must not hold the "running" gate forever.
+	go func() {
+		runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if _, err := h.capEval.RunEval(runCtx, expertID, request); err != nil {
+			h.logger.Error("capability eval failed",
+				zap.String("expert_id", expertID.String()),
+				zap.Error(err))
+		}
+	}()
+
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"status":    "running",
+		"topics":    request.Topics,
+		"top_k":     request.TopK,
+	})
+}
+
+// GetExpertCapabilityEval GET /admin/experts/:id/capability-eval
+//
+// Returns the most recent pass for an expert, or null when it has never been
+// measured — "never measured" is a different state from "measured and empty", and
+// the screen must be able to say which one it is showing.
+func (h *AdminHandler) GetExpertCapabilityEval(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.capEval == nil {
+		response.ServiceUnavailable(c, "capability measurement is not wired in this deployment")
+		return
+	}
+
+	report, err := h.capEval.Report(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("capability eval: read report failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if report == nil {
+		response.OK(c, map[string]interface{}{
+			"expert_id": expertID,
+			"measured":  false,
+		})
+		return
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"measured":  true,
+		"report":    report,
 	})
 }
 

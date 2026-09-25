@@ -184,8 +184,20 @@ func (h *Handler) GetTopics(c *gin.Context) {
 		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
 		return
 	}
+	// I2: this returns BOTH the declared coverage band and the measured depth, so
+	// the caller can show them side by side. They are different scales and must
+	// never be compared numerically - see migration 045's column comments.
+	//
+	// can_handle / cannot_handle used to be omitted here ("backend gap"): they were
+	// generated from a few hundred characters per topic, so returning them would
+	// have published a guess. They are now overwritten by the measured result of an
+	// actual evaluation pass, which is why they are returned with eval_cases so the
+	// caller can tell a measured list from the old declared one.
 	rows, err := h.db.Query(c.Request.Context(), `
-		SELECT topic, depth_level, chunk_count, complexity_ceiling
+		SELECT topic, depth_level, chunk_count, complexity_ceiling,
+		       COALESCE(measured_level,0), COALESCE(eval_cases,0), COALESCE(eval_passed,0),
+		       COALESCE(can_handle,'{}'), COALESCE(cannot_handle,'{}'),
+		       last_evaluated_at
 		FROM expert_capabilities
 		WHERE expert_id=$1
 		ORDER BY depth_level DESC, chunk_count DESC`, id)
@@ -199,13 +211,23 @@ func (h *Handler) GetTopics(c *gin.Context) {
 	var topics []map[string]interface{}
 	for rows.Next() {
 		var topic, complexity string
-		var depth, chunkCount int
-		if err := rows.Scan(&topic, &depth, &chunkCount, &complexity); err != nil {
+		var depth, chunkCount, measuredLevel, evalCases, evalPassed int
+		var canHandle, cannotHandle []string
+		var lastEvaluatedAt *time.Time
+		if err := rows.Scan(&topic, &depth, &chunkCount, &complexity,
+			&measuredLevel, &evalCases, &evalPassed, &canHandle, &cannotHandle,
+			&lastEvaluatedAt); err != nil {
 			continue
 		}
 		topics = append(topics, map[string]interface{}{
 			"topic": topic, "depth_level": depth,
 			"chunk_count": chunkCount, "complexity_ceiling": complexity,
+			"measured_level":    measuredLevel,
+			"eval_cases":        evalCases,
+			"eval_passed":       evalPassed,
+			"can_handle":        canHandle,
+			"cannot_handle":     cannotHandle,
+			"last_evaluated_at": lastEvaluatedAt,
 		})
 	}
 	if topics == nil {

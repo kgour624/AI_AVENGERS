@@ -125,10 +125,31 @@ export interface ExpertTopic {
   depthLevel: 1 | 2 | 3 | 4 | 5
   chunkCount: number
   complexityCeiling: 'basic' | 'intermediate' | 'advanced' | 'expert' | 'master'
-  /** NOT returned by the current GET /experts/:id/topics handler - see comment above. Backend gap, not a frontend rendering choice. */
+  /**
+   * Measured answer depth from a capability evaluation pass (I2): 1 definitions,
+   * 2 mechanics/trade-offs, 3 failure modes. 0 means never measured.
+   *
+   * A DIFFERENT SCALE from depthLevel and never comparable to it: depthLevel counts
+   * chunk coverage (1-5), measuredLevel counts what the expert actually answered
+   * (1-3). The UI shows them side by side, labelled, for exactly that reason.
+   */
+  measuredLevel?: 0 | 1 | 2 | 3
+  /** How many questions were asked about this topic in the last pass. */
+  evalCases?: number
+  /** How many of those were answered, cited and judged supported. */
+  evalPassed?: number
+  /**
+   * can_handle / cannot_handle are only meaningful once evalCases > 0.
+   *
+   * They used to be generated from a few hundred characters per topic; they are now
+   * overwritten by an evaluation pass, so render them ONLY when measured. Showing
+   * them for an unmeasured topic would publish the old guess as a claim.
+   */
   canHandle?: string[]
   cannotHandle?: string[]
   exampleQuestions?: string[]
+  /** When this topic's capability was last measured, if ever. */
+  lastEvaluatedAt?: string | null
 }
 
 /**

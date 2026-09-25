@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import { Card } from '@/components/ui/Card'
+import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
 import { getExpertTopics } from '@/api/experts'
+import { getCapabilityEval, startCapabilityEval } from '@/api/admin'
 import type { Expert, ExpertTopic } from '@/types/expert'
 
 /**
@@ -87,6 +89,25 @@ function summariseTopics(topics: ExpertTopic[]): ExpertTopicsSummary {
   }
 }
 
+/**
+ * measuredLabel renders the MEASURED depth, which is a different scale from the
+ * coverage band above: the expert was asked real questions from its own corpus and
+ * this is how deep it answered. 1 definitions, 2 mechanics and trade-offs,
+ * 3 failure modes. Absent level = never measured, which must not read as "shallow".
+ */
+function measuredLabel(level: number | undefined): { text: string; className: string } {
+  switch (level) {
+    case 3:
+      return { text: 'failure modes', className: 'text-mode-advise' }
+    case 2:
+      return { text: 'mechanics', className: 'text-glow-cyan' }
+    case 1:
+      return { text: 'definitions', className: 'text-glow-amber' }
+    default:
+      return { text: 'not measured', className: 'text-text-disabled' }
+  }
+}
+
 interface ExpertCapabilitiesTableProps {
   expert: Expert
 }
@@ -94,6 +115,7 @@ interface ExpertCapabilitiesTableProps {
 export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps) {
   const [isExpanded, setIsExpanded] = useState(false)
   const [showAll, setShowAll] = useState(false)
+  const [measureError, setMeasureError] = useState<string | null>(null)
 
   // Fetched only when the section is opened: this is a per-expert table read that
   // nobody asked for until they expand it.
@@ -105,6 +127,41 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   })
 
   const summary = useMemo(() => summariseTopics(topics ?? []), [topics])
+
+  // The capability measurement, if one has ever run. Polled while a pass is in
+  // flight: a pass writes questions, asks them and judges the answers — one
+  // generation call per topic plus two calls per question — so it runs in the
+  // background and this screen fills itself in.
+  const { data: evalState } = useQuery({
+    queryKey: ['experts', expert.id, 'capability-eval'],
+    queryFn: () => getCapabilityEval(expert.id),
+    enabled: isExpanded,
+    refetchInterval: (query) => (query.state.data?.report?.status === 'running' ? 5000 : false),
+  })
+
+  const report = evalState?.measured ? evalState.report : undefined
+  const isMeasuring = report?.status === 'running'
+
+  const measureMutation = useMutation({
+    mutationFn: () => startCapabilityEval(expert.id),
+    onSuccess: () => setMeasureError(null),
+    onError: () => setMeasureError('Could not start the measurement.'),
+  })
+
+  // Only a measured topic may publish what it can/cannot handle: before a pass
+  // those lists are still the generated guess, and showing a guess as a claim is
+  // the problem this feature exists to fix.
+  const measuredByTopic = useMemo(() => {
+    const map = new Map<string, { measuredLevel: number; passed: number; cases: number }>()
+    for (const topic of report?.topics ?? []) {
+      map.set(topic.topic, {
+        measuredLevel: topic.measuredLevel,
+        passed: topic.passed,
+        cases: topic.cases,
+      })
+    }
+    return map
+  }, [report])
   const visibleTopics = showAll ? summary.sorted : summary.sorted.slice(0, TOPIC_PAGE_SIZE)
   const hiddenTopics = summary.sorted.length - visibleTopics.length
 
@@ -187,22 +244,107 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                   </ul>
                 </div>
 
+                {/* Measured capability — the difference between "the corpus mentions
+                    this topic" and "the expert can answer a question about it".
+                    Rendered only once a pass has run: before that there is nothing
+                    measured, and saying "not measured" is more honest than an empty
+                    bar that reads as zero. */}
+                <div className="rounded border border-border bg-bg-tertiary p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium text-text-primary">Measured capability</p>
+                      <p className="mt-0.5 text-[10px] text-text-disabled">
+                        Asks questions written from this corpus, then records whether retrieval
+                        found the source chunk, the answer cited it, and a judge found it
+                        supported.
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      isLoading={measureMutation.isPending}
+                      disabled={isMeasuring}
+                      onClick={() => measureMutation.mutate()}
+                    >
+                      {report ? 'Re-measure' : 'Measure'}
+                    </Button>
+                  </div>
+
+                  {isMeasuring && (
+                    <p className="mt-2 text-[11px] text-glow-amber">
+                      Measuring — this runs in the background and takes a few minutes.
+                    </p>
+                  )}
+
+                  {report?.status === 'failed' && (
+                    <p className="mt-2 text-[11px] text-mode-refuse">
+                      The last pass failed before finishing. Run it again for a result.
+                    </p>
+                  )}
+
+                  {report?.status === 'complete' && (
+                    <>
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-text-secondary">
+                        <span>
+                          answered{' '}
+                          <span className="font-mono text-text-primary">
+                            {report.casesPassed}/{report.casesTotal}
+                          </span>
+                        </span>
+                        <span>
+                          source found{' '}
+                          <span className="font-mono text-text-primary">
+                            {report.retrievalHits}/{report.casesTotal}
+                          </span>
+                        </span>
+                        <span>
+                          declined{' '}
+                          <span className="font-mono text-text-primary">{report.refused}</span>
+                        </span>
+                      </div>
+                      <ul className="mt-2 space-y-1">
+                        {report.findings.map((finding) => (
+                          <li key={finding} className="flex gap-1.5 text-[10px] text-text-secondary">
+                            <span className="shrink-0 text-text-disabled">{'\u2022'}</span>
+                            <span>{finding}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+
+                  {!report && !isMeasuring && (
+                    <p className="mt-2 text-[10px] text-text-disabled">
+                      Never measured. Until it is, the only depth reported for this expert is chunk
+                      coverage.
+                    </p>
+                  )}
+
+                  {measureError && <p className="mt-2 text-[10px] text-glow-amber">{measureError}</p>}
+                </div>
+
                 {/* Per-topic rows */}
                 <div className="overflow-hidden rounded border border-border">
-                  <div className="grid grid-cols-[1fr_auto_auto] gap-2 border-b border-border bg-bg-tertiary px-2 py-1 text-[10px] uppercase tracking-wide text-text-disabled">
+                  <div className="grid grid-cols-[1fr_auto_auto_auto] gap-2 border-b border-border bg-bg-tertiary px-2 py-1 text-[10px] uppercase tracking-wide text-text-disabled">
                     <span>Topic</span>
                     <span className="text-right">Chunks</span>
                     <span className="w-24 text-right">Coverage</span>
+                    <span className="w-24 text-right">Measured</span>
                   </div>
                   {visibleTopics.map((topic) => {
                     const band = coverageBand(topic.chunkCount)
                     const width = summary.peakChunks > 0
                       ? Math.max(2, Math.round((topic.chunkCount / summary.peakChunks) * 100))
                       : 0
+                    // Measured depth, when this topic has been evaluated. The scale is
+                    // 1-3 (definitions / mechanics / failure modes) and is NOT the
+                    // coverage band in the previous column.
+                    const measured = measuredByTopic.get(topic.topic)
+                    const measuredInfo = measuredLabel(measured?.measuredLevel)
                     return (
                       <div
                         key={topic.topic}
-                        className="grid grid-cols-[1fr_auto_auto] items-center gap-2 border-b border-border px-2 py-1 last:border-b-0"
+                        className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-2 border-b border-border px-2 py-1 last:border-b-0"
                       >
                         <span
                           className={cn(
@@ -226,6 +368,16 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                           <span className={cn('mt-0.5 block text-right text-[9px]', band.className)}>
                             {band.label}
                           </span>
+                        </span>
+                        <span className="w-24 text-right">
+                          <span className={cn('block text-[10px]', measuredInfo.className)}>
+                            {measuredInfo.text}
+                          </span>
+                          {measured && (
+                            <span className="block text-[9px] text-text-disabled">
+                              {measured.passed}/{measured.cases} answered
+                            </span>
+                          )}
                         </span>
                       </div>
                     )
