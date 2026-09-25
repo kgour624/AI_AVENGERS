@@ -116,6 +116,26 @@ function measuredLabel(level: number | undefined): { text: string; className: st
   }
 }
 
+/**
+ * describeLinkVerdict renders the concept-link comparison in plain words.
+ *
+ * WHY plain words and not "improved/regressed": the reader is deciding whether an
+ * expensive feature earns its place, and "made no difference" is a legitimate, useful
+ * answer that should be neither dressed up as a win nor hidden.
+ */
+function describeLinkVerdict(verdict: string): { text: string; className: string } {
+  switch (verdict) {
+    case 'improved':
+      return { text: 'Concept links helped', className: 'text-mode-advise' }
+    case 'regressed':
+      return { text: 'Concept links made it worse', className: 'text-mode-refuse' }
+    case 'unchanged':
+      return { text: 'Concept links made no difference', className: 'text-text-secondary' }
+    default:
+      return { text: 'Concept links: not comparable yet', className: 'text-glow-amber' }
+  }
+}
+
 interface ExpertCapabilitiesTableProps {
   expert: Expert
 }
@@ -456,6 +476,33 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                       Never measured. Until it is, the only depth reported for this expert is chunk
                       coverage.
                     </p>
+                  )}
+
+                  {/* The link comparison, on the shared questions only. Absent until both
+                      modes have run — and "not comparable yet" is a different statement
+                      from "there is no difference". */}
+                  {report?.comparison ? (
+                    <div className="mt-2 rounded border border-border bg-bg-secondary/40 p-2">
+                      <p
+                        className={cn(
+                          'text-[11px] font-medium',
+                          describeLinkVerdict(report.comparison.verdict).className,
+                        )}
+                      >
+                        {describeLinkVerdict(report.comparison.verdict).text}
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-text-secondary">
+                        {report.comparison.detail}
+                      </p>
+                    </div>
+                  ) : (
+                    report && (
+                      <p className="mt-2 text-[10px] text-text-disabled">
+                        To find out whether the concept links help, run Measure and then Measure
+                        with links. They answer the same stored questions, so the two passes can be
+                        compared fairly.
+                      </p>
+                    )
                   )}
 
                   {measureError && <p className="mt-2 text-[10px] text-glow-amber">{measureError}</p>}

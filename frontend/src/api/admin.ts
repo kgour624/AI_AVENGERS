@@ -787,6 +787,26 @@ export interface CapabilityEvalReport {
   graphExpansion: boolean
   /** Why a failed pass failed, so the screen that offered the button can explain it. */
   errorMessage?: string
+  /** Absent until both modes have completed a pass. */
+  comparison?: CapabilityModeComparison
+}
+
+/**
+ * "Did following the concept links help?" — measured on the questions BOTH modes
+ * actually asked, never on the two passes' totals (a pass can legitimately ask a
+ * different number of questions, and comparing totals would blame retrieval for what
+ * is really a different exam).
+ */
+export interface CapabilityModeComparison {
+  commonCases: number
+  withoutHits: number
+  withHits: number
+  withoutPassed: number
+  withPassed: number
+  withoutMrr: number
+  withMrr: number
+  verdict: 'improved' | 'unchanged' | 'regressed' | 'inconclusive'
+  detail: string
 }
 
 export interface CapabilityEvalResponse {
