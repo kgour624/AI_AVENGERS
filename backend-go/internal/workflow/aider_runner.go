@@ -411,7 +411,11 @@ func (a *AiderRunner) seedWorkspace(ctx context.Context, workflowID uuid.UUID, w
 			}
 		}
 		if hasFiles {
-			cmd := exec.CommandContext(ctx, "rsync", "-a", "--exclude", ".git",
+			// node_modules is excluded so seeded dependencies never balloon the
+			// workspace or get rsync'd between experts; each workspace installs
+			// its own on first verification (A11b).
+			cmd := exec.CommandContext(ctx, "rsync", "-a",
+				"--exclude", ".git", "--exclude", "node_modules",
 				mainWorkspace+"/", workspacePath+"/")
 			if output, rsyncErr := cmd.CombinedOutput(); rsyncErr != nil {
 				// Non-fatal: log and continue with blackboard artifacts only.

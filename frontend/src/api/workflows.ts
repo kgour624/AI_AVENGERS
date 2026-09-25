@@ -78,6 +78,7 @@ export const createWorkflow = (req: {
   title: string
   selectedExpertIds: string[]
   costBudgetUsd?: number
+  requirementText?: string
 }) =>
   baseAPI
     .post<ApiResponse<Workflow>>('/api/v1/workflows', req)

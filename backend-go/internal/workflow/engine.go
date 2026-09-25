@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/observability"
 )
 
@@ -33,6 +34,14 @@ const (
 	StatusCompleted           = "completed"
 	StatusCancelled           = "cancelled"
 	StatusFailed              = "failed"
+)
+
+// Terminal blackboard event types. kanban_sse.go and files_sse.go already
+// listen for exactly these strings to emit kanban_done / file_done, but
+// nothing ever posted them, so the UI never learned a workflow had ended (A8).
+const (
+	EventWorkflowCompleted = "workflow_completed"
+	EventWorkflowFailed    = "workflow_failed"
 )
 
 // phaseOrder defines the valid forward progression.
@@ -91,6 +100,14 @@ type CostLimitResult struct {
 	CostSpentUSD float64 // new total
 }
 
+// EventPoster is the minimal blackboard surface the engine needs to announce
+// terminal lifecycle events. Declared here as an interface (rather than
+// depending on *blackboard.Store) so the engine stays decoupled from the
+// collaboration package and unit tests can leave it nil.
+type EventPoster interface {
+	Post(ctx context.Context, req blackboard.PostRequest) (*blackboard.Event, error)
+}
+
 // Engine owns all writes to the workflows table.
 // Implements the 6-phase state machine.
 //
@@ -100,11 +117,44 @@ type CostLimitResult struct {
 type Engine struct {
 	db     *pgxpool.Pool
 	logger *zap.Logger
+	// poster is optional. When set, Complete/Fail emit the terminal
+	// blackboard events the SSE streams wait for. Nil (tests) = no events.
+	poster EventPoster
 }
 
 // NewEngine creates a new workflow engine.
 func NewEngine(db *pgxpool.Pool, logger *zap.Logger) *Engine {
 	return &Engine{db: db, logger: logger}
+}
+
+// SetEventPoster wires the optional blackboard poster (A8). Mirrors
+// blackboard.Store.SetProvenanceRecorder: nil is a valid "events off" value.
+func (e *Engine) SetEventPoster(p EventPoster) {
+	e.poster = p
+}
+
+// postTerminal emits a terminal lifecycle event. Best-effort: a blackboard
+// failure must never make a state transition report itself as failed.
+func (e *Engine) postTerminal(ctx context.Context, workflowID uuid.UUID, eventType, reason string) {
+	if e.poster == nil {
+		return
+	}
+	content := map[string]interface{}{}
+	if reason != "" {
+		content["reason"] = reason
+	}
+	if _, err := e.poster.Post(ctx, blackboard.PostRequest{
+		WorkflowID:     workflowID,
+		EventType:      eventType,
+		PostedByClient: true, // system event: no expert authored it
+		Content:        content,
+	}); err != nil {
+		e.logger.Warn("workflow: terminal event post failed",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("event_type", eventType),
+			zap.Error(err),
+		)
+	}
 }
 
 // DB exposes the pool for authorization helpers (expert grants).
@@ -378,14 +428,15 @@ func (e *Engine) Complete(ctx context.Context, workflowID uuid.UUID) error {
 		return fmt.Errorf("workflow complete: %w", err)
 	}
 	e.logger.Info("workflow completed", zap.String("workflow_id", workflowID.String()))
+	e.postTerminal(ctx, workflowID, EventWorkflowCompleted, "")
 	return nil
 }
 
 // Fail marks the workflow as failed with a reason.
 func (e *Engine) Fail(ctx context.Context, workflowID uuid.UUID, reason string) error {
 	_, err := e.db.Exec(ctx,
-		`UPDATE workflows SET status = $1, updated_at = NOW() WHERE id = $2`,
-		StatusFailed, workflowID,
+		`UPDATE workflows SET status = $1, failure_reason = $2, updated_at = NOW() WHERE id = $3`,
+		StatusFailed, reason, workflowID,
 	)
 	if err != nil {
 		return fmt.Errorf("workflow fail: %w", err)
@@ -395,6 +446,7 @@ func (e *Engine) Fail(ctx context.Context, workflowID uuid.UUID, reason string) 
 		zap.String("workflow_id", workflowID.String()),
 		zap.String("reason", reason),
 	)
+	e.postTerminal(ctx, workflowID, EventWorkflowFailed, reason)
 	return nil
 }
 
