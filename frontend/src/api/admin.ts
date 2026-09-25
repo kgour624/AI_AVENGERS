@@ -779,6 +779,12 @@ export interface CapabilityEvalReport {
    */
   metrics: RetrievalMetrics
   previousMetrics?: RetrievalMetrics
+  /**
+   * Which retrieval path this pass used. Shown on screen because the comparison above
+   * is only ever against a pass with the same value — a reader who does not know the
+   * mode cannot judge the delta.
+   */
+  graphExpansion: boolean
 }
 
 export interface CapabilityEvalResponse {
@@ -792,6 +798,12 @@ export interface CapabilityEvalStartOptions {
   topics?: number
   topK?: number
   regenerate?: boolean
+  /**
+   * Retrieve with concept links. Off = the path production chat uses. The two are
+   * recorded separately on each pass, so running both is what makes the comparison
+   * attributable instead of a guess.
+   */
+  graphExpansion?: boolean
 }
 
 /** Reads the latest pass. Returns measured:false when there has never been one. */
@@ -812,6 +824,56 @@ export const startCapabilityEval = (expertId: string, options: CapabilityEvalSta
   baseAPI
     .post<ApiResponse<{ expertId: string; status: string }>>(
       `/api/v1/admin/experts/${expertId}/capability-eval`,
-      { topics: options.topics ?? 0, top_k: options.topK ?? 0, regenerate: options.regenerate ?? false },
+      {
+        topics: options.topics ?? 0,
+        top_k: options.topK ?? 0,
+        regenerate: options.regenerate ?? false,
+        graph_expansion: options.graphExpansion ?? false,
+      },
     )
     .then((res) => res.data.data!)
+
+// ============================================================
+// Concept links (I4)
+// ============================================================
+
+/** How two of an expert's topics relate. */
+export interface ConceptEdge {
+  from: string
+  to: string
+  relation: string
+  rationale: string
+}
+
+export interface ConceptGraphResponse {
+  expertId: string
+  count: number
+  edges: ConceptEdge[]
+  relations: string[]
+}
+
+export interface ConceptExtractResult {
+  topics: number
+  edges: number
+  calls: number
+  /** Links the model produced that named a topic or relation that does not exist. */
+  rejected: number
+}
+
+/** Reads the stored concept links. Cheap and read-only. */
+export const getExpertConcepts = (expertId: string) =>
+  baseAPI
+    .get<ApiResponse<ConceptGraphResponse>>(`/api/v1/admin/experts/${expertId}/concepts`)
+    .then((res) => res.data.data!)
+
+/**
+ * Asks the model how this expert's topics relate and stores the answer. Bounded (a
+ * handful of calls over the topic list), so unlike the capability measurement it
+ * returns a result directly.
+ */
+export const extractExpertConcepts = (expertId: string) =>
+  baseAPI
+    .post<ApiResponse<{ expertId: string; result: ConceptExtractResult }>>(
+      `/api/v1/admin/experts/${expertId}/concepts`,
+    )
+    .then((res) => res.data.data!.result)

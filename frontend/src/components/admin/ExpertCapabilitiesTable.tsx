@@ -4,7 +4,13 @@ import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
 import { getExpertTopics } from '@/api/experts'
-import { getCapabilityEval, startCapabilityEval } from '@/api/admin'
+import {
+  extractExpertConcepts,
+  getCapabilityEval,
+  getExpertConcepts,
+  startCapabilityEval,
+  type ConceptEdge,
+} from '@/api/admin'
 import type { Expert, ExpertTopic } from '@/types/expert'
 
 /**
@@ -116,6 +122,7 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   const [isExpanded, setIsExpanded] = useState(false)
   const [showAll, setShowAll] = useState(false)
   const [measureError, setMeasureError] = useState<string | null>(null)
+  const [conceptNote, setConceptNote] = useState<string | null>(null)
 
   // Fetched only when the section is opened: this is a per-expert table read that
   // nobody asked for until they expand it.
@@ -142,10 +149,35 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   const report = evalState?.measured ? evalState.report : undefined
   const isMeasuring = report?.status === 'running'
 
+  // The mode is passed per call rather than held as a checkbox: a hidden tick would
+  // make "which run did I just start?" ambiguous, and the whole point is that the two
+  // runs are compared against each other.
   const measureMutation = useMutation({
-    mutationFn: () => startCapabilityEval(expert.id),
+    mutationFn: (graphExpansion: boolean) =>
+      startCapabilityEval(expert.id, { graphExpansion }),
     onSuccess: () => setMeasureError(null),
     onError: () => setMeasureError('Could not start the measurement.'),
+  })
+
+  // Concept links (I4). Read on expand so the count is visible without running
+  // anything; extraction is a separate, explicit action because it costs model calls.
+  const { data: conceptGraph, refetch: refetchConcepts } = useQuery({
+    queryKey: ['experts', expert.id, 'concepts'],
+    queryFn: () => getExpertConcepts(expert.id),
+    enabled: isExpanded,
+    staleTime: 60_000,
+  })
+
+  const extractMutation = useMutation({
+    mutationFn: () => extractExpertConcepts(expert.id),
+    onSuccess: (result) => {
+      setConceptNote(
+        `Found ${result.edges} link${result.edges === 1 ? '' : 's'} across ${result.topics} topics` +
+          (result.rejected > 0 ? ` (${result.rejected} ignored as invalid)` : ''),
+      )
+      refetchConcepts()
+    },
+    onError: () => setConceptNote('Could not find concept links.'),
   })
 
   // Only a measured topic may publish what it can/cannot handle: before a pass
@@ -259,15 +291,31 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                         supported.
                       </p>
                     </div>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      isLoading={measureMutation.isPending}
-                      disabled={isMeasuring}
-                      onClick={() => measureMutation.mutate()}
-                    >
-                      {report ? 'Re-measure' : 'Measure'}
-                    </Button>
+                    <div className="flex shrink-0 gap-2">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        isLoading={measureMutation.isPending}
+                        disabled={isMeasuring}
+                        onClick={() => measureMutation.mutate(false)}
+                      >
+                        {report ? 'Re-measure' : 'Measure'}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        isLoading={measureMutation.isPending}
+                        disabled={isMeasuring || (conceptGraph?.count ?? 0) === 0}
+                        onClick={() => measureMutation.mutate(true)}
+                        title={
+                          (conceptGraph?.count ?? 0) === 0
+                            ? 'Find concept links first — expanding with none would add nothing'
+                            : 'Measure again, following the concept links'
+                        }
+                      >
+                        Measure with links
+                      </Button>
+                    </div>
                   </div>
 
                   {isMeasuring && (
@@ -284,6 +332,11 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
 
                   {report?.status === 'complete' && (
                     <>
+                      <p className="mt-2 text-[10px] text-text-disabled">
+                        This run retrieved{' '}
+                        {report.graphExpansion ? 'WITH concept links' : 'without concept links'} —
+                        the comparison above is only ever against a run of the same kind.
+                      </p>
                       <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-text-secondary">
                         <span>
                           answered{' '}
@@ -321,6 +374,64 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                   )}
 
                   {measureError && <p className="mt-2 text-[10px] text-glow-amber">{measureError}</p>}
+                </div>
+
+                {/* Concept links (I4). Without these, "Measure with links" has nothing to
+                    follow — so the count is shown and the button says what it does. */}
+                <div className="rounded border border-border bg-bg-tertiary p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium text-text-primary">
+                        Concept links
+                        {conceptGraph ? ` (${conceptGraph.count})` : ''}
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-text-disabled">
+                        How this expert&apos;s topics relate — e.g. one being part of another, or a
+                        failure mode that arises in one. Lets a question pull in the related topic it
+                        did not name.
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      isLoading={extractMutation.isPending}
+                      onClick={() => extractMutation.mutate()}
+                    >
+                      {(conceptGraph?.count ?? 0) > 0 ? 'Re-find links' : 'Find links'}
+                    </Button>
+                  </div>
+
+                  {(conceptGraph?.count ?? 0) > 0 && (
+                    <ul className="mt-2 space-y-1">
+                      {(conceptGraph?.edges ?? []).slice(0, 8).map((edge: ConceptEdge) => (
+                        <li
+                          key={`${edge.from}-${edge.relation}-${edge.to}`}
+                          className="flex flex-wrap items-center gap-1 text-[10px] text-text-secondary"
+                        >
+                          <span className="text-text-primary">{edge.from}</span>
+                          <span className="text-glow-cyan">{edge.relation.replace(/_/g, ' ')}</span>
+                          <span className="text-text-primary">{edge.to}</span>
+                          {edge.rationale && (
+                            <span className="text-text-disabled">— {edge.rationale}</span>
+                          )}
+                        </li>
+                      ))}
+                      {(conceptGraph?.edges.length ?? 0) > 8 && (
+                        <li className="text-[10px] text-text-disabled">
+                          ...and {(conceptGraph?.edges.length ?? 0) - 8} more
+                        </li>
+                      )}
+                    </ul>
+                  )}
+
+                  {conceptGraph?.count === 0 && !extractMutation.isPending && (
+                    <p className="mt-2 text-[10px] text-text-disabled">
+                      No links yet. Find them once per expert — then &ldquo;Measure with links&rdquo;
+                      can be compared against a normal run.
+                    </p>
+                  )}
+
+                  {conceptNote && <p className="mt-2 text-[10px] text-glow-amber">{conceptNote}</p>}
                 </div>
 
                 {/* Per-topic rows */}
