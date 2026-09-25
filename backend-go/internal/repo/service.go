@@ -405,7 +405,47 @@ func oauthStateKey(state string) string {
 // 1. Validate provider
 // 2. Store state -> provider in Redis (TTL 10min)
 // 3. Return authorization URL with state param
+// ErrOAuthNotConfigured reports that this deployment has no OAuth application
+// credentials for the requested provider.
+//
+// WHY it is its own error: GetOAuthURL used to build the authorize URL
+// unconditionally, so on a deployment without GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET
+// (or the GitLab pair) the browser was sent to the provider with an empty
+// client_id and landed on the provider's own error page. Nothing in this app
+// said what was wrong or what to do instead, so the one-click connect looked
+// broken with no explanation. The message now names the missing variables and
+// the path that still works.
+var ErrOAuthNotConfigured = errors.New("oauth is not configured on this server")
+
+// oauthCredentialsMissing reports whether a provider's OAuth app credentials are
+// absent, together with the environment variables the operator has to set.
+//
+// An unknown provider is NOT reported here: the switch in GetOAuthURL already
+// answers that with "unsupported provider", and reporting a missing credential
+// for a provider we do not support would mislead.
+func (s *Service) oauthCredentialsMissing(provider string) (bool, string) {
+	switch provider {
+	case ProviderGitHub:
+		if strings.TrimSpace(s.githubOAuth.ClientID) == "" || strings.TrimSpace(s.githubOAuth.ClientSecret) == "" {
+			return true, "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET"
+		}
+	case ProviderGitLab:
+		if strings.TrimSpace(s.gitlabOAuth.ClientID) == "" || strings.TrimSpace(s.gitlabOAuth.ClientSecret) == "" {
+			return true, "GITLAB_CLIENT_ID/GITLAB_CLIENT_SECRET"
+		}
+	}
+	return false, ""
+}
+
 func (s *Service) GetOAuthURL(ctx context.Context, provider, state, projectID string) (string, error) {
+	// Fail closed, before any URL is built. See ErrOAuthNotConfigured.
+	if missing, envVars := s.oauthCredentialsMissing(provider); missing {
+		return "", fmt.Errorf(
+			"%w: %s are not set, so the one-click %s connect cannot work. Paste a Personal Access Token instead, or set those variables to enable OAuth",
+			ErrOAuthNotConfigured, envVars, provider,
+		)
+	}
+
 	var authURL string
 	switch provider {
 	case ProviderGitHub:
@@ -2422,6 +2462,12 @@ func (h *Handler) GetOAuthURL(c *gin.Context) {
 	state := uuid.New().String() // CSRF protection
 	oauthURL, err := h.svc.GetOAuthURL(c.Request.Context(), provider, state, projectID)
 	if err != nil {
+		// A missing OAuth app is a deployment fact needing an operator fix,
+		// not a bad provider name from the client, so it gets its own code.
+		if errors.Is(err, ErrOAuthNotConfigured) {
+			response.BadRequest(c, "OAUTH_NOT_CONFIGURED", err.Error())
+			return
+		}
 		response.BadRequest(c, "INVALID_PROVIDER", err.Error())
 		return
 	}

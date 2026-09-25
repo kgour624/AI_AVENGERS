@@ -78,9 +78,19 @@ type Workflow struct {
 	// Mode selects the environment: scratch (build something new) or
 	// existing_codebase (work inside a connected client repository, where the
 	// readable file set is a human-approved working set). See migration 041.
-	Mode      string    `json:"mode"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	//
+	// FailureReason is why the workflow stopped, written by Fail(); NULL unless
+	// the workflow failed.
+	//
+	// WHY both live in the read model: each was stored on the row and then never
+	// read back by GetByID/ListWorkflows (Mode omitted from the column list,
+	// FailureReason likewise). The consequences were invisible features rather
+	// than errors — the Codebase tab is gated on Mode, so it never rendered, and
+	// a failed run could not state its cause anywhere on screen.
+	Mode          string    `json:"mode"`
+	FailureReason *string   `json:"failure_reason"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // Workflow environments. Stored in workflows.mode; the CHECK constraint in
@@ -263,7 +273,7 @@ func (e *Engine) Start(ctx context.Context, workflowID uuid.UUID) (*Workflow, er
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
-		           generic_allowance_pct,
+		           generic_allowance_pct, mode, failure_reason,
 		           created_at, updated_at`,
 		StatusRunning, PhaseIntake, now,
 		workflowID, StatusDraft,
@@ -272,7 +282,7 @@ func (e *Engine) Start(ctx context.Context, workflowID uuid.UUID) (*Workflow, er
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct,
+		&w.GenericAllowancePct, &w.Mode, &w.FailureReason,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
@@ -485,7 +495,7 @@ func (e *Engine) GetByID(ctx context.Context, workflowID uuid.UUID) (*Workflow, 
 		        phase_started_at, phase_completed_at,
 		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		        cost_soft_limit_pct, cost_hard_limit_pct,
-		        generic_allowance_pct,
+		        generic_allowance_pct, mode, failure_reason,
 		        created_at, updated_at
 		 FROM workflows WHERE id = $1`,
 		workflowID,
@@ -494,7 +504,7 @@ func (e *Engine) GetByID(ctx context.Context, workflowID uuid.UUID) (*Workflow, 
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct,
+		&w.GenericAllowancePct, &w.Mode, &w.FailureReason,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {

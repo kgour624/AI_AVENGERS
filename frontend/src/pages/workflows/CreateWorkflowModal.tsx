@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/Button'
 import { getProjects } from '@/api/projects'
 import { getExperts } from '@/api/experts'
 import { createWorkflow, startWorkflow, runWorkflow } from '@/api/workflows'
+import { useRepoSyncStatus } from '@/hooks/useRepoSyncStatus'
 import { queryKeys } from '@/api/queryKeys'
 import { cn } from '@/utils/cn'
 
@@ -41,6 +42,22 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
     enabled: isOpen,
   })
 
+  const isExisting = mode === 'existing_codebase'
+
+  // Existing-codebase work needs a connected, synced repository AND a human
+  // approval step before anything can run — so this mode is created as a draft
+  // and started from its Codebase tab, never launched from here.
+  //
+  // WHY the check is duplicated on the client: the backend already refuses the
+  // run (SeedWorkspace fails with "no approved files to read"), which is the
+  // correct place for the guarantee but arrives after the client has committed
+  // to a workflow. Reading the project's repo status up front turns a
+  // guaranteed failure into a sentence, and `enabled` keeps the query from
+  // firing until a project is selected.
+  const { data: repoStatus } = useRepoSyncStatus(projectId, isExisting)
+  const repoReady = !!repoStatus?.connected && repoStatus.status === 'complete'
+  const repoBlocked = isExisting && !!projectId && !repoReady
+
   const createMut = useMutation({
     mutationFn: async () => {
       if (!title.trim()) throw new Error('Title is required')
@@ -54,6 +71,11 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
         requirementText: requirement.trim() || undefined,
         mode,
       })
+      // Launching straight into a run is right for scratch and wrong for an
+      // existing codebase: the approved readable set is what the runner seeds the
+      // workspace from, and it cannot exist before the client has seen this
+      // screen's Codebase tab. A draft is started from there.
+      if (isExisting) return wf
       await startWorkflow(wf.id)
       await runWorkflow(wf.id)
       return wf
@@ -144,10 +166,15 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
               </span>
             </button>
           </div>
-          {mode === 'existing_codebase' && (
+          {isExisting && (
             <p className="mt-1 text-[10px] text-text-disabled">
-              Requires a synced repository on this project. You will approve which files the
-              experts may read before any work starts.
+              {!projectId
+                ? 'Select a project first — this mode reads a repository that must already be connected to it.'
+                : repoBlocked && repoStatus?.connected
+                  ? `The repository is connected but not synced yet (${repoStatus.status}). Wait for the sync, then create the workflow.`
+                  : repoBlocked
+                    ? 'This project has no repository connected. Connect GitHub or GitLab on the project page first.'
+                    : 'Created as a draft: you approve which files the experts may read, then press Start on the Codebase tab.'}
             </p>
           )}
         </div>
@@ -223,9 +250,19 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
           <Button variant="ghost" onClick={handleClose} disabled={createMut.isPending}>Cancel</Button>
           <Button
             onClick={() => createMut.mutate()}
-            disabled={createMut.isPending || !title.trim() || !projectId || selectedExpertIds.length === 0}
+            disabled={
+              createMut.isPending ||
+              !title.trim() ||
+              !projectId ||
+              selectedExpertIds.length === 0 ||
+              repoBlocked
+            }
           >
-            {createMut.isPending ? 'Launching...' : 'Launch Workflow'}
+            {createMut.isPending
+              ? 'Creating...'
+              : isExisting
+                ? 'Create & choose files'
+                : 'Launch Workflow'}
           </Button>
         </div>
       </div>

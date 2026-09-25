@@ -46,7 +46,7 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 		        phase_started_at, phase_completed_at,
 		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		        cost_soft_limit_pct, cost_hard_limit_pct,
-		        generic_allowance_pct,
+		        generic_allowance_pct, mode, failure_reason,
 		        created_at, updated_at
 		 FROM workflows
 		 WHERE client_id = $1
@@ -70,7 +70,7 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 			&w.PhaseStartedAt, &w.PhaseCompletedAt,
 			&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 			&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct,
+			&w.GenericAllowancePct, &w.Mode, &w.FailureReason,
 			&w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
 			continue

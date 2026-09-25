@@ -709,7 +709,9 @@ function KanbanPage() {
           />
         )}
 
-        {activeTab === 'codebase' && id && <CodebasePanel workflowId={id} />}
+        {activeTab === 'codebase' && id && (
+          <CodebasePanel workflowId={id} workflowStatus={workflow?.status} />
+        )}
       </div>
 
       {/* Deliverable chat (§6) — separate from the product chat, own tables,
@@ -724,7 +726,22 @@ function KanbanPage() {
       {id && <AmendmentsPanel workflowId={id} />}
 
       {/* Delivery (§17, §18) — push the harness out, or check what got built. */}
-      {id && <DeliveryPanel workflowId={id} />}
+      {id && <DeliveryPanel workflowId={id} projectId={workflow?.projectId} />}
+
+      {/* A failed workflow has to state its cause. failure_reason has been
+          written by the engine on every failure; the read API simply never
+          returned it, so this screen could do no better than a red FAILED
+          badge. Shown only for a failed status, so the banner can never be
+          mistaken for a live warning. */}
+      {workflow?.status === 'failed' && (
+        <div className="mt-4 rounded-lg border border-mode-refuse/30 bg-mode-refuse/10 p-4">
+          <p className="text-sm font-medium text-mode-refuse">Workflow failed</p>
+          <p className="mt-1 text-xs text-text-secondary">
+            {workflow.failureReason?.trim() ||
+              'No reason was recorded for this failure. Check the Activity tab for the last events.'}
+          </p>
+        </div>
+      )}
 
       {/* Completion notice + Download Design Package */}
       {(stream.isDone || workflow?.status === 'completed') && (

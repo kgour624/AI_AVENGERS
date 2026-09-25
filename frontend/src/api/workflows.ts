@@ -24,6 +24,10 @@ export interface Workflow {
   // inside a connected client repository, where the readable files are a
   // human-approved working set.
   mode: 'scratch' | 'existing_codebase'
+  // failureReason: why the workflow stopped, set only when status === 'failed'.
+  // The engine has always recorded it; the read API did not return it, so the
+  // screen could show a FAILED badge and nothing else.
+  failureReason?: string | null
   createdAt: string
   updatedAt: string
 }
