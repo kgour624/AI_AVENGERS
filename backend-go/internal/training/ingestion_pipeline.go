@@ -1516,52 +1516,19 @@ func errorString(err error) string {
 // buildCapabilitiesFromChunks populates expert_capabilities from course_chunks
 // topic data without LLM analysis. Used as fallback when capability build fails.
 //
-// Mental execution:
-//   745 chunks, 37 topics → 37 capability rows
-//   Each row: topic, depth_level=1, chunk_count=N, complexity_ceiling="basic"
+// Delegates to upsertCapabilitiesFromChunks (reconcile.go) so the reconcile action
+// and the ingestion fallback can never disagree about what a chunk-derived
+// capability is. Best-effort by contract: it logs and returns, because a failed
+// fallback must not fail an otherwise-complete run.
 func (p *IngestionPipeline) buildCapabilitiesFromChunks(ctx context.Context, expertID uuid.UUID) {
-	rows, err := p.db.Query(ctx,
-		`SELECT topic, COUNT(*) as chunk_count
-		 FROM course_chunks
-		 WHERE expert_id = $1
-		   AND topic IS NOT NULL
-		   AND topic != ''
-		 GROUP BY topic
-		 ORDER BY chunk_count DESC`,
-		expertID,
-	)
+	written, err := upsertCapabilitiesFromChunks(ctx, p.db, p.logger, expertID)
 	if err != nil {
 		p.logger.Warn("buildCapabilitiesFromChunks: query failed", zap.Error(err))
 		return
 	}
-	defer rows.Close()
-
-	inserted := 0
-	for rows.Next() {
-		var topic string
-		var chunkCount int
-		if err := rows.Scan(&topic, &chunkCount); err != nil {
-			continue
-		}
-		_, err := p.db.Exec(ctx,
-			`INSERT INTO expert_capabilities
-				(expert_id, topic, depth_level, chunk_count, complexity_ceiling)
-			 VALUES ($1, $2, 1, $3, 'basic')
-			 ON CONFLICT (expert_id, topic) DO UPDATE SET
-				chunk_count = EXCLUDED.chunk_count,
-				updated_at  = NOW()`,
-			expertID, topic, chunkCount,
-		)
-		if err != nil {
-			p.logger.Warn("buildCapabilitiesFromChunks: insert failed",
-				zap.String("topic", topic), zap.Error(err))
-			continue
-		}
-		inserted++
-	}
 	p.logger.Info("buildCapabilitiesFromChunks: done",
 		zap.String("expert_id", expertID.String()),
-		zap.Int("topics_inserted", inserted),
+		zap.Int("topics_inserted", written),
 	)
 }
 
