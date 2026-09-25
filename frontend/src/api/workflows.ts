@@ -1,5 +1,6 @@
 import { baseAPI } from './base'
 import type { ApiResponse } from '@/types/api'
+import { useAuthStore } from '@/stores/authStore'
 
 // ============================================================
 // Workflow types — match backend workflow.Workflow struct
@@ -19,6 +20,10 @@ export interface Workflow {
   costHardLimitPct: number
   // genericAllowancePct: 0-30. 0 = experts use trained + peer knowledge only.
   genericAllowancePct: number
+  // mode (phase 3D): 'scratch' builds something new; 'existing_codebase' works
+  // inside a connected client repository, where the readable files are a
+  // human-approved working set.
+  mode: 'scratch' | 'existing_codebase'
   createdAt: string
   updatedAt: string
 }
@@ -79,6 +84,8 @@ export const createWorkflow = (req: {
   selectedExpertIds: string[]
   costBudgetUsd?: number
   requirementText?: string
+  /** Omitted or 'scratch' keeps the original behaviour. */
+  mode?: 'scratch' | 'existing_codebase'
 }) =>
   baseAPI
     .post<ApiResponse<Workflow>>('/api/v1/workflows', req)
@@ -141,3 +148,135 @@ export const retryTask = (workflowId: string, taskId: string) =>
   baseAPI
     .post<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}/tasks/${taskId}/retry`)
     .then((res) => res.data.data!)
+
+/**
+ * Phase 3D — the human-approved working set for an existing-codebase workflow.
+ *
+ * The backend stores suggestions and approvals in ONE table with three states,
+ * so "the manifest" is simply the approved rows rather than a second list that
+ * could drift out of step. Nothing here lets an expert's suggestion become
+ * readable on its own: only a decision does that.
+ */
+export type CodebaseFileStatus = 'pending' | 'approved' | 'rejected'
+
+export interface CodebaseFile {
+  id: string
+  workflowId: string
+  path: string
+  status: CodebaseFileStatus
+  /** 'expert' = the system proposed it; 'client' = the client added it directly. */
+  source: 'expert' | 'client'
+  reason: string
+  score: number
+  hopDepth: number
+  decidedAt: string | null
+  createdAt: string
+}
+
+export const getCodebaseFiles = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<{ files: CodebaseFile[]; count: number; approved: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/files`
+    )
+    .then((res) => res.data.data!)
+
+/**
+ * Asks the repository ranker for candidate files. Existing rows are left alone
+ * whatever their status, so a file the client already rejected cannot be
+ * silently re-proposed by a later run.
+ */
+export const suggestCodebaseFiles = (workflowId: string, limit?: number) =>
+  baseAPI
+    .post<ApiResponse<{ suggestions: CodebaseFile[]; count: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/suggest`,
+      { limit }
+    )
+    .then((res) => res.data.data!)
+
+export const addCodebaseFile = (workflowId: string, path: string) =>
+  baseAPI
+    .post<ApiResponse<CodebaseFile>>(`/api/v1/workflows/${workflowId}/codebase/files`, { path })
+    .then((res) => res.data.data!)
+
+export const decideCodebaseFile = (
+  workflowId: string,
+  fileId: string,
+  decision: 'approve' | 'reject'
+) =>
+  baseAPI
+    .post<ApiResponse<CodebaseFile>>(
+      `/api/v1/workflows/${workflowId}/codebase/files/${fileId}/decide`,
+      { decision }
+    )
+    .then((res) => res.data.data!)
+
+export const decideCodebaseFilesBulk = (
+  workflowId: string,
+  fileIds: string[],
+  decision: 'approve' | 'reject'
+) =>
+  baseAPI
+    .post<ApiResponse<{ changed: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/files/decide-bulk`,
+      { fileIds, decision }
+    )
+    .then((res) => res.data.data!)
+
+/** The approved paths only — the set an expert is allowed to read. */
+export const getCodebaseManifest = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<{ paths: string[]; count: number }>>(
+      `/api/v1/workflows/${workflowId}/codebase/manifest`
+    )
+    .then((res) => res.data.data!)
+
+/**
+ * Phase 3F — delivery as a patch against the pinned base revision.
+ *
+ * The client's repository is never written to. The patch is generated against
+ * the exact commit the work was based on, so it can be reviewed and applied (or
+ * rejected) by the client themselves.
+ */
+export interface CodebaseChangedFile {
+  /** git name-status code: A, M, D, or R with a similarity score. */
+  status: string
+  path: string
+}
+
+export interface CodebaseDelivery {
+  workflowId: string
+  baseCommitSha: string
+  baselineRef: string
+  changedFiles: CodebaseChangedFile[]
+  patchBytes: number
+  generatedAt: string | null
+}
+
+export const getCodebasePatch = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<CodebaseDelivery>>(`/api/v1/workflows/${workflowId}/codebase/patch`)
+    .then((res) => res.data.data!)
+
+export const generateCodebasePatch = (workflowId: string) =>
+  baseAPI
+    .post<ApiResponse<CodebaseDelivery>>(`/api/v1/workflows/${workflowId}/codebase/patch`)
+    .then((res) => res.data.data!)
+
+/**
+ * Downloads the patch as a file.
+ *
+ * WHY fetch rather than baseAPI: this is a binary-ish attachment, and routing it
+ * through the shared axios instance would push it through the camelCase response
+ * transform. Auth still goes through the same access token.
+ */
+export async function downloadCodebasePatch(workflowId: string): Promise<Blob> {
+  const token = useAuthStore.getState().accessToken
+  const base = import.meta.env.VITE_API_URL ?? ''
+  const res = await fetch(`${base}/api/v1/workflows/${workflowId}/codebase/patch/download`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!res.ok) {
+    throw new Error('patch download failed')
+  }
+  return res.blob()
+}

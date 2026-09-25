@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -86,9 +87,49 @@ type WorkflowRunner struct {
 	gateway         *gateway.ModelGateway
 	// crSvc is optional: nil disables the change-request watcher.
 	// Set via WithChangeRequestService after construction.
-	crSvc           *ChangeRequestService
-	logger          *zap.Logger
+	crSvc *ChangeRequestService
+	// codebase is optional (3E): when set, the approved working set is seeded
+	// into the workspace and unapproved paths are protected from merge. nil
+	// leaves the scratch behaviour exactly as it was.
+	codebase CodebaseWorkspace
+	logger   *zap.Logger
 }
+
+// CodebaseWorkspace is what the runner needs from the approval layer (3E).
+// Declared here, by the consumer, so the runner does not depend on the approval
+// service's internals — only on these two behaviours.
+type CodebaseWorkspace interface {
+	// SeedWorkspace writes the approved files into a workspace. It is a no-op
+	// for scratch workflows, so the runner can call it unconditionally.
+	SeedWorkspace(ctx context.Context, workflowID uuid.UUID, workspaceRoot string) (int, error)
+	// ProtectedPathChecker reports whether a path must not be written. A nil
+	// predicate means nothing is protected.
+	ProtectedPathChecker(ctx context.Context, workflowID uuid.UUID, workspaceRoot string) (func(context.Context, string) bool, error)
+}
+
+// SetCodebaseWorkspace wires the approval layer (3E). Mirrors the other
+// optional setters: nil is a valid "no codebase environment" value.
+func (r *WorkflowRunner) SetCodebaseWorkspace(cw CodebaseWorkspace) {
+	r.codebase = cw
+}
+
+// defaultMaxWaveTasks bounds how many expert tasks in one wave run at once.
+//
+// WHY: the wave loop used to launch one goroutine per task with no ceiling, so
+// a wide wave meant that many concurrent Aider/LLM runs on one host. That is a
+// resource and provider-rate-limit risk, not a correctness one — the limit
+// changes how many run simultaneously, never what they produce.
+const defaultMaxWaveTasks = 4
+
+// maxWaveTasks is overridable by env for ops tuning.
+var maxWaveTasks = func() int {
+	if raw := os.Getenv("MAX_WAVE_CONCURRENCY"); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxWaveTasks
+}()
 
 func NewWorkflowRunner(
 	db *pgxpool.Pool,
@@ -580,6 +621,38 @@ func (r *WorkflowRunner) executeWaves(
 	// Structure: /workspaces/{workflow_id}/{expert_id}/
 	workflowWorkspace := fmt.Sprintf("%s/%s", r.aiderRunner.workspaceDir, workflowID.String())
 
+	// 3E: for an existing-codebase workflow, materialise ONLY the approved files
+	// into the workspace, and protect every other repository path from being
+	// written by the merge. Seeding only what was approved is the read-only
+	// enforcement itself: an unapproved file is not denied at read time, it is
+	// simply absent. A scratch workflow is a documented no-op here, so this
+	// needs no mode check of its own.
+	if r.codebase != nil {
+		// Seed into main/, not the workflow root: main/ is the directory every
+		// expert workspace is seeded from and every merge lands in, so this is
+		// the only place the approved files are actually visible to an expert.
+		mainWorkspace := filepath.Join(workflowWorkspace, "main")
+		written, err := r.codebase.SeedWorkspace(ctx, workflowID, mainWorkspace)
+		if err != nil {
+			// Fail the phase rather than continue: running experts against an
+			// empty or partial codebase would produce confident answers about
+			// code they never saw.
+			return fmt.Errorf("seed codebase workspace: %w", err)
+		}
+		if written > 0 {
+			r.logger.Info("runner: codebase workspace seeded",
+				zap.Int("files", written),
+				zap.String("workspace", mainWorkspace),
+			)
+		}
+		checker, err := r.codebase.ProtectedPathChecker(ctx, workflowID, mainWorkspace)
+		if err != nil {
+			r.logger.Warn("runner: protected-path checker unavailable (non-fatal)", zap.Error(err))
+		} else if checker != nil {
+			r.workspaceMerger.SetProtectedPathChecker(checker)
+		}
+	}
+
 	// Experts already marked complete in runner_state (seeded on resume).
 	// Built once before waves; concurrent appends during this phase do not
 	// affect skip decisions for tasks in later waves of the same call —
@@ -643,11 +716,19 @@ func (r *WorkflowRunner) executeWaves(
 		var waveMu sync.Mutex
 		var waveExpertIDs []string
 
+		// Bound how many tasks of this wave run at once (3E / A10). Acquiring in
+		// the goroutine (not before `go`) keeps launch order identical; it only
+		// limits how many are in flight.
+		sem := make(chan struct{}, maxWaveTasks)
+
 		var wg sync.WaitGroup
 		for _, task := range wave {
 			wg.Add(1)
 			go func(t TaskSpec) {
 				defer wg.Done()
+
+				sem <- struct{}{}
+				defer func() { <-sem }()
 
 				expert, ok := expertMap[t.ExpertID.String()]
 				if !ok {

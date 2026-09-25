@@ -99,6 +99,9 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 		// title (runner.loadRequirement), but a real requirement now reaches
 		// the planner instead of being discarded (A7).
 		RequirementText string `json:"requirement_text"`
+		// Mode selects the environment (3D). Empty means scratch, so existing
+		// clients are unaffected.
+		Mode string `json:"mode"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -119,6 +122,7 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 		Title:             req.Title,
 		SelectedExpertIDs: req.SelectedExpertIDs,
 		CostBudgetUSD:     req.CostBudgetUSD,
+		Mode:              req.Mode,
 	})
 	if err != nil {
 		h.logger.Error("create workflow failed", zap.Error(err))

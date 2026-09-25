@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -33,11 +34,23 @@ import (
 //     {expert_id_2}/           <- Expert 2 isolated workspace
 type WorkspaceMerger struct {
 	logger *zap.Logger
+	// protectedPath, when set, reports whether a repository path must NOT be
+	// written by the workflow. Existing-codebase workflows use it so an expert
+	// cannot overwrite a client file that was never approved for reading (3E).
+	// nil means "nothing is protected", which is the scratch behaviour.
+	protectedPath func(context.Context, string) bool
 }
 
 // NewWorkspaceMerger creates a new WorkspaceMerger.
 func NewWorkspaceMerger(logger *zap.Logger) *WorkspaceMerger {
 	return &WorkspaceMerger{logger: logger}
+}
+
+// SetProtectedPathChecker installs the protected-path predicate (3E). Mirrors
+// Engine.SetEventPoster: nil is a valid "no protection needed" value, so the
+// scratch path is unchanged.
+func (m *WorkspaceMerger) SetProtectedPathChecker(fn func(context.Context, string) bool) {
+	m.protectedPath = fn
 }
 
 // MergeWave merges all expert workspaces from a completed wave into main/.
@@ -150,6 +163,11 @@ func (m *WorkspaceMerger) getChangedFiles(ctx context.Context, workspacePath str
 // artifact: copying it would add hundreds of MB to main/ and, worse, to every
 // other expert's seed on the next wave (A11b).
 func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath string) error {
+	// Drop disallowed edits BEFORE the copy: rsync has no per-file filter, so
+	// the only way to keep an unapproved overwrite out of main/ is to remove it
+	// from the source first.
+	m.removeProtectedChanges(ctx, expertPath)
+
 	cmd := exec.CommandContext(ctx, "rsync", "-a",
 		"--exclude", ".git", "--exclude", "node_modules",
 		expertPath+"/", mainPath+"/")
@@ -157,6 +175,72 @@ func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath 
 		return fmt.Errorf("rsync: %w (output: %s)", err, string(output))
 	}
 	return nil
+}
+
+// removeProtectedChanges deletes files an expert touched that it had no right to
+// touch, before the merge can carry them into main/.
+//
+// WHY delete instead of failing the whole wave: one out-of-scope edit should not
+// throw away the rest of an expert's work, and the edit is invalid on its own
+// terms — the expert could not read that file, so it has no basis for rewriting
+// it. Every removal is logged, never silent.
+func (m *WorkspaceMerger) removeProtectedChanges(ctx context.Context, expertPath string) {
+	if m.protectedPath == nil {
+		return
+	}
+
+	for _, rel := range m.dirtyFiles(ctx, expertPath) {
+		if !m.protectedPath(ctx, rel) {
+			continue
+		}
+		target := filepath.Join(expertPath, filepath.FromSlash(rel))
+		if err := os.Remove(target); err != nil {
+			m.logger.Warn("workspace_merger: could not drop a change to an unapproved file",
+				zap.String("path", rel), zap.Error(err))
+			continue
+		}
+		m.logger.Warn("workspace_merger: dropped a change to a file the client did not approve",
+			zap.String("path", rel),
+			zap.String("expert_path", expertPath),
+		)
+	}
+}
+
+// dirtyFiles lists files an expert workspace has changed, committed or not.
+//
+// WHY `git status --porcelain` rather than `git diff HEAD~1 HEAD`: an expert may
+// never commit its work, and an uncommitted edit is exactly the case the
+// protected-path guard must catch. A committed-only check would let it through.
+func (m *WorkspaceMerger) dirtyFiles(ctx context.Context, workspacePath string) []string {
+	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain")
+	cmd.Dir = workspacePath
+	output, err := cmd.Output()
+	if err != nil {
+		m.logger.Warn("workspace_merger: could not inspect workspace status",
+			zap.String("workspace", workspacePath), zap.Error(err))
+		return nil
+	}
+
+	seen := map[string]bool{}
+	var files []string
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimRight(line, "\r")
+		if len(line) < 4 {
+			continue
+		}
+		// Porcelain format is "XY <path>"; a rename is "old -> new".
+		path := strings.TrimSpace(line[3:])
+		if idx := strings.Index(path, " -> "); idx >= 0 {
+			path = path[idx+4:]
+		}
+		path = strings.Trim(path, `"`)
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		files = append(files, path)
+	}
+	return files
 }
 
 // copyToMain handles the single-expert case: rsync to main, then commit.

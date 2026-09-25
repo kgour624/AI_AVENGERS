@@ -564,6 +564,17 @@ func buildRouter(
 	wfProjector := workflow.NewProjector(postgres.Pool, bbStore, bbSubscriber, logger)
 	wfHandler := workflow.NewHandler(wfEngine, bbStore, redisClient.Client, wfProjector, logger)
 
+	// Phase 3D: the human-approved working set for existing-codebase workflows.
+	// repoSvc is the repository index; codebaseSvc owns the approval rules.
+	wfCodebaseSvc := workflow.NewCodebaseService(postgres.Pool, bbStore, repoSvc, logger)
+	// 3F needs the workspace root to diff the workflow's work against its
+	// baseline; without it, patch generation reports itself unavailable.
+	wfCodebaseSvc.SetWorkspaceRoot(workspaceRoot)
+	wfCodebaseHandler := workflow.NewCodebaseHandler(wfCodebaseSvc, postgres.Pool, logger)
+	// 3E: the runner seeds only the approved working set into the workspace and
+	// keeps unapproved repository paths out of the merge.
+	wfRunner.SetCodebaseWorkspace(wfCodebaseSvc)
+
 	// Workflow chat (docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md §6).
 	//
 	// Entirely separate from the product chat (chatHandler / messageHandler
@@ -826,6 +837,21 @@ func buildRouter(
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
 			workflows.POST("/:id/cancel", wfHandler.CancelWorkflow)
 			workflows.POST("/:id/tasks/:taskId/retry", wfHandler.RetryTask)
+
+			// Phase 3D: the human-approved working set. Every route is behind
+			// the client-ownership check in CodebaseHandler, not the tenant
+			// guard: an approval is this client's private decision.
+			workflows.GET("/:id/codebase/files", wfCodebaseHandler.ListFiles)
+			workflows.POST("/:id/codebase/suggest", wfCodebaseHandler.Suggest)
+			workflows.POST("/:id/codebase/files", wfCodebaseHandler.AddFile)
+			workflows.POST("/:id/codebase/files/decide-bulk", wfCodebaseHandler.DecideBulk)
+			workflows.POST("/:id/codebase/files/:fileId/decide", wfCodebaseHandler.Decide)
+			workflows.GET("/:id/codebase/manifest", wfCodebaseHandler.Manifest)
+			// Phase 3F: deliver the workflow's changes as a patch against the
+			// pinned base. Nothing here pushes to the client's repository.
+			workflows.POST("/:id/codebase/patch", wfCodebaseHandler.GeneratePatch)
+			workflows.GET("/:id/codebase/patch", wfCodebaseHandler.GetPatch)
+			workflows.GET("/:id/codebase/patch/download", wfCodebaseHandler.DownloadPatch)
 		}
 
 		// Workflow chat (§6). Registered on `protected`, so these inherit

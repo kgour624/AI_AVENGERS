@@ -15,7 +15,9 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -1013,6 +1015,137 @@ func (s *Service) persistRepoTree(
 		return fmt.Errorf("commit repo tree: %w", err)
 	}
 	return nil
+}
+
+// RepoFileExists reports whether a path is part of the stored tree for a
+// project's connected repository.
+//
+// WHY this exists as its own query rather than a tree read: callers use it to
+// reject a working-set entry that points at nothing. Sending an expert to a
+// path the repository does not contain would waste a full read cycle and make
+// the approval record claim something untrue.
+func (s *Service) RepoFileExists(ctx context.Context, projectID uuid.UUID, path string) (bool, error) {
+	connectionID, _, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return false, err
+	}
+	var exists bool
+	if err := s.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM repo_files WHERE repo_connection_id=$1 AND path=$2)`,
+		connectionID, path,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check repo file: %w", err)
+	}
+	return exists, nil
+}
+
+// BaseCommitSHA returns the commit the stored tree was pinned to, or "" when no
+// connection or no pin exists yet.
+//
+// WHY callers need it: a patch is only meaningful relative to a revision, and
+// this is the revision the client's approval was based on.
+func (s *Service) BaseCommitSHA(ctx context.Context, projectID uuid.UUID) (string, error) {
+	_, commitSHA, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return "", err
+	}
+	return commitSHA, nil
+}
+
+// CopyFilesToWorkspace writes the stored content of the given repository paths
+// into destRoot, preserving their repository layout. It returns how many files
+// it wrote.
+//
+// WHY content comes from the blob store rather than the provider: the workspace
+// must reflect the SAME pinned revision the client approved. Re-fetching from
+// the branch could silently introduce code that was never reviewed, which is
+// the exact failure the approval loop exists to prevent.
+//
+// WHY enforcement lives here at all: an expert can only read what is on disk.
+// Seeding just the approved paths is therefore the strongest form of read-only
+// enforcement — an unapproved file is not "denied", it simply is not there.
+//
+// A path that is in the tree but has no stored content (binary, oversized) is
+// reported rather than skipped silently, because a missing file would make the
+// workspace disagree with the approved set.
+func (s *Service) CopyFilesToWorkspace(ctx context.Context, projectID uuid.UUID, paths []string, destRoot string) (int, error) {
+	if len(paths) == 0 {
+		return 0, nil
+	}
+
+	connectionID, _, err := s.repoConnection(ctx, projectID)
+	if err != nil {
+		return 0, err
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT rf.path, COALESCE(b.content, ''), (rf.blob_sha IS NOT NULL)
+		   FROM repo_files rf
+		   LEFT JOIN repo_blobs b ON b.sha = rf.blob_sha
+		  WHERE rf.repo_connection_id=$1 AND rf.path = ANY($2)`,
+		connectionID, paths,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("load repo files for workspace: %w", err)
+	}
+	defer rows.Close()
+
+	cleanRoot := filepath.Clean(destRoot)
+	prefix := cleanRoot + string(os.PathSeparator)
+
+	found := make(map[string]bool, len(paths))
+	written := 0
+	var missingContent []string
+
+	for rows.Next() {
+		var repoPath, content string
+		var hasContent bool
+		if err := rows.Scan(&repoPath, &content, &hasContent); err != nil {
+			return written, fmt.Errorf("scan repo file for workspace: %w", err)
+		}
+		found[repoPath] = true
+		if !hasContent {
+			missingContent = append(missingContent, repoPath)
+			continue
+		}
+
+		target := filepath.Join(cleanRoot, filepath.FromSlash(repoPath))
+		// A repository path is attacker-influenced data (it comes from the
+		// provider). filepath.Join cleans "..", so verify the result really
+		// stayed inside the workspace before writing anything.
+		if !strings.HasPrefix(target, prefix) {
+			return written, fmt.Errorf("refusing to write outside the workspace: %q", repoPath)
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return written, fmt.Errorf("create workspace dir for %s: %w", repoPath, err)
+		}
+		if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+			return written, fmt.Errorf("write workspace file %s: %w", repoPath, err)
+		}
+		written++
+	}
+	if err := rows.Err(); err != nil {
+		return written, fmt.Errorf("iterate repo files for workspace: %w", err)
+	}
+
+	// Paths the caller asked for that are not in the stored tree at all. This
+	// means the approved set and the index disagree, which an operator needs to
+	// know about rather than infer from a quiet shortfall in the file count.
+	var unknown []string
+	for _, p := range paths {
+		if !found[p] {
+			unknown = append(unknown, p)
+		}
+	}
+	if len(unknown) > 0 || len(missingContent) > 0 {
+		s.logger.Warn("repo workspace seed incomplete",
+			zap.Int("written", written),
+			zap.Int("requested", len(paths)),
+			zap.Strings("not_in_tree", unknown),
+			zap.Strings("content_unavailable", missingContent),
+		)
+	}
+	return written, nil
 }
 
 // ListRepoTree returns the stored file tree for a project's connected repo,

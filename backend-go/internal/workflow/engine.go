@@ -74,10 +74,22 @@ type Workflow struct {
 	// GenericAllowancePct: client-set ceiling (0-30) on how much of an
 	// expert's answer may be generic knowledge. 0 (default) means trained
 	// knowledge + peer experts only. See migration 017.
-	GenericAllowancePct float64        `json:"generic_allowance_pct"`
-	CreatedAt          time.Time       `json:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at"`
+	GenericAllowancePct float64 `json:"generic_allowance_pct"`
+	// Mode selects the environment: scratch (build something new) or
+	// existing_codebase (work inside a connected client repository, where the
+	// readable file set is a human-approved working set). See migration 041.
+	Mode      string    `json:"mode"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 }
+
+// Workflow environments. Stored in workflows.mode; the CHECK constraint in
+// migration 041 is the authority, these exist so Go code never spells the
+// strings by hand.
+const (
+	ModeScratch          = "scratch"
+	ModeExistingCodebase = "existing_codebase"
+)
 
 // MaxGenericAllowancePct is the product ceiling on generic knowledge.
 // Trained knowledge must always remain the majority contributor; the same
@@ -91,6 +103,9 @@ type CreateRequest struct {
 	Title             string
 	SelectedExpertIDs []uuid.UUID
 	CostBudgetUSD     float64 // 0 = use default (10.0)
+	// Mode is the environment. Empty means ModeScratch, so every existing
+	// caller keeps the behaviour it had before modes existed.
+	Mode string
 }
 
 // CostLimitResult is returned by UpdateCostSpent.
@@ -177,6 +192,17 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*Workflow, erro
 		budget = 10.0 // default per migration 006
 	}
 
+	// Defaulting here (rather than at each call site) keeps "no mode given"
+	// meaning the original scratch behaviour, which is what every existing
+	// caller and every existing row expects.
+	mode := req.Mode
+	if mode == "" {
+		mode = ModeScratch
+	}
+	if mode != ModeScratch && mode != ModeExistingCodebase {
+		return nil, fmt.Errorf("workflow create: unknown mode %q", mode)
+	}
+
 	expertIDsJSON, err := json.Marshal(req.SelectedExpertIDs)
 	if err != nil {
 		return nil, fmt.Errorf("workflow create: marshal expert ids: %w", err)
@@ -187,23 +213,23 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*Workflow, erro
 	err = e.db.QueryRow(ctx,
 		`INSERT INTO workflows
 			(client_id, project_id, title, status, current_phase,
-			 selected_expert_ids, cost_budget_usd)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 selected_expert_ids, cost_budget_usd, mode)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		 RETURNING id, client_id, project_id, title, status, current_phase,
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
-		           generic_allowance_pct,
+		           generic_allowance_pct, mode,
 		           created_at, updated_at`,
 		req.ClientID, req.ProjectID, req.Title,
 		StatusDraft, PhaseIntake,
-		string(expertIDsJSON), budget,
+		string(expertIDsJSON), budget, mode,
 	).Scan(
 		&w.ID, &w.ClientID, &w.ProjectID, &w.Title, &w.Status, &w.CurrentPhase,
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct,
+		&w.GenericAllowancePct, &w.Mode,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
