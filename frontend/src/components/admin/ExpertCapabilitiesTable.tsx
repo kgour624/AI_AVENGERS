@@ -127,6 +127,7 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   const [measureError, setMeasureError] = useState<string | null>(null)
   const [conceptNote, setConceptNote] = useState<string | null>(null)
   const [depthNote, setDepthNote] = useState<string | null>(null)
+  const [depthAwaitingJob, setDepthAwaitingJob] = useState(false)
   // True from the moment a pass is started until a finished report arrives.
   //
   // WHY this exists: the first fetch after starting returns status 'running', which is
@@ -202,24 +203,41 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
 
   // Depth layers (I5): what KIND of content the corpus holds. Read on expand; the
   // classification is a separate, bounded action because it costs model calls.
-  const { data: depthLayers, refetch: refetchLayers } = useQuery({
+  const { data: depthState, error: depthError } = useQuery({
     queryKey: ['experts', expert.id, 'depth-layers'],
     queryFn: () => getExpertDepthLayers(expert.id),
     enabled: isExpanded,
     staleTime: 60_000,
+    // The status lives in the database, not in the original POST request. Poll while
+    // waiting for the first job row and while that row says queued/running; stop on a
+    // terminal state so an expanded card does not poll forever.
+    refetchInterval: (query) => {
+      const status = query.state.data?.job?.status
+      return depthAwaitingJob || status === 'queued' || status === 'running' ? 3000 : false
+    },
+    refetchOnWindowFocus: true,
   })
+
+  const depthLayers = depthState?.report
+  const depthJob = depthState?.job
+  const depthJobActive = depthAwaitingJob || depthJob?.status === 'queued' || depthJob?.status === 'running'
+
+  useEffect(() => {
+    if (depthJob && depthJob.status !== 'queued' && depthJob.status !== 'running') {
+      setDepthAwaitingJob(false)
+    }
+  }, [depthJob])
 
   const classifyMutation = useMutation({
     mutationFn: () => classifyExpertDepthLayers(expert.id),
-    onSuccess: (result) => {
-      setDepthNote(
-        `Classified ${result.classified} chunk${result.classified === 1 ? '' : 's'}` +
-          (result.remaining > 0 ? `, ${result.remaining} left — run again` : ', done') +
-          (result.rejected > 0 ? ` (${result.rejected} answers ignored as invalid)` : ''),
-      )
-      refetchLayers()
+    onSuccess: (job) => {
+      setDepthNote(null)
+      setDepthAwaitingJob(job.status === 'queued' || job.status === 'running')
+      queryClient.invalidateQueries({ queryKey: ['experts', expert.id, 'depth-layers'] })
     },
-    onError: () => setDepthNote('Could not classify the corpus.'),
+    onError: (error) => {
+      setDepthNote(error instanceof Error ? error.message : 'Could not start classification.')
+    },
   })
 
   const extractMutation = useMutation({
@@ -465,12 +483,54 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                     <Button
                       size="sm"
                       variant="secondary"
-                      isLoading={classifyMutation.isPending}
+                      isLoading={classifyMutation.isPending || depthJobActive}
+                      disabled={depthJobActive}
                       onClick={() => classifyMutation.mutate()}
                     >
-                      {depthLayers && depthLayers.classified > 0 ? 'Classify more' : 'Classify content'}
+                      {depthJobActive
+                        ? 'Classification running…'
+                        : depthLayers && depthLayers.classified > 0
+                          ? 'Classify more'
+                          : 'Classify content'}
                     </Button>
                   </div>
+
+                  {depthJob && (depthJob.status === 'queued' || depthJob.status === 'running') && (
+                    <div className="mt-2 rounded border border-glow-amber/30 bg-glow-amber/5 p-2">
+                      <p className="text-[11px] font-medium text-glow-amber">
+                        Classification is running in the background. You can leave this page and
+                        come back; progress is saved.
+                      </p>
+                      <p className="mt-1 text-[10px] text-text-secondary">
+                        {depthJob.classified}/{depthJob.total} chunks classified
+                        {depthJob.remaining > 0 ? ` · ${depthJob.remaining} still to do` : ''}
+                        {depthJob.calls > 0 ? ` · ${depthJob.calls} AI batches` : ''}
+                      </p>
+                      {depthJob.total > 0 && (
+                        <div className="mt-1 h-1.5 w-full overflow-hidden rounded bg-bg-secondary">
+                          <div
+                            className="h-full rounded bg-glow-amber transition-all"
+                            style={{ width: `${Math.min(100, Math.round((depthJob.classified / depthJob.total) * 100))}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {depthJob?.status === 'failed' && (
+                    <p className="mt-2 rounded border border-mode-refuse/30 bg-mode-refuse/5 p-2 text-[11px] text-mode-refuse">
+                      Classification stopped: {depthJob.errorMessage || 'unknown error'}. Your
+                      completed batches are saved. Press Classify more to continue with the
+                      remaining chunks.
+                    </p>
+                  )}
+
+                  {depthJob?.status === 'complete' && depthJob.remaining > 0 && (
+                    <p className="mt-2 text-[11px] text-text-secondary">
+                      This batch finished: {depthJob.classified} classified, {depthJob.remaining}{' '}
+                      left. Press Classify more to continue.
+                    </p>
+                  )}
 
                   {depthLayers && depthLayers.classified > 0 && (
                     <>
@@ -519,13 +579,19 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                     </>
                   )}
 
-                  {depthLayers && depthLayers.classified === 0 && !classifyMutation.isPending && (
+                  {depthLayers && depthLayers.classified === 0 && !classifyMutation.isPending && !depthJobActive && !depthError && (
                     <p className="mt-2 text-[10px] text-text-disabled">
                       Nothing classified yet — run it once and the gaps become visible.
                     </p>
                   )}
 
-                  {depthNote && <p className="mt-2 text-[10px] text-glow-amber">{depthNote}</p>}
+                  {depthError && (
+                    <p className="mt-2 text-[10px] text-mode-refuse">
+                      Could not read classification status: {depthError.message}. Refresh the page
+                      to try again.
+                    </p>
+                  )}
+                  {depthNote && <p className="mt-2 text-[10px] text-text-secondary">{depthNote}</p>}
                 </div>
 
                 {/* Concept links (I4). Without these, "Measure with links" has nothing to

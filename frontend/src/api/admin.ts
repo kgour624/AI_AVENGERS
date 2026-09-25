@@ -911,6 +911,26 @@ export interface DepthLayerReport {
   findings: string[]
 }
 
+export interface DepthClassificationJob {
+  id: string
+  expertId: string
+  status: 'queued' | 'running' | 'complete' | 'failed'
+  total: number
+  classified: number
+  remaining: number
+  calls: number
+  rejected: number
+  errorMessage: string
+  createdAt: string
+  updatedAt: string
+  completedAt?: string | null
+}
+
+export interface DepthLayersState {
+  report: DepthLayerReport
+  job?: DepthClassificationJob | null
+}
+
 export interface DepthClassifyResult {
   classified: number
   /** How many chunks still have no layer — run again to continue. */
@@ -922,7 +942,7 @@ export interface DepthClassifyResult {
 
 export const getExpertDepthLayers = (expertId: string) =>
   baseAPI
-    .get<ApiResponse<DepthLayerReport>>(`/api/v1/admin/experts/${expertId}/depth-layers`)
+    .get<ApiResponse<DepthLayersState>>(`/api/v1/admin/experts/${expertId}/depth-layers`)
     .then((res) => res.data.data!)
 
 /**
@@ -932,7 +952,7 @@ export const getExpertDepthLayers = (expertId: string) =>
  */
 export const classifyExpertDepthLayers = (expertId: string) =>
   baseAPI
-    .post<ApiResponse<{ expertId: string; result: DepthClassifyResult }>>(
+    .post<ApiResponse<{ expertId: string; job: DepthClassificationJob }>>(
       `/api/v1/admin/experts/${expertId}/depth-layers`,
     )
-    .then((res) => res.data.data!.result)
+    .then((res) => res.data.data!.job)
