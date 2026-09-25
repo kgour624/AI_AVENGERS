@@ -138,6 +138,18 @@ func NewAdminHandler(
 // positional argument that every caller has to keep in order.
 func (h *AdminHandler) SetCapabilityEvaluator(e *training.CapabilityEvaluator) {
 	h.capEval = e
+
+	// I3: the ingest gate reads a MEASURED capability, so the pipeline needs a way to
+	// trigger a pass. It is handed in as a single function rather than as the
+	// evaluator itself, so the pipeline never learns about the context assembler the
+	// measurement depends on. Not wiring it is a supported state: the gate then
+	// reports the capability as unmeasured and the expert stays in draft.
+	if h.ingestion != nil {
+		h.ingestion.SetCapabilityMeasurer(func(ctx context.Context, expertID uuid.UUID, topics int) error {
+			_, err := e.RunEval(ctx, expertID, training.CapabilityEvalRequest{Topics: topics})
+			return err
+		})
+	}
 }
 
 // ============================================================

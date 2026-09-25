@@ -111,13 +111,17 @@ type CapabilityEvaluator struct {
 	db        *pgxpool.Pool
 	gateway   *gateway.ModelGateway
 	retriever CapabilityRetriever
+	answerer  *groundedAnswerer
 	logger    *zap.Logger
 }
 
 // NewCapabilityEvaluator builds an evaluator. retriever may be nil, in which case
 // RunEval fails loudly rather than reporting a retrieval score it never measured.
 func NewCapabilityEvaluator(db *pgxpool.Pool, gw *gateway.ModelGateway, retriever CapabilityRetriever, logger *zap.Logger) *CapabilityEvaluator {
-	return &CapabilityEvaluator{db: db, gateway: gw, retriever: retriever, logger: logger}
+	return &CapabilityEvaluator{
+		db: db, gateway: gw, retriever: retriever,
+		answerer: newGroundedAnswerer(gw, logger), logger: logger,
+	}
 }
 
 // CapabilityEvalRequest is one evaluation pass's budget.
@@ -594,19 +598,19 @@ func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UU
 		}
 	}
 
-	// Build the context with [n] markers, in the order retrieval returned it, so
-	// the citation check and the judge see the same numbering the answer does.
-	var sb strings.Builder
-	for i, chunk := range chunks {
-		sb.WriteString(fmt.Sprintf("[%d] %s\n\n", i+1, clipPromptText(chunk.Text, promptPassageChars)))
+	// Build the context with [n] markers, in the order retrieval returned it, so the
+	// citation check and the judge see the same numbering the answer does.
+	texts := make([]string, 0, len(chunks))
+	for _, chunk := range chunks {
+		texts = append(texts, chunk.Text)
 	}
-	contextBlock := sb.String()
+	contextBlock := buildNumberedContext(texts, promptPassageChars)
 	if strings.TrimSpace(contextBlock) == "" {
 		result.FailureReason = FailureRetrievalMissed
 		return result
 	}
 
-	answer, err := e.answerQuestion(ctx, c.Question, contextBlock)
+	answer, err := e.answerer.Answer(ctx, c.Question, contextBlock)
 	if err != nil {
 		result.FailureReason = FailureEmpty
 		e.logger.Warn("capability eval: answering failed",
@@ -617,22 +621,14 @@ func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UU
 	result.Cited = countCitationMarkers(answer) > 0
 	result.Refused = strings.Contains(answer, insufficientContextMarker)
 
-	if result.Refused {
-		// A refusal is a capability failure for these cases: every question was
-		// written from a passage the expert's own corpus contains.
-		result.FailureReason = FailureRefused
-		return result
-	}
-	if strings.TrimSpace(answer) == "" {
-		result.FailureReason = FailureEmpty
-		return result
-	}
-	if !result.Cited {
-		result.FailureReason = FailureNotCited
+	// One definition of "well-formed enough to judge", shared with the ingest smoke
+	// test so a weaker copy cannot let a weaker expert through a training gate.
+	if reason := refusalOrCitationFailure(answer); reason != "" {
+		result.FailureReason = reason
 		return result
 	}
 
-	result.Grounded = e.judgeAnswer(ctx, c.Question, contextBlock, answer)
+	result.Grounded = e.answerer.Judge(ctx, c.Question, contextBlock, answer)
 	if result.Grounded != "supported" {
 		result.FailureReason = FailureUngrounded
 		return result
@@ -648,80 +644,6 @@ func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UU
 
 	result.Passed = true
 	return result
-}
-
-// answerQuestion asks with the corpus as the only permitted source.
-func (e *CapabilityEvaluator) answerQuestion(ctx context.Context, question, contextBlock string) (string, error) {
-	prompt := fmt.Sprintf(`Answer the question using ONLY the context below.
-
-Question: %s
-
-Context:
-%s
-
-Rules:
-- Cite the context you used with [n] markers matching the numbers above.
-- If the context does not contain the answer, reply with exactly %s and nothing else.`,
-		question, contextBlock, insufficientContextMarker)
-
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
-		Model:       gateway.ModelStrong,
-		UserPrompt:  prompt,
-		MaxTokens:   2048,
-		Temperature: 0.2,
-	})
-	if err != nil {
-		return "", err
-	}
-	return resp.Content, nil
-}
-
-// judgeAnswer asks a second call whether the answer is actually supported.
-//
-// WHY a separate call and not the answering call grading itself: the pipeline is
-// not trusted to grade its own homework — the same reason storage verification
-// re-reads the database instead of trusting the store's own count.
-func (e *CapabilityEvaluator) judgeAnswer(ctx context.Context, question, contextBlock, answer string) string {
-	prompt := fmt.Sprintf(`Question: %s
-
-Context:
-%s
-
-Answer:
-%s
-
-Is the answer fully supported by the context above? Judge only whether the context
-supports it, not whether the style is good.
-
-Return ONLY JSON: {"verdict":"supported"|"refuted"|"unverifiable","reason":"..."}`,
-		question, contextBlock, answer)
-
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
-		// A different tier from the answering call: an LLM judge is subject to
-		// egocentric bias when it grades its own model's output.
-		Model:       gateway.ModelCheap,
-		UserPrompt:  prompt,
-		MaxTokens:   1024,
-		Temperature: 0,
-	})
-	if err != nil {
-		// An unjudged case cannot be called supported; treat it as unverifiable
-		// rather than as a pass.
-		e.logger.Warn("capability eval: judge call failed (case recorded as unverifiable)",
-			zap.Error(err))
-		return "unverifiable"
-	}
-
-	verdict := parseJudgeVerdict(resp.Content)
-	if verdict == "unverifiable" {
-		// WHY this is logged: an unparseable judge is indistinguishable from a
-		// genuinely unsupported answer in the results table, and a silent judge
-		// failure would look like a capability problem. The raw response is
-		// clipped so one bad reply cannot flood the log.
-		e.logger.Warn("capability eval: judge verdict unparseable (case recorded as unverifiable)",
-			zap.String("raw_response", clipPromptText(resp.Content, 200)))
-	}
-	return verdict
 }
 
 // parseJudgeVerdict reads the judge's JSON, defaulting to unverifiable.

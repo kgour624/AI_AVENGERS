@@ -163,6 +163,42 @@ export function describeJobEvent(ev: IngestionJobEvent): { type: string; message
         message: `\u2705 Complete \u2014 ${num(d, 'chunks_this_run')} chunks this run, corpus ${num(d, 'corpus_total')}, ${(ms / 1000).toFixed(1)}s, smoke test ${d.smoke_test_passed === true ? 'passed' : 'failed'}`,
       }
     }
+    // I3: the ingest-time capability measurement and the training gate. Both are
+    // rendered because they are the two events that explain WHY an expert did or did
+    // not become usable — without them the timeline ends on "complete" and the draft
+    // status looks arbitrary.
+    case 'capability_measured': {
+      const status = str(d, 'status')
+      if (status === 'failed') {
+        return {
+          type: 'mismatch',
+          message: `\u26a0\ufe0f Capability measurement failed \u2014 ${str(d, 'error') || 'unknown error'}`,
+        }
+      }
+      return {
+        type: 'update',
+        message: `Measuring what the expert can answer (${num(d, 'topics')} topics)...`,
+      }
+    }
+    case 'gate_evaluated': {
+      // conditions is a JSON array of {name, met, detail}; the failures are the only
+      // part worth a sentence, and each already carries its own numbers.
+      const conditions = Array.isArray(d.conditions) ? d.conditions : []
+      const failed = conditions.filter((c) => (c as { met?: boolean }).met !== true)
+      if (failed.length === 0) {
+        return { type: 'verified', message: '\u2705 Training gate passed \u2014 expert is trained' }
+      }
+      const reasons = failed
+        .map((c) => {
+          const cond = c as { name?: string; detail?: string }
+          return `${cond.name ?? 'condition'}: ${cond.detail ?? 'failed'}`
+        })
+        .join('; ')
+      return {
+        type: 'mismatch',
+        message: `\u26a0\ufe0f Training gate failed (${failed.length}) \u2014 expert stays draft \u2014 ${reasons}`,
+      }
+    }
     default:
       return { type: 'update', message: `${ev.stage} \u2014 ${ev.kind}` }
   }

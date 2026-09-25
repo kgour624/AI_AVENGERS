@@ -58,6 +58,14 @@ const (
 	KindFailed = "failed"
 	// KindComplete: job finished successfully.
 	KindComplete = "complete"
+	// KindCapabilityMeasured: the ingest-time capability measurement ran (I3). Its
+	// result is what the training gate's capability condition reads, so the timeline
+	// records whether it ran, failed, or was never wired.
+	KindCapabilityMeasured = "capability_measured"
+	// KindGateEvaluated: the ingest gate's five §5.3 conditions were evaluated. Each
+	// condition is carried with its verdict and the numbers behind it, so the screen
+	// can say WHICH condition blocked training.
+	KindGateEvaluated = "gate_evaluated"
 )
 
 // Event is one row of ingestion_job_events.

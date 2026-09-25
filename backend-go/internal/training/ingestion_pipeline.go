@@ -61,7 +61,12 @@ type IngestionPipeline struct {
 	extractor *docextract.Extractor
 	// workers caps concurrent topic/embed batches (T3).
 	workers int
-	logger   *zap.Logger
+	// capabilityMeasurer runs the measurement pass the ingest gate requires (I3).
+	// Nil-safe: when unwired the gate reports that capability was never measured and
+	// the expert stays in draft, which is the correct outcome for an environment
+	// that cannot measure.
+	capabilityMeasurer CapabilityMeasurer
+	logger             *zap.Logger
 }
 
 // NewIngestionPipeline creates a new ingestion pipeline.
@@ -978,7 +983,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	// WHY before marking complete: training_status must reflect real state.
 	smokeStarted := p.beginStage(ctx, jobID, expertID, StageSmokeTest, "Running smoke test...")
 	ptimer.Start("smoke_test")
-	smokeTestPassed, smokePassCount, smokeErr := p.runSmokeTest(ctx, expertID, expertName)
+	smoke, smokeErr := p.runSmokeTest(ctx, expertID, expertName)
 	ptimer.Stop("smoke_test")
 	if smokeErr != nil {
 		p.logger.Warn("smoke test error (non-fatal, expert stays draft)",
@@ -987,20 +992,59 @@ func (p *IngestionPipeline) IngestTranscript(
 		)
 	}
 	p.endStage(ctx, jobID, expertID, StageSmokeTest, smokeStarted, map[string]interface{}{
-		"passed":       smokeTestPassed,
-		"probes_passed": smokePassCount,
+		"passed":        smoke.Passed,
+		"probes_passed": smoke.PassedProbes,
+		"probes_uncited": smoke.Uncited,
+		"probes_unanswered": smoke.NoAnswer,
 		"probes_total":  smokeTestProbeCount,
 		"error":        errorString(smokeErr),
 	})
 
-	// Phase C: "complete" is a claim about the CORPUS, so it has to be earned.
-	// Both gates the pipeline already computed were being discarded: the storage
-	// verdict from verifyStoredCorpus and the smoke test result. The run was
-	// marked complete regardless, which is how a corpus holding 277 of 395 chunks
-	// came to be reported as a clean success. The run still finished, so it is not
-	// a failure — but the status now says so out loud.
+	// I3: the training gate. DOMAIN_EXPERT_COLLABORATION_DESIGN.md §5.3 lists five
+	// conditions for 'trained'; they are now evaluated explicitly and in one place,
+	// and every unmet one is named in the job's warning text. Two of them were
+	// enforced before (storage verification, and a smoke test that measured retrieval
+	// only) and three were never read at all: charter rules, clarification coverage
+	// and capability depth.
+	//
+	// The capability condition is measured DURING ingest. A gate that only passes
+	// after a separate manual pass is a gate that mostly reports "unknown", and
+	// "unknown" must not read as a pass. The measurer is injected, so an environment
+	// without one fails the condition instead of silently skipping it.
+	if p.capabilityMeasurer != nil {
+		p.emit(ctx, jobID, expertID, StageSmokeTest, jobevents.KindCapabilityMeasured, map[string]interface{}{
+			"status": "started",
+			"topics": gateMeasureTopics,
+		})
+		if measureErr := p.capabilityMeasurer(ctx, expertID, gateMeasureTopics); measureErr != nil {
+			// Non-fatal: the gate reports the capability as unmeasured and the expert
+			// stays in draft, which is the correct outcome when the pass cannot run.
+			p.logger.Warn("capability measurement failed during ingest (gate will report it unmeasured)",
+				zap.String("expert_id", expertID.String()),
+				zap.Error(measureErr))
+			p.emit(ctx, jobID, expertID, StageSmokeTest, jobevents.KindCapabilityMeasured, map[string]interface{}{
+				"status": "failed",
+				"error":  measureErr.Error(),
+			})
+		}
+	} else {
+		p.logger.Warn("no capability measurer wired — the gate cannot see measured capability",
+			zap.String("expert_id", expertID.String()))
+	}
+
+	gateInputs, gateErr := p.collectGateInputs(ctx, expertID, charter, smoke)
+	if gateErr != nil {
+		// Fail closed. An unreadable gate is not a passed gate, and silently treating
+		// it as one would reintroduce exactly the problem this gate exists to fix.
+		p.logger.Warn("ingest gate could not be evaluated — expert stays draft",
+			zap.String("expert_id", expertID.String()),
+			zap.Error(gateErr))
+	}
+	gateConditions := EvaluateIngestGate(gateInputs)
+	gateOK := gateErr == nil && GatePassed(gateConditions)
+
 	verificationOK := ledger.VerificationStatus == VerificationVerified
-	warnReasons := make([]string, 0, 2)
+	warnReasons := make([]string, 0, len(gateConditions)+1)
 	if !verificationOK {
 		reason := ledger.MismatchReason
 		if reason == "" {
@@ -1008,10 +1052,8 @@ func (p *IngestionPipeline) IngestTranscript(
 		}
 		warnReasons = append(warnReasons, "corpus verification: "+reason)
 	}
-	if !smokeTestPassed {
-		warnReasons = append(warnReasons, fmt.Sprintf(
-			"smoke test failed (%d/%d probes passed)", smokePassCount, smokeTestProbeCount))
-	}
+	warnReasons = append(warnReasons, UnmetGateReasons(gateConditions)...)
+
 	finalStatus := "complete"
 	warningText := ""
 	if len(warnReasons) > 0 {
@@ -1019,14 +1061,15 @@ func (p *IngestionPipeline) IngestTranscript(
 		warningText = "completed with warnings — " + strings.Join(warnReasons, "; ")
 	}
 
-	// training_status='trained' is what makes an expert publicly usable, so it
-	// now requires BOTH gates. WHY both: the smoke test probes a handful of
-	// topics and can pass on the rows that survived a partial store or a dedup —
-	// it is evidence that retrieval works for some topics, not that the whole
-	// corpus landed. Fail closed: an expert that is not fully retrievable must
-	// not be handed to users.
-	if smokeTestPassed && verificationOK {
-		// Mark expert as trained and publicly visible.
+	p.emitFinal(ctx, jobID, expertID, StageComplete, jobevents.KindGateEvaluated, map[string]interface{}{
+		"passed":     gateOK,
+		"conditions": gateConditions,
+	})
+
+	// 'trained' is what makes an expert publicly usable, so it now requires the whole
+	// gate AND the storage verification. Fail closed: an expert that cannot answer
+	// about its own corpus must not be handed to users.
+	if gateOK && verificationOK {
 		_, err = p.db.Exec(ctx,
 			`UPDATE experts SET
 				training_status = 'trained',
@@ -1038,13 +1081,12 @@ func (p *IngestionPipeline) IngestTranscript(
 		if err != nil {
 			p.logger.Warn("failed to set training_status=trained", zap.Error(err))
 		}
-		p.logger.Info("smoke test PASSED and corpus verified — expert is trained",
+		p.logger.Info("ingest gate passed and corpus verified — expert is trained",
 			zap.String("expert_id", expertID.String()),
-			zap.Int("probes_passed", smokePassCount),
+			zap.Int("measured_topics", gateInputs.MeasuredTopics),
+			zap.Int("probes_passed", smoke.PassedProbes),
 		)
 	} else {
-		// Keep expert in draft — the corpus is not fully usable yet.
-		// Admin should upload more transcripts and re-ingest.
 		_, err = p.db.Exec(ctx,
 			`UPDATE experts SET
 				training_status = 'draft',
@@ -1056,12 +1098,16 @@ func (p *IngestionPipeline) IngestTranscript(
 		if err != nil {
 			p.logger.Warn("failed to reset training_status=draft", zap.Error(err))
 		}
-		p.logger.Warn("expert stays in draft — corpus not usable",
+		p.logger.Warn("expert stays in draft — ingest gate not satisfied",
 			zap.String("expert_id", expertID.String()),
-			zap.Int("probes_passed", smokePassCount),
-			zap.Bool("smoke_test_passed", smokeTestPassed),
+			zap.Int("chunks", gateInputs.Chunks),
+			zap.Int("charter_rules", gateInputs.CharterRules),
+			zap.Int("clarification_topics", gateInputs.ClarificationTopics),
+			zap.Int("measured_topics", gateInputs.MeasuredTopics),
+			zap.Bool("capability_measured", gateInputs.CapabilityMeasured),
+			zap.Bool("smoke_passed", smoke.Passed),
 			zap.Bool("verification_ok", verificationOK),
-			zap.String("warnings", warningText),
+			zap.Strings("unmet", UnmetGateReasons(gateConditions)),
 		)
 	}
 
@@ -1073,7 +1119,7 @@ func (p *IngestionPipeline) IngestTranscript(
 		zap.Int("chunks", len(chunks)),
 		zap.Int("topics", uniqueTopics),
 		zap.Int64("duration_ms", duration),
-		zap.Bool("smoke_test_passed", smokeTestPassed),
+		zap.Bool("smoke_test_passed", smoke.Passed),
 	)
 
 	// Log per-step phase breakdown for ingestion observability.
@@ -1110,8 +1156,10 @@ func (p *IngestionPipeline) IngestTranscript(
 		"corpus_topics":     actualTotalTopics,
 		"avg_depth":         avgDepth,
 		"duration_ms":       duration,
-		"smoke_test_passed": smokeTestPassed,
-		"smoke_probes":      smokePassCount,
+		"smoke_test_passed": smoke.Passed,
+		"smoke_probes":      smoke.PassedProbes,
+		"gate_passed":       gateOK,
+		"gate_conditions":   gateConditions,
 		"cost_usd":          tracker.TotalCost(),
 		"workers":           p.workers,
 		"phase_ms":          phaseTotals,
@@ -1908,6 +1956,24 @@ const (
 	smokeTestTopK = 10
 )
 
+// SmokeTestResult is what the smoke test measured, per §5.3(5): an expert must answer
+// its own topic probes with citations, not merely retrieve a matching chunk.
+//
+// WHY separate counters instead of one pass/fail: "retrieved but never cited" and
+// "declined to answer" are different defects with different fixes — the first is a
+// grounding problem, the second a coverage or prompt problem — and a single boolean
+// would hide which one the expert has.
+type SmokeTestResult struct {
+	Passed       bool
+	Probes       int
+	PassedProbes int
+	// Uncited counts probes whose retrieval matched but whose answer carried no
+	// citation marker.
+	Uncited int
+	// NoAnswer counts probes where the answer was empty or an explicit refusal.
+	NoAnswer int
+}
+
 // runSmokeTest verifies that the expert's corpus is retrievable.
 //
 // Algorithm:
@@ -1935,7 +2001,12 @@ func (p *IngestionPipeline) runSmokeTest(
 	ctx context.Context,
 	expertID uuid.UUID,
 	expertName string,
-) (passed bool, passCount int, err error) {
+) (SmokeTestResult, error) {
+	// §5.3(5) requires an actual response with citations, so the probe now answers as
+	// well as retrieves. The answerer is shared with the capability evaluation, so the
+	// citation rule cannot drift between the two places that enforce it.
+	answerer := newGroundedAnswerer(p.gateway, p.logger)
+	result := SmokeTestResult{}
 
 	p.logger.Info("smoke test starting",
 		zap.String("expert_id", expertID.String()),
@@ -1954,7 +2025,7 @@ func (p *IngestionPipeline) runSmokeTest(
 		expertID, smokeTestProbeCount,
 	)
 	if err != nil {
-		return false, 0, fmt.Errorf("smoke test: failed to load topics: %w", err)
+		return result, fmt.Errorf("smoke test: failed to load topics: %w", err)
 	}
 	defer rows.Close()
 
@@ -1966,7 +2037,7 @@ func (p *IngestionPipeline) runSmokeTest(
 		}
 	}
 	if err = rows.Err(); err != nil {
-		return false, 0, fmt.Errorf("smoke test: topic scan error: %w", err)
+		return result, fmt.Errorf("smoke test: topic scan error: %w", err)
 	}
 
 	// If expert_capabilities is empty (capability build failed), load
@@ -2013,7 +2084,7 @@ func (p *IngestionPipeline) runSmokeTest(
 	}
 
 	// Step 2–6: Probe each topic.
-	passCount = 0
+	passCount := 0
 	for i, topic := range topics {
 		probeQuestion := fmt.Sprintf(
 			"What does %s teach about %s?",
@@ -2030,7 +2101,7 @@ func (p *IngestionPipeline) runSmokeTest(
 			)
 			// ML sidecar failure is infrastructure, not corpus quality.
 			// Return error so caller can decide (non-fatal).
-			return false, passCount, fmt.Errorf("smoke test: ML sidecar unavailable: %w", embedErr)
+			return result, fmt.Errorf("smoke test: ML sidecar unavailable: %w", embedErr)
 		}
 		queryVec := pgvector.NewVector(embeddings[0])
 
@@ -2079,7 +2150,7 @@ func (p *IngestionPipeline) runSmokeTest(
 				zap.Error(rerankErr),
 			)
 			// Rerank failure = ML sidecar issue, return error.
-			return false, passCount, fmt.Errorf("smoke test: rerank unavailable: %w", rerankErr)
+			return result, fmt.Errorf("smoke test: rerank unavailable: %w", rerankErr)
 		}
 
 		// Step 6: Check if best rerank score meets threshold.
@@ -2091,6 +2162,40 @@ func (p *IngestionPipeline) runSmokeTest(
 		}
 
 		probePassed := bestScore >= smokeTestRerankThreshold
+
+		// §5.3(5) asks for "non-REFUSE responses WITH CITATIONS", not for a good
+		// retrieval score. Until now this test only measured retrieval, so an expert
+		// that retrieved the right chunk and then answered without grounding it —
+		// or declined to answer at all — passed the gate. The answer is only checked
+		// when retrieval already matched: a probe that never found the chunk is
+		// already explained, and asking the model to answer from poor context would
+		// spend a call to learn the same thing.
+		if probePassed {
+			contextBlock := buildNumberedContext(candidates, promptPassageChars)
+			answer, answerErr := answerer.Answer(ctx, probeQuestion, contextBlock)
+			switch {
+			case answerErr != nil:
+				// Infrastructure, not corpus quality: count it as unusable and let the
+				// caller decide, exactly as the embed/rerank failures above do.
+				p.logger.Warn("smoke test: answering failed for probe",
+					zap.Int("probe_index", i),
+					zap.String("topic", topic),
+					zap.Error(answerErr),
+				)
+				result.NoAnswer++
+				probePassed = false
+			default:
+				switch refusalOrCitationFailure(answer) {
+				case FailureNotCited:
+					result.Uncited++
+					probePassed = false
+				case FailureRefused, FailureEmpty:
+					result.NoAnswer++
+					probePassed = false
+				}
+			}
+		}
+
 		if probePassed {
 			passCount++
 		}
@@ -2118,20 +2223,26 @@ func (p *IngestionPipeline) runSmokeTest(
 		p.logger.Warn("smoke test: no probes ran, expert stays draft",
 			zap.String("expert_id", expertID.String()),
 		)
-		return false, 0, nil
+		result.Passed = false
+		return result, nil
 	}
 
-	passed = passCount >= effectiveThreshold
+	passed := passCount >= effectiveThreshold
+	result.Passed = passed
+	result.PassedProbes = passCount
+	result.Probes = len(topics)
 
 	p.logger.Info("smoke test complete",
 		zap.String("expert_id", expertID.String()),
 		zap.Int("probes_run", len(topics)),
 		zap.Int("probes_passed", passCount),
+		zap.Int("probes_uncited", result.Uncited),
+		zap.Int("probes_unanswered", result.NoAnswer),
 		zap.Int("effective_threshold", effectiveThreshold),
 		zap.Bool("passed", passed),
 	)
 
-	return passed, passCount, nil
+	return result, nil
 }
 
 // isFatalLLMError returns true when the error indicates a permanent
