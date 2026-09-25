@@ -4,7 +4,7 @@ import { useAuthStore } from '@/stores/authStore'
 import { camelizeKeys, snakeifyKeys } from '@/utils/casing'
 
 export type StreamEvent =
-  | { type: 'update' | 'complete' | 'failed' | 'hello'; job: IngestionJob; ts: string }
+  | { type: 'update' | 'complete' | 'complete_with_warnings' | 'failed' | 'hello'; job: IngestionJob; ts: string }
   | { type: 'event'; event: IngestionJobEvent; ts: string }
   | { type: 'heartbeat'; ts: string }
   | { type: 'waiting'; ts: string }
@@ -232,9 +232,21 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
           return
         }
 
-        if (data.type === 'hello' || data.type === 'update' || data.type === 'complete' || data.type === 'failed') {
+        // complete_with_warnings is terminal too: the pipeline has finished and
+        // will not write again. Treating it as non-terminal would leave the modal
+        // waiting on a run that is already over.
+        if (
+          data.type === 'hello' ||
+          data.type === 'update' ||
+          data.type === 'complete' ||
+          data.type === 'complete_with_warnings' ||
+          data.type === 'failed'
+        ) {
           const job = (data as { job: IngestionJob }).job
-          const isDone = job?.status === 'complete' || job?.status === 'failed'
+          const isDone =
+            job?.status === 'complete' ||
+            job?.status === 'complete_with_warnings' ||
+            job?.status === 'failed'
           const isPaused = job?.status === 'paused'
           setState((prev) => ({
             ...prev,

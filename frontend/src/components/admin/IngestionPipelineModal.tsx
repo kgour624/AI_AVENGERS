@@ -18,7 +18,8 @@ const STAGES = [
 
 const STAGE_ORDER: Record<string, number> = {
   pending: 0, chunking: 1, topic_extraction: 2, charter_extraction: 3,
-  embedding: 4, storing: 5, smoke_test: 6, complete: 7, failed: -1,
+  embedding: 4, storing: 5, smoke_test: 6, complete: 7, complete_with_warnings: 7,
+  failed: -1,
   // FIX: paused was missing — getStageStatus returned wrong result for paused jobs
   paused: -1,
 }
@@ -30,7 +31,10 @@ function getStageStatus(stageKey: string, currentStage: string, jobStatus: strin
   const current = STAGE_ORDER[currentStage] ?? 0
   const mine = STAGE_ORDER[stageKey] ?? 0
   if (mine < current) return 'done'
-  if (mine === current) return jobStatus === 'complete' ? 'done' : 'active'
+  // completed = the pipeline finished, with or without warnings. Both mean every
+  // stage ran, so neither should leave the last card looking "active".
+  const finished = jobStatus === 'complete' || jobStatus === 'complete_with_warnings'
+  if (mine === current) return finished ? 'done' : 'active'
   return 'waiting'
 }
 
@@ -47,7 +51,7 @@ function formatCost(usd: number): string {
 }
 
 function calcProgress(stage: string, processed: number, total: number, status: string): number {
-  if (status === 'complete') return 100
+  if (status === 'complete' || status === 'complete_with_warnings') return 100
   if (status === 'failed') {
     const idx = STAGE_ORDER[stage] ?? 0
     return idx > 0 ? Math.max((idx / 7) * 100, 5) : 5
@@ -127,7 +131,15 @@ export function IngestionPipelineModal({
   const progress = job
     ? calcProgress(currentStage, job.processedChunks, job.totalChunks, job.status)
     : 0
-  const isDone = job?.status === 'complete'
+  // The run finished cleanly.
+  const isComplete = job?.status === 'complete'
+  // The run finished, but the corpus is not fully usable (storage verification
+  // failed, or the smoke test did not pass). It is still a terminal state — the
+  // pipeline is done — so it must not count as "running".
+  const isWarning = job?.status === 'complete_with_warnings'
+  // Terminal-and-finished, either way. Drives the progress bar, the ETA and the
+  // "is this still going?" checks; the box below distinguishes the two.
+  const isDone = isComplete || isWarning
   const isFailed = job?.status === 'failed'
   // FIX: paused was not handled — UI showed "Extracting..." frozen for 30+ min
   const isPaused = job?.status === 'paused'
@@ -206,7 +218,8 @@ export function IngestionPipelineModal({
               <div
                 className={cn(
                   'h-full rounded-full transition-all duration-500 ease-arc',
-                  isDone ? 'bg-mode-advise shadow-[0_0_8px_oklch(68%_0.18_145_/_0.6)]'
+                  isWarning ? 'bg-glow-amber shadow-[0_0_8px_oklch(78%_0.18_80_/_0.5)]'
+                  : isDone ? 'bg-mode-advise shadow-[0_0_8px_oklch(68%_0.18_145_/_0.6)]'
                   : isFailed ? 'bg-mode-refuse'
                   : isPaused ? 'bg-glow-amber shadow-[0_0_8px_oklch(78%_0.18_80_/_0.5)]'
                   : 'bg-brand shadow-[0_0_8px_oklch(68%_0.28_295_/_0.5)]',
@@ -476,9 +489,27 @@ export function IngestionPipelineModal({
         )}
 
         {/* Complete box */}
-        {isDone && (
+        {isComplete && (
           <div className="rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-3 text-center">
             <p className="text-sm font-medium text-mode-advise">{'\u2705'} Ingestion Complete</p>
+          </div>
+        )}
+
+        {/* Finished, but not cleanly. Amber rather than green: the corpus was not
+            verified, or retrieval failed its probes, so the expert stays in draft.
+            The reason is written by the pipeline into errorMessage. */}
+        {isWarning && (
+          <div className="rounded-lg border border-glow-amber/40 bg-glow-amber/10 p-3">
+            <p className="text-sm font-medium text-glow-amber">
+              {'\u26a0\ufe0f'} Ingestion finished with warnings
+            </p>
+            <p className="mt-1 text-[11px] text-glow-amber/90 break-all">
+              {job?.errorMessage || 'The corpus was not fully verified. The expert stays in draft.'}
+            </p>
+            <p className="mt-1 text-[10px] text-text-secondary">
+              The corpus was stored, but it is not fully usable — the expert is not published for
+              answers. Fix the cause above, then re-ingest.
+            </p>
           </div>
         )}
 

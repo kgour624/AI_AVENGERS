@@ -2053,6 +2053,13 @@ func (h *AdminHandler) StreamIngestionJob(c *gin.Context) {
 			switch job.Status {
 			case "complete":
 				eventType, terminal = "complete", true
+			case "complete_with_warnings":
+				// The run finished but the corpus is not fully usable (storage
+				// verification failed, or the smoke test did not pass). It is
+				// terminal — the pipeline is done and will not write again — so
+				// the stream must close, or the modal sits on "running" forever
+				// waiting for events that will never come.
+				eventType, terminal = "complete_with_warnings", true
 			case "failed":
 				eventType, terminal = "failed", true
 			case "paused":
