@@ -5,7 +5,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -100,6 +102,74 @@ type RepoFile struct {
 	Content  string
 	Size     int
 	Language string
+}
+
+// Errors returned by the file-tree read path. They are sentinels so the
+// handler can map each one to the right HTTP status instead of string-matching.
+// ErrNoRepoConnection is declared with the token helpers below; a repository
+// that is connected but never synced is a different condition, hence
+// ErrRepoTreeEmpty.
+var (
+	// ErrRepoTreeEmpty — a repository is connected but has never been synced.
+	ErrRepoTreeEmpty = errors.New("repository has not been synced yet")
+	// ErrRepoFileNotFound — the path is not part of the stored tree.
+	ErrRepoFileNotFound = errors.New("file not found in repository tree")
+	// ErrRepoFileContentUnavailable — the file exists in the tree but its
+	// content was deliberately not stored (binary, unsupported, or too large).
+	ErrRepoFileContentUnavailable = errors.New("file content was not stored for this file")
+)
+
+// repoTreeItem is one blob from a provider's tree listing. SizeBytes is nil
+// when the provider does not report a size — which is exactly the GitLab case,
+// and the reason sizes are a pointer rather than a plain int.
+type repoTreeItem struct {
+	Path      string
+	SizeBytes *int
+	BlobSHA   string
+}
+
+// repoTreeRow is a tree item plus whatever content we managed to fetch for it.
+// It is the unit persistRepoTree writes.
+type repoTreeRow struct {
+	Path       string
+	SizeBytes  *int
+	Language   string
+	BlobSHA    string
+	Content    string
+	HasContent bool
+}
+
+// RepoTreeEntry is one file as returned to the API. BlobSHA is empty and
+// HasContent false for files whose content was not stored.
+type RepoTreeEntry struct {
+	Path       string `json:"path"`
+	BlobSHA    string `json:"blob_sha,omitempty"`
+	Language   string `json:"language,omitempty"`
+	SizeBytes  *int   `json:"size_bytes,omitempty"`
+	HasContent bool   `json:"has_content"`
+}
+
+// RepoFileContent is a single stored file body.
+type RepoFileContent struct {
+	Path      string `json:"path"`
+	CommitSHA string `json:"commit_sha"`
+	Language  string `json:"language,omitempty"`
+	SizeBytes int    `json:"size_bytes"`
+	Content   string `json:"content"`
+}
+
+// gitBlobSHA returns the SHA-1 git would assign this blob:
+// sha1("blob <len>\x00" + content).
+//
+// WHY compute it instead of trusting the provider: GitHub's tree API reports a
+// per-blob sha, but GitLab's does not. Deriving it locally gives both providers
+// the same content-addressed key, so identical bytes are stored once whether
+// they appear twice in one commit or across two commits.
+func gitBlobSHA(content string) string {
+	h := sha1.New()
+	fmt.Fprintf(h, "blob %d\x00", len(content))
+	h.Write([]byte(content))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // Service handles GitHub/GitLab integration.
@@ -399,14 +469,17 @@ func (s *Service) GetSyncStatus(ctx context.Context, projectID uuid.UUID) (map[s
 // runSync performs the actual repo sync in background.
 //
 // Mental execution:
-// 1. Load connection + decrypt token
-// 2. Fetch file tree from GitHub/GitLab API
-// 3. Filter relevant files (by extension, size)
-// 4. Fetch file contents in batches
-// 5. Chunk each file
-// 6. Generate embeddings (batch)
-// 7. Store in repo_chunks
-// 8. Update sync status
+// 1. Load connection + resolve a currently-valid token
+// 2. Pin the branch's head commit
+// 3. Fetch the FULL tree (every blob, so the structure is complete)
+// 4. Fetch + chunk + embed + store content for the supported files
+// 5. Persist the tree: metadata for every blob, content for the fetched ones
+// 6. Update sync status
+//
+// Steps 2 and 5 are additive and deliberately non-fatal. A repository whose
+// head commit cannot be read (or whose tree cannot be written) still gets its
+// chunk corpus: the new file-tree index must never regress the existing RAG
+// sync that experts already depend on.
 func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 	s.logger.Info("repo sync started", zap.String("connection_id", connectionID.String()))
 
@@ -431,15 +504,53 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 		return
 	}
 
-	// Fetch file tree
-	files, err := s.fetchFileTree(ctx, provider, repoURL, branch, accessToken)
+	// Pin the revision the stored tree is taken from. Without it the tree would
+	// be "whatever main was at sync time", which no later phase can reason
+	// about, so a failure here skips tree storage rather than guessing.
+	commitSHA, err := s.fetchHeadCommitSHA(ctx, provider, repoURL, branch, accessToken)
+	if err != nil {
+		s.logger.Warn("head commit lookup failed; repo tree will not be stored (non-fatal)",
+			zap.String("connection_id", connectionID.String()),
+			zap.Error(err),
+		)
+		commitSHA = ""
+	}
+
+	// If pinning succeeded, fetch both tree and bodies by the immutable commit
+	// SHA, not by the moving branch name. This closes the race where the branch
+	// advances between the head lookup and the tree/content requests.
+	treeRef := branch
+	if commitSHA != "" {
+		treeRef = commitSHA
+	}
+
+	// Fetch the full tree so the stored structure matches the real repository.
+	entries, err := s.fetchFileTree(ctx, provider, repoURL, treeRef, accessToken)
 	if err != nil {
 		s.logger.Error("fetch file tree failed", zap.Error(err))
 		s.updateSyncStatus(ctx, connectionID, "failed", err.Error(), 0)
 		return
 	}
 
-	s.logger.Info("files to process", zap.Int("count", len(files)))
+	// One row per tree entry up front; content is filled in as it is fetched,
+	// so files we never ingest still appear in the tree with metadata only.
+	rows := make([]repoTreeRow, 0, len(entries))
+	rowIndex := make(map[string]int, len(entries))
+	for _, entry := range entries {
+		rowIndex[entry.Path] = len(rows)
+		rows = append(rows, repoTreeRow{
+			Path:      entry.Path,
+			SizeBytes: entry.SizeBytes,
+			Language:  getLanguage(entry.Path),
+			BlobSHA:   entry.BlobSHA,
+		})
+	}
+
+	files := supportedFiles(entries)
+	s.logger.Info("repo tree fetched",
+		zap.Int("tree_entries", len(entries)),
+		zap.Int("supported", len(files)),
+	)
 
 	// Delete existing repo chunks for this connection
 	_, _ = s.db.Exec(ctx,
@@ -459,17 +570,24 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 
 		// Fetch content for batch
 		var repoFiles []RepoFile
-		for _, filePath := range batch {
-			content, err := s.fetchFileContent(ctx, provider, repoURL, branch, filePath, accessToken)
+		for _, entry := range batch {
+			content, err := s.fetchFileContent(ctx, provider, repoURL, treeRef, entry.Path, accessToken)
 			if err != nil {
 				s.logger.Warn("fetch file content failed",
-					zap.String("file", filePath), zap.Error(err))
+					zap.String("file", entry.Path), zap.Error(err))
 				continue
 			}
-			lang := getLanguage(filePath)
+			lang := getLanguage(entry.Path)
+			size := len(content)
+			if idx, ok := rowIndex[entry.Path]; ok {
+				rows[idx].Content = content
+				rows[idx].BlobSHA = gitBlobSHA(content)
+				rows[idx].HasContent = true
+				rows[idx].SizeBytes = &size
+			}
 			repoFiles = append(repoFiles, RepoFile{
-				Path: filePath, Content: content,
-				Size: len(content), Language: lang,
+				Path: entry.Path, Content: content,
+				Size: size, Language: lang,
 			})
 		}
 
@@ -511,15 +629,224 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 		}
 	}
 
+	// Persist the tree (metadata for all, content for what was fetched).
+	// Non-fatal: the chunk corpus above is already committed, and failing the
+	// whole sync because an index write failed would throw that work away.
+	if commitSHA != "" {
+		if err := s.persistRepoTree(ctx, projectID, connectionID, commitSHA, rows); err != nil {
+			s.logger.Warn("persist repo tree failed (non-fatal)",
+				zap.String("connection_id", connectionID.String()),
+				zap.Error(err),
+			)
+		} else if _, err := s.db.Exec(ctx,
+			`UPDATE repo_connections SET last_commit_sha=$1 WHERE id=$2`,
+			commitSHA, connectionID,
+		); err != nil {
+			s.logger.Warn("store last_commit_sha failed (non-fatal)",
+				zap.String("connection_id", connectionID.String()),
+				zap.Error(err),
+			)
+		}
+	}
+
 	s.updateSyncStatus(ctx, connectionID, "complete", "", totalChunks)
 	s.logger.Info("repo sync complete",
 		zap.Int("total_chunks", totalChunks),
+		zap.Int("tree_entries", len(rows)),
 		zap.String("connection_id", connectionID.String()),
 	)
 }
 
-// fetchFileTree fetches the list of relevant files from a repo.
-func (s *Service) fetchFileTree(ctx context.Context, provider, repoURL, branch, token string) ([]string, error) {
+// persistRepoTree replaces the stored tree for a connection in one transaction.
+//
+// WHY replace rather than merge: the tree is fetched wholesale, so the rows for
+// this connection are exactly the truth at commitSHA. Deleting first means a
+// file deleted upstream cannot linger in the index. Blobs are keyed by content
+// hash and inserted with DO NOTHING, so identical bytes are written once even
+// when they repeat across paths or commits.
+func (s *Service) persistRepoTree(
+	ctx context.Context,
+	projectID, connectionID uuid.UUID,
+	commitSHA string,
+	rows []repoTreeRow,
+) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin repo tree write: %w", err)
+	}
+	defer tx.Rollback(ctx) // harmless after a successful commit
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM repo_files WHERE repo_connection_id=$1`, connectionID,
+	); err != nil {
+		return fmt.Errorf("clear previous repo tree: %w", err)
+	}
+
+	batch := &pgx.Batch{}
+	seenBlob := make(map[string]bool, len(rows))
+	for _, row := range rows {
+		if !row.HasContent || seenBlob[row.BlobSHA] {
+			continue
+		}
+		seenBlob[row.BlobSHA] = true
+		batch.Queue(
+			`INSERT INTO repo_blobs (sha, size_bytes, content) VALUES ($1, $2, $3)
+			 ON CONFLICT (sha) DO NOTHING`,
+			row.BlobSHA, len(row.Content), row.Content,
+		)
+	}
+
+	queued := batch.Len()
+	for _, row := range rows {
+		var blobSHA, size interface{}
+		if row.HasContent {
+			blobSHA = row.BlobSHA
+		}
+		if row.SizeBytes != nil {
+			size = *row.SizeBytes
+		}
+		batch.Queue(
+			`INSERT INTO repo_files
+				(project_id, repo_connection_id, commit_sha, path, blob_sha, language, size_bytes)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			 ON CONFLICT (repo_connection_id, commit_sha, path) DO UPDATE SET
+				blob_sha=EXCLUDED.blob_sha,
+				language=EXCLUDED.language,
+				size_bytes=EXCLUDED.size_bytes,
+				updated_at=NOW()`,
+			projectID, connectionID, commitSHA, row.Path, blobSHA, row.Language, size,
+		)
+	}
+
+	results := tx.SendBatch(ctx, batch)
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := results.Exec(); err != nil {
+			results.Close()
+			// The blob inserts are queued before the file inserts; report which
+			// half failed so a partial write is diagnosable from the log alone.
+			if i < queued {
+				return fmt.Errorf("store repo blob: %w", err)
+			}
+			return fmt.Errorf("store repo file row: %w", err)
+		}
+	}
+	if err := results.Close(); err != nil {
+		return fmt.Errorf("close repo tree batch: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit repo tree: %w", err)
+	}
+	return nil
+}
+
+// ListRepoTree returns the stored file tree for a project's connected repo,
+// plus the commit it was taken from.
+//
+// It returns the whole tree as a flat, path-ordered list rather than a
+// per-directory paginated listing: the sync already caps the tree at the
+// provider's page limits, and the frontend builds folders from flat paths
+// anyway (FilesPanel.buildTree), so a single call avoids N round-trips for a
+// hierarchy the client reconstructs in one pass.
+func (s *Service) ListRepoTree(ctx context.Context, projectID uuid.UUID) ([]RepoTreeEntry, string, error) {
+	var connectionID uuid.UUID
+	var lastCommit *string
+	err := s.db.QueryRow(ctx,
+		`SELECT id, last_commit_sha
+		   FROM repo_connections
+		  WHERE project_id=$1
+		  ORDER BY created_at DESC LIMIT 1`,
+		projectID,
+	).Scan(&connectionID, &lastCommit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", ErrNoRepoConnection
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("load repo connection: %w", err)
+	}
+
+	rows, err := s.db.Query(ctx,
+		`SELECT path, COALESCE(blob_sha, ''), COALESCE(language, ''), size_bytes,
+		        (blob_sha IS NOT NULL)
+		   FROM repo_files
+		  WHERE repo_connection_id=$1
+		  ORDER BY path`,
+		connectionID,
+	)
+	if err != nil {
+		return nil, "", fmt.Errorf("list repo tree: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []RepoTreeEntry
+	for rows.Next() {
+		var entry RepoTreeEntry
+		if err := rows.Scan(&entry.Path, &entry.BlobSHA, &entry.Language, &entry.SizeBytes, &entry.HasContent); err != nil {
+			return nil, "", fmt.Errorf("scan repo tree row: %w", err)
+		}
+		entries = append(entries, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, "", fmt.Errorf("iterate repo tree: %w", err)
+	}
+
+	if len(entries) == 0 {
+		return nil, "", ErrRepoTreeEmpty
+	}
+
+	commitSHA := ""
+	if lastCommit != nil {
+		commitSHA = *lastCommit
+	}
+	return entries, commitSHA, nil
+}
+
+// GetRepoFileContent returns one stored file body.
+//
+// A path that is in the tree but whose content was not stored (binary,
+// unsupported, or over the cap) is reported as unavailable — distinct from a
+// path that is not in the tree at all, so the UI can explain which it is.
+func (s *Service) GetRepoFileContent(ctx context.Context, projectID uuid.UUID, path string) (*RepoFileContent, error) {
+	var commitSHA, language, content string
+	var size int
+		var hasContent bool
+	err := s.db.QueryRow(ctx,
+		`SELECT rf.commit_sha, COALESCE(rf.language, ''), COALESCE(b.content, ''), COALESCE(b.size_bytes, 0), (rf.blob_sha IS NOT NULL)
+		   FROM repo_files rf
+		   LEFT JOIN repo_blobs b ON b.sha = rf.blob_sha
+		  WHERE rf.repo_connection_id = (
+		        SELECT id FROM repo_connections
+		         WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1
+		        )
+		    AND rf.path = $2
+		  ORDER BY rf.updated_at DESC
+		  LIMIT 1`,
+		projectID, path,
+	).Scan(&commitSHA, &language, &content, &size, &hasContent)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrRepoFileNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load repo file: %w", err)
+	}
+	if !hasContent {
+		return nil, ErrRepoFileContentUnavailable
+	}
+	return &RepoFileContent{
+		Path:      path,
+		CommitSHA: commitSHA,
+		Language:  language,
+		SizeBytes: size,
+		Content:   content,
+	}, nil
+}
+
+// fetchFileTree fetches every blob in the repo's tree.
+//
+// WHY it no longer filters by extension or size: the tree is now persisted so
+// the client can see the real structure of their repository (3A). Files we do
+// not ingest are still listed; only their content is skipped. supportedFiles
+// selects the subset that is actually fetched and indexed.
+func (s *Service) fetchFileTree(ctx context.Context, provider, repoURL, branch, token string) ([]repoTreeItem, error) {
 	switch provider {
 	case ProviderGitHub:
 		return s.fetchGitHubTree(ctx, repoURL, branch, token)
@@ -530,8 +857,26 @@ func (s *Service) fetchFileTree(ctx context.Context, provider, repoURL, branch, 
 	}
 }
 
+// supportedFiles narrows a tree listing to the files that should have their
+// content fetched. A size already known to exceed the cap is dropped here so
+// the fetch is not even attempted; when the provider reports no size (GitLab)
+// the read-time cap in readCappedFile is the backstop.
+func supportedFiles(entries []repoTreeItem) []repoTreeItem {
+	var out []repoTreeItem
+	for _, entry := range entries {
+		if !isSupportedFile(entry.Path) {
+			continue
+		}
+		if entry.SizeBytes != nil && *entry.SizeBytes > maxRepoFileBytes {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // fetchGitHubTree fetches file tree from GitHub API.
-func (s *Service) fetchGitHubTree(ctx context.Context, repoURL, branch, token string) ([]string, error) {
+func (s *Service) fetchGitHubTree(ctx context.Context, repoURL, branch, token string) ([]repoTreeItem, error) {
 	// Extract owner/repo from URL
 	ownerRepo := extractOwnerRepo(repoURL)
 	apiURL := fmt.Sprintf("https://api.github.com/repos/%s/git/trees/%s?recursive=1", ownerRepo, branch)
@@ -555,29 +900,25 @@ func (s *Service) fetchGitHubTree(ctx context.Context, repoURL, branch, token st
 			Path string `json:"path"`
 			Type string `json:"type"`
 			Size int    `json:"size"`
+			SHA  string `json:"sha"`
 		} `json:"tree"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
 
-	var files []string
+	var items []repoTreeItem
 	for _, item := range result.Tree {
 		if item.Type != "blob" {
-			continue
-		}
-		if item.Size > 100*1024 { // Skip files > 100KB
 			continue
 		}
 		if shouldSkipPath(item.Path) {
 			continue
 		}
-		if !isSupportedFile(item.Path) {
-			continue
-		}
-		files = append(files, item.Path)
+		size := item.Size
+		items = append(items, repoTreeItem{Path: item.Path, SizeBytes: &size, BlobSHA: item.SHA})
 	}
-	return files, nil
+	return items, nil
 }
 
 // fetchGitLabTree fetches the file tree from the GitLab API, following
@@ -586,14 +927,14 @@ func (s *Service) fetchGitHubTree(ctx context.Context, repoURL, branch, token st
 // WHY the loop: GitLab returns at most per_page entries and an X-Next-Page
 // header; the old single request with per_page=100 silently ingested only the
 // first 100 files of any larger repo (A3).
-func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token string) ([]string, error) {
+func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token string) ([]repoTreeItem, error) {
 	projectPath := extractGitLabPath(repoURL)
 	baseURL := fmt.Sprintf(
 		"https://gitlab.com/api/v4/projects/%s/repository/tree?recursive=true&ref=%s&per_page=100",
 		url.QueryEscape(projectPath), branch,
 	)
 
-	var files []string
+	var items []repoTreeItem
 	for page := 1; page <= gitLabMaxTreePages; page++ {
 		apiURL := fmt.Sprintf("%s&page=%d", baseURL, page)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
@@ -611,25 +952,26 @@ func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token st
 			return nil, fmt.Errorf("GitLab API returned %d", resp.StatusCode)
 		}
 
-		var items []struct {
+		var pageItems []struct {
 			Path string `json:"path"`
 			Type string `json:"type"`
 		}
-		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		if err := json.NewDecoder(resp.Body).Decode(&pageItems); err != nil {
 			resp.Body.Close()
 			return nil, err
 		}
 		nextPage := resp.Header.Get("X-Next-Page")
 		resp.Body.Close()
 
-		for _, item := range items {
+		for _, item := range pageItems {
 			if item.Type != "blob" {
 				continue
 			}
-			if shouldSkipPath(item.Path) || !isSupportedFile(item.Path) {
+			if shouldSkipPath(item.Path) {
 				continue
 			}
-			files = append(files, item.Path)
+			// GitLab's tree API reports no size, so SizeBytes stays nil.
+			items = append(items, repoTreeItem{Path: item.Path})
 		}
 
 		if nextPage == "" {
@@ -643,7 +985,61 @@ func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token st
 			)
 		}
 	}
-	return files, nil
+	return items, nil
+}
+
+// fetchHeadCommitSHA resolves the branch's current commit, so the stored tree
+// can be pinned to a revision instead of "whatever the branch was at sync time".
+func (s *Service) fetchHeadCommitSHA(ctx context.Context, provider, repoURL, branch, token string) (string, error) {
+	var apiURL string
+	switch provider {
+	case ProviderGitHub:
+		apiURL = fmt.Sprintf("https://api.github.com/repos/%s/commits/%s",
+			extractOwnerRepo(repoURL), url.QueryEscape(branch))
+	case ProviderGitLab:
+		apiURL = fmt.Sprintf(
+			"https://gitlab.com/api/v4/projects/%s/repository/commits?ref_name=%s&per_page=1",
+			url.QueryEscape(extractGitLabPath(repoURL)), url.QueryEscape(branch),
+		)
+	default:
+		return "", fmt.Errorf("unsupported provider: %s", provider)
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("head commit request failed: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("head commit API returned %d", resp.StatusCode)
+	}
+
+	if provider == ProviderGitHub {
+		var result struct {
+			SHA string `json:"sha"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return "", err
+		}
+		if result.SHA == "" {
+			return "", fmt.Errorf("head commit response contained no sha")
+		}
+		return result.SHA, nil
+	}
+
+	// GitLab returns a list of commits; the first is the head.
+	var result []struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	if len(result) == 0 || result[0].ID == "" {
+		return "", fmt.Errorf("head commit response was empty")
+	}
+	return result[0].ID, nil
 }
 
 // fetchFileContent fetches a single file's content, capped at maxRepoFileBytes.
@@ -1415,4 +1811,79 @@ func (h *Handler) GetSyncStatus(c *gin.Context) {
 		return
 	}
 	response.OK(c, status)
+}
+
+// ListRepoTree GET /projects/:id/repo/tree
+//
+// Returns every stored file for the connected repository plus the commit it was
+// read from. A connected-but-never-synced repo answers 200 with an empty list
+// and synced=false: that is a normal state the UI should explain, not an error.
+func (h *Handler) ListRepoTree(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid project ID")
+		return
+	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
+
+	entries, commitSHA, err := h.svc.ListRepoTree(c.Request.Context(), projectID)
+	switch {
+	case errors.Is(err, ErrNoRepoConnection):
+		response.NotFound(c, "repo connection")
+		return
+	case errors.Is(err, ErrRepoTreeEmpty):
+		response.OK(c, gin.H{"files": []RepoTreeEntry{}, "commit_sha": "", "synced": false})
+		return
+	case err != nil:
+		h.logger.Error("list repo tree failed",
+			zap.String("project_id", projectID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+
+	response.OK(c, gin.H{"files": entries, "commit_sha": commitSHA, "synced": true})
+}
+
+// GetRepoFile GET /projects/:id/repo/file?path=...
+//
+// Read-only: this is the only way code reaches the client's screen, and it
+// never writes back to the provider. `path` is matched exactly against the
+// stored tree, so a traversal attempt simply misses.
+func (h *Handler) GetRepoFile(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid project ID")
+		return
+	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
+
+	path := c.Query("path")
+	if strings.TrimSpace(path) == "" {
+		response.BadRequest(c, "MISSING_PATH", "path query param required")
+		return
+	}
+
+	file, err := h.svc.GetRepoFileContent(c.Request.Context(), projectID, path)
+	switch {
+	case errors.Is(err, ErrRepoFileContentUnavailable):
+		response.Conflict(c, "this file's content was not stored (binary, unsupported type, or larger than the size limit)")
+		return
+	case errors.Is(err, ErrRepoFileNotFound):
+		response.NotFound(c, "repo file")
+		return
+	case err != nil:
+		h.logger.Error("load repo file failed",
+			zap.String("project_id", projectID.String()),
+			zap.String("path", path),
+			zap.Error(err),
+		)
+		response.InternalError(c)
+		return
+	}
+
+	response.OK(c, file)
 }

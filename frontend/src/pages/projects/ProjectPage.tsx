@@ -6,6 +6,7 @@ import { getProjectTimeline } from '@/api/memory'
 import type { Project } from '@/types/project'
 import type { L3Event } from '@/types/memory'
 import { RepoStatus } from '@/components/project/RepoStatus'
+import { RepoTreePanel } from '@/components/project/RepoTreePanel'
 import { ChatList } from '@/components/project/ChatList'
 import { ProjectExpertManager } from '@/components/project/ProjectExpertManager'
 import { ProjectTimeline } from '@/components/project/ProjectTimeline'
@@ -119,6 +120,10 @@ export default function ProjectPage() {
 
       <div className="mt-6">
         <RepoStatus projectId={project.id} />
+      </div>
+
+      <div className="mt-6">
+        <RepoTreePanel projectId={project.id} />
       </div>
     </div>
   )

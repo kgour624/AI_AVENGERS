@@ -88,3 +88,50 @@ export const getRepoSyncStatus = (projectId: string) =>
   baseAPI
     .get<ApiResponse<RepoSyncStatus>>(`/api/v1/projects/${projectId}/repo/status`)
     .then((res) => res.data.data!)
+
+/**
+ * Phase 3A — the stored repository file tree (read-only).
+ *
+ * `synced: false` with an empty list is a real, normal response: the repo is
+ * connected but has never completed a sync. Callers must check it rather than
+ * treating an empty tree as "repository has no files".
+ *
+ * `hasContent: false` means the file exists in the tree but its body was
+ * deliberately not stored (binary, unsupported type, or over the size cap), so
+ * `getRepoFile` will refuse it. The UI shows those rows but does not pretend
+ * they can be opened.
+ */
+export interface RepoTreeEntry {
+  path: string
+  blob_sha?: string
+  language?: string
+  size_bytes?: number
+  has_content: boolean
+}
+
+export interface RepoTreeResponse {
+  files: RepoTreeEntry[]
+  commit_sha: string
+  synced: boolean
+}
+
+export const getRepoTree = (projectId: string) =>
+  baseAPI
+    .get<ApiResponse<RepoTreeResponse>>(`/api/v1/projects/${projectId}/repo/tree`)
+    .then((res) => res.data.data!)
+
+export interface RepoFileContent {
+  path: string
+  commit_sha: string
+  language?: string
+  size_bytes: number
+  content: string
+}
+
+/** Read one stored file body. Read-only: nothing here writes back to the provider. */
+export const getRepoFile = (projectId: string, path: string) =>
+  baseAPI
+    .get<ApiResponse<RepoFileContent>>(`/api/v1/projects/${projectId}/repo/file`, {
+      params: { path },
+    })
+    .then((res) => res.data.data!)
