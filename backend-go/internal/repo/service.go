@@ -131,6 +131,39 @@ type repoTreeItem struct {
 	BlobSHA   string
 }
 
+// classifyTree decides which tree entries can reuse the previously stored
+// index.
+//
+// It is a pure function on purpose: this single rule decides whether a sync
+// re-downloads and re-embeds a file, so it is the one piece of the incremental
+// path that must be provable without a database or a provider.
+//
+// A file counts as unchanged only when the provider reports a blob id AND that
+// id matches what we stored AND we still hold the content. The content check is
+// load-bearing: if a file were once stored as metadata-only (binary, too large)
+// and we ignored that, every later sync would keep calling it unchanged and it
+// could never become indexed.
+func classifyTree(entries []repoTreeItem, previous map[string]prevRepoFile) (map[string]bool, []string) {
+	unchanged := make(map[string]bool, len(entries))
+	var unchangedPaths []string
+
+	for _, entry := range entries {
+		carried, ok := previous[entry.Path]
+		if !ok {
+			continue
+		}
+		if entry.BlobSHA == "" || carried.BlobSHA == "" {
+			continue
+		}
+		if carried.BlobSHA != entry.BlobSHA || !carried.HasContent {
+			continue
+		}
+		unchanged[entry.Path] = true
+		unchangedPaths = append(unchangedPaths, entry.Path)
+	}
+	return unchanged, unchangedPaths
+}
+
 // repoTreeRow is a tree item plus whatever content we managed to fetch for it.
 // It is the unit persistRepoTree writes.
 type repoTreeRow struct {
@@ -140,6 +173,79 @@ type repoTreeRow struct {
 	BlobSHA    string
 	Content    string
 	HasContent bool
+
+	// BlobAlreadyStored marks a row whose blob_sha was carried over from the
+	// previous commit: the bytes are already in repo_blobs, so re-inserting
+	// them (and re-reading the file over the network) would be pure waste.
+	BlobAlreadyStored bool
+}
+
+// prevRepoFile is what a previous sync recorded about one path. It is the only
+// input to the incremental decision, so it deliberately holds no content: the
+// whole point of incremental re-indexing is to decide without fetching.
+type prevRepoFile struct {
+	BlobSHA    string
+	Language   string
+	SizeBytes  *int
+	HasContent bool
+}
+
+// loadPreviousRepoIndex reads the currently stored tree for a connection,
+// keyed by path.
+func (s *Service) loadPreviousRepoIndex(ctx context.Context, connectionID uuid.UUID) (map[string]prevRepoFile, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT path, COALESCE(blob_sha, ''), COALESCE(language, ''), size_bytes,
+		        (blob_sha IS NOT NULL)
+		   FROM repo_files
+		  WHERE repo_connection_id=$1`,
+		connectionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load previous repo index: %w", err)
+	}
+	defer rows.Close()
+
+	out := map[string]prevRepoFile{}
+	for rows.Next() {
+		var p string
+		var entry prevRepoFile
+		if err := rows.Scan(&p, &entry.BlobSHA, &entry.Language, &entry.SizeBytes, &entry.HasContent); err != nil {
+			return nil, fmt.Errorf("scan previous repo index: %w", err)
+		}
+		out[p] = entry
+	}
+	return out, rows.Err()
+}
+
+// loadRepoEdgesForSources reads back the edges leaving the given files.
+//
+// WHY this exists: an unchanged file's imports cannot have changed, so its
+// edges are reused verbatim instead of being re-derived — which would require
+// its content, which is exactly what the incremental path refuses to re-fetch.
+func (s *Service) loadRepoEdgesForSources(ctx context.Context, connectionID uuid.UUID, sources []string) ([]repoEdge, error) {
+	if len(sources) == 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(ctx,
+		`SELECT src_path, dst_path, kind
+		   FROM repo_file_edges
+		  WHERE repo_connection_id=$1 AND src_path = ANY($2)`,
+		connectionID, sources,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("load reusable repo edges: %w", err)
+	}
+	defer rows.Close()
+
+	var edges []repoEdge
+	for rows.Next() {
+		var edge repoEdge
+		if err := rows.Scan(&edge.Src, &edge.Dst, &edge.Kind); err != nil {
+			return nil, fmt.Errorf("scan reusable repo edge: %w", err)
+		}
+		edges = append(edges, edge)
+	}
+	return edges, rows.Err()
 }
 
 // RepoTreeEntry is one file as returned to the API. BlobSHA is empty and
@@ -576,41 +682,87 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 		return
 	}
 
+	// Incremental decision: which files can be carried over untouched?
+	//
+	// A file is unchanged when the provider reports the SAME blob id we already
+	// stored AND we still hold its content. Content is required, not optional:
+	// reusing a file we never stored the body of would lock in the earlier gap
+	// forever, because every later sync would keep calling it "unchanged".
+	previous, err := s.loadPreviousRepoIndex(ctx, connectionID)
+	if err != nil {
+		// Non-fatal by design: losing the previous index only costs us the
+		// optimisation, so the sync falls back to the full path.
+		s.logger.Warn("load previous repo index failed; falling back to a full re-index",
+			zap.String("connection_id", connectionID.String()),
+			zap.Error(err),
+		)
+		previous = map[string]prevRepoFile{}
+	}
+
 	// One row per tree entry up front; content is filled in as it is fetched,
 	// so files we never ingest still appear in the tree with metadata only.
 	rows := make([]repoTreeRow, 0, len(entries))
 	rowIndex := make(map[string]int, len(entries))
+	unchanged, unchangedPaths := classifyTree(entries, previous)
+
 	for _, entry := range entries {
 		rowIndex[entry.Path] = len(rows)
-		rows = append(rows, repoTreeRow{
+		row := repoTreeRow{
 			Path:      entry.Path,
 			SizeBytes: entry.SizeBytes,
 			Language:  getLanguage(entry.Path),
 			BlobSHA:   entry.BlobSHA,
-		})
+		}
+		if unchanged[entry.Path] {
+			carried := previous[entry.Path]
+			row.BlobSHA = carried.BlobSHA
+			row.Language = carried.Language
+			row.SizeBytes = carried.SizeBytes
+			row.HasContent = true
+			row.BlobAlreadyStored = true
+		}
+		rows = append(rows, row)
 	}
 
-	files := supportedFiles(entries)
+	// Only files we did not carry over are fetched, embedded and re-parsed.
+	supported := supportedFiles(entries)
+	var toFetch []repoTreeItem
+	for _, entry := range supported {
+		if !unchanged[entry.Path] {
+			toFetch = append(toFetch, entry)
+		}
+	}
+
 	s.logger.Info("repo tree fetched",
 		zap.Int("tree_entries", len(entries)),
-		zap.Int("supported", len(files)),
+		zap.Int("supported", len(supported)),
+		zap.Int("unchanged_reused", len(unchangedPaths)),
+		zap.Int("to_fetch", len(toFetch)),
 	)
 
-	// Delete existing repo chunks for this connection
-	_, _ = s.db.Exec(ctx,
-		`DELETE FROM repo_chunks WHERE repo_connection_id=$1`,
-		connectionID,
-	)
+	// Chunks are kept for carried-over files and dropped for everything else.
+	// Deleting by exclusion also removes the chunks of files deleted upstream:
+	// they are absent from the tree, so they are absent from the keep list.
+	// An empty keep list deletes every chunk, which is exactly the old
+	// full-re-index behaviour — the fallback path stays correct.
+	if _, err := s.db.Exec(ctx,
+		`DELETE FROM repo_chunks
+		  WHERE repo_connection_id=$1 AND NOT (file_path = ANY($2))`,
+		connectionID, unchangedPaths,
+	); err != nil {
+		s.logger.Warn("prune repo chunks failed (non-fatal)",
+			zap.String("connection_id", connectionID.String()), zap.Error(err))
+	}
 
 	totalChunks := 0
 
 	// Process files in batches of 5
-	for i := 0; i < len(files); i += 5 {
+	for i := 0; i < len(toFetch); i += 5 {
 		end := i + 5
-		if end > len(files) {
-			end = len(files)
+		if end > len(toFetch) {
+			end = len(toFetch)
 		}
-		batch := files[i:end]
+		batch := toFetch[i:end]
 
 		// Fetch content for batch
 		var repoFiles []RepoFile
@@ -673,18 +825,34 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 		}
 	}
 
-	// Derive the dependency graph from the files whose content we actually hold.
-	// A metadata-only file cannot be parsed, so it contributes no outgoing edges
-	// — the graph is exactly as complete as the stored corpus, no more.
-	treeContents := make(map[string]string, len(rows))
-	treeLanguages := make(map[string]string, len(rows))
+	// Derive the dependency graph from the files we actually re-read, then add
+	// back the edges of the files we carried over.
+	//
+	// WHY carried-over files are excluded from parsing: an unchanged file's
+	// imports cannot have changed, so re-parsing it would force the very fetch
+	// this incremental path exists to avoid. Its stored edges are reused
+	// verbatim instead.
+	treeContents := make(map[string]string, len(toFetch))
+	treeLanguages := make(map[string]string, len(toFetch))
 	for _, row := range rows {
-		if row.HasContent {
+		if row.HasContent && !row.BlobAlreadyStored {
 			treeContents[row.Path] = row.Content
 			treeLanguages[row.Path] = row.Language
 		}
 	}
 	edges := buildRepoEdges(treeContents, treeLanguages)
+
+	reusedEdges, err := s.loadRepoEdgesForSources(ctx, connectionID, unchangedPaths)
+	if err != nil {
+		// Non-fatal: a missing edge set makes the graph smaller, never wrong,
+		// and the next sync rebuilds it.
+		s.logger.Warn("reuse repo edges failed (non-fatal)",
+			zap.String("connection_id", connectionID.String()),
+			zap.Error(err),
+		)
+	} else {
+		edges = append(edges, reusedEdges...)
+	}
 
 	// Persist the tree and its graph (metadata for all, content for what was
 	// fetched). Non-fatal: the chunk corpus above is already committed, and
@@ -707,10 +875,25 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 		}
 	}
 
-	s.updateSyncStatus(ctx, connectionID, "complete", "", totalChunks)
+	// Report the whole corpus, not just what this run embedded. total_chunks is
+	// shown to the client as "chunks indexed", and an incremental sync that
+	// touched three files must not make the repository look like it shrank.
+	storedChunks := 0
+	if err := s.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM repo_chunks WHERE repo_connection_id=$1`, connectionID,
+	).Scan(&storedChunks); err != nil {
+		storedChunks = totalChunks
+		s.logger.Warn("count repo chunks failed (non-fatal)",
+			zap.String("connection_id", connectionID.String()), zap.Error(err))
+	}
+
+	s.updateSyncStatus(ctx, connectionID, "complete", "", storedChunks)
 	s.logger.Info("repo sync complete",
-		zap.Int("total_chunks", totalChunks),
+		zap.Int("indexed_chunks", storedChunks),
+		zap.Int("new_chunks", totalChunks),
 		zap.Int("tree_entries", len(rows)),
+		zap.Int("unchanged_reused", len(unchangedPaths)),
+		zap.Int("fetched", len(toFetch)),
 		zap.Int("edges", len(edges)),
 		zap.String("connection_id", connectionID.String()),
 	)
@@ -755,7 +938,9 @@ func (s *Service) persistRepoTree(
 	batch := &pgx.Batch{}
 	seenBlob := make(map[string]bool, len(rows))
 	for _, row := range rows {
-		if !row.HasContent || seenBlob[row.BlobSHA] {
+		// A carried-over row's blob is already stored; re-queuing it would mean
+		// writing (and holding in memory) bytes we deliberately never fetched.
+		if !row.HasContent || row.BlobAlreadyStored || seenBlob[row.BlobSHA] {
 			continue
 		}
 		seenBlob[row.BlobSHA] = true
@@ -1433,6 +1618,10 @@ func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token st
 		var pageItems []struct {
 			Path string `json:"path"`
 			Type string `json:"type"`
+			// GitLab returns the blob SHA as `id`. It is what makes incremental
+			// re-indexing possible on GitLab: without it every sync would have
+			// to fetch every file to notice that nothing changed.
+			ID string `json:"id"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&pageItems); err != nil {
 			resp.Body.Close()
@@ -1448,8 +1637,9 @@ func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token st
 			if shouldSkipPath(item.Path) {
 				continue
 			}
-			// GitLab's tree API reports no size, so SizeBytes stays nil.
-			items = append(items, repoTreeItem{Path: item.Path})
+			// GitLab's tree API reports no size, so SizeBytes stays nil, but it
+			// does report the blob id, so change detection still works.
+			items = append(items, repoTreeItem{Path: item.Path, BlobSHA: item.ID})
 		}
 
 		if nextPage == "" {
