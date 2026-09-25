@@ -222,7 +222,11 @@ export function IngestionPipelineModal({
                   </span>
                 )}
               </div>
-              {job.costUsd && job.costUsd > 0 && (
+              {/* typeof guard, not `{job.costUsd && ...}`: cost arrives as the
+                  number 0 (backend sends COALESCE(cost_usd,0)), and React
+                  renders a bare 0 as text — that is the permanent "0" that sat
+                  under the progress bar on every stage. */}
+              {typeof job.costUsd === 'number' && job.costUsd > 0 && (
                 <span className="rounded-full border border-glow-amber/30 bg-glow-amber/10 px-2 py-0.5 text-[10px] font-medium text-glow-amber">
                   {formatCost(job.costUsd)}
                 </span>
@@ -283,6 +287,16 @@ export function IngestionPipelineModal({
                 <span className="font-mono">{stream.verification.corpusTotalChunks}</span> chunks
               </p>
             )}
+            {/* Chunks with no vector are invisible to retrieval no matter how
+                many rows exist, so a non-zero count is shown even when the
+                overall check passes. */}
+            {typeof stream.verification.reality.null_embeddings === 'number' &&
+              stream.verification.reality.null_embeddings > 0 && (
+                <p className="mt-1 text-[10px] text-glow-amber">
+                  {stream.verification.reality.null_embeddings} chunks have no embedding — retrieval
+                  will miss them.
+                </p>
+              )}
           </div>
         )}
 
