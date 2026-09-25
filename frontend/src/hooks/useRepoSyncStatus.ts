@@ -10,10 +10,14 @@ import { getRepoSyncStatus } from '@/api/repo'
  * GET /projects/:id/repo/status is the only way to observe progress.
  * Stops polling once status leaves pending/syncing.
  */
-export function useRepoSyncStatus(projectId: string) {
+export function useRepoSyncStatus(projectId: string, enabled = true) {
   return useQuery({
     queryKey: ['projects', projectId, 'repo', 'status'],
     queryFn: () => getRepoSyncStatus(projectId),
+    // enabled exists for callers that render before a project is chosen
+    // (CreateWorkflowModal): without it, an empty projectId would be requested
+    // as GET /projects//repo/status. RepoStatus keeps the default.
+    enabled: enabled && projectId !== '',
     refetchInterval: (query) => {
       const data = query.state.data
       if (!data || !data.connected) return false

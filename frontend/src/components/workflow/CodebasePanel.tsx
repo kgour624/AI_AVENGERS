@@ -8,8 +8,11 @@ import {
   generateCodebasePatch,
   getCodebaseFiles,
   getCodebasePatch,
+  runWorkflow,
+  startWorkflow,
   suggestCodebaseFiles,
   type CodebaseFile,
+  type Workflow,
 } from '@/api/workflows'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
@@ -35,7 +38,15 @@ function statusBadge(status: CodebaseFile['status']) {
   return <Badge variant="warning">PENDING</Badge>
 }
 
-export function CodebasePanel({ workflowId }: { workflowId: string }) {
+export function CodebasePanel({
+  workflowId,
+  workflowStatus,
+}: {
+  workflowId: string
+  // workflowStatus drives the start control below. Passed in rather than fetched
+  // again because KanbanPage already polls the workflow every 10s.
+  workflowStatus?: Workflow['status']
+}) {
   const queryClient = useQueryClient()
   const [newPath, setNewPath] = useState('')
   const [actionError, setActionError] = useState<string | null>(null)
@@ -110,6 +121,28 @@ export function CodebasePanel({ workflowId }: { workflowId: string }) {
     onError: () => setActionError('Could not download the patch.'),
   })
 
+  // Starting the run is the step AFTER approval, and it belongs here rather than
+  // in the create dialog.
+  //
+  // WHY: an existing-codebase workflow must have an approved readable set before
+  // the runner seeds a workspace. The create dialog used to create-and-run in one
+  // click, so every such workflow started with an empty approved set and failed
+  // immediately ("no approved files to read") — with the tab that would have let
+  // the client fix it not even visible. Creating a draft and starting it from the
+  // screen where the files are approved removes that trap.
+  const startMutation = useMutation({
+    mutationFn: async () => {
+      await startWorkflow(workflowId)
+      await runWorkflow(workflowId)
+    },
+    onSuccess: () => {
+      setActionError(null)
+      queryClient.invalidateQueries({ queryKey: ['workflow', workflowId] })
+    },
+    onError: () =>
+      setActionError('Could not start the workflow. It must still be a draft with at least one approved file.'),
+  })
+
   if (isLoading) {
     return <div className="h-32 animate-pulse rounded-lg bg-surface-overlay" />
   }
@@ -122,6 +155,33 @@ export function CodebasePanel({ workflowId }: { workflowId: string }) {
 
   return (
     <div className="space-y-4">
+      {workflowStatus === 'draft' && (
+        <Card className="p-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <span className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
+                Start
+              </span>
+              <p className="mt-1 text-[11px] text-text-disabled">
+                {approvedCount > 0
+                  ? `The experts will read only the ${approvedCount} approved file${
+                      approvedCount === 1 ? '' : 's'
+                    }, and a patch will be generated against the commit this started from.`
+                  : 'Approve at least one file first — a run with nothing approved has no code to read and would fail.'}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              disabled={approvedCount === 0}
+              isLoading={startMutation.isPending}
+              onClick={() => startMutation.mutate()}
+            >
+              Start workflow
+            </Button>
+          </div>
+        </Card>
+      )}
+
       <Card className="p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-2">

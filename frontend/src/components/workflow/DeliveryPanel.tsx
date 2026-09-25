@@ -1,6 +1,8 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { exportHarnessToGit, ingestCodeFeedback, type GitExportResult } from '@/api/delivery'
+import { useRepoSyncStatus } from '@/hooks/useRepoSyncStatus'
 import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
@@ -198,7 +200,19 @@ function CodeFeedbackForm({ workflowId }: { workflowId: string }) {
   )
 }
 
-export function DeliveryPanel({ workflowId }: { workflowId: string }) {
+export function DeliveryPanel({
+  workflowId,
+  projectId,
+}: {
+  workflowId: string
+  // projectId lets the panel say "connect a repo first" instead of letting the
+  // push fail with "no usable git provider credential for this project". The
+  // connect flow lives on the project page, so the fix is a link away.
+  projectId?: string
+}) {
+  const { data: repoStatus } = useRepoSyncStatus(projectId ?? '', !!projectId)
+  const needsRepo = !!projectId && !!repoStatus && !repoStatus.connected
+
   return (
     <div className="mt-6">
       <div className="mb-2 flex items-center justify-between">
@@ -206,6 +220,19 @@ export function DeliveryPanel({ workflowId }: { workflowId: string }) {
           Delivery
         </span>
       </div>
+
+      {needsRepo && (
+        <div className="mb-3 rounded-lg border border-glass-border bg-surface-raised p-3">
+          <p className="text-[11px] text-text-secondary">
+            This project has no connected repository, so there is no credential to push with.{' '}
+            <Link to={`/projects/${projectId}`} className="text-brand underline">
+              Connect GitHub or GitLab on the project page
+            </Link>{' '}
+            first — the repository URL below must be one that connection can reach. A Personal
+            Access Token works even when the one-click OAuth app is not configured.
+          </p>
+        </div>
+      )}
       <div className="grid grid-cols-2 gap-4">
         <Card className="p-4">
           <ExportForm workflowId={workflowId} />

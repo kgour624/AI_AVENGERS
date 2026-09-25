@@ -179,14 +179,18 @@ type AiderCheckpoint struct {
 
 // Run executes the Aider loop for one expert's task.
 //
-// CRITICAL: This is Phase 1 skeleton - no actual Aider calls yet.
-// Phase 2 will add runAiderIteration() with real Aider integration.
+// Steps: initialise the per-expert workspace, seed it with the design artifacts
+// and the prior wave's files, then run up to maxIterations Aider iterations —
+// each one observing the workspace (git status, build errors, test failures,
+// coverage in QA) and committing what it changed, under a per-iteration timeout.
+// A run that reaches maxIterations with work committed returns Completed=false
+// rather than an error; only a run that committed nothing at all fails. Finally
+// the committed files are published as code_artifact_produced events.
 //
-// Current implementation:
-//  1. Initialize workspace
-//  2. Seed with design artifacts
-//  3. TODO: Run Aider loop (Phase 2)
-//  4. TODO: Post code artifacts (Phase 3)
+// This comment used to call the function a "Phase 1 skeleton - no actual Aider
+// calls yet" with TODOs for the loop and artifact posting. Both have been
+// implemented for a long time (runAiderIteration, publishCodeArtifacts), so the
+// note was describing a different file than the one a reader was looking at.
 func (a *AiderRunner) Run(ctx context.Context, req AiderRunRequest) (*AiderRunResult, error) {
 	// PHASE 5: Track start time for duration metrics
 	startTime := time.Now()

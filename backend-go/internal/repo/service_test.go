@@ -2,6 +2,7 @@ package repo
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -248,5 +249,69 @@ func TestFetchHeadCommitSHAErrorsOnEmptyResult(t *testing.T) {
 	}
 	if _, err := svc.fetchHeadCommitSHA(context.Background(), ProviderGitLab, "https://gitlab.com/acme/service", "main", "token"); err == nil {
 		t.Fatal("fetchHeadCommitSHA() expected an error for an empty commit list")
+	}
+}
+
+// The one-click OAuth connect must refuse before it builds any URL when the
+// deployment has no OAuth app credentials. Previously the authorize URL was
+// assembled with an empty client_id and the browser landed on the provider's
+// error page, which reads as "the button is broken" rather than "the server is
+// not configured".
+func TestOAuthCredentialsMissing(t *testing.T) {
+	configured := &Service{
+		githubOAuth: OAuthConfig{ClientID: "gh-id", ClientSecret: "gh-secret"},
+		gitlabOAuth: OAuthConfig{ClientID: "gl-id", ClientSecret: "gl-secret"},
+	}
+	unconfigured := &Service{}
+
+	tests := []struct {
+		name     string
+		svc      *Service
+		provider string
+		want     bool
+		wantVars string
+	}{
+		{name: "github configured", svc: configured, provider: ProviderGitHub, want: false},
+		{name: "gitlab configured", svc: configured, provider: ProviderGitLab, want: false},
+		{
+			name: "github missing", svc: unconfigured, provider: ProviderGitHub,
+			want: true, wantVars: "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET",
+		},
+		{
+			name: "gitlab missing", svc: unconfigured, provider: ProviderGitLab,
+			want: true, wantVars: "GITLAB_CLIENT_ID/GITLAB_CLIENT_SECRET",
+		},
+		{
+			// Half-configured is still unconfigured: a client id with no secret
+			// cannot complete the token exchange, so the handshake must not start.
+			name:     "github id without secret",
+			svc:      &Service{githubOAuth: OAuthConfig{ClientID: "gh-id"}},
+			provider: ProviderGitHub, want: true, wantVars: "GITHUB_CLIENT_ID/GITHUB_CLIENT_SECRET",
+		},
+		{
+			// An unknown provider is not reported here — GetOAuthURL answers that
+			// with "unsupported provider", and claiming a missing credential for a
+			// provider we do not support would point the operator at the wrong fix.
+			name: "unknown provider", svc: unconfigured, provider: "bitbucket", want: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			missing, vars := tc.svc.oauthCredentialsMissing(tc.provider)
+			if missing != tc.want {
+				t.Fatalf("missing = %v, want %v", missing, tc.want)
+			}
+			if missing && vars != tc.wantVars {
+				t.Fatalf("env vars = %q, want %q", vars, tc.wantVars)
+			}
+		})
+	}
+}
+
+func TestGetOAuthURLRefusesWithoutCredentials(t *testing.T) {
+	s := &Service{}
+	if _, err := s.GetOAuthURL(context.Background(), ProviderGitHub, "state", "project"); !errors.Is(err, ErrOAuthNotConfigured) {
+		t.Fatalf("GetOAuthURL error = %v, want ErrOAuthNotConfigured", err)
 	}
 }
