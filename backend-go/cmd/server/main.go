@@ -766,6 +766,9 @@ func buildRouter(
 			projects.POST("/:id/repo", repoHandler.ConnectRepo)
 			projects.POST("/:id/repo/sync", repoHandler.SyncRepo)
 			projects.GET("/:id/repo/status", repoHandler.GetSyncStatus)
+			// Phase 3A: read-only access to the stored file tree + file bodies.
+			projects.GET("/:id/repo/tree", repoHandler.ListRepoTree)
+			projects.GET("/:id/repo/file", repoHandler.GetRepoFile)
 		}
 
 		// OAuth initiation — protected so we know which user is connecting

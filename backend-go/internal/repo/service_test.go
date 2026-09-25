@@ -53,12 +53,18 @@ func TestFetchGitLabTreeFollowsPagination(t *testing.T) {
 		})},
 	}
 
-	files, err := svc.fetchGitLabTree(context.Background(), "https://gitlab.com/acme/service", "main", "token")
+	entries, err := svc.fetchGitLabTree(context.Background(), "https://gitlab.com/acme/service", "main", "token")
 	if err != nil {
 		t.Fatalf("fetchGitLabTree() error = %v", err)
 	}
-	if want := []string{"cmd/app/main.go", "internal/store/store.go"}; fmt.Sprint(files) != fmt.Sprint(want) {
-		t.Fatalf("files = %v, want %v", files, want)
+	// The tree now keeps every blob (unsupported ones included) so the stored
+	// structure is complete; only content fetching is filtered later.
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		paths = append(paths, entry.Path)
+	}
+	if want := []string{"cmd/app/main.go", "README.txt", "internal/store/store.go"}; fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
 	}
 	if want := []string{"1", "2"}; fmt.Sprint(requestedPages) != fmt.Sprint(want) {
 		t.Fatalf("requested pages = %v, want %v", requestedPages, want)
@@ -165,5 +171,82 @@ func TestRefreshGitLabTokenUsesRefreshGrant(t *testing.T) {
 	}
 	if tok.AccessToken != "new-access" || tok.RefreshToken != "new-refresh" || tok.ExpiresAt.IsZero() {
 		t.Fatalf("refreshed token = %+v, missing refreshed credentials/expiry", tok)
+	}
+}
+
+func TestGitLabTreeEntriesCarryNoSize(t *testing.T) {
+	svc := &Service{
+		logger: zap.NewNop(),
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, make(http.Header), `[{"path":"a.go","type":"blob"}]`), nil
+		})},
+	}
+	entries, err := svc.fetchGitLabTree(context.Background(), "https://gitlab.com/acme/service", "main", "token")
+	if err != nil {
+		t.Fatalf("fetchGitLabTree() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].SizeBytes != nil || entries[0].BlobSHA != "" {
+		t.Fatalf("entries = %+v, want one entry with nil size and no provider blob SHA", entries)
+	}
+}
+
+func TestSupportedFilesDropsUnsupportedAndOversized(t *testing.T) {
+	big := maxRepoFileBytes + 1
+	entries := []repoTreeItem{
+		{Path: "main.go"},
+		{Path: "logo.png"},
+		{Path: "huge.go", SizeBytes: &big},
+		{Path: "unknown_size.go"},
+	}
+	got := supportedFiles(entries)
+	want := []string{"main.go", "unknown_size.go"}
+	paths := make([]string, 0, len(got))
+	for _, entry := range got {
+		paths = append(paths, entry.Path)
+	}
+	if fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Fatalf("supportedFiles() = %v, want %v", paths, want)
+	}
+}
+
+func TestGitBlobSHAMatchesGitBlobHash(t *testing.T) {
+	// git hash-object of "hello\n" is a known value; this pins the
+	// "blob <len>\x00" framing, which is the entire reason the SHA is computed
+	// locally instead of trusted from a provider field.
+	if got, want := gitBlobSHA("hello\n"), "ce013625030ba8dba906f756967f9e9ca394464a"; got != want {
+		t.Fatalf("gitBlobSHA() = %s, want %s", got, want)
+	}
+}
+
+func TestFetchHeadCommitSHAParsesBothProviders(t *testing.T) {
+	github := &Service{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, make(http.Header), `{"sha":"abc123"}`), nil
+		})},
+	}
+	sha, err := github.fetchHeadCommitSHA(context.Background(), ProviderGitHub, "https://github.com/acme/service", "main", "token")
+	if err != nil || sha != "abc123" {
+		t.Fatalf("github head sha = (%q, %v), want abc123", sha, err)
+	}
+
+	gitlab := &Service{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, make(http.Header), `[{"id":"def456"}]`), nil
+		})},
+	}
+	sha, err = gitlab.fetchHeadCommitSHA(context.Background(), ProviderGitLab, "https://gitlab.com/acme/service", "main", "token")
+	if err != nil || sha != "def456" {
+		t.Fatalf("gitlab head sha = (%q, %v), want def456", sha, err)
+	}
+}
+
+func TestFetchHeadCommitSHAErrorsOnEmptyResult(t *testing.T) {
+	svc := &Service{
+		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return httpResponse(http.StatusOK, make(http.Header), `[]`), nil
+		})},
+	}
+	if _, err := svc.fetchHeadCommitSHA(context.Background(), ProviderGitLab, "https://gitlab.com/acme/service", "main", "token"); err == nil {
+		t.Fatal("fetchHeadCommitSHA() expected an error for an empty commit list")
 	}
 }
