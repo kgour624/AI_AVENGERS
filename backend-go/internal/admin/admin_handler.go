@@ -51,7 +51,10 @@ type AdminHandler struct {
 	capEval *training.CapabilityEvaluator
 	// concepts (I4) stores the typed relationships between an expert's topics. Nil-safe:
 	// when unwired the concept endpoints report that the graph is unavailable.
-	concepts    *training.ConceptGraph
+	concepts *training.ConceptGraph
+	// depthLayers (I5) classifies chunks by content kind and reports coverage. Nil-safe:
+	// when unwired the depth endpoints report that it is unavailable.
+	depthLayers *training.DepthClassifier
 	categoryReg *category.Registry
 	// domainReg backs the domain-profile admin endpoints (max tokens,
 	// coverage/citation/strip modes, etc — see ListDomainProfiles /
@@ -158,6 +161,11 @@ func (h *AdminHandler) SetCapabilityEvaluator(e *training.CapabilityEvaluator) {
 // SetConceptGraph wires the concept-relationship store (I4).
 func (h *AdminHandler) SetConceptGraph(g *training.ConceptGraph) {
 	h.concepts = g
+}
+
+// SetDepthClassifier wires the content-kind classifier (I5).
+func (h *AdminHandler) SetDepthClassifier(c *training.DepthClassifier) {
+	h.depthLayers = c
 }
 
 // ============================================================
@@ -2537,6 +2545,65 @@ func (h *AdminHandler) GetExpertConcepts(c *gin.Context) {
 		"edges":     edges,
 		"relations": training.ConceptRelations(),
 	})
+}
+
+// ============================================================
+// DEPTH LAYERS (I5)
+// ============================================================
+
+// ClassifyExpertDepthLayers POST /admin/experts/:id/depth-layers
+//
+// Labels a bounded batch of chunks by content kind (what/why, how/trade-offs,
+// failure/edge) and reports how many are still unclassified. Deliberately per-call
+// bounded and resumable: it costs model calls, so the admin decides how far to go and
+// the corpus says how much is left.
+func (h *AdminHandler) ClassifyExpertDepthLayers(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.depthLayers == nil {
+		response.ServiceUnavailable(c, "depth classification is not wired in this deployment")
+		return
+	}
+
+	result, err := h.depthLayers.Classify(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("depth classification failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]interface{}{
+		"expert_id": expertID,
+		"result":    result,
+	})
+}
+
+// GetExpertDepthLayers GET /admin/experts/:id/depth-layers
+//
+// Reads the content-kind coverage. This is the answer to "is this expert deep or does
+// it only know what things are?", derived from the course rather than declared.
+func (h *AdminHandler) GetExpertDepthLayers(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	if h.depthLayers == nil {
+		response.ServiceUnavailable(c, "depth classification is not wired in this deployment")
+		return
+	}
+
+	report, err := h.depthLayers.Report(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("depth coverage read failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, report)
 }
 
 // RegenerateCharter POST /admin/experts/:id/regenerate-charter

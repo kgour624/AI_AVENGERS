@@ -5,9 +5,11 @@ import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
 import { getExpertTopics } from '@/api/experts'
 import {
+  classifyExpertDepthLayers,
   extractExpertConcepts,
   getCapabilityEval,
   getExpertConcepts,
+  getExpertDepthLayers,
   startCapabilityEval,
   type ConceptEdge,
 } from '@/api/admin'
@@ -123,6 +125,7 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   const [showAll, setShowAll] = useState(false)
   const [measureError, setMeasureError] = useState<string | null>(null)
   const [conceptNote, setConceptNote] = useState<string | null>(null)
+  const [depthNote, setDepthNote] = useState<string | null>(null)
 
   // Fetched only when the section is opened: this is a per-expert table read that
   // nobody asked for until they expand it.
@@ -166,6 +169,28 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
     queryFn: () => getExpertConcepts(expert.id),
     enabled: isExpanded,
     staleTime: 60_000,
+  })
+
+  // Depth layers (I5): what KIND of content the corpus holds. Read on expand; the
+  // classification is a separate, bounded action because it costs model calls.
+  const { data: depthLayers, refetch: refetchLayers } = useQuery({
+    queryKey: ['experts', expert.id, 'depth-layers'],
+    queryFn: () => getExpertDepthLayers(expert.id),
+    enabled: isExpanded,
+    staleTime: 60_000,
+  })
+
+  const classifyMutation = useMutation({
+    mutationFn: () => classifyExpertDepthLayers(expert.id),
+    onSuccess: (result) => {
+      setDepthNote(
+        `Classified ${result.classified} chunk${result.classified === 1 ? '' : 's'}` +
+          (result.remaining > 0 ? `, ${result.remaining} left — run again` : ', done') +
+          (result.rejected > 0 ? ` (${result.rejected} answers ignored as invalid)` : ''),
+      )
+      refetchLayers()
+    },
+    onError: () => setDepthNote('Could not classify the corpus.'),
   })
 
   const extractMutation = useMutation({
@@ -374,6 +399,91 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                   )}
 
                   {measureError && <p className="mt-2 text-[10px] text-glow-amber">{measureError}</p>}
+                </div>
+
+                {/* Depth layers (I5). This is the honest replacement for the old "average
+                    depth" number: it says what KIND of content exists, so "this topic has
+                    no failure-mode content" becomes visible instead of being averaged
+                    away. Everything here comes from the course, nothing is generated. */}
+                <div className="rounded border border-border bg-bg-tertiary p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="text-xs font-medium text-text-primary">
+                        Depth layers
+                        {depthLayers && depthLayers.classified > 0
+                          ? ` (${depthLayers.classified}/${depthLayers.totalChunks} classified)`
+                          : ''}
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-text-disabled">
+                        What kind of content the corpus holds: what/why, how and trade-offs, or
+                        failure and edge cases. A topic with no failure content will explain it but
+                        cannot answer &ldquo;what breaks under load&rdquo;.
+                      </p>
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      isLoading={classifyMutation.isPending}
+                      onClick={() => classifyMutation.mutate()}
+                    >
+                      {depthLayers && depthLayers.classified > 0 ? 'Classify more' : 'Classify content'}
+                    </Button>
+                  </div>
+
+                  {depthLayers && depthLayers.classified > 0 && (
+                    <>
+                      <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-text-secondary">
+                        <span>
+                          what / why{' '}
+                          <span className="font-mono text-text-primary">{depthLayers.definition}</span>
+                        </span>
+                        <span>
+                          how / trade-offs{' '}
+                          <span className="font-mono text-text-primary">{depthLayers.mechanics}</span>
+                        </span>
+                        <span>
+                          failure / edge{' '}
+                          <span className="font-mono text-text-primary">{depthLayers.failure}</span>
+                        </span>
+                      </div>
+                      <ul className="mt-2 space-y-1">
+                        {depthLayers.findings.map((finding) => (
+                          <li key={finding} className="flex gap-1.5 text-[10px] text-text-secondary">
+                            <span className="shrink-0 text-text-disabled">{'•'}</span>
+                            <span>{finding}</span>
+                          </li>
+                        ))}
+                      </ul>
+                      {depthLayers.topicsWithoutFailure > 0 && (
+                        <ul className="mt-2 max-h-32 overflow-y-auto rounded border border-glass-border">
+                          {depthLayers.topics
+                            .filter((topic) => topic.failure === 0)
+                            .slice(0, 12)
+                            .map((topic) => (
+                              <li
+                                key={topic.topic}
+                                className="flex items-center justify-between gap-2 border-b border-glass-border px-2 py-1 last:border-b-0"
+                              >
+                                <span className="truncate text-[10px] text-text-secondary">
+                                  {topic.topic}
+                                </span>
+                                <span className="shrink-0 text-[10px] text-glow-amber">
+                                  {topic.total} chunks, none on failure
+                                </span>
+                              </li>
+                            ))}
+                        </ul>
+                      )}
+                    </>
+                  )}
+
+                  {depthLayers && depthLayers.classified === 0 && !classifyMutation.isPending && (
+                    <p className="mt-2 text-[10px] text-text-disabled">
+                      Nothing classified yet — run it once and the gaps become visible.
+                    </p>
+                  )}
+
+                  {depthNote && <p className="mt-2 text-[10px] text-glow-amber">{depthNote}</p>}
                 </div>
 
                 {/* Concept links (I4). Without these, "Measure with links" has nothing to

@@ -877,3 +877,60 @@ export const extractExpertConcepts = (expertId: string) =>
       `/api/v1/admin/experts/${expertId}/concepts`,
     )
     .then((res) => res.data.data!.result)
+
+// ============================================================
+// Depth layers (I5)
+// ============================================================
+
+/**
+ * What KIND of content each chunk is. Derived from the course, never generated:
+ * 1 what/why, 2 how/trade-offs, 3 failure/edge. A topic with no layer-3 chunks will
+ * explain it but cannot answer "what breaks under load".
+ */
+export interface TopicLayerCoverage {
+  topic: string
+  definition: number
+  mechanics: number
+  failure: number
+  total: number
+}
+
+export interface DepthLayerReport {
+  expertId: string
+  totalChunks: number
+  classified: number
+  unclassified: number
+  definition: number
+  mechanics: number
+  failure: number
+  topicsWithoutFailure: number
+  topicsWithoutMechanics: number
+  topics: TopicLayerCoverage[]
+  findings: string[]
+}
+
+export interface DepthClassifyResult {
+  classified: number
+  /** How many chunks still have no layer — run again to continue. */
+  remaining: number
+  calls: number
+  /** Answers that named a passage or layer that does not exist. */
+  rejected: number
+}
+
+export const getExpertDepthLayers = (expertId: string) =>
+  baseAPI
+    .get<ApiResponse<DepthLayerReport>>(`/api/v1/admin/experts/${expertId}/depth-layers`)
+    .then((res) => res.data.data!)
+
+/**
+ * Classifies one bounded batch and reports what is left. Resumable on purpose: it costs
+ * model calls, so the admin decides how far to go rather than one click launching an
+ * unbounded pass over the whole corpus.
+ */
+export const classifyExpertDepthLayers = (expertId: string) =>
+  baseAPI
+    .post<ApiResponse<{ expertId: string; result: DepthClassifyResult }>>(
+      `/api/v1/admin/experts/${expertId}/depth-layers`,
+    )
+    .then((res) => res.data.data!.result)

@@ -505,6 +505,13 @@ func buildRouter(
 	contextAssembler.SetConceptNeighbourFinder(conceptGraph)
 	adminHandler.SetConceptGraph(conceptGraph)
 
+	// I5: content-kind classification ("is this expert deep, or does it only know what
+	// things are?"). On demand rather than inside ingest: it costs model calls, and the
+	// answer is about the corpus, not about this particular upload.
+	adminHandler.SetDepthClassifier(
+		training.NewDepthClassifier(postgres.Pool, modelGateway, logger),
+	)
+
 	// Collaboration layer (Phase C + D)
 	bbStore := blackboard.NewStore(postgres.Pool, redisClient.Client, logger)
 	bbStore.SetProvenanceRecorder(provSvc) // C1: signed chain per artifact
@@ -961,6 +968,11 @@ func buildRouter(
 		// what is stored. Retrieval expansion reads the same table.
 		adminGroup.POST("/experts/:id/concepts", adminHandler.ExtractExpertConcepts)
 		adminGroup.GET("/experts/:id/concepts", adminHandler.GetExpertConcepts)
+
+		// I5: what kind of content each chunk is. POST classifies a bounded batch and
+		// reports what is left; GET reads the coverage.
+		adminGroup.POST("/experts/:id/depth-layers", adminHandler.ClassifyExpertDepthLayers)
+		adminGroup.GET("/experts/:id/depth-layers", adminHandler.GetExpertDepthLayers)
 		adminGroup.GET("/clients", adminHandler.ListClients)
 		adminGroup.PATCH("/clients/:id", adminHandler.UpdateClient)
 		// Managed accounts: admin + domain_expert CRUD + expert grants
