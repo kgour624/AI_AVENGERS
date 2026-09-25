@@ -568,6 +568,9 @@ func buildRouter(
 	// repoSvc is the repository index; codebaseSvc owns the approval rules.
 	wfCodebaseSvc := workflow.NewCodebaseService(postgres.Pool, bbStore, repoSvc, logger)
 	wfCodebaseHandler := workflow.NewCodebaseHandler(wfCodebaseSvc, postgres.Pool, logger)
+	// 3E: the runner seeds only the approved working set into the workspace and
+	// keeps unapproved repository paths out of the merge.
+	wfRunner.SetCodebaseWorkspace(wfCodebaseSvc)
 
 	// Workflow chat (docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md §6).
 	//

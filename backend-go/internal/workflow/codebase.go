@@ -61,6 +61,10 @@ const (
 type RepoCodeSource interface {
 	SuggestRepoFiles(ctx context.Context, projectID uuid.UUID, requirement string, limit int) ([]repo.RepoFileSuggestion, error)
 	RepoFileExists(ctx context.Context, projectID uuid.UUID, path string) (bool, error)
+	// CopyFilesToWorkspace materialises approved files into a workspace. It is
+	// here (rather than in the runner) because the blob store is the repository
+	// package's business; the runner should not know how file content is kept.
+	CopyFilesToWorkspace(ctx context.Context, projectID uuid.UUID, paths []string, destRoot string) (int, error)
 }
 
 // CodebaseFile is one entry in a workflow's working set.
@@ -121,6 +125,111 @@ func (s *CodebaseService) workflowProject(ctx context.Context, workflowID uuid.U
 // intentionally covers "no such workflow" and "belongs to another client"
 // together, so it is reused here rather than declared again.
 var ErrNotCodebaseWorkflow = errors.New("workflow is not in the existing-codebase environment")
+
+// SeedWorkspace materialises the approved working set into a workflow workspace.
+//
+// THIS IS THE READ-ONLY ENFORCEMENT (3E). An expert can only read what is on
+// disk, so writing exactly the approved files — and nothing else — means an
+// unapproved file is not "denied at read time", it is simply absent. That is a
+// stronger guarantee than a per-read permission check, because it cannot be
+// bypassed by a tool that forgets to ask.
+//
+// A scratch workflow has no repository, so this is a documented no-op rather
+// than an error: the runner calls it unconditionally and should not have to
+// know which environment it is in.
+func (s *CodebaseService) SeedWorkspace(ctx context.Context, workflowID uuid.UUID, workspaceRoot string) (int, error) {
+	var projectID uuid.UUID
+	var mode string
+	err := s.db.QueryRow(ctx,
+		`SELECT project_id, mode FROM workflows WHERE id=$1`, workflowID,
+	).Scan(&projectID, &mode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, ErrWorkflowNotFound
+	}
+	if err != nil {
+		return 0, fmt.Errorf("load workflow for workspace seed: %w", err)
+	}
+	if mode != ModeExistingCodebase {
+		return 0, nil // scratch workflow: nothing to seed
+	}
+
+	paths, err := s.Manifest(ctx, workflowID)
+	if err != nil {
+		return 0, err
+	}
+	if len(paths) == 0 {
+		// An existing-codebase workflow with an empty manifest would run with no
+		// code at all. Failing loudly here is better than letting experts work
+		// blind and producing an answer about a repository they never saw.
+		return 0, ErrEmptyManifest
+	}
+
+	written, err := s.repo.CopyFilesToWorkspace(ctx, projectID, paths, workspaceRoot)
+	if err != nil {
+		return written, fmt.Errorf("seed codebase workspace: %w", err)
+	}
+	s.logger.Info("codebase workspace seeded",
+		zap.String("workflow_id", workflowID.String()),
+		zap.Int("approved_paths", len(paths)),
+		zap.Int("written", written),
+	)
+	return written, nil
+}
+
+// ErrEmptyManifest reports an existing-codebase workflow with nothing approved.
+var ErrEmptyManifest = errors.New("existing-codebase workflow has no approved files to read")
+
+// ProtectedPathChecker builds the predicate the workspace merger uses to refuse
+// unapproved overwrites.
+//
+// A path is protected when it exists in the client's repository but was NOT
+// approved: the expert could not have read it, so it must not be able to write
+// it either. Paths that are not in the repository at all are new files, which
+// the workflow is allowed to create.
+func (s *CodebaseService) ProtectedPathChecker(ctx context.Context, workflowID uuid.UUID, workspaceRoot string) (func(context.Context, string) bool, error) {
+	var projectID uuid.UUID
+	var mode string
+	err := s.db.QueryRow(ctx,
+		`SELECT project_id, mode FROM workflows WHERE id=$1`, workflowID,
+	).Scan(&projectID, &mode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrWorkflowNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load workflow for protected paths: %w", err)
+	}
+	if mode != ModeExistingCodebase {
+		return nil, nil // scratch workflow: every path is the workflow's own
+	}
+
+	approved, err := s.Manifest(ctx, workflowID)
+	if err != nil {
+		return nil, err
+	}
+	approvedSet := make(map[string]bool, len(approved))
+	for _, p := range approved {
+		approvedSet[p] = true
+	}
+
+	return func(checkCtx context.Context, path string) bool {
+		if approvedSet[path] {
+			return false
+		}
+		exists, err := s.repo.RepoFileExists(checkCtx, projectID, path)
+		if err != nil {
+			// FAIL CLOSED. If we cannot prove the path is new, treating it as
+			// protected costs one skipped file; treating it as new could
+			// overwrite a client file nobody approved.
+			s.logger.Warn("protected-path check failed; treating path as protected",
+				zap.String("workflow_id", workflowID.String()),
+				zap.String("path", path),
+				zap.Error(err),
+			)
+			return true
+		}
+		return exists
+	}, nil
+}
 
 // ListFiles returns the whole working set, newest proposals first.
 func (s *CodebaseService) ListFiles(ctx context.Context, workflowID uuid.UUID) ([]CodebaseFile, error) {
