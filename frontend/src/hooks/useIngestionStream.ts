@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { IngestionJob, IngestionJobEvent } from '@/api/admin'
 import { useAuthStore } from '@/stores/authStore'
-import { camelizeKeys } from '@/utils/casing'
+import { camelizeKeys, snakeifyKeys } from '@/utils/casing'
 
 export type StreamEvent =
   | { type: 'update' | 'complete' | 'failed' | 'hello'; job: IngestionJob; ts: string }
@@ -84,7 +84,13 @@ function numMap(value: unknown): Record<string, number> {
  * and for the history replay, so it must not depend on component state.
  */
 export function describeJobEvent(ev: IngestionJobEvent): { type: string; message: string } {
-  const d = ev.detail ?? {}
+  // The stream camelizes the whole frame (see the onmessage handler below), so
+  // by the time an event reaches here every snake_case key in `detail` is
+  // camelCase — but every read in the switch below is snake_case. Left as-is,
+  // that silently yields 0 for every number (`batches 0/0`, `0ms`, `corpus 0`)
+  // and false for every flag (`smoke test failed`). Convert back once here: one
+  // fix for all of them, independent of how many keys each branch reads.
+  const d = snakeifyKeys<Record<string, unknown>>(ev.detail ?? {})
   switch (ev.kind) {
     case 'run_started': {
       const resumed = d.resumed === true
@@ -262,14 +268,18 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
               ...prev.eventLog,
             ].slice(0, maxEvents)
 
+            // Same camelCase trap as describeJobEvent (above): the detail keys
+            // arrive camelized, so read them through a snake_case view.
+            const detail = snakeifyKeys<Record<string, unknown>>(ev.detail ?? {})
+
             let verification = prev.verification
             if (ev.kind === 'verified') {
               verification = {
-                ok: ev.detail?.ok === true,
-                claim: numMap(ev.detail?.claim),
-                reality: numMap(ev.detail?.reality),
-                corpusTotalChunks: num(ev.detail ?? {}, 'corpus_total_chunks'),
-                sourceFile: str(ev.detail ?? {}, 'source_file'),
+                ok: detail.ok === true,
+                claim: numMap(detail.claim),
+                reality: numMap(detail.reality),
+                corpusTotalChunks: num(detail, 'corpus_total_chunks'),
+                sourceFile: str(detail, 'source_file'),
               }
             }
 
@@ -277,11 +287,11 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
             if (ev.kind === 'batch_done') {
               progress = {
                 stage: ev.stage,
-                batchesDone: num(ev.detail ?? {}, 'batches_done'),
-                batchesTotal: num(ev.detail ?? {}, 'batches_total'),
-                workers: num(ev.detail ?? {}, 'workers'),
-                chunksDone: num(ev.detail ?? {}, 'chunks_done'),
-                chunksTotal: num(ev.detail ?? {}, 'chunks_total'),
+                batchesDone: num(detail, 'batches_done'),
+                batchesTotal: num(detail, 'batches_total'),
+                workers: num(detail, 'workers'),
+                chunksDone: num(detail, 'chunks_done'),
+                chunksTotal: num(detail, 'chunks_total'),
               }
             }
 
