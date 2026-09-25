@@ -2568,8 +2568,19 @@ func (h *AdminHandler) ClassifyExpertDepthLayers(c *gin.Context) {
 		return
 	}
 
-	result, err := h.depthLayers.Classify(c.Request.Context(), expertID)
+	job, err := h.depthLayers.StartBackground(c.Request.Context(), expertID)
 	if err != nil {
+		if errors.Is(err, training.ErrDepthClassificationRunning) {
+			// Return the running job so a second click/tab can follow the same work,
+			// rather than launching a duplicate or showing a generic 500.
+			job, latestErr := h.depthLayers.LatestJob(c.Request.Context(), expertID)
+			if latestErr == nil && job != nil {
+				response.OK(c, map[string]interface{}{"expert_id": expertID, "job": job})
+				return
+			}
+			response.Conflict(c, "depth classification is already running")
+			return
+		}
 		h.logger.Error("depth classification failed",
 			zap.String("expert_id", expertID.String()), zap.Error(err))
 		response.InternalError(c)
@@ -2577,7 +2588,7 @@ func (h *AdminHandler) ClassifyExpertDepthLayers(c *gin.Context) {
 	}
 	response.OK(c, map[string]interface{}{
 		"expert_id": expertID,
-		"result":    result,
+		"job":       job,
 	})
 }
 
@@ -2596,14 +2607,25 @@ func (h *AdminHandler) GetExpertDepthLayers(c *gin.Context) {
 		return
 	}
 
-	report, err := h.depthLayers.Report(c.Request.Context(), expertID)
+	ctx := c.Request.Context()
+	report, err := h.depthLayers.Report(ctx, expertID)
 	if err != nil {
 		h.logger.Error("depth coverage read failed",
 			zap.String("expert_id", expertID.String()), zap.Error(err))
 		response.InternalError(c)
 		return
 	}
-	response.OK(c, report)
+	job, err := h.depthLayers.LatestJob(ctx, expertID)
+	if err != nil {
+		h.logger.Error("depth classification job read failed",
+			zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]interface{}{
+		"report": report,
+		"job":    job,
+	})
 }
 
 // RegenerateCharter POST /admin/experts/:id/regenerate-charter
@@ -3981,4 +4003,3 @@ func (h *AdminHandler) SetGateThreshold(c *gin.Context) {
 	}
 	response.OK(c, row)
 }
-
