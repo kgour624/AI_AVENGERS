@@ -795,7 +795,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	storeStarted := p.beginStage(ctx, jobID, expertID, StageStoring,
 		fmt.Sprintf("Saving %d chunks to database...", len(chunks)))
 	ptimer.Start("store")
-	chunkIDs, err := p.storeChunks(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile)
+	chunkIDs, storeStats, err := p.storeChunks(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile)
 	ptimer.Stop("store")
 	if err != nil {
 		p.updateJobStatus(ctx, jobID, "failed", "storage failed: "+err.Error(), 0, 0)
@@ -804,26 +804,53 @@ func (p *IngestionPipeline) IngestTranscript(
 		})
 		return nil, fmt.Errorf("chunk storage failed: %w", err)
 	}
-	p.logger.Info("chunks stored", zap.Int("count", len(chunkIDs)))
+	p.logger.Info("chunks stored",
+		zap.Int("resolved", len(chunkIDs)),
+		zap.Int("parsed", storeStats.Parsed),
+		zap.Int("inserted", storeStats.Inserted),
+		zap.Int("duplicates", storeStats.Duplicates),
+		zap.Int("reused", storeStats.Reused),
+	)
 	p.endStage(ctx, jobID, expertID, StageStoring, storeStarted, map[string]interface{}{
-		"chunks": len(chunkIDs),
+		"chunks":     len(chunkIDs),
+		"parsed":     storeStats.Parsed,
+		"inserted":   storeStats.Inserted,
+		"duplicates": storeStats.Duplicates,
+		"reused":     storeStats.Reused,
 	})
 
 	// T2: double confirmation. The pipeline is not trusted to grade its own
 	// homework — re-read the database and compare it against what this run
 	// claims it produced. The result is recorded as a `verified` event so the
 	// admin sees "claim vs reality" without opening psql.
+	//
+	// WHY the claim is now ExpectedStored() and not len(chunks): the conflict
+	// clause makes "parsed" and "stored" legitimately different numbers, so
+	// comparing stored rows against the parse count reported a mismatched
+	// database on every document that repeats text. The identity that actually
+	// detects loss is stored == preexisting_for_file + inserted. The breakdown
+	// (parsed / duplicates / inserted / reused) is emitted alongside it, so the
+	// gap is explained rather than hidden.
 	verifyTopics := countUniqueTopics(topicResults)
-	verifyGeneral := 0
+	verifyFallback := 0
 	for _, t := range topicResults {
-		if t.Topic == "" || t.Topic == "general" {
-			verifyGeneral++
+		if t.Topic == "" {
+			verifyFallback++
 		}
 	}
-	if _, verifyErr := p.verifyStoredCorpus(ctx, jobID, expertID, sourceFile,
-		len(chunks), verifyTopics, verifyGeneral); verifyErr != nil {
-		p.logger.Warn("post-store verification failed (non-fatal)", zap.Error(verifyErr))
+	ledger := RunLedger{
+		JobID:           jobID,
+		ExpertID:        expertID,
+		SourceFile:      sourceFile,
+		Stats:           storeStats,
+		FallbackClaimed: verifyFallback,
 	}
+	if verifyErr := p.verifyStoredCorpus(ctx, &ledger, verifyTopics); verifyErr != nil {
+		p.logger.Warn("post-store verification failed (non-fatal)", zap.Error(verifyErr))
+		ledger.VerificationStatus = VerificationNotChecked
+		ledger.MismatchReason = verifyErr.Error()
+	}
+	p.writeRunLedger(ctx, ledger)
 
 	// Step 7: Update expert charters
 	//
@@ -1031,7 +1058,16 @@ func (p *IngestionPipeline) IngestTranscript(
 		phaseTotals[phase.Phase] = phase.Duration.Milliseconds()
 	}
 	p.emitFinal(ctx, jobID, expertID, StageComplete, jobevents.KindComplete, map[string]interface{}{
-		"chunks_this_run":   len(chunks),
+		"chunks_this_run": len(chunks),
+		// Phase B breakdown: `chunks_this_run` is the parse count, which is not
+		// the same as what landed in the corpus. Sending both lets the timeline
+		// state the real numbers instead of implying 395 stored rows when 118 of
+		// them were repeats of text already held.
+		"chunks_parsed":     storeStats.Parsed,
+		"chunks_duplicate":  storeStats.Duplicates,
+		"chunks_inserted":   storeStats.Inserted,
+		"chunks_reused":     storeStats.Reused,
+		"verification":      ledger.VerificationStatus,
 		"topics":            uniqueTopics,
 		"corpus_total":      actualTotalChunks,
 		"corpus_topics":     actualTotalTopics,
@@ -1068,6 +1104,12 @@ func (p *IngestionPipeline) IngestTranscript(
 //
 // Ordering is preserved: chunk_index still comes from the chunker, and the
 // link pass walks chunkIDs in index order.
+//
+// WHY it returns StoreStats: ON CONFLICT DO NOTHING makes "how many chunks were
+// parsed" and "how many rows exist" legitimately different numbers, and the
+// command tag is the only place the true insert count exists. Discarding it is
+// what let a 395-chunk document report 277 stored rows as a database failure.
+// The stats are read from the database's own row counts, never from intent.
 func (p *IngestionPipeline) storeChunks(
 	ctx context.Context,
 	jobID uuid.UUID,
@@ -1076,8 +1118,9 @@ func (p *IngestionPipeline) storeChunks(
 	topics []TopicResult,
 	embeddings [][]float32,
 	sourceFile string,
-	) ([]uuid.UUID, error) {
+) ([]uuid.UUID, StoreStats, error) {
 	chunkIDs := make([]uuid.UUID, len(chunks))
+	stats := StoreStats{Parsed: len(chunks)}
 
 	// C6: stamp each new chunk with the provider/model that produced its
 	// vector, so a later embedding-provider/model change is detectable as a
@@ -1096,6 +1139,27 @@ func (p *IngestionPipeline) storeChunks(
 			chunks[i].ChunkHash = HashChunkText(chunks[i].Text)
 		}
 	}
+
+	// Distinct dedup keys cap the rows this run can create, and the gap between
+	// parsed and distinct is exactly the duplicate count the admin needs to see.
+	// Counted AFTER the hash backfill above, so a chunk that arrived without a
+	// hash is never mistaken for a repeat of another chunk.
+	stats.UniqueHashes, stats.Duplicates = countDistinctHashes(chunks)
+
+	// Measured BEFORE the inserts, so the storage identity can be checked after:
+	// stored_for_file == preexisting_for_file + inserted. Every row this pass
+	// creates carries sourceFile, and a row skipped by the conflict clause adds
+	// nothing — so a failure of that identity means a row was really lost.
+	if err := p.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM course_chunks WHERE expert_id = $1 AND source_file = $2`,
+		expertID, sourceFile,
+	).Scan(&stats.PreexistingForFile); err != nil {
+		return nil, stats, fmt.Errorf("count existing chunks for file: %w", err)
+	}
+
+	// covered tracks the distinct chunks present in the corpus as the batches
+	// land, which is what the stored-count actually is — not the parse count.
+	covered := make(map[string]struct{}, len(chunks))
 
 	// storeBatchSize trades statement size against round trips. 200 rows × 10
 	// params = 2000 bind parameters — comfortably under Postgres's 65535 limit.
@@ -1131,14 +1195,20 @@ func (p *IngestionPipeline) storeChunks(
 		}
 		sb.WriteString(` ON CONFLICT (expert_id, chunk_hash) DO NOTHING`)
 
-		if _, err := p.db.Exec(ctx, sb.String(), args...); err != nil {
-			return nil, fmt.Errorf("failed to insert chunks %d..%d: %w", batchStart, batchEnd-1, err)
+		tag, err := p.db.Exec(ctx, sb.String(), args...)
+		if err != nil {
+			return nil, stats, fmt.Errorf("failed to insert chunks %d..%d: %w", batchStart, batchEnd-1, err)
 		}
+		// The command tag is the only honest source for "how many rows this
+		// statement created": ON CONFLICT DO NOTHING reports skipped rows by
+		// simply not counting them, so len(batch) would overstate the store.
+		batchInserted := int(tag.RowsAffected())
+		stats.Inserted += batchInserted
 
 		// Resolve ids for this batch (new rows AND deduplicated rows).
 		idByHash, err := p.lookupChunkIDs(ctx, expertID, chunks[batchStart:batchEnd])
 		if err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 		for i := batchStart; i < batchEnd; i++ {
 			id, ok := idByHash[chunks[i].ChunkHash]
@@ -1146,24 +1216,41 @@ func (p *IngestionPipeline) storeChunks(
 				// The row must exist: it was either inserted above or already
 				// present (ON CONFLICT). Missing means the dedup key changed
 				// mid-write — surface it instead of storing a zero UUID.
-				return nil, fmt.Errorf("chunk %d missing after insert (hash %s)", i, chunks[i].ChunkHash)
+				return nil, stats, fmt.Errorf("chunk %d missing after insert (hash %s)", i, chunks[i].ChunkHash)
 			}
 			chunkIDs[i] = id
+			covered[chunks[i].ChunkHash] = struct{}{}
 		}
 
-		chunksDone := batchEnd
-		p.updateJobProgress(ctx, jobID, chunksDone, len(chunks))
+		// The job row keeps counting PARSED chunks (batchEnd of len(chunks)): the
+		// progress bar and ETA describe pipeline throughput, and every chunk sent
+		// to the store really was processed. The event below reports distinct
+		// chunks present in the corpus, which is the number that used to be
+		// misreported as "stored 395/395" while the corpus held 277.
+		p.updateJobProgress(ctx, jobID, batchEnd, len(chunks))
 		p.emit(ctx, jobID, expertID, StageStoring, jobevents.KindChunkStored, map[string]interface{}{
-			"chunks_done":  chunksDone,
-			"chunks_total": len(chunks),
-			"batch_size":   batchEnd - batchStart,
+			"chunks_done":    len(covered),
+			"chunks_total":   stats.UniqueHashes,
+			"batch_size":     batchEnd - batchStart,
+			"batch_inserted": batchInserted,
 		})
+	}
+
+	// Reused is derived, never counted per batch: each distinct hash either
+	// created a row or already existed, so deriving it from UniqueHashes and
+	// Inserted means the two can never disagree.
+	stats.Reused = stats.UniqueHashes - stats.Inserted
+	if stats.Reused < 0 {
+		// Only reachable if the database reported more inserted rows than
+		// distinct hashes were sent. Clamp so the ledger never stores a negative
+		// count, and leave the contradiction for verification to report.
+		stats.Reused = 0
 	}
 
 	// Link pass (after every insert, so cross-batch neighbours resolve).
 	p.linkChunks(ctx, chunkIDs)
 
-	return chunkIDs, nil
+	return chunkIDs, stats, nil
 }
 
 // lookupChunkIDs resolves chunk_hash → id for the given chunks in one query.
@@ -1215,10 +1302,32 @@ func (p *IngestionPipeline) linkChunks(ctx context.Context, chunkIDs []uuid.UUID
 	if len(chunkIDs) == 0 {
 		return
 	}
+
+	// Duplicate text inside one document resolves to the same row id, so this
+	// slice can carry one id at two positions. Linking it verbatim would make a
+	// row its own neighbour (two source rows updating the same target, with
+	// Postgres free to pick either). Collapse to first-appearance order so the
+	// chain runs over distinct rows.
+	unique := make([]uuid.UUID, 0, len(chunkIDs))
+	seen := make(map[uuid.UUID]struct{}, len(chunkIDs))
+	for _, id := range chunkIDs {
+		if id == uuid.Nil {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		unique = append(unique, id)
+	}
+	if len(unique) == 0 {
+		return
+	}
+
 	const linkBatch = 500
 
-	for start := 0; start < len(chunkIDs); start += linkBatch {
-		end := min(start+linkBatch, len(chunkIDs))
+	for start := 0; start < len(unique); start += linkBatch {
+		end := min(start+linkBatch, len(unique))
 
 		ids := make([]uuid.UUID, 0, end-start)
 		prev := make([]uuid.UUID, 0, end-start)
@@ -1226,12 +1335,12 @@ func (p *IngestionPipeline) linkChunks(ctx context.Context, chunkIDs []uuid.UUID
 		for i := start; i < end; i++ {
 			var prevID, nextID uuid.UUID
 			if i > 0 {
-				prevID = chunkIDs[i-1]
+				prevID = unique[i-1]
 			}
-			if i+1 < len(chunkIDs) {
-				nextID = chunkIDs[i+1]
+			if i+1 < len(unique) {
+				nextID = unique[i+1]
 			}
-			ids = append(ids, chunkIDs[i])
+			ids = append(ids, unique[i])
 			prev = append(prev, prevID)
 			next = append(next, nextID)
 		}
@@ -1253,19 +1362,35 @@ func (p *IngestionPipeline) linkChunks(ctx context.Context, chunkIDs []uuid.UUID
 }
 
 // verifyStoredCorpus is the T2 "double confirmation" step: it re-reads the
-// database and compares it against what this run claims it produced, then
-// writes the result as a `verified` event.
+// database, compares it against what this run claims it produced, and records
+// the verdict on the ledger and on the timeline as a `verified` event.
 //
-// WHY: previously the only way to confirm ingestion had really stored what it
-// claimed was to open psql — the UI showed the pipeline's own numbers. This
-// makes the claim and the check part of the same durable timeline, and a
-// mismatch is visible in amber instead of being silently wrong.
+// WHY the check stays but the claim changed: previously the only way to confirm
+// ingestion had really stored what it claimed was to open psql. The check is
+// sound; the expectation was not. It compared stored rows against the number of
+// chunks PARSED, which made every document that repeats text look like a
+// database mismatch — 395 parsed, 277 stored, 118 of them repeats of text the
+// corpus already held. A warning that fires on the normal case is worse than no
+// warning, because it teaches the admin to ignore the amber box.
+//
+// The claim is now the storage identity:
+//
+//	stored_for_file == preexisting_for_file + inserted
+//
+// Every inserted row carries this file, and a row skipped by the conflict clause
+// adds nothing — so this can only fail when a row was genuinely lost, or
+// something else wrote to the same expert+file. The parsed/duplicate/inserted
+// breakdown travels with it, so the gap is explained instead of hidden.
+//
+// Topic counts are REPORTED but do not gate the verdict: dedup drops repeated
+// chunks, so the number of distinct topics behind the surviving rows is not
+// comparable to the topics the run produced. Gating on it would reintroduce the
+// same class of false alarm.
 func (p *IngestionPipeline) verifyStoredCorpus(
 	ctx context.Context,
-	jobID, expertID uuid.UUID,
-	sourceFile string,
-	expectedChunks, expectedTopics, expectedGeneral int,
-) (bool, error) {
+	l *RunLedger,
+	claimedTopics int,
+) error {
 	var stored, storedTopics, storedGeneral, nullEmbeddings int
 	err := p.db.QueryRow(ctx, `
 		SELECT COUNT(*),
@@ -1274,32 +1399,48 @@ func (p *IngestionPipeline) verifyStoredCorpus(
 		       COUNT(*) FILTER (WHERE embedding IS NULL)
 		  FROM course_chunks
 		 WHERE expert_id = $1 AND source_file = $2`,
-		expertID, sourceFile,
+		l.ExpertID, l.SourceFile,
 	).Scan(&stored, &storedTopics, &storedGeneral, &nullEmbeddings)
 	if err != nil {
-		return false, fmt.Errorf("verify stored corpus: %w", err)
+		return fmt.Errorf("verify stored corpus: %w", err)
 	}
 
 	// Corpus-wide count gives the admin the "after append" picture, not just
 	// this file's contribution (append mode is the default).
 	var corpusTotal int
 	if scanErr := p.db.QueryRow(ctx,
-		`SELECT COUNT(*) FROM course_chunks WHERE expert_id = $1`, expertID,
+		`SELECT COUNT(*) FROM course_chunks WHERE expert_id = $1`, l.ExpertID,
 	).Scan(&corpusTotal); scanErr != nil {
 		p.logger.Warn("verify: corpus total query failed (non-fatal)", zap.Error(scanErr))
 	}
 
-	ok := stored == expectedChunks &&
-		storedTopics == expectedTopics &&
-		storedGeneral == expectedGeneral &&
-		nullEmbeddings == 0
+	l.StoredForFile = stored
+	l.GeneralStored = storedGeneral
+	l.NullEmbeddings = nullEmbeddings
+	l.CorpusTotal = corpusTotal
 
-	p.emit(ctx, jobID, expertID, StageStoring, jobevents.KindVerified, map[string]interface{}{
+	expected := l.ExpectedStored()
+	switch {
+	case stored != expected:
+		l.VerificationStatus = VerificationMismatch
+		l.MismatchReason = fmt.Sprintf(
+			"expected %d rows for this file (%d pre-existing + %d inserted), found %d",
+			expected, l.Stats.PreexistingForFile, l.Stats.Inserted, stored,
+		)
+	case nullEmbeddings > 0:
+		l.VerificationStatus = VerificationMismatch
+		l.MismatchReason = fmt.Sprintf("%d stored chunks have no embedding", nullEmbeddings)
+	default:
+		l.VerificationStatus = VerificationVerified
+		l.MismatchReason = ""
+	}
+	ok := l.VerificationStatus == VerificationVerified
+
+	p.emit(ctx, l.JobID, l.ExpertID, StageStoring, jobevents.KindVerified, map[string]interface{}{
 		"ok": ok,
 		"claim": map[string]interface{}{
-			"chunks":         expectedChunks,
-			"topics":         expectedTopics,
-			"general_chunks": expectedGeneral,
+			"chunks": expected,
+			"topics": claimedTopics,
 		},
 		"reality": map[string]interface{}{
 			"chunks":          stored,
@@ -1307,10 +1448,23 @@ func (p *IngestionPipeline) verifyStoredCorpus(
 			"general_chunks":  storedGeneral,
 			"null_embeddings": nullEmbeddings,
 		},
+		// The breakdown turns "277 is not 395" into something the admin can act
+		// on: 118 of those chunks were repeats of text already in the corpus.
+		"breakdown": map[string]interface{}{
+			"parsed":               l.Stats.Parsed,
+			"duplicate":            l.Stats.Duplicates,
+			"inserted":             l.Stats.Inserted,
+			"reused":               l.Stats.Reused,
+			"preexisting_for_file": l.Stats.PreexistingForFile,
+			"stored_for_file":      stored,
+		},
+		"fallback_chunks":     l.FallbackClaimed,
 		"corpus_total_chunks": corpusTotal,
-		"source_file":         sourceFile,
+		"source_file":         l.SourceFile,
+		"mismatch_reason":     l.MismatchReason,
+		"summary":             l.describeLedger(),
 	})
-	return ok, nil
+	return nil
 }
 
 // errorString renders err for a JSON event detail, using "" for nil so the
