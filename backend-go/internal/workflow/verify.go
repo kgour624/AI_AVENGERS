@@ -2,11 +2,13 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"ai_avengers/backend/internal/validation"
 )
@@ -38,13 +40,10 @@ import (
 // React expert's workspace was guaranteed to fail and told a frontend expert to
 // go fix a Go build error.
 //
-// STATUS OF THE TOOLCHAIN TODAY, because the paragraph above reads as though it
-// is still missing and it is not: commit 31becac added `go nodejs npm` to the
-// runtime image, so these checks really do run. The unavailable path is still
-// live and still correct — node dependencies are deliberately not installed, a
-// command can time out, and the §17 ingest runs against repositories whose
-// toolchain may be something else entirely — but "the image has no compiler" is
-// history, not current behaviour.
+// STATUS OF THE TOOLCHAIN TODAY: commit 31becac added `go nodejs npm` to the
+// runtime image, so these checks can run. Node dependencies are installed on
+// demand with lifecycle scripts disabled and a timeout; network/install failure
+// remains "unavailable", not a claim that the code itself is broken.
 
 // VerifyStatus is the outcome of checking one project in a workspace.
 type VerifyStatus string
@@ -182,16 +181,13 @@ func (a *AiderRunner) verifyWorkspace(ctx context.Context, workspacePath string)
 	// --- Node / React ---
 	switch {
 	case hasWorkspaceFile(workspacePath, "package.json"):
-		if !hasWorkspaceDir(workspacePath, "node_modules") {
-			// npm run build would fail on missing modules, which says nothing
-			// about the generated code. Dependencies are deliberately not
-			// installed here: that is a network fetch of arbitrary packages
-			// inside the api container.
-			v.Results = append(v.Results, VerifyResult{
-				Project: "node",
-				Status:  VerifyUnavailable,
-				Reason:  "dependencies are not installed (no node_modules), so the build was not run",
-			})
+		// A11: dependencies are installed first so the build can actually
+		// run. The installer checks the manifest fingerprint, so existing
+		// node_modules is reused only when package.json/lockfiles are unchanged.
+		// Install failure stays "unavailable", never pass or code failure.
+		res, ok := a.installNodeDependencies(ctx, workspacePath)
+		if !ok {
+			v.Results = append(v.Results, res)
 			break
 		}
 		// --if-present: a project with no build or test script is not a failure.
@@ -208,6 +204,102 @@ func (a *AiderRunner) verifyWorkspace(ctx context.Context, workspacePath string)
 	}
 
 	return v
+}
+
+// nodeInstallTimeout bounds a dependency install. Fetching arbitrary packages
+// over the network must never hang a workflow.
+const nodeInstallTimeout = 5 * time.Minute
+const nodeInstallFingerprintFile = ".ai-avengers-deps.sha256"
+
+// installNodeDependencies installs a Node project's dependencies so its build
+// and tests can actually run.
+//
+// WHY --ignore-scripts: `npm install` runs lifecycle scripts (preinstall,
+// install, postinstall) declared by every dependency by default, and since the
+// §17 ingest that package.json can belong to a CLIENT's cloned repository.
+// Ignoring scripts removes that remote-code-execution path while still
+// resolving the module graph the build needs. What remains is the exposure
+// runProjectChecks already accepts: `npm run build` executes the project's own
+// scripts with validation.MinimalEnv, i.e. no platform secrets.
+//
+// ok is false when the install could not complete; the caller must report that
+// as unavailable, never as a pass and never as a code failure.
+func (a *AiderRunner) installNodeDependencies(ctx context.Context, workspacePath string) (VerifyResult, bool) {
+	if _, err := exec.LookPath("npm"); err != nil {
+		return VerifyResult{
+			Project: "node",
+			Status:  VerifyUnavailable,
+			Reason:  `"npm" is not installed in this image`,
+		}, false
+	}
+	fingerprint, err := nodeDependencyFingerprint(workspacePath)
+	if err != nil {
+		return VerifyResult{Project: "node", Status: VerifyUnavailable, Reason: "could not fingerprint package manifests: " + err.Error()}, false
+	}
+	if hasWorkspaceDir(workspacePath, "node_modules") && nodeInstallFingerprintMatches(workspacePath, fingerprint) {
+		return VerifyResult{}, true
+	}
+
+	// `npm ci` is exact and lockfile-driven; without a lockfile, `npm install`
+	// is the only option. Both skip lifecycle scripts.
+	args := []string{"install", "--ignore-scripts", "--no-audit", "--no-fund", "--package-lock=false"}
+	if hasWorkspaceFile(workspacePath, "package-lock.json") || hasWorkspaceFile(workspacePath, "npm-shrinkwrap.json") {
+		args = []string{"ci", "--ignore-scripts", "--no-audit", "--no-fund"}
+	}
+
+	installCtx, cancel := context.WithTimeout(ctx, nodeInstallTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(installCtx, "npm", args...)
+	cmd.Dir = workspacePath
+	cmd.Env = validation.MinimalEnv()
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		// Keep the marker inside node_modules: rsync excludes that directory,
+		// so this internal cache metadata can never leak into main/ or a client
+		// deliverable.
+		if err := os.WriteFile(filepath.Join(workspacePath, "node_modules", nodeInstallFingerprintFile), []byte(fingerprint), 0600); err != nil {
+			return VerifyResult{Project: "node", Status: VerifyUnavailable, Reason: "dependencies installed but install fingerprint could not be saved: " + err.Error()}, false
+		}
+		return VerifyResult{}, true
+	}
+	if installCtx.Err() != nil {
+		return VerifyResult{
+			Project: "node",
+			Status:  VerifyUnavailable,
+			Reason:  fmt.Sprintf("dependency install did not finish within %s", nodeInstallTimeout),
+		}, false
+	}
+	return VerifyResult{
+		Project: "node",
+		Status:  VerifyUnavailable,
+		Reason:  "dependency install failed: " + strings.TrimSpace(string(out)),
+	}, false
+}
+
+// nodeDependencyFingerprint hashes package.json and available lockfiles so
+// node_modules is reused only while the declared dependency set is unchanged.
+func nodeDependencyFingerprint(workspacePath string) (string, error) {
+	h := sha256.New()
+	for _, name := range []string{"package.json", "package-lock.json", "npm-shrinkwrap.json"} {
+		content, err := os.ReadFile(filepath.Join(workspacePath, name))
+		if err != nil {
+			if os.IsNotExist(err) && name != "package.json" {
+				continue
+			}
+			return "", err
+		}
+		_, _ = h.Write([]byte(name))
+		_, _ = h.Write([]byte{0})
+		_, _ = h.Write(content)
+		_, _ = h.Write([]byte{0})
+	}
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
+}
+
+func nodeInstallFingerprintMatches(workspacePath, expected string) bool {
+	content, err := os.ReadFile(filepath.Join(workspacePath, "node_modules", nodeInstallFingerprintFile))
+	return err == nil && string(content) == expected
 }
 
 // runProjectChecks runs commands in order and stops at the first problem.

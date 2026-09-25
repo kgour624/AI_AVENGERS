@@ -145,9 +145,14 @@ func (m *WorkspaceMerger) getChangedFiles(ctx context.Context, workspacePath str
 	return files, nil
 }
 
-// rsyncToMain copies files from expertPath into mainPath, excluding .git/
+// rsyncToMain copies files from expertPath into mainPath, excluding .git/ and
+// node_modules/. node_modules is excluded because it is a per-workspace build
+// artifact: copying it would add hundreds of MB to main/ and, worse, to every
+// other expert's seed on the next wave (A11b).
 func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath string) error {
-	cmd := exec.CommandContext(ctx, "rsync", "-a", "--exclude", ".git", expertPath+"/", mainPath+"/")
+	cmd := exec.CommandContext(ctx, "rsync", "-a",
+		"--exclude", ".git", "--exclude", "node_modules",
+		expertPath+"/", mainPath+"/")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("rsync: %w (output: %s)", err, string(output))
 	}

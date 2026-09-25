@@ -62,6 +62,31 @@ var skipDirs = map[string]bool{
 	"target": true, "bin": true, "obj": true,
 }
 
+const (
+	// maxRepoFileBytes mirrors the GitHub tree size guard (100KB). GitHub
+	// filters oversized files out of the tree, but GitLab's tree API returns
+	// no size at all — so the cap is also enforced when content is read, for
+	// both providers, instead of trusting the tree listing (A3).
+	maxRepoFileBytes = 100 * 1024
+
+	// gitLabMaxTreePages bounds the GitLab pagination loop. GitLab returns
+	// 100 entries per page plus an X-Next-Page header; without a cap a broken
+	// or enormous repo could spin forever. 100 pages = 10,000 entries.
+	gitLabMaxTreePages = 100
+
+	// gitLabOAuthScope must be "api", not "read_repository": the harness
+	// export creates a new GitLab project when the client has none
+	// (workflow/export_git.go calls /user, /namespaces and POST /projects),
+	// and write_repository does not grant API access. read_repository, the
+	// previous value, additionally made every push fail (A4a).
+	gitLabOAuthScope = "api"
+
+	// gitLabRefreshSkew is how long before expiry a GitLab token is refreshed.
+	// GitLab.com access tokens expire (expires_in, ~2h); refreshing a little
+	// early avoids handing a token that lapses mid-request (A4b).
+	gitLabRefreshSkew = 5 * time.Minute
+)
+
 // OAuthConfig holds OAuth2 configuration for a provider.
 type OAuthConfig struct {
 	ClientID     string
@@ -170,9 +195,10 @@ func (s *Service) GetOAuthURL(ctx context.Context, provider, state, projectID st
 		)
 	case ProviderGitLab:
 		authURL = fmt.Sprintf(
-			"https://gitlab.com/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=read_repository&state=%s",
+			"https://gitlab.com/oauth/authorize?client_id=%s&redirect_uri=%s&response_type=code&scope=%s&state=%s",
 			s.gitlabOAuth.ClientID,
 			url.QueryEscape(s.gitlabOAuth.RedirectURL),
+			gitLabOAuthScope,
 			state,
 		)
 	default:
@@ -191,28 +217,92 @@ func (s *Service) GetOAuthURL(ctx context.Context, provider, state, projectID st
 	return authURL, nil
 }
 
-// ExchangeCode exchanges OAuth code for access token.
+// oauthToken is a provider's OAuth token response. GitLab.com issues a
+// refresh token and an expiry; GitHub's classic OAuth returns a non-expiring
+// token, so RefreshToken/ExpiresAt stay empty for GitHub (A4b).
+type oauthToken struct {
+	AccessToken  string
+	RefreshToken string
+	ExpiresAt    time.Time
+}
+
+// ExchangeCode exchanges OAuth code for an access token.
+//
+// Kept as the narrow single-token contract so existing callers are unaffected;
+// ExchangeOAuthCode is the fuller form for flows that must persist a refresh
+// token and expiry.
 func (s *Service) ExchangeCode(ctx context.Context, provider, code string) (string, error) {
+	tok, err := s.ExchangeOAuthCode(ctx, provider, code)
+	if err != nil {
+		return "", err
+	}
+	return tok.AccessToken, nil
+}
+
+// ExchangeOAuthCode exchanges an OAuth code for the provider's full token set.
+func (s *Service) ExchangeOAuthCode(ctx context.Context, provider, code string) (oauthToken, error) {
 	switch provider {
 	case ProviderGitHub:
-		return s.exchangeGitHubCode(ctx, code)
+		accessToken, err := s.exchangeGitHubCode(ctx, code)
+		return oauthToken{AccessToken: accessToken}, err
 	case ProviderGitLab:
 		return s.exchangeGitLabCode(ctx, code)
 	default:
-		return "", fmt.Errorf("unsupported provider: %s", provider)
+		return oauthToken{}, fmt.Errorf("unsupported provider: %s", provider)
 	}
 }
 
-// ConnectRepo saves a repo connection with encrypted token.
+// ConnectRepo saves a repo connection from a personal access token (or any
+// non-expiring credential). OAuth connections that carry a refresh token and
+// expiry go through ConnectRepoOAuth instead.
 func (s *Service) ConnectRepo(
 	ctx context.Context,
 	projectID, clientID uuid.UUID,
 	provider, repoURL, accessToken, defaultBranch string,
 ) (uuid.UUID, error) {
+	return s.saveConnection(ctx, projectID, clientID, provider, repoURL, accessToken, "", time.Time{}, defaultBranch)
+}
+
+// ConnectRepoOAuth saves an OAuth connection including its refresh token and
+// expiry, so AccessTokenForProject can refresh before the token lapses (A4b).
+func (s *Service) ConnectRepoOAuth(
+	ctx context.Context,
+	projectID, clientID uuid.UUID,
+	provider, repoURL, accessToken, refreshToken, defaultBranch string,
+	expiresAt time.Time,
+) (uuid.UUID, error) {
+	return s.saveConnection(ctx, projectID, clientID, provider, repoURL, accessToken, refreshToken, expiresAt, defaultBranch)
+}
+
+// saveConnection is the single writer for repo_connections. Encrypting both
+// tokens, and clearing the refresh fields when a PAT is connected, lives here
+// so a reconnect can never leave a stale refresh token behind.
+func (s *Service) saveConnection(
+	ctx context.Context,
+	projectID, clientID uuid.UUID,
+	provider, repoURL, accessToken, refreshToken string,
+	expiresAt time.Time,
+	defaultBranch string,
+) (uuid.UUID, error) {
 	// Encrypt token before storing
 	encryptedToken, err := s.encrypt(accessToken)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("encrypt token failed: %w", err)
+	}
+
+	// A refresh token is a credential in its own right — encrypt it the same
+	// way. nil means SQL NULL, which is also what clears it on a PAT reconnect.
+	var encryptedRefresh interface{}
+	if refreshToken != "" {
+		enc, err := s.encrypt(refreshToken)
+		if err != nil {
+			return uuid.Nil, fmt.Errorf("encrypt refresh token failed: %w", err)
+		}
+		encryptedRefresh = enc
+	}
+	var expiryArg interface{}
+	if !expiresAt.IsZero() {
+		expiryArg = expiresAt
 	}
 
 	// Extract repo name from URL
@@ -221,18 +311,22 @@ func (s *Service) ConnectRepo(
 	var connID uuid.UUID
 	err = s.db.QueryRow(ctx,
 		`INSERT INTO repo_connections
-			(project_id, client_id, provider, repo_url, repo_name, default_branch, access_token)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
+			(project_id, client_id, provider, repo_url, repo_name, default_branch,
+			 access_token, refresh_token, token_expires_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 ON CONFLICT (project_id) DO UPDATE SET
 			provider=EXCLUDED.provider,
 			repo_url=EXCLUDED.repo_url,
 			repo_name=EXCLUDED.repo_name,
 			default_branch=EXCLUDED.default_branch,
 			access_token=EXCLUDED.access_token,
+			refresh_token=EXCLUDED.refresh_token,
+			token_expires_at=EXCLUDED.token_expires_at,
 			sync_status='pending',
 			updated_at=NOW()
 		 RETURNING id`,
-		projectID, clientID, provider, repoURL, repoName, defaultBranch, encryptedToken,
+		projectID, clientID, provider, repoURL, repoName, defaultBranch,
+		encryptedToken, encryptedRefresh, expiryArg,
 	).Scan(&connID)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save connection failed: %w", err)
@@ -318,21 +412,22 @@ func (s *Service) runSync(ctx context.Context, connectionID uuid.UUID) {
 
 	// Load connection
 	var projectID uuid.UUID
-	var provider, repoURL, encryptedToken, branch string
+	var provider, repoURL, branch string
 	err := s.db.QueryRow(ctx,
-		`SELECT project_id, provider, repo_url, access_token, default_branch
+		`SELECT project_id, provider, repo_url, default_branch
 		 FROM repo_connections WHERE id=$1`,
 		connectionID,
-	).Scan(&projectID, &provider, &repoURL, &encryptedToken, &branch)
+	).Scan(&projectID, &provider, &repoURL, &branch)
 	if err != nil {
 		s.updateSyncStatus(ctx, connectionID, "failed", "connection not found", 0)
 		return
 	}
 
-	// Decrypt token
-	accessToken, err := s.decrypt(encryptedToken)
+	// Resolve a token that is valid right now; this refreshes an expiring
+	// GitLab OAuth token before it is used (A4b).
+	accessToken, err := s.accessTokenForConnection(ctx, connectionID)
 	if err != nil {
-		s.updateSyncStatus(ctx, connectionID, "failed", "token decryption failed", 0)
+		s.updateSyncStatus(ctx, connectionID, "failed", err.Error(), 0)
 		return
 	}
 
@@ -485,45 +580,73 @@ func (s *Service) fetchGitHubTree(ctx context.Context, repoURL, branch, token st
 	return files, nil
 }
 
-// fetchGitLabTree fetches file tree from GitLab API.
+// fetchGitLabTree fetches the file tree from the GitLab API, following
+// pagination.
+//
+// WHY the loop: GitLab returns at most per_page entries and an X-Next-Page
+// header; the old single request with per_page=100 silently ingested only the
+// first 100 files of any larger repo (A3).
 func (s *Service) fetchGitLabTree(ctx context.Context, repoURL, branch, token string) ([]string, error) {
 	projectPath := extractGitLabPath(repoURL)
-	apiURL := fmt.Sprintf(
+	baseURL := fmt.Sprintf(
 		"https://gitlab.com/api/v4/projects/%s/repository/tree?recursive=true&ref=%s&per_page=100",
 		url.QueryEscape(projectPath), branch,
 	)
 
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("GitLab API request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	var items []struct {
-		Path string `json:"path"`
-		Type string `json:"type"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
-		return nil, err
-	}
-
 	var files []string
-	for _, item := range items {
-		if item.Type != "blob" {
-			continue
+	for page := 1; page <= gitLabMaxTreePages; page++ {
+		apiURL := fmt.Sprintf("%s&page=%d", baseURL, page)
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := s.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("GitLab API request failed: %w", err)
 		}
-		if shouldSkipPath(item.Path) || !isSupportedFile(item.Path) {
-			continue
+
+		// The old code never checked the status and decoded the error body as
+		// if it were a tree, so a bad token looked like an empty repo.
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("GitLab API returned %d", resp.StatusCode)
 		}
-		files = append(files, item.Path)
+
+		var items []struct {
+			Path string `json:"path"`
+			Type string `json:"type"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+			resp.Body.Close()
+			return nil, err
+		}
+		nextPage := resp.Header.Get("X-Next-Page")
+		resp.Body.Close()
+
+		for _, item := range items {
+			if item.Type != "blob" {
+				continue
+			}
+			if shouldSkipPath(item.Path) || !isSupportedFile(item.Path) {
+				continue
+			}
+			files = append(files, item.Path)
+		}
+
+		if nextPage == "" {
+			break
+		}
+		if page == gitLabMaxTreePages {
+			s.logger.Warn("GitLab tree pagination hit the page cap; a very large repo may be partially ingested",
+				zap.String("repo", projectPath),
+				zap.Int("pages", page),
+				zap.Int("max_pages", gitLabMaxTreePages),
+			)
+		}
 	}
 	return files, nil
 }
 
-// fetchFileContent fetches a single file's content.
+// fetchFileContent fetches a single file's content, capped at maxRepoFileBytes.
 func (s *Service) fetchFileContent(ctx context.Context, provider, repoURL, branch, filePath, token string) (string, error) {
 	switch provider {
 	case ProviderGitHub:
@@ -540,8 +663,11 @@ func (s *Service) fetchFileContent(ctx context.Context, provider, repoURL, branc
 			return "", err
 		}
 		defer resp.Body.Close()
-		content, err := io.ReadAll(resp.Body)
-		return string(content), err
+		if resp.StatusCode != http.StatusOK {
+			// Without this the JSON error body was stored as file content.
+			return "", fmt.Errorf("GitHub content API returned %d for %s", resp.StatusCode, filePath)
+		}
+		return s.readCappedFile(resp.Body, filePath)
 
 	case ProviderGitLab:
 		projectPath := extractGitLabPath(repoURL)
@@ -556,10 +682,36 @@ func (s *Service) fetchFileContent(ctx context.Context, provider, repoURL, branc
 			return "", err
 		}
 		defer resp.Body.Close()
-		content, err := io.ReadAll(resp.Body)
-		return string(content), err
+		if resp.StatusCode != http.StatusOK {
+			return "", fmt.Errorf("GitLab content API returned %d for %s", resp.StatusCode, filePath)
+		}
+		return s.readCappedFile(resp.Body, filePath)
 	}
 	return "", fmt.Errorf("unsupported provider")
+}
+
+// readCappedFile reads at most maxRepoFileBytes. Oversized files are rejected
+// rather than passed downstream as plausible-looking partial source.
+//
+// WHY: GitLab's tree API carries no size, so oversized files cannot be
+// filtered before they are fetched. Capping the read gives both providers the
+// same effective 100KB guard instead of pulling a multi-megabyte blob into
+// memory. Returning an error also prevents the first 100KB from being treated
+// as if it were the complete file (A3).
+func (s *Service) readCappedFile(r io.Reader, filePath string) (string, error) {
+	limited := io.LimitReader(r, maxRepoFileBytes+1)
+	content, err := io.ReadAll(limited)
+	if err != nil {
+		return "", err
+	}
+	if len(content) > maxRepoFileBytes {
+		s.logger.Warn("repo file exceeds the size cap and was skipped",
+			zap.String("file", filePath),
+			zap.Int("cap_bytes", maxRepoFileBytes),
+		)
+		return "", fmt.Errorf("repo file exceeds %d-byte content limit; skipped", maxRepoFileBytes)
+	}
+	return string(content), nil
 }
 
 // exchangeGitHubCode exchanges OAuth code for GitHub access token.
@@ -595,8 +747,32 @@ func (s *Service) exchangeGitHubCode(ctx context.Context, code string) (string, 
 	return result.AccessToken, nil
 }
 
-// exchangeGitLabCode exchanges OAuth code for GitLab access token.
-func (s *Service) exchangeGitLabCode(ctx context.Context, code string) (string, error) {
+// gitLabTokenResponse is the shape GitLab returns from both the
+// authorization_code and refresh_token grants.
+type gitLabTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+	ExpiresIn    int    `json:"expires_in"`
+	Error        string `json:"error"`
+}
+
+// toOAuthToken converts the wire response, turning expires_in into an absolute
+// expiry so callers never have to remember when the response was received.
+func (r gitLabTokenResponse) toOAuthToken() oauthToken {
+	tok := oauthToken{AccessToken: r.AccessToken, RefreshToken: r.RefreshToken}
+	if r.ExpiresIn > 0 {
+		tok.ExpiresAt = time.Now().Add(time.Duration(r.ExpiresIn) * time.Second)
+	}
+	return tok
+}
+
+// exchangeGitLabCode exchanges OAuth code for a GitLab token set.
+//
+// WHY this returns the refresh token and expiry, not just the access token:
+// GitLab.com access tokens expire (expires_in, ~2h) and the old code read only
+// access_token — so a connected GitLab repo stopped syncing two hours later
+// with no way to recover (A4b).
+func (s *Service) exchangeGitLabCode(ctx context.Context, code string) (oauthToken, error) {
 	data := url.Values{}
 	data.Set("client_id", s.gitlabOAuth.ClientID)
 	data.Set("client_secret", s.gitlabOAuth.ClientSecret)
@@ -612,21 +788,49 @@ func (s *Service) exchangeGitLabCode(ctx context.Context, code string) (string, 
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return "", err
+		return oauthToken{}, err
 	}
 	defer resp.Body.Close()
 
-	var result struct {
-		AccessToken string `json:"access_token"`
-		Error       string `json:"error"`
-	}
+	var result gitLabTokenResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return "", err
+		return oauthToken{}, err
 	}
 	if result.Error != "" {
-		return "", fmt.Errorf("GitLab OAuth error: %s", result.Error)
+		return oauthToken{}, fmt.Errorf("GitLab OAuth error: %s", result.Error)
 	}
-	return result.AccessToken, nil
+	return result.toOAuthToken(), nil
+}
+
+// refreshGitLabToken trades a refresh token for a new GitLab token set.
+func (s *Service) refreshGitLabToken(ctx context.Context, refreshToken string) (oauthToken, error) {
+	data := url.Values{}
+	data.Set("client_id", s.gitlabOAuth.ClientID)
+	data.Set("client_secret", s.gitlabOAuth.ClientSecret)
+	data.Set("refresh_token", refreshToken)
+	data.Set("grant_type", "refresh_token")
+	data.Set("redirect_uri", s.gitlabOAuth.RedirectURL)
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
+		"https://gitlab.com/oauth/token",
+		strings.NewReader(data.Encode()),
+	)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return oauthToken{}, err
+	}
+	defer resp.Body.Close()
+
+	var result gitLabTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return oauthToken{}, err
+	}
+	if result.Error != "" {
+		return oauthToken{}, fmt.Errorf("GitLab token refresh error: %s", result.Error)
+	}
+	return result.toOAuthToken(), nil
 }
 
 // updateSyncStatus updates the sync status in DB.
@@ -675,31 +879,58 @@ var ErrProviderMismatch = errors.New("the connected provider does not match the 
 // The returned token is for immediate in-memory use. Callers must never write
 // it to disk, into a git config, or into a log line.
 func (s *Service) AccessTokenForProject(ctx context.Context, projectID uuid.UUID, provider string) (string, error) {
-	var encrypted, storedProvider string
+	var connectionID uuid.UUID
+	var storedProvider string
 	err := s.db.QueryRow(ctx,
-		`SELECT COALESCE(access_token, ''), provider
+		`SELECT id, provider
 		   FROM repo_connections
 		  WHERE project_id = $1
 		  ORDER BY created_at DESC
 		  LIMIT 1`,
 		projectID,
-	).Scan(&encrypted, &storedProvider)
+	).Scan(&connectionID, &storedProvider)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", ErrNoRepoConnection
 	}
 	if err != nil {
 		return "", fmt.Errorf("load repo connection: %w", err)
 	}
-	if encrypted == "" {
+	if storedProvider != provider {
+		return "", fmt.Errorf("%w: connected %s, asked for %s", ErrProviderMismatch, storedProvider, provider)
+	}
+	return s.accessTokenForConnection(ctx, connectionID)
+}
+
+// accessTokenForConnection returns a token that is valid right now for one
+// connection. For a GitLab OAuth connection whose token is about to expire it
+// refreshes first; everything else just decrypts (A4b).
+func (s *Service) accessTokenForConnection(ctx context.Context, connectionID uuid.UUID) (string, error) {
+	var storedProvider, encryptedAccess, encryptedRefresh string
+	var expiresAt *time.Time
+	err := s.db.QueryRow(ctx,
+		`SELECT provider, COALESCE(access_token, ''), COALESCE(refresh_token, ''), token_expires_at
+		   FROM repo_connections
+		  WHERE id = $1`,
+		connectionID,
+	).Scan(&storedProvider, &encryptedAccess, &encryptedRefresh, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoRepoConnection
+	}
+	if err != nil {
+		return "", fmt.Errorf("load repo connection: %w", err)
+	}
+	if encryptedAccess == "" {
 		// A row can exist with a NULL token: access_token is nullable and
 		// ConnectRepo is not the only way a row is created.
 		return "", ErrNoRepoConnection
 	}
-	if storedProvider != provider {
-		return "", fmt.Errorf("%w: connected %s, asked for %s", ErrProviderMismatch, storedProvider, provider)
+
+	if storedProvider == ProviderGitLab && encryptedRefresh != "" && expiresAt != nil &&
+		time.Until(*expiresAt) < gitLabRefreshSkew {
+		return s.refreshConnectionToken(ctx, connectionID)
 	}
 
-	token, err := s.decrypt(encrypted)
+	token, err := s.decrypt(encryptedAccess)
 	if err != nil {
 		// Deliberately does not wrap the decrypt error's text into something
 		// that could carry ciphertext into a log. The cause is almost always a
@@ -710,6 +941,92 @@ func (s *Service) AccessTokenForProject(ctx context.Context, projectID uuid.UUID
 		return "", ErrNoRepoConnection
 	}
 	return token, nil
+}
+
+// refreshConnectionToken serializes refreshes across API replicas by locking
+// the connection row in a transaction. GitLab may rotate refresh tokens, so
+// concurrent requests must not redeem the same stored token. A waiter re-reads
+// the row after acquiring the lock and reuses the winner's fresh token.
+func (s *Service) refreshConnectionToken(ctx context.Context, connectionID uuid.UUID) (string, error) {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin GitLab token refresh: %w", err)
+	}
+	defer tx.Rollback(ctx) // harmless after a successful commit
+
+	var encryptedAccess, encryptedRefresh string
+	var expiresAt *time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT COALESCE(access_token, ''), COALESCE(refresh_token, ''), token_expires_at
+		   FROM repo_connections
+		  WHERE id = $1
+		  FOR UPDATE`,
+		connectionID,
+	).Scan(&encryptedAccess, &encryptedRefresh, &expiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNoRepoConnection
+	}
+	if err != nil {
+		return "", fmt.Errorf("lock repo connection for token refresh: %w", err)
+	}
+
+	// Another request may have refreshed while this one waited for the row lock.
+	if expiresAt != nil && time.Until(*expiresAt) >= gitLabRefreshSkew {
+		token, err := s.decrypt(encryptedAccess)
+		if err != nil {
+			return "", fmt.Errorf("stored token could not be decrypted — was ENCRYPTION_KEY changed after the repo was connected?")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return "", fmt.Errorf("commit GitLab refresh read: %w", err)
+		}
+		return token, nil
+	}
+	if encryptedRefresh == "" {
+		return "", fmt.Errorf("GitLab OAuth token expired and no refresh token is stored; reconnect the repository")
+	}
+
+	refreshPlain, err := s.decrypt(encryptedRefresh)
+	if err != nil {
+		return "", fmt.Errorf("stored refresh token could not be decrypted — was ENCRYPTION_KEY changed after the repo was connected?")
+	}
+	tok, err := s.refreshGitLabToken(ctx, refreshPlain)
+	if err != nil {
+		return "", fmt.Errorf("GitLab token refresh failed: %w", err)
+	}
+	if strings.TrimSpace(tok.AccessToken) == "" {
+		return "", ErrNoRepoConnection
+	}
+
+	encAccess, err := s.encrypt(tok.AccessToken)
+	if err != nil {
+		return "", fmt.Errorf("encrypt refreshed token: %w", err)
+	}
+	var encRefresh interface{}
+	if tok.RefreshToken != "" {
+		encRefresh, err = s.encrypt(tok.RefreshToken)
+		if err != nil {
+			return "", fmt.Errorf("encrypt refreshed refresh token: %w", err)
+		}
+	}
+	var expiryArg interface{}
+	if !tok.ExpiresAt.IsZero() {
+		expiryArg = tok.ExpiresAt
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE repo_connections
+		    SET access_token = $1,
+		        refresh_token = COALESCE($2, refresh_token),
+		        token_expires_at = COALESCE($3, token_expires_at),
+		        updated_at = NOW()
+		  WHERE id = $4`,
+		encAccess, encRefresh, expiryArg, connectionID,
+	); err != nil {
+		return "", fmt.Errorf("persist refreshed GitLab token: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit refreshed GitLab token: %w", err)
+	}
+	return tok.AccessToken, nil
 }
 
 // encrypt encrypts a string using AES-256-GCM.
@@ -845,6 +1162,26 @@ func (h *Handler) assertProjectAccess(c *gin.Context, projectID uuid.UUID) bool 
 	}
 	role, _ := c.Get("role")
 	roleStr, _ := role.(string)
+	// AssertProject enforces tenant visibility, but multiple clients can share
+	// one tenant. Repo credentials belong to the project's specific client, so
+	// retain the same per-owner boundary used by project.GetByID as well.
+	if roleStr != "admin" {
+		var owned bool
+		if err := h.svc.db.QueryRow(c.Request.Context(),
+			`SELECT EXISTS (
+				SELECT 1 FROM projects
+				 WHERE id = $1 AND client_id = $2 AND deleted_at IS NULL
+			)`,
+			projectID, clientID,
+		).Scan(&owned); err != nil {
+			response.InternalError(c)
+			return false
+		}
+		if !owned {
+			response.Forbidden(c, "project not found or not accessible")
+			return false
+		}
+	}
 	scope, err := h.tenant.Resolve(c.Request.Context(), clientID, roleStr)
 	if err != nil {
 		response.Forbidden(c, "Tenant scope could not be resolved")
@@ -946,8 +1283,10 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	// user lands where they started instead of the project list.
 	projectURL := fmt.Sprintf("%s/projects/%s", frontendBase, projectID)
 
-	// Exchange code for access token
-	accessToken, err := h.svc.ExchangeCode(c.Request.Context(), provider, code)
+	// Exchange code for the provider's token set. GitLab also returns a
+	// refresh token and an expiry — both are persisted so the connection
+	// keeps working after the access token lapses (A4b).
+	tok, err := h.svc.ExchangeOAuthCode(c.Request.Context(), provider, code)
 	if err != nil {
 		h.logger.Error("OAuth code exchange failed",
 			zap.String("provider", provider),
@@ -973,9 +1312,9 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	// Connect repo with the obtained token
 	// repo_url and default_branch will be fetched during sync
 	// For now store a placeholder URL — sync will update it
-	connID, err := h.svc.ConnectRepo(
+	connID, err := h.svc.ConnectRepoOAuth(
 		c.Request.Context(), projectID, clientID,
-		provider, "", accessToken, "main",
+		provider, "", tok.AccessToken, tok.RefreshToken, "main", tok.ExpiresAt,
 	)
 	if err != nil {
 		h.logger.Error("ConnectRepo failed after OAuth", zap.Error(err))
