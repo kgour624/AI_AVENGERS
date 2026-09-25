@@ -3,12 +3,14 @@ package training
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
@@ -991,16 +993,29 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 		&report.TopK, &report.StartedAt, &report.CompletedAt,
 		&report.GraphExpansion, &report.ErrorMessage)
 	if err != nil {
-		// No run yet is not an error for the caller: the screen shows "never
-		// measured", which is a different state from "measured and empty".
-		return nil, nil
+		// "Never evaluated" is a real state, not an error — the screen says "never
+		// measured", which is different from "measured and empty".
+		//
+		// Anything ELSE is a real failure and must be returned. Swallowing it here was
+		// the second half of the bug that made a finished 9/9 pass render as "Never
+		// measured": a broken query and an empty table were indistinguishable.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("capability eval: read latest run: %w", err)
 	}
 
+	// The question lives on the CASE, not on the result — a JOIN, not a column that does
+	// not exist. This is the bug that made a finished 9/9 pass read as "Never measured":
+	// the query errored, the endpoint returned 500, and the screen could not tell that
+	// apart from having no data at all.
 	rows, err := e.db.Query(ctx, `
-		SELECT topic, level, passed, hit_rank, grounded, refused, failure_reason, question
-		  FROM expert_capability_results
-		 WHERE run_id = $1
-		 ORDER BY topic, level`, report.RunID)
+		SELECT r.topic, r.level, r.passed, r.hit_rank, r.grounded, r.refused,
+		       r.failure_reason, c.question
+		  FROM expert_capability_results r
+		  JOIN expert_capability_cases c ON c.id = r.case_id
+		 WHERE r.run_id = $1
+		 ORDER BY r.topic, r.level`, report.RunID)
 	if err != nil {
 		return nil, fmt.Errorf("capability eval: read results: %w", err)
 	}

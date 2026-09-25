@@ -151,7 +151,7 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   // flight: a pass writes questions, asks them and judges the answers — one
   // generation call per topic plus two calls per question — so it runs in the
   // background and this screen fills itself in.
-  const { data: evalState } = useQuery({
+  const { data: evalState, error: evalError } = useQuery({
     queryKey: ['experts', expert.id, 'capability-eval'],
     queryFn: () => getCapabilityEval(expert.id),
     enabled: isExpanded,
@@ -423,7 +423,17 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                     </>
                   )}
 
-                  {!report && !isMeasuring && (
+                  {/* A failed request and "no measurement yet" looked identical on this
+                      panel, which is how a finished pass came to read as "Never measured".
+                      They must never look the same again. */}
+                  {evalError && (
+                    <p className="mt-2 text-[11px] text-mode-refuse">
+                      Could not read the measurement result: {evalError.message}. The pass may have
+                      finished — reload the page and look again.
+                    </p>
+                  )}
+
+                  {!report && !isMeasuring && !evalError && (
                     <p className="mt-2 text-[10px] text-text-disabled">
                       Never measured. Until it is, the only depth reported for this expert is chunk
                       coverage.
