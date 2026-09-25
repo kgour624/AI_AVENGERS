@@ -707,9 +707,21 @@ Return ONLY JSON: {"verdict":"supported"|"refuted"|"unverifiable","reason":"..."
 	if err != nil {
 		// An unjudged case cannot be called supported; treat it as unverifiable
 		// rather than as a pass.
+		e.logger.Warn("capability eval: judge call failed (case recorded as unverifiable)",
+			zap.Error(err))
 		return "unverifiable"
 	}
-	return parseJudgeVerdict(resp.Content)
+
+	verdict := parseJudgeVerdict(resp.Content)
+	if verdict == "unverifiable" {
+		// WHY this is logged: an unparseable judge is indistinguishable from a
+		// genuinely unsupported answer in the results table, and a silent judge
+		// failure would look like a capability problem. The raw response is
+		// clipped so one bad reply cannot flood the log.
+		e.logger.Warn("capability eval: judge verdict unparseable (case recorded as unverifiable)",
+			zap.String("raw_response", clipPromptText(resp.Content, 200)))
+	}
+	return verdict
 }
 
 // parseJudgeVerdict reads the judge's JSON, defaulting to unverifiable.
