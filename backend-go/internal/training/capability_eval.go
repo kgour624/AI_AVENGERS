@@ -226,6 +226,9 @@ type CapabilityEvalReport struct {
 	// GraphExpansion records which retrieval path this pass used. The baseline above
 	// is only ever the previous pass with the same value.
 	GraphExpansion bool `json:"graph_expansion"`
+	// ErrorMessage is why a failed pass failed, so an admin who cannot read server logs
+	// still learns the reason from the screen that offered the button.
+	ErrorMessage string `json:"error_message"`
 }
 
 // RunEval performs one pass: ensure the question set, then ask every question and
@@ -978,7 +981,7 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 	err := e.db.QueryRow(ctx, `
 		SELECT id, status, topics_total, cases_total, cases_passed,
 		       retrieval_hits, grounded, refused, top_k, started_at, completed_at,
-		       graph_expansion
+		       graph_expansion, error_message
 		  FROM expert_capability_eval_runs
 		 WHERE expert_id = $1
 		 ORDER BY started_at DESC
@@ -986,7 +989,7 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 	).Scan(&report.RunID, &report.Status, &report.TopicsTotal, &report.CasesTotal,
 		&report.CasesPassed, &report.RetrievalHits, &report.Grounded, &report.Refused,
 		&report.TopK, &report.StartedAt, &report.CompletedAt,
-		&report.GraphExpansion)
+		&report.GraphExpansion, &report.ErrorMessage)
 	if err != nil {
 		// No run yet is not an error for the caller: the screen shows "never
 		// measured", which is a different state from "measured and empty".
