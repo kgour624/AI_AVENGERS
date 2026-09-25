@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useEffect, useMemo, useState } from 'react'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
@@ -121,11 +121,20 @@ interface ExpertCapabilitiesTableProps {
 }
 
 export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps) {
+  const queryClient = useQueryClient()
   const [isExpanded, setIsExpanded] = useState(false)
   const [showAll, setShowAll] = useState(false)
   const [measureError, setMeasureError] = useState<string | null>(null)
   const [conceptNote, setConceptNote] = useState<string | null>(null)
   const [depthNote, setDepthNote] = useState<string | null>(null)
+  // True from the moment a pass is started until a finished report arrives.
+  //
+  // WHY this exists: the first fetch after starting returns status 'running', which is
+  // what keeps polling alive — but until that fetch happens there is NO report at all,
+  // so polling based on status alone never starts and the screen sits on "Never
+  // measured" forever. That is exactly what happened when Measure was pressed: the pass
+  // ran on the server and the page never asked again.
+  const [awaitingReport, setAwaitingReport] = useState(false)
 
   // Fetched only when the section is opened: this is a per-expert table read that
   // nobody asked for until they expand it.
@@ -146,11 +155,25 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
     queryKey: ['experts', expert.id, 'capability-eval'],
     queryFn: () => getCapabilityEval(expert.id),
     enabled: isExpanded,
-    refetchInterval: (query) => (query.state.data?.report?.status === 'running' ? 5000 : false),
+    refetchInterval: (query) => {
+      const status = query.state.data?.report?.status
+      return awaitingReport || status === 'running' ? 5000 : false
+    },
   })
 
   const report = evalState?.measured ? evalState.report : undefined
-  const isMeasuring = report?.status === 'running'
+  // "Measuring" covers both states: waiting for the first sight of a run, and seeing one
+  // that is still going. Without the first half the throttle line never appears while a
+  // pass is starting, so the button looks like it did nothing.
+  const isMeasuring = awaitingReport || report?.status === 'running'
+
+  // Stop waiting as soon as a report exists in a finished state, so polling does not run
+  // forever after a pass completes.
+  useEffect(() => {
+    if (report && report.status !== 'running') {
+      setAwaitingReport(false)
+    }
+  }, [report])
 
   // The mode is passed per call rather than held as a checkbox: a hidden tick would
   // make "which run did I just start?" ambiguous, and the whole point is that the two
@@ -158,7 +181,13 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   const measureMutation = useMutation({
     mutationFn: (graphExpansion: boolean) =>
       startCapabilityEval(expert.id, { graphExpansion }),
-    onSuccess: () => setMeasureError(null),
+    onSuccess: () => {
+      setMeasureError(null)
+      setAwaitingReport(true)
+      // Fetch straight away: the pass is already running on the server, and this call
+      // is what turns "never measured" into "running" on screen.
+      queryClient.invalidateQueries({ queryKey: ['experts', expert.id, 'capability-eval'] })
+    },
     onError: () => setMeasureError('Could not start the measurement.'),
   })
 
@@ -345,13 +374,16 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
 
                   {isMeasuring && (
                     <p className="mt-2 text-[11px] text-glow-amber">
-                      Measuring — this runs in the background and takes a few minutes.
+                      Measuring — this runs in the background and takes a few minutes. This panel
+                      updates itself; you can leave it open or come back later.
                     </p>
                   )}
 
                   {report?.status === 'failed' && (
                     <p className="mt-2 text-[11px] text-mode-refuse">
-                      The last pass failed before finishing. Run it again for a result.
+                      The last pass failed before finishing
+                      {report.errorMessage ? `: ${report.errorMessage}` : '.'} Run it again for a
+                      result.
                     </p>
                   )}
 

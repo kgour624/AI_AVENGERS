@@ -785,6 +785,8 @@ export interface CapabilityEvalReport {
    * mode cannot judge the delta.
    */
   graphExpansion: boolean
+  /** Why a failed pass failed, so the screen that offered the button can explain it. */
+  errorMessage?: string
 }
 
 export interface CapabilityEvalResponse {
