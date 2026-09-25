@@ -1,8 +1,21 @@
 import { useEffect, useRef, useState } from 'react'
+import { useMutation } from '@tanstack/react-query'
 import { Modal } from '@/components/ui/Modal'
+import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
 import { useIngestionStream } from '@/hooks/useIngestionStream'
-import { resumeIngestionJob, retryIngestionJob } from '@/api/admin'
+import {
+  RECONCILE_REPAIR_ACTIONS,
+  RECONCILE_RESOLVE_ACTIONS,
+  getIngestionAudit,
+  getIngestionDiagnostics,
+  reconcileIngestion,
+  resumeIngestionJob,
+  retryIngestionJob,
+  type IngestionAudit,
+  type IngestionDiagnostics,
+  type ReconcileActionResult,
+} from '@/api/admin'
 
 // ============================================================
 // Stage definitions
@@ -111,6 +124,26 @@ function describeIngestError(msg: string): string {
   return msg
 }
 
+/**
+ * describeVerdict renders the per-file storage verdict from the diagnostics.
+ *
+ * WHY a switch and not a lookup object: the verdict is a union of four strings,
+ * and a lookup would let a new verdict from the backend fall through to nothing.
+ * A default branch keeps an unknown value visible and labelled instead of blank.
+ */
+function describeVerdict(verdict: string): { text: string; className: string } {
+  switch (verdict) {
+    case 'complete':
+      return { text: 'all chunks present', className: 'text-mode-advise' }
+    case 'duplicates_merged':
+      return { text: 'repeats merged', className: 'text-glow-amber' }
+    case 'tail_missing':
+      return { text: 'store stopped early', className: 'text-mode-refuse' }
+    default:
+      return { text: 'not checked', className: 'text-text-disabled' }
+  }
+}
+
 export function IngestionPipelineModal({
   isOpen, onClose, expertId, expertName,
 }: IngestionPipelineModalProps) {
@@ -118,6 +151,14 @@ export function IngestionPipelineModal({
   const logRef = useRef<HTMLDivElement>(null)
   const [isResuming, setIsResuming] = useState(false)
   const [resumeError, setResumeError] = useState<string | null>(null)
+
+  // Corpus check + repair (Phase D/E). Local state, not react-query cache: the
+  // check is an on-demand expert-wide read, and caching it would show stale
+  // numbers right after a repair — the one moment the admin is looking.
+  const [audit, setAudit] = useState<IngestionAudit | null>(null)
+  const [diagnostics, setDiagnostics] = useState<IngestionDiagnostics | null>(null)
+  const [repairPlan, setRepairPlan] = useState<ReconcileActionResult[] | null>(null)
+  const [repairNote, setRepairNote] = useState<string | null>(null)
 
   // Auto-scroll log to top (newest first)
   useEffect(() => {
@@ -144,6 +185,86 @@ export function IngestionPipelineModal({
   // FIX: paused was not handled — UI showed "Extracting..." frozen for 30+ min
   const isPaused = job?.status === 'paused'
   const isRunning = !!job && !isDone && !isFailed && !isPaused
+
+  // ------------------------------------------------------------------
+  // Corpus check + repair (Phase D/E)
+  // ------------------------------------------------------------------
+
+  // The verification card says whether THIS run's rows landed. The corpus check
+  // asks the wider question: do the stored chunks, the expert's cached totals and
+  // the run ledger still agree? Only fetched on request — it is an expert-wide
+  // read, and running it on every modal open would spend a request nobody asked
+  // for.
+  const auditMutation = useMutation({
+    mutationFn: () => {
+      if (!expertId) throw new Error('no expert selected')
+      return getIngestionAudit(expertId)
+    },
+    onSuccess: async (result) => {
+      setAudit(result)
+      setDiagnostics(null)
+      setRepairPlan(null)
+      setRepairNote(null)
+      // The per-file explanation is only meaningful when something is actually
+      // wrong, so it is fetched then and not before.
+      if (result.mismatchedRuns > 0 && job?.id && expertId) {
+        try {
+          setDiagnostics(await getIngestionDiagnostics(expertId, job.id))
+        } catch {
+          setRepairNote('Could not load the per-file breakdown for this run.')
+        }
+      }
+    },
+    onError: () => setRepairNote('Corpus check failed.'),
+  })
+
+  // Dry run first, always. The admin sees what would change before anything is
+  // written, and the Apply button only appears if a repair would do something.
+  const planMutation = useMutation({
+    mutationFn: () => {
+      if (!expertId) throw new Error('no expert selected')
+      return reconcileIngestion(expertId, RECONCILE_REPAIR_ACTIONS, true)
+    },
+    onSuccess: (result) => {
+      setRepairPlan(result.results)
+      setRepairNote(null)
+    },
+    onError: () => setRepairNote('Could not build a repair plan.'),
+  })
+
+  const applyMutation = useMutation({
+    mutationFn: () => {
+      if (!expertId) throw new Error('no expert selected')
+      return reconcileIngestion(expertId, RECONCILE_REPAIR_ACTIONS, false)
+    },
+    onSuccess: (result) => {
+      setRepairPlan(result.results)
+      setRepairNote('Repair applied.')
+      // Re-read: the numbers the admin is looking at just changed.
+      auditMutation.mutate()
+    },
+    onError: () => setRepairNote('Repair failed. Nothing was changed for the actions that errored.'),
+  })
+
+  // Separate from the repairs on purpose: the backend treats "this discrepancy is
+  // acceptable" as a human decision, so it must be a deliberate click and never a
+  // side effect of fixing the derived state.
+  const resolveMutation = useMutation({
+    mutationFn: () => {
+      if (!expertId || !job?.id) throw new Error('no run selected')
+      return reconcileIngestion(expertId, RECONCILE_RESOLVE_ACTIONS, false, job.id)
+    },
+    onSuccess: () => {
+      setRepairNote('This run is marked as reviewed.')
+      auditMutation.mutate()
+    },
+    onError: () => setRepairNote('Could not mark the run as reviewed.'),
+  })
+
+  // Offered only when there is something to review: a warning run, or a
+  // verification the backend refused to call verified.
+  const mismatched = !!stream.verification && !stream.verification.ok
+  const canResolveRun = !!job?.id && (isWarning || mismatched)
 
   const handleResume = async () => {
     if (!expertId || !job?.id) return
@@ -294,6 +415,34 @@ export function IngestionPipelineModal({
                 </span>
               </span>
             </div>
+            {/* The breakdown answers the question the counts raise: "395 parsed
+                but 277 stored" reads as data loss until the 118 chunks that
+                repeated text already in the corpus are named. Rendered as the
+                backend computed it — a second implementation here would be a
+                second thing to keep in step. */}
+            {typeof stream.verification.breakdown?.parsed === 'number' && (
+              <p className="mt-1 text-[10px] text-text-secondary">
+                parsed{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.breakdown.parsed}
+                </span>
+                {' → '}duplicates merged{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.breakdown.duplicate ?? 0}
+                </span>
+                {' → '}inserted{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.breakdown.inserted ?? 0}
+                </span>
+                {' → '}stored{' '}
+                <span className="font-mono text-text-primary">
+                  {stream.verification.breakdown.stored_for_file ?? 0}
+                </span>
+              </p>
+            )}
+            {stream.verification.summary && (
+              <p className="mt-1 text-[10px] text-text-disabled">{stream.verification.summary}</p>
+            )}
             {stream.verification.corpusTotalChunks > 0 && (
               <p className="mt-1 text-[10px] text-text-disabled">
                 corpus total after this run:{' '}
@@ -512,6 +661,122 @@ export function IngestionPipelineModal({
             </p>
           </div>
         )}
+
+        {/* Phase D/E: the corpus check. The card above judges this run; this asks
+            the wider question — do the stored chunks, the expert's cached totals
+            and the run ledger still agree — and offers the repairs for the parts
+            that are derivable. It cannot recreate chunks that were never stored,
+            and says so rather than leaving a button that looks like it might. */}
+        <div className="rounded-lg border border-surface-border bg-surface-raised/30 p-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-text-primary">Corpus check</p>
+              <p className="mt-0.5 text-[10px] text-text-disabled">
+                Compares the stored chunks, the expert&apos;s cached totals and the run ledger.
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={() => auditMutation.mutate()}
+              isLoading={auditMutation.isPending}
+            >
+              Run check
+            </Button>
+          </div>
+
+          {audit && (
+            <div className="mt-2">
+              <div className="grid grid-cols-3 gap-2 text-[10px] text-text-secondary">
+                <span>
+                  chunks <span className="font-mono text-text-primary">{audit.corpusChunks}</span>
+                </span>
+                <span>
+                  topics <span className="font-mono text-text-primary">{audit.corpusTopics}</span>
+                </span>
+                <span>
+                  no vector{' '}
+                  <span className="font-mono text-text-primary">{audit.nullEmbeddings}</span>
+                </span>
+              </div>
+
+              <ul className="mt-2 space-y-1">
+                {audit.findings.map((finding) => (
+                  <li key={finding} className="flex gap-1.5 text-[10px] text-text-secondary">
+                    <span className="shrink-0 text-text-disabled">{'\u2022'}</span>
+                    <span>{finding}</span>
+                  </li>
+                ))}
+              </ul>
+
+              {diagnostics && diagnostics.files.length > 0 && (
+                <div className="mt-2 rounded border border-glass-border">
+                  {diagnostics.files.map((file) => {
+                    const verdict = describeVerdict(file.verdict)
+                    return (
+                      <div
+                        key={file.sourceFile}
+                        className="flex items-center justify-between gap-2 border-b border-glass-border px-2 py-1 last:border-b-0"
+                      >
+                        <span className="truncate text-[10px] text-text-secondary">
+                          {file.sourceFile}
+                        </span>
+                        <span className={cn('shrink-0 text-[10px] font-medium', verdict.className)}>
+                          {verdict.text}
+                        </span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => planMutation.mutate()}
+                  isLoading={planMutation.isPending}
+                >
+                  What would a repair change?
+                </Button>
+                {repairPlan && repairPlan.some((result) => result.changed > 0) && (
+                  <Button
+                    size="sm"
+                    onClick={() => applyMutation.mutate()}
+                    isLoading={applyMutation.isPending}
+                  >
+                    Apply repair
+                  </Button>
+                )}
+                {canResolveRun && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => resolveMutation.mutate()}
+                    isLoading={resolveMutation.isPending}
+                  >
+                    Mark this run as reviewed
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {repairPlan && (
+            <ul className="mt-2 space-y-1">
+              {repairPlan.map((result) => (
+                <li key={result.action} className="flex gap-1.5 text-[10px]">
+                  <span className="shrink-0 font-mono text-text-primary">{result.action}</span>
+                  <span className={result.changed > 0 ? 'text-glow-amber' : 'text-text-disabled'}>
+                    {result.detail}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {repairNote && <p className="mt-2 text-[10px] text-glow-amber">{repairNote}</p>}
+        </div>
 
         {/* Event log — sourced from ingestion_job_events (Postgres), so it is
             identical for every viewer and survives a refresh. */}

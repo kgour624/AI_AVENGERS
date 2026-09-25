@@ -595,3 +595,131 @@ export const issueBootstrapToken = () =>
     .then((res) => res.data.data!)
 
 
+
+// ============================================================
+// Ingestion corpus check + repair (Phase D/E)
+// ============================================================
+
+/** One ingestion_runs row: what a run actually stored. */
+export interface IngestionRunAudit {
+  jobId: string
+  sourceFile: string
+  verificationStatus: 'not_checked' | 'verified' | 'mismatch' | 'repaired'
+  mismatchReason: string
+  parsed: number
+  duplicates: number
+  inserted: number
+  reused: number
+  storedForFile: number
+  generalStored: number
+  fallbackChunks: number
+  nullEmbeddings: number
+  createdAt: string
+}
+
+/** "Is this expert's corpus what it claims to be?" — numbers plus sentences. */
+export interface IngestionAudit {
+  expertId: string
+  corpusChunks: number
+  corpusTopics: number
+  nullEmbeddings: number
+  generalChunks: number
+  declaredChunks: number
+  declaredTopics: number
+  statsDrift: boolean
+  capabilityRows: number
+  staleCapabilityRows: number
+  missingCapabilities: boolean
+  mismatchedRuns: number
+  uncheckedRuns: number
+  runs: IngestionRunAudit[]
+  findings: string[]
+}
+
+/** Why a file holds fewer rows than its run parsed. */
+export type FileIntegrityVerdict = 'complete' | 'duplicates_merged' | 'tail_missing' | 'unchecked'
+
+export interface IngestionFileIntegrity {
+  sourceFile: string
+  storedRows: number
+  expectedFromLedger: number
+  minIndex: number
+  maxIndex: number
+  distinctIndices: number
+  missingIndices: number
+  shortfall: number
+  tailMissing: boolean
+  nullEmbeddings: number
+  generalChunks: number
+  fallbackChunks: number
+  verdict: FileIntegrityVerdict
+}
+
+export interface IngestionDiagnostics {
+  jobId: string
+  expertId: string
+  runs: IngestionRunAudit[]
+  files: IngestionFileIntegrity[]
+  findings: string[]
+}
+
+export type ReconcileAction = 'expert_stats' | 'capabilities' | 'embeddings' | 'resolve_run'
+
+export interface ReconcileActionResult {
+  action: ReconcileAction
+  applied: boolean
+  dryRun: boolean
+  changed: number
+  detail: string
+}
+
+export interface ReconcileResponse {
+  expertId: string
+  dryRun: boolean
+  applied: boolean
+  results: ReconcileActionResult[]
+  availableActions: ReconcileAction[]
+}
+
+/** Actions that rebuild derived state. resolve_run is deliberately separate. */
+export const RECONCILE_REPAIR_ACTIONS: ReconcileAction[] = [
+  'expert_stats',
+  'capabilities',
+  'embeddings',
+]
+
+/**
+ * The one judgement action: "this discrepancy is acceptable". Kept apart from the
+ * repairs because it is a human decision, not a derived-state fix.
+ */
+export const RECONCILE_RESOLVE_ACTIONS: ReconcileAction[] = ['resolve_run']
+
+export const getIngestionAudit = (expertId: string) =>
+  baseAPI
+    .get<ApiResponse<IngestionAudit>>(`/api/v1/admin/experts/${expertId}/ingestion/audit`)
+    .then((res) => res.data.data!)
+
+export const getIngestionDiagnostics = (expertId: string, jobId: string) =>
+  baseAPI
+    .get<ApiResponse<IngestionDiagnostics>>(
+      `/api/v1/admin/experts/${expertId}/ingestion/diagnostics`,
+      { params: { job: jobId } },
+    )
+    .then((res) => res.data.data!)
+
+/**
+ * Runs the requested repairs. The backend defaults dry_run to true, and this
+ * wrapper does too — a repair call must be explicit about writing.
+ */
+export const reconcileIngestion = (
+  expertId: string,
+  actions: ReconcileAction[],
+  dryRun: boolean,
+  jobId?: string,
+) =>
+  baseAPI
+    .post<ApiResponse<ReconcileResponse>>(
+      `/api/v1/admin/experts/${expertId}/ingestion/reconcile`,
+      { actions, dry_run: dryRun, job_id: jobId },
+    )
+    .then((res) => res.data.data!)

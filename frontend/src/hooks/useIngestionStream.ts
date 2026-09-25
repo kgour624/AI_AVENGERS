@@ -36,6 +36,14 @@ export interface IngestionVerification {
   reality: Record<string, number>
   corpusTotalChunks: number
   sourceFile: string
+  /**
+   * parsed → duplicates → inserted → reused → stored, from the run's own
+   * accounting. This is what explains the gap: `stored 277, parsed 395` looks
+   * like loss until the 118 repeats of text already in the corpus are shown.
+   */
+  breakdown: Record<string, number>
+  /** The backend's one-line rendering of the same breakdown. */
+  summary: string
 }
 
 export interface IngestionStreamState {
@@ -292,6 +300,8 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
                 reality: numMap(detail.reality),
                 corpusTotalChunks: num(detail, 'corpus_total_chunks'),
                 sourceFile: str(detail, 'source_file'),
+                breakdown: numMap(detail.breakdown),
+                summary: str(detail, 'summary'),
               }
             }
 
