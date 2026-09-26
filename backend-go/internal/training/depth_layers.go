@@ -518,7 +518,17 @@ Return ONLY JSON, one entry per passage:
 // model calls spent, and a non-nil error only when some part could not be
 // classified at all (any partial result is still returned so nothing good is lost).
 func (c *DepthClassifier) classifyBatch(ctx context.Context, texts []string) (map[int]int, int, int, error) {
-	response, err := c.requestLayers(ctx, texts)
+	return classifyWithCaller(ctx, c.requestLayers, texts)
+}
+
+// batchCaller is the one model call a batch needs. It is a type (not a
+// method-pointer branch) so the split/merge logic is unit-testable without a
+// live model — the regression tests below pin the recovery behaviour so a future
+// edit cannot silently drop it again.
+type batchCaller func(ctx context.Context, texts []string) (string, error)
+
+func classifyWithCaller(ctx context.Context, call batchCaller, texts []string) (map[int]int, int, int, error) {
+	response, err := call(ctx, texts)
 	if err == nil {
 		layers, rejected, parseErr := parseDepthLayers(response, len(texts))
 		if parseErr == nil {
@@ -529,13 +539,13 @@ func (c *DepthClassifier) classifyBatch(ctx context.Context, texts []string) (ma
 	if len(texts) == 1 {
 		return nil, 0, 1, err
 	}
-	return c.splitBatch(ctx, texts, len(texts)/2, 1, err)
+	return splitWithCaller(ctx, call, texts, len(texts)/2, 1, err)
 }
 
-// splitBatch classifies the two halves and merges their results.
-func (c *DepthClassifier) splitBatch(ctx context.Context, texts []string, mid, calls int, firstErr error) (map[int]int, int, int, error) {
-	leftLayers, leftRejected, leftCalls, leftErr := c.classifyBatch(ctx, texts[:mid])
-	rightLayers, rightRejected, rightCalls, rightErr := c.classifyBatch(ctx, texts[mid:])
+// splitWithCaller classifies the two halves and merges their results.
+func splitWithCaller(ctx context.Context, call batchCaller, texts []string, mid, calls int, firstErr error) (map[int]int, int, int, error) {
+	leftLayers, leftRejected, leftCalls, leftErr := classifyWithCaller(ctx, call, texts[:mid])
+	rightLayers, rightRejected, rightCalls, rightErr := classifyWithCaller(ctx, call, texts[mid:])
 	calls += leftCalls + rightCalls
 
 	merged := make(map[int]int, len(leftLayers)+len(rightLayers))
