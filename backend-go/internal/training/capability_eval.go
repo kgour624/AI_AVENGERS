@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/chinawall"
+	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/gateway"
 )
 
@@ -109,6 +110,10 @@ type CapabilityRetriever interface {
 	// a separate method so a pass can measure each path, and so the difference between
 	// two runs can be attributed to expansion alone.
 	GetCourseChunksExpanded(ctx context.Context, expertID uuid.UUID, taskDescription string, topK int) ([]chinawall.CourseChunk, error)
+	// GetCourseChunksWithPreference is the same retrieval with the section/layer
+	// nudge applied. A separate method for the same reason as expansion above: a
+	// pass can measure each path, so a difference is attributable to one change.
+	GetCourseChunksWithPreference(ctx context.Context, expertID uuid.UUID, question string, topK int, pref appcontext.RetrievalPreference) ([]chinawall.CourseChunk, error)
 }
 
 // CapabilityEvaluator generates capability questions from a corpus, asks them, and
@@ -145,6 +150,15 @@ type CapabilityEvalRequest struct {
 	// comparisons are only made against a run with the SAME value — otherwise the
 	// difference would be attributed to whichever change was made last.
 	GraphExpansion bool
+
+	// LayerPreference retrieves with the ranking nudged toward the depth layer the
+	// question itself was asked at: a level-1 question prefers layer-1 chunks, a
+	// level-3 question prefers layer-3. It nudges only — nothing is filtered out —
+	// so a pass can only reorder what plain retrieval already found.
+	//
+	// Mutually exclusive with GraphExpansion in the comparison: this pass is
+	// measured against a PLAIN one, so the difference is the nudge and nothing else.
+	LayerPreference bool
 }
 
 // CapabilityCase is one stored question with its ground truth.
@@ -256,6 +270,14 @@ type CapabilityEvalReport struct {
 	// GraphExpansion records which retrieval path this pass used. The baseline above
 	// is only ever the previous pass with the same value.
 	GraphExpansion bool `json:"graph_expansion"`
+	// LayerPreference records which retrieval path this pass used, alongside
+	// GraphExpansion above.
+	LayerPreference bool `json:"layer_preference"`
+	// PreferenceComparison answers "did preferring the depth the question was asked
+	// at help?" on the questions a plain pass and a preference pass share. Separate
+	// from Comparison so a single run reports both experiments without one being
+	// mistaken for the other.
+	PreferenceComparison *ModeComparison `json:"preference_comparison,omitempty"`
 	// ErrorMessage is why a failed pass failed, so an admin who cannot read server logs
 	// still learns the reason from the screen that offered the button.
 	ErrorMessage string `json:"error_message"`
@@ -281,7 +303,7 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 		req.TopK = defaultEvalTopK
 	}
 
-	runID, err := e.createRun(ctx, expertID, req.TopK, req.GraphExpansion)
+	runID, err := e.createRun(ctx, expertID, req.TopK, req.GraphExpansion, req.LayerPreference)
 	if err != nil {
 		return uuid.Nil, err
 	}
@@ -295,12 +317,12 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 	return runID, nil
 }
 
-func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int, graphExpansion bool) (uuid.UUID, error) {
+func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int, graphExpansion, layerPreference bool) (uuid.UUID, error) {
 	var runID uuid.UUID
 	if err := e.db.QueryRow(ctx, `
-		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k, graph_expansion)
-		VALUES ($1, 'running', $2, $3)
-		RETURNING id`, expertID, topK, graphExpansion).Scan(&runID); err != nil {
+		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k, graph_expansion, layer_preference)
+		VALUES ($1, 'running', $2, $3, $4)
+		RETURNING id`, expertID, topK, graphExpansion, layerPreference).Scan(&runID); err != nil {
 		return uuid.Nil, fmt.Errorf("capability eval: create run: %w", err)
 	}
 	return runID, nil
@@ -358,7 +380,7 @@ func (e *CapabilityEvaluator) executeRun(ctx context.Context, runID, expertID uu
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		result := e.evaluateCase(ctx, expertID, c, req.TopK, req.GraphExpansion)
+		result := e.evaluateCase(ctx, expertID, c, req.TopK, req.GraphExpansion, req.LayerPreference)
 		if err := e.storeResult(ctx, runID, expertID, c, result); err != nil {
 			return err
 		}
@@ -670,16 +692,20 @@ func (e *CapabilityEvaluator) loadCases(ctx context.Context, expertID uuid.UUID)
 }
 
 // evaluateCase asks one question and scores the three components.
-func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UUID, c CapabilityCase, topK int, graphExpansion bool) CapabilityCaseResult {
+func (e *CapabilityEvaluator) evaluateCase(ctx context.Context, expertID uuid.UUID, c CapabilityCase, topK int, graphExpansion, layerPreference bool) CapabilityCaseResult {
 	result := CapabilityCaseResult{CaseID: c.ID, Question: c.Question, Topic: c.Topic, Level: c.Level}
 
 	var (
 		chunks []chinawall.CourseChunk
 		err    error
 	)
-	if graphExpansion {
+	switch {
+	case layerPreference:
+		chunks, err = e.retriever.GetCourseChunksWithPreference(
+			ctx, expertID, c.Question, topK, preferenceForLevel(c.Level))
+	case graphExpansion:
 		chunks, err = e.retriever.GetCourseChunksExpanded(ctx, expertID, c.Question, topK)
-	} else {
+	default:
 		chunks, err = e.retriever.GetCourseChunksForWorkflow(ctx, expertID, c.Question, topK)
 	}
 	if err != nil {
@@ -1014,7 +1040,7 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 	err := e.db.QueryRow(ctx, `
 		SELECT id, status, topics_total, cases_total, cases_passed,
 		       retrieval_hits, grounded, refused, top_k, started_at, completed_at,
-		       graph_expansion, error_message
+		       graph_expansion, layer_preference, error_message
 		  FROM expert_capability_eval_runs
 		 WHERE expert_id = $1
 		 ORDER BY started_at DESC
@@ -1022,7 +1048,7 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 	).Scan(&report.RunID, &report.Status, &report.TopicsTotal, &report.CasesTotal,
 		&report.CasesPassed, &report.RetrievalHits, &report.Grounded, &report.Refused,
 		&report.TopK, &report.StartedAt, &report.CompletedAt,
-		&report.GraphExpansion, &report.ErrorMessage)
+		&report.GraphExpansion, &report.LayerPreference, &report.ErrorMessage)
 	if err != nil {
 		// "Never evaluated" is a real state, not an error — the screen says "never
 		// measured", which is different from "measured and empty".
@@ -1094,9 +1120,9 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 	if prevErr := e.db.QueryRow(ctx, `
 		SELECT id FROM expert_capability_eval_runs
 		 WHERE expert_id = $1 AND id <> $2 AND status = 'complete'
-		   AND graph_expansion = $3
+		   AND graph_expansion = $3 AND layer_preference = $4
 		 ORDER BY started_at DESC
-		 LIMIT 1`, expertID, report.RunID, report.GraphExpansion).Scan(&previousRunID); prevErr == nil {
+		 LIMIT 1`, expertID, report.RunID, report.GraphExpansion, report.LayerPreference).Scan(&previousRunID); prevErr == nil {
 		if previous, mErr := e.runMetrics(ctx, previousRunID); mErr == nil {
 			report.Previous = &previous
 		}
@@ -1109,11 +1135,35 @@ func (e *CapabilityEvaluator) Report(ctx context.Context, expertID uuid.UUID) (*
 			zap.String("expert_id", expertID.String()), zap.Error(cmpErr))
 	}
 
+	if comparison, cmpErr := e.comparePreference(ctx, expertID); cmpErr == nil {
+		report.PreferenceComparison = comparison
+	} else {
+		e.logger.Warn("capability eval: could not compare the depth preference",
+			zap.String("expert_id", expertID.String()), zap.Error(cmpErr))
+	}
+
 	for _, topic := range order {
 		report.TopicReports = append(report.TopicReports, buildTopicReport(topic, coverage[topic], byTopic[topic]))
 	}
 	report.Findings = evalFindings(report)
 	return report, nil
+}
+
+// preferenceForLevel maps a question's declared depth to the retrieval nudge that
+// goes with it.
+//
+// Pure, and unit-tested. WHAT THE HYPOTHESIS IS, stated plainly because a
+// measurement without one is just a number: a question asked at level 1 should
+// retrieve better when surface chunks rank first, and a level-3 question when deep
+// ones do. Level 0 (unknown) gets no preference at all — guessing a depth and then
+// measuring against it would prove nothing about anything.
+func preferenceForLevel(level int) appcontext.RetrievalPreference {
+	switch level {
+	case 1, 2, 3:
+		return appcontext.RetrievalPreference{Layer: level}
+	default:
+		return appcontext.RetrievalPreference{}
+	}
 }
 
 // linkVerdict decides whether following the concept links helped, from counts alone.
@@ -1138,26 +1188,68 @@ func linkVerdict(commonCases, withoutHits, withHits int) string {
 
 // compareModes joins the latest completed pass of each mode on the questions they
 // share, and states whether following the links found more sources.
+// latestCompletedRun finds the newest completed pass with exactly these retrieval
+// flags. Exactly is the point: comparing across modes is what the whole
+// measurement exists to avoid.
+func (e *CapabilityEvaluator) latestCompletedRun(ctx context.Context, expertID uuid.UUID, graphExpansion, layerPreference bool) (*uuid.UUID, error) {
+	var id uuid.UUID
+	err := e.db.QueryRow(ctx, `
+		SELECT id FROM expert_capability_eval_runs
+		 WHERE expert_id = $1 AND status = 'complete'
+		   AND graph_expansion = $2 AND layer_preference = $3
+		 ORDER BY started_at DESC
+		 LIMIT 1`, expertID, graphExpansion, layerPreference).Scan(&id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("capability eval: find comparable run: %w", err)
+	}
+	return &id, nil
+}
+
+// compareModes answers the concept-link question: plain retrieval against the same
+// retrieval with graph expansion.
 func (e *CapabilityEvaluator) compareModes(ctx context.Context, expertID uuid.UUID) (*ModeComparison, error) {
-	var plainRunID, graphRunID *uuid.UUID
-	if err := e.db.QueryRow(ctx, `
-		SELECT
-		  (SELECT id FROM expert_capability_eval_runs
-		    WHERE expert_id = $1 AND status = 'complete' AND graph_expansion = FALSE
-		    ORDER BY started_at DESC LIMIT 1),
-		  (SELECT id FROM expert_capability_eval_runs
-		    WHERE expert_id = $1 AND status = 'complete' AND graph_expansion = TRUE
-		    ORDER BY started_at DESC LIMIT 1)`, expertID,
-	).Scan(&plainRunID, &graphRunID); err != nil {
-		return nil, fmt.Errorf("capability eval: find comparable runs: %w", err)
+	plainRunID, err := e.latestCompletedRun(ctx, expertID, false, false)
+	if err != nil {
+		return nil, err
+	}
+	graphRunID, err := e.latestCompletedRun(ctx, expertID, true, false)
+	if err != nil {
+		return nil, err
 	}
 	if plainRunID == nil || graphRunID == nil {
 		// One mode has never been run: nothing to compare, and inventing a verdict from
 		// a single mode is the mistake this comparison exists to prevent.
 		return nil, nil
 	}
+	return e.compareRuns(ctx, *plainRunID, *graphRunID, "Concept links")
+}
 
-	comparison := &ModeComparison{WithoutRunID: *plainRunID, WithRunID: *graphRunID}
+// comparePreference answers the depth question: plain retrieval against the same
+// retrieval with the section/layer nudge. Both runs have graph expansion OFF, so
+// the only difference between them is the nudge.
+func (e *CapabilityEvaluator) comparePreference(ctx context.Context, expertID uuid.UUID) (*ModeComparison, error) {
+	plainRunID, err := e.latestCompletedRun(ctx, expertID, false, false)
+	if err != nil {
+		return nil, err
+	}
+	preferRunID, err := e.latestCompletedRun(ctx, expertID, false, true)
+	if err != nil {
+		return nil, err
+	}
+	if plainRunID == nil || preferRunID == nil {
+		return nil, nil
+	}
+	return e.compareRuns(ctx, *plainRunID, *preferRunID, "The depth preference")
+}
+
+// compareRuns joins two completed passes on the questions they share and states the
+// verdict. subject names what the second pass changed, so both experiments the
+// screen reports are built by one piece of logic instead of two that could drift.
+func (e *CapabilityEvaluator) compareRuns(ctx context.Context, withoutRunID, withRunID uuid.UUID, subject string) (*ModeComparison, error) {
+	comparison := &ModeComparison{WithoutRunID: withoutRunID, WithRunID: withRunID}
 	if err := e.db.QueryRow(ctx, `
 		SELECT COUNT(*),
 		       COALESCE(SUM(CASE WHEN p.hit_rank > 0 THEN 1 ELSE 0 END), 0),
@@ -1169,7 +1261,7 @@ func (e *CapabilityEvaluator) compareModes(ctx context.Context, expertID uuid.UU
 		  FROM expert_capability_results p
 		  JOIN expert_capability_results g
 		    ON g.case_id = p.case_id AND g.run_id = $2
-		 WHERE p.run_id = $1`, *plainRunID, *graphRunID,
+		 WHERE p.run_id = $1`, withoutRunID, withRunID,
 	).Scan(&comparison.CommonCases, &comparison.WithoutHits, &comparison.WithHits,
 		&comparison.WithoutPassed, &comparison.WithPassed,
 		&comparison.WithoutMRR, &comparison.WithMRR); err != nil {
@@ -1179,14 +1271,14 @@ func (e *CapabilityEvaluator) compareModes(ctx context.Context, expertID uuid.UU
 	comparison.Verdict = linkVerdict(comparison.CommonCases, comparison.WithoutHits, comparison.WithHits)
 	if comparison.Verdict == "inconclusive" {
 		comparison.Detail = fmt.Sprintf(
-			"Concept links are not comparable yet: the two passes share only %d question(s). Run Measure and Measure with links once each so they answer the same questions.",
-			comparison.CommonCases)
+			"%s cannot be judged yet: the two passes share only %d question(s). Run both passes once each so they answer the same questions.",
+			subject, comparison.CommonCases)
 		return comparison, nil
 	}
 
 	comparison.Detail = fmt.Sprintf(
-		"Concept links (%s) on the same %d question(s): source found %d/%d without links, %d/%d with links; MRR %.2f -> %.2f; answered %d/%d -> %d/%d.",
-		comparison.Verdict, comparison.CommonCases,
+		"%s (%s) on the same %d question(s): source found %d/%d without it, %d/%d with it; MRR %.2f -> %.2f; answered %d/%d -> %d/%d.",
+		subject, comparison.Verdict, comparison.CommonCases,
 		comparison.WithoutHits, comparison.CommonCases, comparison.WithHits, comparison.CommonCases,
 		comparison.WithoutMRR, comparison.WithMRR,
 		comparison.WithoutPassed, comparison.CommonCases, comparison.WithPassed, comparison.CommonCases)
@@ -1238,6 +1330,9 @@ func evalFindings(r *CapabilityEvalReport) []string {
 
 	// The links verdict, on the questions both modes actually asked. Absent means one
 	// mode has never been run, so the answer is unknown rather than "no difference".
+	if r.PreferenceComparison != nil {
+		findings = append(findings, r.PreferenceComparison.Detail)
+	}
 	if r.Comparison != nil {
 		findings = append(findings, r.Comparison.Detail)
 	}
