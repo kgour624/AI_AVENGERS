@@ -16,21 +16,24 @@ import (
 // the workflow_tasks table (Kanban state).
 //
 // DESIGN: Single Write Path
-//   Runner → Post event on blackboard
-//   Projector → reads event → updates workflow_tasks
-//   Kanban SSE → reads from same Redis channel (no DB polling)
+//
+//	Runner → Post event on blackboard
+//	Projector → reads event → updates workflow_tasks
+//	Kanban SSE → reads from same Redis channel (no DB polling)
 //
 // WHY Projector not direct INSERT:
-//   If Runner writes directly to workflow_tasks AND blackboard,
-//   they can diverge on failure (e.g. blackboard write succeeds,
-//   DB write fails). Projector ensures workflow_tasks is always
-//   a faithful projection of blackboard_events.
+//
+//	If Runner writes directly to workflow_tasks AND blackboard,
+//	they can diverge on failure (e.g. blackboard write succeeds,
+//	DB write fails). Projector ensures workflow_tasks is always
+//	a faithful projection of blackboard_events.
 //
 // Event → Projection mapping:
-//   task_plan_ready      → INSERT workflow_tasks rows
-//   task_status_changed  → UPDATE workflow_tasks.status
-//   task_failed          → UPDATE workflow_tasks.status = 'failed'
-//   artifact posted      → UPDATE workflow_tasks.produced_artifact_event_id
+//
+//	task_plan_ready      → INSERT workflow_tasks rows
+//	task_status_changed  → UPDATE workflow_tasks.status
+//	task_failed          → UPDATE workflow_tasks.status = 'failed'
+//	artifact posted      → UPDATE workflow_tasks.produced_artifact_event_id
 type Projector struct {
 	db     *pgxpool.Pool
 	store  *blackboard.Store
@@ -48,18 +51,19 @@ func NewProjector(db *pgxpool.Pool, store *blackboard.Store, sub *blackboard.Sub
 // Stops when ctx is cancelled (workflow complete or failed).
 //
 // Mental execution:
-//   workflowID = abc
-//   Subscribe from seq=0
 //
-//   Event: task_plan_ready {tasks: [{expert_id, title, description}, ...]}
-//   → INSERT workflow_tasks for each task
+//	workflowID = abc
+//	Subscribe from seq=0
 //
-//   Event: task_status_changed {expert_id, status: "in_progress"}
-//   → UPDATE workflow_tasks SET status='in_progress' WHERE assigned_expert_id=expert_id
+//	Event: task_plan_ready {tasks: [{expert_id, title, description}, ...]}
+//	→ INSERT workflow_tasks for each task
 //
-//   Event: architecture_decision (artifact)
-//   → UPDATE workflow_tasks SET produced_artifact_event_id=event.ID
-//      WHERE assigned_expert_id=event.PostedByExpertID
+//	Event: task_status_changed {expert_id, status: "in_progress"}
+//	→ UPDATE workflow_tasks SET status='in_progress' WHERE assigned_expert_id=expert_id
+//
+//	Event: architecture_decision (artifact)
+//	→ UPDATE workflow_tasks SET produced_artifact_event_id=event.ID
+//	   WHERE assigned_expert_id=event.PostedByExpertID
 func (p *Projector) Run(ctx context.Context, workflowID uuid.UUID) {
 	p.logger.Info("projector started", zap.String("workflow_id", workflowID.String()))
 
@@ -135,6 +139,7 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 		var payload struct {
 			ExpertID string `json:"expert_id"`
 			Status   string `json:"status"`
+			Attempt  int    `json:"attempt"`
 		}
 		if err := json.Unmarshal(event.Content, &payload); err != nil {
 			return
@@ -146,11 +151,15 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 		if _, err := p.db.Exec(ctx,
 			`UPDATE workflow_tasks SET
 				status = $1,
-				started_at   = CASE WHEN $1 = 'in_progress' AND started_at IS NULL THEN NOW() ELSE started_at END,
-				completed_at = CASE WHEN $1 IN ('done','failed') THEN NOW() ELSE completed_at END,
+				started_at   = CASE WHEN $1 = 'in_progress' THEN NOW() ELSE started_at END,
+				completed_at = CASE
+					WHEN $1 = 'in_progress' AND $4 <= 1 THEN NULL
+					WHEN $1 IN ('done','failed') THEN NOW()
+					ELSE completed_at
+				END,
 				updated_at   = NOW()
 			 WHERE workflow_id = $2 AND assigned_expert_id = $3`,
-			payload.Status, workflowID, expertID,
+			payload.Status, workflowID, expertID, payload.Attempt,
 		); err != nil {
 			p.logger.Warn("projector: task_status_changed update failed",
 				zap.String("workflow_id", workflowID.String()),
@@ -226,11 +235,11 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 
 		// Parse event data
 		var artifactData struct {
-			Filename     string `json:"filename"`
-			FilePath     string `json:"file_path"`
-			Language     string `json:"language"`
-			LinesOfCode  int    `json:"lines_of_code"`
-			CommitSHA    string `json:"commit_sha"`
+			Filename    string `json:"filename"`
+			FilePath    string `json:"file_path"`
+			Language    string `json:"language"`
+			LinesOfCode int    `json:"lines_of_code"`
+			CommitSHA   string `json:"commit_sha"`
 		}
 		if err := json.Unmarshal(event.Content, &artifactData); err != nil {
 			p.logger.Warn("code_artifact_produced: parse failed",
@@ -336,15 +345,25 @@ func (p *Projector) project(ctx context.Context, workflowID uuid.UUID, event bla
 // PostTaskStatus posts a task_status_changed event on the blackboard.
 // Called by AgentLoop instead of direct DB write.
 // Projector will pick this up and update workflow_tasks.
-func PostTaskStatus(ctx context.Context, store *blackboard.Store, workflowID, expertID uuid.UUID, status string) error {
+func PostTaskStatus(ctx context.Context, store *blackboard.Store, workflowID, expertID uuid.UUID, phase, status string, revisionID uuid.UUID, attempt int) error {
+	content := map[string]string{
+		"expert_id": expertID.String(),
+		"status":    status,
+		"phase":     phase,
+	}
+	if revisionID != uuid.Nil {
+		// Blackboard deduplicates identical event content. The revision makes a
+		// later redesign's in_progress/done events distinct from the first run.
+		content["revision_id"] = revisionID.String()
+	}
+	if attempt > 0 {
+		content["attempt"] = fmt.Sprint(attempt)
+	}
 	_, err := store.Post(ctx, blackboard.PostRequest{
 		WorkflowID:       workflowID,
 		EventType:        "task_status_changed",
 		PostedByExpertID: &expertID,
-		Content: map[string]string{
-			"expert_id": expertID.String(),
-			"status":    status,
-		},
+		Content:          content,
 	})
 	if err != nil {
 		return fmt.Errorf("PostTaskStatus: %w", err)

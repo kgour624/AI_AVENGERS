@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -30,17 +32,23 @@ const (
 // shows instead of hiding.
 const maxTaskAttempts = 3
 
+// RevisionInitial is the stable key assigned by migration to task-attempt rows
+// created before client redesigns had their own revision id.
+var RevisionInitial = uuid.Nil
+
 // TaskAttempt is one unit of work in a workflow: what one expert was asked to do
 // in one phase.
 //
-// Identity is (WorkflowID, Phase, ExpertID) — the table's UNIQUE key — which is
-// what makes re-running safe: a retry updates this row rather than creating a
-// second one, so there is no way for a resume to produce the same section twice.
+// Identity is (WorkflowID, Phase, ExpertID); RevisionID says which deliberate
+// design version this row currently represents. Retries in one revision update
+// the row. A new client redesign resets its bounded attempt counter and replaces
+// the current revision marker, while prior artifacts remain in the blackboard.
 type TaskAttempt struct {
 	ID              uuid.UUID
 	WorkflowID      uuid.UUID
 	Phase           string
 	ExpertID        uuid.UUID
+	RevisionID      uuid.UUID
 	Attempt         int
 	Status          string
 	ArtifactEventID *uuid.UUID
@@ -113,14 +121,14 @@ func (s *TaskAttemptStore) Load(ctx context.Context, workflowID uuid.UUID, phase
 		return nil, nil
 	}
 	row := s.db.QueryRow(ctx,
-		`SELECT id, workflow_id, phase, expert_id, attempt, status,
+		`SELECT id, workflow_id, phase, expert_id, revision_id, attempt, status,
 		        artifact_event_id, error, started_at, finished_at
 		   FROM workflow_task_attempts
 		  WHERE workflow_id = $1 AND phase = $2 AND expert_id = $3`,
 		workflowID, phase, expertID,
 	)
 	var a TaskAttempt
-	if err := row.Scan(&a.ID, &a.WorkflowID, &a.Phase, &a.ExpertID, &a.Attempt,
+	if err := row.Scan(&a.ID, &a.WorkflowID, &a.Phase, &a.ExpertID, &a.RevisionID, &a.Attempt,
 		&a.Status, &a.ArtifactEventID, &a.Error, &a.StartedAt, &a.FinishedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -136,7 +144,7 @@ func (s *TaskAttemptStore) Load(ctx context.Context, workflowID uuid.UUID, phase
 // Returns the row to complete later, the decision, and an error. When the
 // decision is DecisionAbandoned the caller must record a failure for the expert
 // — an exhausted unit is not a finished one.
-func (s *TaskAttemptStore) Claim(ctx context.Context, workflowID uuid.UUID, phase string, expertID uuid.UUID) (*TaskAttempt, AttemptDecision, error) {
+func (s *TaskAttemptStore) Claim(ctx context.Context, workflowID uuid.UUID, phase string, expertID, revisionID uuid.UUID) (*TaskAttempt, AttemptDecision, error) {
 	if s == nil || s.db == nil {
 		// No ledger wired: fall back to running the work. Doing the work twice
 		// is recoverable; skipping work that never happened is not.
@@ -147,30 +155,56 @@ func (s *TaskAttemptStore) Claim(ctx context.Context, workflowID uuid.UUID, phas
 	if err != nil {
 		return nil, DecisionRun, err
 	}
-	decision := decideAttempt(prev)
+	decision := decideRevisionAttempt(prev, revisionID)
 	if decision == DecisionSkipDone || decision == DecisionAbandoned {
 		return prev, decision, nil
 	}
 
 	row := s.db.QueryRow(ctx,
 		`INSERT INTO workflow_task_attempts
-		     (workflow_id, phase, expert_id, attempt, status, started_at, updated_at)
-		 VALUES ($1, $2, $3, 1, $4, NOW(), NOW())
-		 ON CONFLICT (workflow_id, phase, expert_id) DO UPDATE SET
-		     attempt     = workflow_task_attempts.attempt + 1,
-		     status      = $4,
-		     error       = '',
-		     started_at  = NOW(),
-		     finished_at = NULL,
-		     updated_at  = NOW()
-		 RETURNING id, workflow_id, phase, expert_id, attempt, status, started_at`,
-		workflowID, phase, expertID, AttemptRunning,
+		     (workflow_id, phase, expert_id, revision_id, attempt, status, started_at, updated_at)
+		 VALUES ($1, $2, $3, $4, 1, $5, NOW(), NOW())
+		ON CONFLICT (workflow_id, phase, expert_id) DO UPDATE SET
+			attempt     = CASE WHEN workflow_task_attempts.revision_id IS DISTINCT FROM EXCLUDED.revision_id
+			                   THEN 1 ELSE workflow_task_attempts.attempt + 1 END,
+			artifact_event_id = CASE WHEN workflow_task_attempts.revision_id IS DISTINCT FROM EXCLUDED.revision_id
+			                         THEN NULL ELSE workflow_task_attempts.artifact_event_id END,
+			revision_id = EXCLUDED.revision_id,
+			error       = '',
+			status      = $5,
+			started_at  = NOW(),
+			finished_at = NULL,
+			updated_at  = NOW()
+		 RETURNING id, workflow_id, phase, expert_id, revision_id, attempt, status, started_at`,
+		workflowID, phase, expertID, revisionID, AttemptRunning,
 	)
 	var a TaskAttempt
-	if err := row.Scan(&a.ID, &a.WorkflowID, &a.Phase, &a.ExpertID, &a.Attempt, &a.Status, &a.StartedAt); err != nil {
+	if err := row.Scan(&a.ID, &a.WorkflowID, &a.Phase, &a.ExpertID, &a.RevisionID, &a.Attempt, &a.Status, &a.StartedAt); err != nil {
 		return nil, DecisionRun, fmt.Errorf("claim task attempt: %w", err)
 	}
 	return &a, decision, nil
+}
+
+// decideRevisionAttempt permits deliberate redesign work once, while keeping
+// same-revision retries subject to the regular bounded attempt policy.
+func decideRevisionAttempt(prev *TaskAttempt, revisionID uuid.UUID) AttemptDecision {
+	if prev != nil && prev.RevisionID != revisionID {
+		return DecisionRun
+	}
+	return decideAttempt(prev)
+}
+
+func taskStatusDedupKey(workflowID, expertID uuid.UUID, phase, status string, revisionID uuid.UUID, attempt int) string {
+	identity := fmt.Sprintf("%s:%s:%s:%s:%s:%d", workflowID, expertID, phase, status, revisionID, attempt)
+	sum := sha256.Sum256([]byte(identity))
+	return "task-status:" + hex.EncodeToString(sum[:])
+}
+
+func redesignRevisionID(workflowID, approvalID uuid.UUID) uuid.UUID {
+	if approvalID != uuid.Nil {
+		return approvalID
+	}
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("workflow-redesign:"+workflowID.String()))
 }
 
 // Succeed marks a claimed unit as finished, recording the artifact it produced

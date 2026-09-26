@@ -33,20 +33,23 @@ const recentArtifactsToKeepRaw = 5
 // AgentLoop runs one expert through the OTA (Observe-Think-Act) loop.
 //
 // PATTERN: OTA Loop (Arpit Bhiyani AI Masterclass)
-//   Observe: ReadBlackboard + 3-Gate knowledge access
-//   Think:   LLM call with gate-controlled context
-//   Act:     Execute tool calls: PostArtifact, AskExpert
-//   Repeat until TASK_COMPLETE or max iterations
+//
+//	Observe: ReadBlackboard + 3-Gate knowledge access
+//	Think:   LLM call with gate-controlled context
+//	Act:     Execute tool calls: PostArtifact, AskExpert
+//	Repeat until TASK_COMPLETE or max iterations
 //
 // 3-GATE KNOWLEDGE ACCESS (Human Brain Model):
-//   Gate 1: Own training (70-80% knowledge) — generic BLOCKED if passes
-//   Gate 2: Peer knowledge (team's work) — generic BLOCKED if covers task
-//   Gate 3: Generic gap filling (20-30%) — only when Gates 1+2 fail
-//   Generic claims saved to pending_experience for admin review.
+//
+//	Gate 1: Own training (70-80% knowledge) — generic BLOCKED if passes
+//	Gate 2: Peer knowledge (team's work) — generic BLOCKED if covers task
+//	Gate 3: Generic gap filling (20-30%) — only when Gates 1+2 fail
+//	Generic claims saved to pending_experience for admin review.
 //
 // 2-PHASE BEHAVIOR:
-//   Design phase (high_level_design): Gates 1+2+3 active
-//   Implementation phase (implementation): Gate 1 only, China Wall strict
+//
+//	Design phase (high_level_design): Gates 1+2+3 active
+//	Implementation phase (implementation): Gate 1 only, China Wall strict
 type AgentLoop struct {
 	db             *pgxpool.Pool
 	tools          *Tools
@@ -95,6 +98,10 @@ type AgentLoopRequest struct {
 	// knowledge only. Re-read by the runner on every phase attempt, so a
 	// client raising it and re-running takes effect immediately.
 	GenericAllowancePct float64
+	// RevisionID separates deliberate client redesigns from retries of the
+	// original task and makes repeat task-status events non-duplicate.
+	RevisionID uuid.UUID
+	Attempt    int
 }
 
 type AgentLoopResult struct {
@@ -106,22 +113,23 @@ type AgentLoopResult struct {
 // Run executes the OTA loop for one expert's task.
 //
 // Mental execution:
-//   Expert: System Design, Task: "Design URL shortener architecture"
 //
-//   Iteration 1:
-//     Observe: ReadBlackboard(since=0) -> [requirement_captured event]
-//     Context: 1 artifact, no summarization needed
-//     Think:   LLM(system=charter+task, user="Context: [req]\nTask: Design...")
-//     Act:     LLM outputs <tool_call>PostArtifact{architecture_decision}</tool_call>
-//              -> PostArtifact -> blackboard event
-//              -> PostTaskStatus(done) -> task_status_changed event
-//              -> LLM outputs TASK_COMPLETE -> exit
+//	Expert: System Design, Task: "Design URL shortener architecture"
 //
-//   Iteration 2 (if no TASK_COMPLETE):
-//     Observe: ReadBlackboard(since=lastSeq) -> new events
-//     Context: if > 10 artifacts -> summarize old ones
-//     Think:   LLM with updated context
-//     Act:     ...
+//	Iteration 1:
+//	  Observe: ReadBlackboard(since=0) -> [requirement_captured event]
+//	  Context: 1 artifact, no summarization needed
+//	  Think:   LLM(system=charter+task, user="Context: [req]\nTask: Design...")
+//	  Act:     LLM outputs <tool_call>PostArtifact{architecture_decision}</tool_call>
+//	           -> PostArtifact -> blackboard event
+//	           -> PostTaskStatus(done) -> task_status_changed event
+//	           -> LLM outputs TASK_COMPLETE -> exit
+//
+//	Iteration 2 (if no TASK_COMPLETE):
+//	  Observe: ReadBlackboard(since=lastSeq) -> new events
+//	  Context: if > 10 artifacts -> summarize old ones
+//	  Think:   LLM with updated context
+//	  Act:     ...
 func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopResult, error) {
 	a.logger.Info("agent loop started",
 		zap.String("workflow_id", req.WorkflowID.String()),
@@ -131,7 +139,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 
 	// Signal task start via blackboard event (not direct DB write).
 	// Projector will pick this up and update workflow_tasks.
-	if err := PostTaskStatus(ctx, a.store, req.WorkflowID, req.Expert.ID, "in_progress"); err != nil {
+	if err := PostTaskStatus(ctx, a.store, req.WorkflowID, req.Expert.ID, req.WorkflowPhase, "in_progress", req.RevisionID, req.Attempt); err != nil {
 		a.logger.Warn("agent loop: PostTaskStatus in_progress failed", zap.Error(err))
 		// Non-fatal: continue anyway.
 	}
@@ -334,7 +342,7 @@ func (a *AgentLoop) Run(ctx context.Context, req AgentLoopRequest) (*AgentLoopRe
 	}
 
 	// Signal task done via blackboard event.
-	_ = PostTaskStatus(ctx, a.store, req.WorkflowID, req.Expert.ID, "done")
+	_ = PostTaskStatus(ctx, a.store, req.WorkflowID, req.Expert.ID, req.WorkflowPhase, "done", req.RevisionID, req.Attempt)
 
 	// B3: write the settled design decision into project memory so A6's
 	// [PROJECT MEMORY] injection is actually populated for later waves /
@@ -684,12 +692,13 @@ func extractToolCallBlocks(text string) []string {
 // and a backslash escape does not terminate the string.
 //
 // Mental execution:
-//   `{"a":1}]`              -> `{"a":1}`   (stray trailing bracket dropped)
-//   `[{"a":1}]`             -> `{"a":1}`   (array wrapper skipped)
-//   `{"code":"func(){}"}`   -> whole object (braces inside string ignored)
-//   `{"s":"a\"}b"}`         -> whole object (escaped quote handled)
-//   `{"a":1`                -> ""          (never balances)
-//   `no json here`          -> ""
+//
+//	`{"a":1}]`              -> `{"a":1}`   (stray trailing bracket dropped)
+//	`[{"a":1}]`             -> `{"a":1}`   (array wrapper skipped)
+//	`{"code":"func(){}"}`   -> whole object (braces inside string ignored)
+//	`{"s":"a\"}b"}`         -> whole object (escaped quote handled)
+//	`{"a":1`                -> ""          (never balances)
+//	`no json here`          -> ""
 func extractFirstJSONObject(s string) string {
 	start := strings.Index(s, "{")
 	if start == -1 {

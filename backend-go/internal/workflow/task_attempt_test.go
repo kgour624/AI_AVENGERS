@@ -75,6 +75,85 @@ func TestDecideAttempt(t *testing.T) {
 	}
 }
 
+func TestDecideRevisionAttempt(t *testing.T) {
+	original := uuid.New()
+	redesign := uuid.New()
+	succeeded := &TaskAttempt{RevisionID: original, Status: AttemptSucceeded, Attempt: 1}
+	if got := decideRevisionAttempt(succeeded, original); got != DecisionSkipDone {
+		t.Fatalf("same revision decision = %q, want %q", got, DecisionSkipDone)
+	}
+	if got := decideRevisionAttempt(succeeded, redesign); got != DecisionRun {
+		t.Fatalf("new redesign decision = %q, want %q", got, DecisionRun)
+	}
+	failed := &TaskAttempt{RevisionID: original, Status: AttemptFailed, Attempt: maxTaskAttempts}
+	if got := decideRevisionAttempt(failed, original); got != DecisionAbandoned {
+		t.Fatalf("exhausted same revision decision = %q, want %q", got, DecisionAbandoned)
+	}
+	if got := decideRevisionAttempt(failed, redesign); got != DecisionRun {
+		t.Fatalf("new revision after exhausted prior = %q, want %q", got, DecisionRun)
+	}
+}
+
+func TestParseDesignRevisionIDAndChangeGoal(t *testing.T) {
+	revision := uuid.New()
+	if got := parseDesignRevisionID(revision.String()); got != revision {
+		t.Fatalf("parsed revision = %s, want %s", got, revision)
+	}
+	if got := parseDesignRevisionID("not-a-uuid"); got != uuid.Nil {
+		t.Fatalf("invalid revision = %s, want uuid.Nil", got)
+	}
+	if got := withChangeGoal("base description", " \n "); got != "base description" {
+		t.Fatalf("empty change goal altered task: %q", got)
+	}
+	if got := withChangeGoal("base description", "Add a bulk endpoint"); got != "base description\n\nCLIENT-REQUESTED REDESIGN:\nAdd a bulk endpoint" {
+		t.Fatalf("change goal not attached as expected: %q", got)
+	}
+}
+
+func TestTaskStatusRevisionKeySeparatesEvents(t *testing.T) {
+	workflowID, expertID := uuid.New(), uuid.New()
+	originalKey := taskStatusDedupKey(workflowID, expertID, PhaseHighLevelDesign, "in_progress", RevisionInitial, 1)
+	redesignID := uuid.New()
+	redesignKey := taskStatusDedupKey(workflowID, expertID, PhaseHighLevelDesign, "in_progress", redesignID, 1)
+	if originalKey == redesignKey {
+		t.Fatal("redesign task status key must differ from original task status key")
+	}
+	otherPhaseKey := taskStatusDedupKey(workflowID, expertID, PhaseDetailedDesign, "in_progress", redesignID, 1)
+	retryKey := taskStatusDedupKey(workflowID, expertID, PhaseHighLevelDesign, "in_progress", redesignID, 2)
+	if otherPhaseKey == redesignKey {
+		t.Fatal("task status keys must separate design phases")
+	}
+	if retryKey == redesignKey {
+		t.Fatal("task status keys must separate retry numbers")
+	}
+	if again := taskStatusDedupKey(workflowID, expertID, PhaseHighLevelDesign, "in_progress", redesignID, 1); again != redesignKey {
+		t.Fatal("same revision and attempt must have a repeatable event identity")
+	}
+}
+
+func TestRedesignRevisionIDUsesApprovalIDAndIsStableForRecovery(t *testing.T) {
+	workflowID := uuid.New()
+	approvalID := uuid.New()
+	if got := redesignRevisionID(workflowID, approvalID); got != approvalID {
+		t.Fatalf("approval revision id = %s, want approval id %s", got, approvalID)
+	}
+	first := redesignRevisionID(workflowID, uuid.Nil)
+	second := redesignRevisionID(workflowID, uuid.Nil)
+	if first == uuid.Nil || first != second {
+		t.Fatalf("fallback revision must be stable and non-zero, got %s and %s", first, second)
+	}
+}
+
+func TestWithChangeGoalAddsOnlyNonEmptyGoal(t *testing.T) {
+	base := "Update the API design"
+	if got := withChangeGoal(base, " \n "); got != base {
+		t.Fatalf("empty goal changed the task: %q", got)
+	}
+	if got := withChangeGoal(base, "Add a bulk move endpoint"); got != base+"\n\nCLIENT-REQUESTED REDESIGN:\nAdd a bulk move endpoint" {
+		t.Fatalf("change goal missing or malformed: %q", got)
+	}
+}
+
 func TestMaxTaskAttemptsIsBounded(t *testing.T) {
 	// A guard on the constant itself: a cap of 1 would retry nothing (one
 	// transient provider error would permanently fail a unit), and a very large
@@ -109,11 +188,29 @@ func TestAttemptNumberNilSafe(t *testing.T) {
 	}
 }
 
+func TestSnapshotRunnerStateKeepsRedesignRevision(t *testing.T) {
+	revision := uuid.New().String()
+	state := &runnerState{
+		Phase:              PhaseDetailedDesign,
+		CompletedExpertIDs: []string{"expert-1"},
+		DesignRevisionID:   revision,
+		RedesignGoal:       "Add a bulk endpoint",
+	}
+	snapshot := snapshotRunnerState(state, nil)
+	if snapshot.DesignRevisionID != revision || snapshot.RedesignGoal != state.RedesignGoal {
+		t.Fatalf("snapshot lost revision data: %+v", snapshot)
+	}
+	snapshot.CompletedExpertIDs[0] = "changed"
+	if state.CompletedExpertIDs[0] != "expert-1" {
+		t.Fatal("snapshot must not alias the source completed-expert slice")
+	}
+}
+
 // An unwired ledger must run the work rather than skip it. Skipping on "no data"
 // is the failure mode this whole change removes.
 func TestClaimWithoutLedgerRuns(t *testing.T) {
 	var s *TaskAttemptStore
-	if _, decision, err := s.Claim(context.Background(), uuid.Nil, PhaseHighLevelDesign, uuid.Nil); err != nil || decision != DecisionRun {
+	if _, decision, err := s.Claim(context.Background(), uuid.Nil, PhaseHighLevelDesign, uuid.Nil, uuid.Nil); err != nil || decision != DecisionRun {
 		t.Fatalf("unwired ledger: decision = %q err = %v, want %q and nil", decision, err, DecisionRun)
 	}
 }
