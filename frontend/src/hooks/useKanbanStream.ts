@@ -10,6 +10,11 @@ export interface ApprovalGate {
 }
 
 export interface KanbanStreamState {
+  // isFailed distinguishes a workflow that ENDED from one that SUCCEEDED. The
+  // backend closes the kanban stream for both, sending event_type
+  // 'workflow_completed' or 'workflow_failed' — previously only isDone was read,
+  // so a failed workflow rendered the green "Workflow Complete" bar.
+  isFailed: boolean
   tasks: KanbanTask[]
   isConnected: boolean
   isDone: boolean
@@ -40,6 +45,7 @@ export function useKanbanStream(workflowId: string | null): KanbanStreamState {
     tasks: [],
     isConnected: false,
     isDone: false,
+    isFailed: false,
     approvalGate: null,
     eventLog: [],
   })
@@ -92,8 +98,17 @@ export function useKanbanStream(workflowId: string | null): KanbanStreamState {
 
           switch (type) {
             case 'kanban_done': {
-              setState((prev) => ({ ...prev, isDone: true, isConnected: false, approvalGate: null }))
-              addLog('done', 'Workflow completed')
+              // data.eventType is 'workflow_failed' when the run failed. Without
+              // reading it, a failure was announced to the screen as completion.
+              const failed = String(data?.eventType ?? '') === 'workflow_failed'
+              setState((prev) => ({
+                ...prev,
+                isDone: true,
+                isFailed: failed,
+                isConnected: false,
+                approvalGate: null,
+              }))
+              addLog(failed ? 'error' : 'done', failed ? 'Workflow failed' : 'Workflow completed')
               es.close(); esRef.current = null
               break
             }

@@ -585,16 +585,25 @@ function KanbanPage() {
             {workflow && (workflow.status === 'running' || workflow.status === 'paused_for_approval') && (
               <CancelWorkflowButton workflowId={id!} workflowTitle={workflow.title} />
             )}
-            {/* SSE connection indicator */}
+            {/* Run state indicator. "Failed" is its own state: the stream closes
+                for a failure exactly as it does for success, so a two-way test
+                (done or not) labelled every failed workflow "Complete". */}
             <div className="flex items-center gap-1.5">
               <span className={cn(
                 'h-2 w-2 rounded-full',
-                stream.isDone ? 'bg-mode-advise'
+                stream.isFailed || workflow?.status === 'failed' ? 'bg-mode-refuse'
+                : stream.isDone ? 'bg-mode-advise'
                 : stream.isConnected ? 'bg-mode-advise animate-pulse'
                 : 'bg-glow-amber animate-pulse'
               )} />
               <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
-                {stream.isDone ? 'Complete' : stream.isConnected ? 'Live' : 'Connecting...'}
+                {stream.isFailed || workflow?.status === 'failed'
+                  ? 'Failed'
+                  : stream.isDone
+                    ? 'Complete'
+                    : stream.isConnected
+                      ? 'Live'
+                      : 'Connecting...'}
               </span>
             </div>
           </div>
@@ -743,8 +752,11 @@ function KanbanPage() {
         </div>
       )}
 
-      {/* Completion notice + Download Design Package */}
-      {(stream.isDone || workflow?.status === 'completed') && (
+      {/* Completion notice + Download Design Package.
+          Gated on a stream that did not fail AND a status that is not failed:
+          the stream closes for a failure too, and showing the green bar over a
+          failed run is how "it says complete but nothing was produced" started. */}
+      {!stream.isFailed && workflow?.status !== 'failed' && (stream.isDone || workflow?.status === 'completed') && (
         <div className="mt-4 rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-4">
           <div className="flex items-center justify-between gap-4">
             <p className="text-sm font-medium text-mode-advise">{'\u2705'} Workflow Complete</p>
