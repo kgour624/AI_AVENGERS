@@ -224,20 +224,22 @@ export default function ChatPage() {
   async function handleSend(
     text: string,
     expertIds: string[],
-    file?: File,
+    files?: File[],
     replyToMessageId?: string,
     includeFullThread?: boolean,
-    templateName?: string
+    templateName?: string,
+    genericAllowancePct?: number
   ) {
     setPendingUserText(text)
     await sendMessage({
       chatId: chat.id,
       message: text,
       expertIds,
-      file,
+      files,
       replyToMessageId,
       includeFullThread,
       templateName,
+      genericAllowancePct,
     })
 
     // WHY re-read stream status via getState() rather than the `stream`

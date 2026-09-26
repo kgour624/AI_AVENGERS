@@ -470,6 +470,9 @@ func buildRouter(
 	projectHandler := project.NewHandler(projectSvc, logger)
 	chatHandler := chat.NewHandler(chatSvc, logger)
 	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
+	// Attachments in chat are read with the same extractor training ingestion
+	// uses, so a PDF/DOCX/XLSX upload becomes text instead of binary garbage.
+	messageHandler.SetExtractor(docExtractor)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
 	// T-CAT: expose the expert's category answer formats to clients so the chat

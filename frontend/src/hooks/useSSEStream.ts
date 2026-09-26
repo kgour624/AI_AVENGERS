@@ -36,7 +36,14 @@ export interface SendMessageOptions {
   chatId: string
   message: string
   expertIds: string[]
-  file?: File
+  /** One or more attachments. Each is extracted to text by the backend. */
+  files?: File[]
+  /**
+   * T-GEN: generic knowledge ceiling for this message (0-30). 0/absent keeps
+   * the strict China Wall; >0 lets the expert answer uncovered parts from
+   * general knowledge, tagged [GENERIC].
+   */
+  genericAllowancePct?: number
   /**
    * CT-D4/CT-C1: optional reply target. undefined = fresh question,
    * the existing behavior for every message sent before this feature.
@@ -107,19 +114,30 @@ export function useSSEStream() {
   const { startStream, setError } = useStreamStore()
 
   const sendMessage = async (options: SendMessageOptions) => {
-    const { chatId, message, expertIds, file, replyToMessageId, includeFullThread, templateName } =
-      options
+    const {
+      chatId,
+      message,
+      expertIds,
+      files,
+      replyToMessageId,
+      includeFullThread,
+      templateName,
+      genericAllowancePct,
+    } = options
+    const hasFiles = Boolean(files && files.length > 0)
 
     startStream(chatId)
 
     let body: BodyInit
     const headers: HeadersInit = {}
 
-    if (file) {
+    if (hasFiles) {
       const formData = new FormData()
       formData.append('message', message)
       formData.append('expert_ids', JSON.stringify(expertIds))
-      formData.append('file', file)
+      // Repeated "file" entries — the backend loops over form.File["file"].
+      for (const f of files ?? []) formData.append('file', f)
+      if (genericAllowancePct) formData.append('generic_allowance_pct', String(genericAllowancePct))
       // CT-D4/CT-C1: multipart branch also needs reply fields threaded
       // through — message/handler.go's Send() reads these from
       // c.PostForm just like message/expert_ids on this same branch.
@@ -138,6 +156,7 @@ export function useSSEStream() {
         ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
         ...(includeFullThread ? { include_full_thread: true } : {}),
         ...(templateName ? { template_name: templateName } : {}),
+        ...(genericAllowancePct ? { generic_allowance_pct: genericAllowancePct } : {}),
       })
       headers['Content-Type'] = 'application/json'
     }

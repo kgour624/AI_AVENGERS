@@ -42,6 +42,10 @@ import { cn } from '@/utils/cn'
  *   the backend contract doesn't actually accept.
  */
 
+// Attachments per message. Mirrors the backend cap (2MB per file, max 5 files)
+// so the UI never builds a request the server would trim or reject.
+const MAX_ATTACHMENTS = 5
+
 // localStorage keys for persistent selection
 function getSelectionKey(chatId: string) {
   return `chat_${chatId}_expert_selection`
@@ -99,17 +103,40 @@ export interface MessageInputProps {
   onSend: (
     message: string,
     expertIds: string[],
-    file?: File,
+    files?: File[],
     replyToMessageId?: string,
     includeFullThread?: boolean,
-    templateName?: string
+    templateName?: string,
+    genericAllowancePct?: number
   ) => void
   isSending: boolean
 }
 
 export function MessageInput({ chatId, experts, onSend, isSending }: MessageInputProps) {
   const [message, setMessage] = useState('')
-  const [attachedFile, setAttachedFile] = useState<File | null>(null)
+  const [attachedFiles, setAttachedFiles] = useState<File[]>([])
+  /**
+   * T-GEN: generic knowledge ceiling for this message, persisted per chat so a
+   * user who raises it once does not have to re-pick it every message. 0 = the
+   * strict China Wall (default), matching the workflow's 0-30% rule.
+   */
+  const [allowancePct, setAllowancePct] = useState(() => {
+    try {
+      const saved = localStorage.getItem(`chat_${chatId}_generic_allowance`)
+      const parsed = saved ? Number(saved) : 0
+      return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, 30) : 0
+    } catch {
+      return 0
+    }
+  })
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(`chat_${chatId}_generic_allowance`, String(allowancePct))
+    } catch {
+      /* storage disabled — the in-memory value still applies */
+    }
+  }, [chatId, allowancePct])
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   // Feature #6: Persistent expert selection with lock toggle
@@ -182,14 +209,13 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   }
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
-    const file = acceptedFiles[acceptedFiles.length - 1]
-    if (file) setAttachedFile(file)
+    setAttachedFiles((prev) => [...prev, ...acceptedFiles].slice(0, MAX_ATTACHMENTS))
   }, [])
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
     noClick: true, // WHY noClick: the visible [📎] attach button (not the whole textarea) opens the file picker - see the button below calling `open()` via getInputProps's ref trick would be redundant; instead we let users click the paperclip OR drag anywhere onto the input area.
-    multiple: false,
+    multiple: true,
   })
 
   function autoResize() {
@@ -215,13 +241,14 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     onSend(
       trimmed,
       Array.from(selectedIds),
-      attachedFile ?? undefined,
+      attachedFiles.length > 0 ? attachedFiles : undefined,
       replyTarget?.messageId,
       replyState?.includeFullThread,
-      formatToSend
+      formatToSend,
+      allowancePct > 0 ? allowancePct : undefined
     )
     setMessage('')
-    setAttachedFile(null)
+    setAttachedFiles([])
     
     // Feature #6: Only clear selection if NOT locked
     if (!isLocked) {
@@ -403,25 +430,53 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
         <input
           id="message-file-input"
           type="file"
+          multiple
           className="hidden"
           onChange={(e) => {
-            const file = e.target.files?.[0]
-            if (file) setAttachedFile(file)
+            const picked = Array.from(e.target.files ?? [])
+            if (picked.length > 0) {
+              setAttachedFiles((prev) => [...prev, ...picked].slice(0, MAX_ATTACHMENTS))
+            }
+            // Reset so picking the same file twice still fires onChange.
+            e.target.value = ''
           }}
         />
+
+        {/* T-GEN: answer basis — trained-only by default, matching the strict
+            China Wall and the workflow's 0-30% rule. */}
+        <select
+          value={allowancePct}
+          onChange={(e) => setAllowancePct(Number(e.target.value))}
+          title="How much general knowledge the experts may use when the trained knowledge does not cover the question"
+          className="rounded-md border border-surface-border bg-surface-overlay px-2 py-1 text-xs text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+        >
+          <option value={0}>Trained only</option>
+          <option value={5}>≤5% generic</option>
+          <option value={10}>≤10% generic</option>
+          <option value={20}>≤20% generic</option>
+          <option value={30}>≤30% generic</option>
+        </select>
 
         <Button onClick={handleSend} disabled={!canSend} size="sm">
           Send
         </Button>
       </div>
 
-      {attachedFile && (
-        <p className="mt-1 text-xs text-text-secondary">
-          📎 {attachedFile.name}{' '}
-          <button type="button" onClick={() => setAttachedFile(null)} className="underline">
-            remove
-          </button>
-        </p>
+      {attachedFiles.length > 0 && (
+        <div className="mt-1 flex flex-wrap gap-2">
+          {attachedFiles.map((f, i) => (
+            <span key={`${f.name}-${i}`} className="text-xs text-text-secondary">
+              📎 {f.name}{' '}
+              <button
+                type="button"
+                onClick={() => setAttachedFiles((prev) => prev.filter((_, j) => j !== i))}
+                className="underline"
+              >
+                remove
+              </button>
+            </span>
+          ))}
+        </div>
       )}
       
       {isLocked && selectedIds.size > 0 && (

@@ -49,6 +49,9 @@ type OrchestratorRequest struct {
 	// TemplateName (T-CAT): optional named answer format from the expert's
 	// category ("Code" / "Approach" / ...). Empty = the category default.
 	TemplateName string
+	// GenericAllowancePct (0-30): the client's generic ceiling for this
+	// message. 0 = strict China Wall (the default, unchanged behaviour).
+	GenericAllowancePct float64
 	// TokenCh: when non-nil, Gate 5 generation streams tokens here.
 	// message/handler.go creates this channel and forwards tokens to SSE.
 	// nil = blocking (used by tests, smoke test, non-streaming callers).
@@ -275,22 +278,25 @@ func NewOrchestrator(
 //
 // Step 1: Load both experts from DB
 // Step 2: Launch 2 goroutines simultaneously
-//   Goroutine 1: DB Expert processes question
-//   Goroutine 2: SD Expert processes question
+//
+//	Goroutine 1: DB Expert processes question
+//	Goroutine 2: SD Expert processes question
+//
 // Step 3: Collect results (timeout: 120s)
 // Step 4: If 2+ experts responded → synthesize
 // Step 5: Update memory async
 // Step 6: Return combined response
 //
 // WHY parallel (not sequential):
-//   Chat flow = conversational Q&A. Each expert answers independently
-//   from their own training corpus. No expert needs another's output
-//   to answer a chat question — they have different knowledge domains.
 //
-//   Multi-agent COLLABORATION (where Expert B reads Expert A's output)
-//   happens in the WORKFLOW flow (/api/v1/workflows), not here.
-//   Workflow uses the Blackboard pattern — experts post artifacts,
-//   others read them, OTA loop drives each expert.
+//	Chat flow = conversational Q&A. Each expert answers independently
+//	from their own training corpus. No expert needs another's output
+//	to answer a chat question — they have different knowledge domains.
+//
+//	Multi-agent COLLABORATION (where Expert B reads Expert A's output)
+//	happens in the WORKFLOW flow (/api/v1/workflows), not here.
+//	Workflow uses the Blackboard pattern — experts post artifacts,
+//	others read them, OTA loop drives each expert.
 func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*OrchestratorResponse, error) {
 	start := time.Now()
 
@@ -549,6 +555,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 			TemplateSections:       templateSections,
 			DefaultLanguage:        defaultLanguage,
 			AskStructurePermission: askStructurePermission,
+			GenericAllowancePct:    req.GenericAllowancePct,
 		},
 		assembledCtx.CourseChunks,
 		projectSummary,
@@ -904,10 +911,11 @@ func (o *Orchestrator) loadExperts(ctx context.Context, expertIDs []uuid.UUID) (
 // for injection into the LLM system prompt.
 //
 // WHY format here (not in enforcer/chinawall):
-//   appcontext.ReplyThreadEntry lives in the context package.
-//   chinawall imports context would create a circular dependency
-//   (context already imports chinawall for CourseChunk).
-//   Formatting here keeps the dependency direction clean.
+//
+//	appcontext.ReplyThreadEntry lives in the context package.
+//	chinawall imports context would create a circular dependency
+//	(context already imports chinawall for CourseChunk).
+//	Formatting here keeps the dependency direction clean.
 //
 // Returns empty string for fresh questions (no reply thread) —
 // enforcer skips injection when empty.
@@ -939,15 +947,17 @@ func parseJSON(data []byte, dst interface{}) error {
 // Creates a new buffered channel lazily on first access.
 //
 // WHY sync.Map.LoadOrStore:
-//   Multiple goroutines may call this simultaneously for the same expert.
-//   LoadOrStore is atomic — only one channel is ever created per expert.
-//   The "loser" goroutine discards its newly created channel and uses
-//   the winner's channel. No mutex needed.
+//
+//	Multiple goroutines may call this simultaneously for the same expert.
+//	LoadOrStore is atomic — only one channel is ever created per expert.
+//	The "loser" goroutine discards its newly created channel and uses
+//	the winner's channel. No mutex needed.
 //
 // WHY buffered channel as semaphore:
-//   Buffered channel of size N = semaphore with N slots.
-//   Send = acquire. Receive = release.
-//   Non-blocking select in caller = try-acquire without waiting.
+//
+//	Buffered channel of size N = semaphore with N slots.
+//	Send = acquire. Receive = release.
+//	Non-blocking select in caller = try-acquire without waiting.
 func (o *Orchestrator) getExpertSemaphore(expertID string) chan struct{} {
 	newSem := make(chan struct{}, o.expertMaxConcurrency)
 	actual, _ := o.expertSemaphores.LoadOrStore(expertID, newSem)
