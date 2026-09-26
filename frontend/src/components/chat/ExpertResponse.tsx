@@ -6,6 +6,7 @@ import { ModeBadge } from '@/components/ui/Badge'
 import { CitationChip } from './CitationChip'
 import { CodeBlock } from './CodeBlock'
 import { RatingWidget } from './RatingWidget'
+import { AnswerExplanation } from '@/components/chat/AnswerExplanation'
 import { useReplyStore } from '@/stores/replyStore'
 import { splitContentByCitations } from '@/utils/parseCitations'
 import { cn } from '@/utils/cn'
@@ -238,6 +239,7 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
   const [showReasoning, setShowReasoning] = useState(false)
   const [copied, setCopied] = useState(false)
   const [isExpanded, setIsExpanded] = useState(false)
+  const [showExplanation, setShowExplanation] = useState(false)
   const reduceMotion = useReducedMotion()
   const setReplyTarget = useReplyStore((s) => s.setReplyTarget)
 
@@ -418,7 +420,24 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
 
       <div className="mt-3 flex items-center justify-between">
         {persistedMessageId ? (
-          <RatingWidget messageId={persistedMessageId} />
+          <div className="flex items-center gap-3">
+            <RatingWidget messageId={persistedMessageId} />
+            {/* The explanation sits next to the rating on purpose: both are the
+                reader asking "should I trust this?", and the answer is the gates,
+                the sources and the claim check. */}
+            {/* Deliberately NOT a second "why did I say this": that button
+                shows the expert's own decision trace from the stream. This one
+                opens the STORED audit record — gates, the sources that were
+                actually used, the claim check, the quality verdict and the
+                provenance chain — which the stream never carried. */}
+            <button
+              onClick={() => setShowExplanation(true)}
+              className="text-xs text-brand hover:underline"
+              title="Gates, sources, claim check, quality and provenance, from the stored record"
+            >
+              Evidence &amp; audit
+            </button>
+          </div>
         ) : (
           <span className="text-xs text-text-disabled">
             {isStreaming ? 'Streaming...' : 'Rating available after save'}
@@ -457,6 +476,12 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
 
       {showReasoning && (
         <ReasoningPanel gateStopped={response.gateStopped} mode={response.mode} confidence={response.confidence} />
+      )}
+
+      {/* The stored audit record, fetched on demand rather than shipped with
+          every streamed answer: it is only interesting when someone asks. */}
+      {showExplanation && persistedMessageId && (
+        <AnswerExplanation messageId={persistedMessageId} onClose={() => setShowExplanation(false)} />
       )}
     </motion.div>
   )

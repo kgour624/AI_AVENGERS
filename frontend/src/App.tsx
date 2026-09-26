@@ -80,6 +80,8 @@ const router = createBrowserRouter([
               { path: 'stats', lazy: () => import('@/pages/admin/AdminStats') },
               { path: 'settings', lazy: () => import('@/pages/admin/AdminSettings') },
               { path: 'llm-settings', lazy: () => import('@/pages/admin/AdminLLMSettings') },
+              { path: 'usage', lazy: () => import('@/pages/admin/AdminUsage') },
+              { path: 'reliability', lazy: () => import('@/pages/admin/AdminReliability') },
             ],
           },
         ],

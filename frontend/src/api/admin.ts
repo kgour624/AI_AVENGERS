@@ -371,6 +371,99 @@ export const updateLLMSettings = (req: {
     .then((res) => res.data.data!)
 
 // ============================================================
+// USAGE / COST (C5)
+// ============================================================
+// The backend has aggregated usage since C5 but no screen ever showed it, so
+// "what is this costing and where is it going" had no answer in the product.
+export interface UsageRow {
+  key: string
+  label: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  costUsd: number
+}
+
+export type UsageGroupBy = 'tenant' | 'project' | 'expert' | 'model' | 'use_case'
+
+export const getUsage = (groupBy: UsageGroupBy = 'model') =>
+  baseAPI
+    .get<ApiResponse<{ groupBy: string; rows: UsageRow[] }>>('/api/v1/admin/usage', {
+      params: { group_by: groupBy },
+    })
+    .then((res) => res.data.data!)
+
+export interface UsageBudgetStatus {
+  tenantId?: string
+  spendUsd: number
+  limitUsd: number
+  percent: number
+  alertThreshold: number
+  alert: boolean
+  breached: boolean
+}
+
+export const getUsageBudgets = () =>
+  baseAPI
+    .get<ApiResponse<{ global: UsageBudgetStatus | null; tenants: UsageBudgetStatus[] }>>(
+      '/api/v1/admin/usage/budgets'
+    )
+    .then((res) => res.data.data!)
+
+export const getUsageAlerts = () =>
+  baseAPI
+    .get<ApiResponse<UsageBudgetStatus[]>>('/api/v1/admin/usage/alerts')
+    .then((res) => res.data.data!)
+
+// ============================================================
+// RELIABILITY (C10)
+// ============================================================
+export interface ReliabilityComponent {
+  name: string
+  status: string
+  error?: string
+}
+
+export interface ReliabilitySLO {
+  llmCallsTotal: number
+  llmErrorsTotal: number
+  availability: number
+  errorRate: number
+  availabilityTarget: number
+  errorBudgetRemaining: number
+  status: string
+  errorBudgetWindowDays: number
+  uptimeSeconds: number
+}
+
+export interface ReliabilityStatus {
+  status: string
+  version: string
+  components: ReliabilityComponent[]
+  slo?: ReliabilitySLO
+  generatedAt: string
+}
+
+export interface ReliabilityEvent {
+  id: string
+  kind: string
+  severity: string
+  component?: string
+  detail: unknown
+  createdAt: string
+}
+
+export const getReliabilityStatus = () =>
+  baseAPI
+    .get<ApiResponse<ReliabilityStatus>>('/api/v1/admin/reliability/status')
+    .then((res) => res.data.data!)
+
+export const getReliabilityEvents = (limit = 50) =>
+  baseAPI
+    .get<ApiResponse<ReliabilityEvent[]>>('/api/v1/admin/reliability/events', { params: { limit } })
+    .then((res) => res.data.data!)
+
+// ============================================================
 // LLM PROVIDER HEALTH (G4)
 // ============================================================
 // Two questions the LLM Settings screen has to answer: is a provider being
