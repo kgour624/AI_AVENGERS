@@ -116,6 +116,9 @@ export const createExpert = (req: CreateExpertRequest) =>
  */
 export interface UpdateExpertRequest {
   name?: string
+  // Migration 059: per-expert strictness ("full_strip" | "code_exempt").
+  stripMode?: 'full_strip' | 'code_exempt'
+
   description?: string
   isActive?: boolean
   reasoningCharter?: string

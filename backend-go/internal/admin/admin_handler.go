@@ -455,6 +455,9 @@ func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 		// assignment is not a requirement from CATEGORY_TEMPLATE_HANDOFF.md
 		// and can be added later as its own explicit endpoint if needed.
 		CategoryID *uuid.UUID `json:"category_id"`
+		// Migration 059: per-expert strictness ("full_strip" | "code_exempt").
+		// Optional — omitted means "leave it as it is".
+		StripMode *string `json:"strip_mode"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -462,6 +465,10 @@ func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 	}
 	if req.CategoryID != nil && h.categoryReg.Get(*req.CategoryID) == nil {
 		response.BadRequest(c, "INVALID_CATEGORY_ID", "category_id does not reference an existing category")
+		return
+	}
+	if req.StripMode != nil && !validExpertStripModes[*req.StripMode] {
+		response.BadRequest(c, "INVALID_STRIP_MODE", "strip_mode must be full_strip or code_exempt")
 		return
 	}
 
@@ -589,6 +596,16 @@ func (h *AdminHandler) UpdateExpert(c *gin.Context) {
 			`UPDATE experts SET category_id=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
 			*req.CategoryID, id); err != nil {
 			h.logger.Error("update expert category_id failed", zap.Error(err))
+		}
+	}
+
+	// VIP pass / strict. Set only when provided, so omitting it keeps the
+	// expert's current mode (PATCH semantics, same as every field above).
+	if req.StripMode != nil {
+		if _, err := h.db.Exec(ctx,
+			`UPDATE experts SET strip_mode=$1, updated_at=NOW() WHERE id=$2 AND deleted_at IS NULL`,
+			*req.StripMode, id); err != nil {
+			h.logger.Error("update expert strip_mode failed", zap.Error(err))
 		}
 	}
 
