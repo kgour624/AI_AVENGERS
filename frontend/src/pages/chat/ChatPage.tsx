@@ -106,6 +106,9 @@ export default function ChatPage() {
   const [pendingUserText, setPendingUserText] = useState<string | null>(null)
   // Last request, kept so a failed answer offers a one-click Retry.
   const [lastSend, setLastSend] = useState<SendMessageOptions | null>(null)
+  // Assistant-message count when the current request was sent, so the completion
+  // effect can tell "history refreshed with the new answer" from "history is old".
+  const assistantCountAtSendRef = useRef(0)
   const [isEditingTitle, setIsEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState(chat.title)
   const [isSavingTitle, setIsSavingTitle] = useState(false)
@@ -167,6 +170,18 @@ export default function ChatPage() {
   const clearStream = useStreamStore((s) => s.clearStream)
 
   const isStreamActive = stream !== undefined && stream.status !== 'complete' && stream.status !== 'error'
+
+  // Once the persisted history contains an assistant reply, the streamed copy is
+  // redundant: drop it so the answer is not rendered twice. If the refetch never
+  // brings it, the streamed copy stays visible instead of the answer vanishing.
+  useEffect(() => {
+    if (stream?.status !== 'complete') return
+    // Clear only when the history actually GREW — comparing to the count at send
+    // time, because the chat already has older assistant turns and a plain
+    // "has any assistant message" check would wipe the new answer instantly.
+    const assistantNow = messages.filter((m) => m.role === 'assistant').length
+    if (assistantNow > assistantCountAtSendRef.current) clearStream(chat.id)
+  }, [messages, stream?.status, chat.id, clearStream])
 
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const isNearBottomRef = useRef(true)
@@ -248,6 +263,7 @@ export default function ChatPage() {
       genericAllowancePct,
     }
     setLastSend(payload)
+    assistantCountAtSendRef.current = messages.filter((m) => m.role === 'assistant').length
     setPendingUserText(text)
     await sendMessage(payload)
 
@@ -259,8 +275,12 @@ export default function ChatPage() {
     // snapshot. Reading fresh state avoids acting on outdated status.
     const finalStatus = useStreamStore.getState().activeStreams.get(chat.id)?.status
     if (finalStatus === 'complete') {
+      // Keep the streamed answer on screen until the PERSISTED messages actually
+      // contain it — a matching effect below clears the stream at that point.
+      // Previously the stream was cleared immediately after revalidate(), so
+      // when the refetch came back without the new assistant row (or failed) the
+      // answer vanished and the screen was left empty.
       await revalidator.revalidate()
-      clearStream(chat.id)
       setPendingUserText(null)
     }
     // WHY no action on 'error': the error message stays visible via
