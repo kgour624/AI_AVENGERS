@@ -45,6 +45,22 @@ type CrossVerifier struct {
 	// reviewers approve. Zero value = disabled (safe default until
 	// SetDebatePolicy installs the live policy from config).
 	debate DebatePolicy
+	// multiCritic (A5): the same artifact reviewed by a second critic on a
+	// different model, so a single weak reviewer is no longer the only gate.
+	// Zero value = disabled until SetMultiCriticPolicy installs the policy.
+	multiCritic MultiCriticPolicy
+}
+
+// SetMultiCriticPolicy installs the A5 review policy. Safe on a nil receiver, so
+// wiring it cannot be the reason a boot fails.
+func (cv *CrossVerifier) SetMultiCriticPolicy(p MultiCriticPolicy) {
+	if cv == nil {
+		return
+	}
+	if p.SecondCritic == "" {
+		p.SecondCritic = DefaultMultiCriticPolicy().SecondCritic
+	}
+	cv.multiCritic = p
 }
 
 // NewCrossVerifier creates a new CrossVerifier.
@@ -215,7 +231,7 @@ func (cv *CrossVerifier) reviewArtifact(
 		var changeRequests []string
 
 		for _, reviewer := range reviewers {
-			status, comment, reviewErr := cv.runReview(ctx, workflowID, artifact, reviewer, allExperts)
+			status, comment, reviewErr := cv.reviewWithSecondCritic(ctx, workflowID, artifact, reviewer, allExperts)
 			if reviewErr != nil {
 				cv.logger.Warn("cross-verify: reviewer failed (skipping)",
 					zap.String("reviewer", reviewer.Name),
@@ -692,12 +708,101 @@ func (cv *CrossVerifier) latestRevisedArtifact(
 //   Q: What if LLM response is malformed?
 //   A: Default to "approved" (non-blocking). Log warning.
 //      We don't want review failures to block the workflow.
+// runReview is the single-critic review: one call, on the cheap tier, posted as
+// one review_comment. Kept because it is the behaviour the system has always had
+// and the thing a policy change is measured against.
 func (cv *CrossVerifier) runReview(
 	ctx context.Context,
 	workflowID uuid.UUID,
 	artifact blackboard.Event,
 	reviewer workflowExpert,
 	allExperts []workflowExpert,
+) (status string, comment string, err error) {
+	status, comment, err = cv.askReviewer(ctx, artifact, reviewer, allExperts, gateway.ModelCheap)
+	if err != nil {
+		return "", "", err
+	}
+	cv.postReviewComment(ctx, workflowID, artifact, reviewer, status, comment, nil)
+	return status, comment, nil
+}
+
+// reviewWithSecondCritic asks the same reviewer twice on two different models and
+// acts on the combined verdict.
+//
+// WHY the second opinion is not just another sample: two answers from one model
+// share its blind spots, so the second critic deliberately speaks on a different
+// tier. A disagreement is not averaged either — see combineCriticVerdicts — it
+// becomes changes_requested and names both critics, because the doubt itself is
+// the finding.
+func (cv *CrossVerifier) reviewWithSecondCritic(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	artifact blackboard.Event,
+	reviewer workflowExpert,
+	allExperts []workflowExpert,
+) (status string, comment string, err error) {
+	if !cv.multiCritic.Enabled {
+		return cv.runReview(ctx, workflowID, artifact, reviewer, allExperts)
+	}
+
+	first, firstComment, firstErr := cv.askReviewer(ctx, artifact, reviewer, allExperts, gateway.ModelCheap)
+	if firstErr != nil {
+		return "", "", firstErr
+	}
+	opinions := []CriticOpinion{{
+		Critic: reviewer.Name, Model: string(gateway.ModelCheap),
+		Status: first, Comment: firstComment,
+	}}
+
+	second, secondComment, secondErr := cv.askReviewer(ctx, artifact, reviewer, allExperts, cv.multiCritic.SecondCritic)
+	if secondErr != nil {
+		// One critic answered and one could not. Failing the review here would
+		// block work for an infrastructure reason; approving on one opinion would
+		// silently drop the protection this policy exists to add. So the single
+		// opinion is used, and the screen is told the second critic was absent.
+		cv.logger.Warn("cross-verify: second critic unavailable — using the single review",
+			zap.String("reviewer", reviewer.Name),
+			zap.String("artifact_type", artifact.EventType),
+			zap.Error(secondErr),
+		)
+		opinions = append(opinions, CriticOpinion{
+			Critic: reviewer.Name, Model: string(cv.multiCritic.SecondCritic),
+			Status: "unavailable", Comment: secondErr.Error(),
+		})
+		combined, combinedComment := combineCriticVerdicts([]CriticOpinion{opinions[0]})
+		cv.postReviewComment(ctx, workflowID, artifact, reviewer, combined, combinedComment, opinions)
+		return combined, combinedComment, nil
+	}
+	opinions = append(opinions, CriticOpinion{
+		Critic: reviewer.Name, Model: string(cv.multiCritic.SecondCritic),
+		Status: second, Comment: secondComment,
+	})
+
+	combined, combinedComment := combineCriticVerdicts(opinions)
+	if combined == "" {
+		return "", "", fmt.Errorf("cross-verify: no critic verdict for %s", artifact.EventType)
+	}
+	if combined != first && combined != second {
+		cv.logger.Warn("cross-verify: critics disagree — treated as changes requested",
+			zap.String("reviewer", reviewer.Name),
+			zap.String("artifact_type", artifact.EventType),
+			zap.String("first", first),
+			zap.String("second", second),
+		)
+	}
+	cv.postReviewComment(ctx, workflowID, artifact, reviewer, combined, combinedComment, opinions)
+	return combined, combinedComment, nil
+}
+
+// askReviewer asks one reviewer, on one model tier, and parses the verdict. It
+// posts nothing: what to record is the caller's decision, which is what lets the
+// single-critic and two-critic paths share one prompt and one parser.
+func (cv *CrossVerifier) askReviewer(
+	ctx context.Context,
+	artifact blackboard.Event,
+	reviewer workflowExpert,
+	allExperts []workflowExpert,
+	model gateway.ModelType,
 ) (status string, comment string, err error) {
 	// Build review prompt
 	artifactContent := string(artifact.Content)
@@ -727,7 +832,7 @@ func (cv *CrossVerifier) runReview(
 	)
 
 	resp, callErr := cv.gateway.Call(ctx, gateway.LLMRequest{
-		Model: gateway.ModelCheap, // Reviews use cheap model (fast, low cost)
+		Model: model,
 		// artifact carries its own workflow id — no extra parameter needed.
 		WorkflowID:   &artifact.WorkflowID,
 		SystemPrompt: systemPrompt,
@@ -738,27 +843,41 @@ func (cv *CrossVerifier) runReview(
 		return "", "", fmt.Errorf("review LLM call failed: %w", callErr)
 	}
 
-	// Post review_comment to blackboard
 	responseText := strings.TrimSpace(resp.Content)
 	parsedStatus, parsedComment := parseReviewResponse(responseText)
+	return parsedStatus, parsedComment, nil
+}
 
+// postReviewComment records one review verdict. When critics is non-empty the
+// individual opinions ride along, so a disagreement is visible on the artifact
+// instead of being flattened into the combined verdict.
+func (cv *CrossVerifier) postReviewComment(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	artifact blackboard.Event,
+	reviewer workflowExpert,
+	status, comment string,
+	critics []CriticOpinion,
+) {
+	content := map[string]interface{}{
+		"artifact_id":     artifact.ID.String(),
+		"artifact_type":   artifact.EventType,
+		"status":          status,
+		"comment":         comment,
+		"reviewer":        reviewer.Name,
+		"reviewer_domain": reviewer.Domain,
+	}
+	if len(critics) > 0 {
+		content["critics"] = critics
+	}
 	_, _ = cv.store.Post(ctx, blackboard.PostRequest{
 		WorkflowID:         workflowID,
 		EventType:          "review_comment",
 		PostedByExpertID:   &reviewer.ID,
 		PostedByClient:     false,
 		ReferencesEventIDs: []uuid.UUID{artifact.ID},
-		Content: map[string]interface{}{
-			"artifact_id":     artifact.ID.String(),
-			"artifact_type":   artifact.EventType,
-			"status":          parsedStatus,
-			"comment":         parsedComment,
-			"reviewer":        reviewer.Name,
-			"reviewer_domain": reviewer.Domain,
-		},
+		Content:            content,
 	})
-
-	return parsedStatus, parsedComment, nil
 }
 
 // parseReviewResponse parses the LLM's review response.
@@ -769,7 +888,10 @@ func (cv *CrossVerifier) runReview(
 //     "CHANGES_REQUESTED: missing error handling in auth flow"
 //     "BLOCKED: SQL injection vulnerability in user input"
 //
-//   If format is unexpected: default to "approved" (non-blocking).
+//   If format is unexpected: default to changes_requested (fail closed).
+//   An unreadable verdict is not an approval, and the code below has always
+//   behaved that way — this comment said the opposite, which is the kind of
+//   contradiction that gets a gate quietly weakened later.
 func parseReviewResponse(response string) (status string, comment string) {
 	upper := strings.ToUpper(response)
 
