@@ -6,7 +6,10 @@ import {
   getCodeCraftModels,
   getEmbeddingSettings,
   updateEmbeddingSettings,
+  getModelLimits,
+  updateModelLimits,
 } from '@/api/admin'
+import type { ModelLimit } from '@/api/admin'
 import type { CodeCraftModel } from '@/types/codecraftapi'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
@@ -85,6 +88,49 @@ function AdminLLMSettings() {
   const [cavotiModelCheap, setCavotiModelCheap] = useState('')
   const [cavotiModelStrong, setCavotiModelStrong] = useState('')
   const [cavotiModelFast, setCavotiModelFast] = useState('')
+
+  // Model token limits state. Drafts are keyed by provider|tier and only hold
+  // the rows the admin has actually touched, so an untouched table saves nothing.
+  const { data: limitsData } = useQuery({
+    queryKey: ['admin', 'model-limits'],
+    queryFn: getModelLimits,
+  })
+  const [limitDrafts, setLimitDrafts] = useState<Record<string, ModelLimit>>({})
+  const [newLimitProvider, setNewLimitProvider] = useState('anthropic')
+  const [newLimitTier, setNewLimitTier] = useState('strong')
+  const [limitsError, setLimitsError] = useState('')
+  const [limitsSuccess, setLimitsSuccess] = useState('')
+
+  const limitKey = (l: { provider: string; tier: string }) => `${l.provider}|${l.tier}`
+
+  // Server rows plus anything drafted on top, so a newly added row is visible
+  // before it is saved.
+  const limitRows: ModelLimit[] = []
+  const seenLimitKeys = new Set<string>()
+  for (const row of limitsData?.limits ?? []) {
+    limitRows.push(limitDrafts[limitKey(row)] ?? row)
+    seenLimitKeys.add(limitKey(row))
+  }
+  for (const draft of Object.values(limitDrafts)) {
+    if (!seenLimitKeys.has(limitKey(draft))) limitRows.push(draft)
+  }
+
+  const editLimit = (row: ModelLimit, patch: Partial<ModelLimit>) =>
+    setLimitDrafts((prev) => ({ ...prev, [limitKey(row)]: { ...row, ...patch } }))
+
+  const limitsMutation = useMutation({
+    mutationFn: () => updateModelLimits(Object.values(limitDrafts)),
+    onSuccess: () => {
+      setLimitsError('')
+      setLimitsSuccess('Token limits saved. The next LLM call uses them — no restart needed.')
+      setLimitDrafts({})
+      queryClient.invalidateQueries({ queryKey: ['admin', 'model-limits'] })
+    },
+    onError: (err: unknown) => {
+      setLimitsSuccess('')
+      setLimitsError(handleAPIError(err))
+    },
+  })
 
   // Embedding settings state
   const [embeddingProvider, setEmbeddingProvider] = useState<'sidecar' | 'codecraftapi' | ''>('')
@@ -441,6 +487,123 @@ function AdminLLMSettings() {
               Save Embedding Settings
             </Button>
           </div>
+
+          {/* Per-model token limits.
+              WHY this screen and not env vars: the right number depends on the
+              model, and the same deployment serves several providers through
+              different keys. A limit that is too low does not fail loudly — a
+              reasoning model simply returns an empty answer — so the fix has to
+              be reachable without a redeploy. */}
+          <Card>
+            <p className="text-sm font-medium text-text-primary mb-1">Model token limits</p>
+            <p className="text-xs text-text-secondary mb-3">
+              The most this system will ask a model for. Output is the number that matters for
+              reasoning models: they spend part of it thinking before writing anything, so too
+              low comes back as an empty reply. <span className="text-text-primary">0</span> means
+              "use the provider's own maximum". An input limit is enforced only once you set it.
+            </p>
+
+            {limitRows.length > 0 ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-text-disabled">
+                      <th className="py-1 pr-3 font-medium">Provider</th>
+                      <th className="py-1 pr-3 font-medium">Tier</th>
+                      <th className="py-1 pr-3 font-medium">Max input tokens</th>
+                      <th className="py-1 font-medium">Max output tokens</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {limitRows.map((row) => (
+                      <tr key={limitKey(row)}>
+                        <td className="py-1 pr-3 text-text-secondary">{row.provider}</td>
+                        <td className="py-1 pr-3 text-text-secondary">
+                          {row.tier === '*' ? 'all tiers' : row.tier}
+                        </td>
+                        <td className="py-1 pr-3">
+                          <input
+                            type="number"
+                            min={0}
+                            value={row.maxInputTokens}
+                            onChange={(e) =>
+                              editLimit(row, { maxInputTokens: Number(e.target.value) || 0 })
+                            }
+                            className="w-28 rounded border border-surface-border bg-surface-secondary px-2 py-1 text-text-primary"
+                          />
+                        </td>
+                        <td className="py-1">
+                          <input
+                            type="number"
+                            min={0}
+                            value={row.maxOutputTokens}
+                            onChange={(e) =>
+                              editLimit(row, { maxOutputTokens: Number(e.target.value) || 0 })
+                            }
+                            className="w-28 rounded border border-surface-border bg-surface-secondary px-2 py-1 text-text-primary"
+                          />
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <p className="text-xs text-text-disabled">
+                No limits configured — every provider is using its own maximum.
+              </p>
+            )}
+
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <div>
+                <p className="text-xs text-text-secondary mb-1">Provider</p>
+                <select
+                  className="rounded-md border border-surface-border bg-surface-secondary text-text-primary text-sm px-3 py-2"
+                  value={newLimitProvider}
+                  onChange={(e) => setNewLimitProvider(e.target.value)}
+                >
+                  {(limitsData?.providers ?? ['anthropic']).map((p) => (
+                    <option key={p} value={p}>{p}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <p className="text-xs text-text-secondary mb-1">Tier</p>
+                <select
+                  className="rounded-md border border-surface-border bg-surface-secondary text-text-primary text-sm px-3 py-2"
+                  value={newLimitTier}
+                  onChange={(e) => setNewLimitTier(e.target.value)}
+                >
+                  {(limitsData?.tiers ?? ['strong', 'fast', 'cheap', '*']).map((t) => (
+                    <option key={t} value={t}>{t === '*' ? 'all tiers' : t}</option>
+                  ))}
+                </select>
+              </div>
+              <Button
+                variant="secondary"
+                onClick={() =>
+                  editLimit(
+                    { provider: newLimitProvider, tier: newLimitTier, maxInputTokens: 0, maxOutputTokens: 0 },
+                    {}
+                  )
+                }
+              >
+                Add row
+              </Button>
+            </div>
+
+            {limitsError && <p className="text-sm text-mode-refuse mt-3">{limitsError}</p>}
+            {limitsSuccess && <p className="text-sm text-mode-advise mt-3">{limitsSuccess}</p>}
+
+            <Button
+              onClick={() => limitsMutation.mutate()}
+              isLoading={limitsMutation.isPending}
+              disabled={Object.keys(limitDrafts).length === 0}
+              className="mt-3"
+            >
+              Save Token Limits
+            </Button>
+          </Card>
 
         </div>
       )}

@@ -133,7 +133,12 @@ Format:
   }
 ]`,
 		UserPrompt:  userPrompt,
-		MaxTokens:   2000,
+		// 0 = let the gateway use the model's configured output limit. A hard
+		// 2000 here is what made planning fail on a reasoning model: it spent
+		// the whole budget thinking, returned no JSON, three times, and the
+		// workflow died at intake. The number belongs to the model, which is an
+		// admin setting (Admin → LLM Settings).
+		MaxTokens:   0,
 		Temperature: 0.1,
 	})
 	if err != nil {

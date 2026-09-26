@@ -3491,6 +3491,83 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 	})
 }
 
+// GetLLMModelLimits GET /admin/llm-settings/model-limits
+//
+// Returns every configured per-model token limit. An empty list is a valid
+// answer: with no rows the gateway uses each provider's own maximum, which is
+// the behaviour that existed before this table.
+func (h *AdminHandler) GetLLMModelLimits(c *gin.Context) {
+	limits, err := h.gateway.ListModelLimits(c.Request.Context())
+	if err != nil {
+		h.logger.Error("list model limits failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if limits == nil {
+		limits = []gateway.ModelLimit{}
+	}
+	response.OK(c, map[string]interface{}{
+		"limits": limits,
+		"providers": []string{
+			"openrouter", "deepseek", "anthropic", "gemini", "codecraftapi", "cavoti",
+		},
+		"tiers": []string{
+			gateway.LimitTierStrong, gateway.LimitTierFast,
+			gateway.LimitTierCheap, gateway.LimitTierDefault,
+		},
+		"note": "0 = not configured, so the provider's own maximum applies. An input limit is enforced only when set.",
+	})
+}
+
+// UpdateLLMModelLimits PUT /admin/llm-settings/model-limits
+//
+// Body: {limits: [{provider, tier, max_input_tokens, max_output_tokens}, ...]}
+// Upserts the given rows and leaves every other row untouched, so the screen can
+// save one edited row without resending the whole table.
+func (h *AdminHandler) UpdateLLMModelLimits(c *gin.Context) {
+	var req struct {
+		Limits []gateway.ModelLimit `json:"limits"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+
+	validProviders := map[string]bool{
+		"openrouter": true, "deepseek": true,
+		"anthropic": true, "gemini": true,
+		"codecraftapi": true, "cavoti": true,
+	}
+	validTiers := map[string]bool{
+		gateway.LimitTierStrong:  true,
+		gateway.LimitTierFast:    true,
+		gateway.LimitTierCheap:   true,
+		gateway.LimitTierDefault: true,
+	}
+	for _, l := range req.Limits {
+		if !validProviders[l.Provider] {
+			response.BadRequest(c, "INVALID_PROVIDER", "provider must be one of: openrouter, deepseek, anthropic, gemini, codecraftapi, cavoti")
+			return
+		}
+		if !validTiers[l.Tier] {
+			response.BadRequest(c, "INVALID_TIER", "tier must be: strong, fast, cheap, *")
+			return
+		}
+		if l.MaxInputTokens < 0 || l.MaxOutputTokens < 0 {
+			response.BadRequest(c, "INVALID_TOKEN_LIMIT", "token limits must be >= 0 (0 = not configured)")
+			return
+		}
+	}
+
+	adminID := c.MustGet("user_id").(uuid.UUID)
+	if err := h.gateway.UpsertModelLimits(c.Request.Context(), &adminID, req.Limits); err != nil {
+		h.logger.Error("save model limits failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, map[string]interface{}{"saved": len(req.Limits)})
+}
+
 // UpdateLLMSettings POST /admin/llm-settings
 // Body: {provider: "deepseek", fallback_provider: "openrouter", api_keys: {"deepseek": "sk-xxx"},
 //        codecraftapi_model_cheap: "...", codecraftapi_model_strong: "...", codecraftapi_model_fast: "..."}
