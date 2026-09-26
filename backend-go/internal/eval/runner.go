@@ -66,11 +66,23 @@ func (s *RunSummary) HasVitalFailure() bool {
 type Runner struct {
 	model  string
 	logger *zap.Logger
+	// judge (T3) is OPTIONAL. Nil → deterministic scoring only (CI default).
+	judge Judge
 }
 
 // NewRunner builds a runner. model is recorded on the run for delta context.
 func NewRunner(model string, logger *zap.Logger) *Runner {
 	return &Runner{model: model, logger: logger}
+}
+
+// WithJudge layers an LLM judge on top of the deterministic scorer and returns
+// the runner for chaining. When set, each non-refusal case gains an extra
+// "judge" component check; the deterministic checks and the vital-failure gate
+// are unchanged. A judge error is logged and the component is omitted, so a
+// model outage can never flip a case.
+func (r *Runner) WithJudge(j Judge) *Runner {
+	r.judge = j
+	return r
 }
 
 // Run evaluates every case in the set. Cases the Answerer skips are
@@ -103,23 +115,48 @@ func (r *Runner) Run(ctx context.Context, set *GoldenSet, a Answerer) *RunSummar
 			continue
 		}
 		v := Score(c, obs)
+		passed := v.Passed
+		checks := v.Checks
+
+		// T3: optional LLM-judge component. Refusals are judged by the
+		// deterministic refusal check alone — grading a deliberate refusal with a
+		// helpfulness rubric would penalise correct behaviour.
+		if r.judge != nil && !c.Expect.Refuse {
+			jr, judgeErr := r.judge.Judge(ctx, c, obs)
+			if judgeErr != nil {
+				if r.logger != nil {
+					r.logger.Warn("eval judge failed — component omitted (deterministic result stands)",
+						zap.String("case_id", c.ID), zap.Error(judgeErr))
+				}
+			} else {
+				checks = append(checks, Check{
+					Name:   "judge",
+					Passed: jr.Passed,
+					Detail: detailf("score=%.2f feedback=%s", jr.Score, jr.Feedback),
+				})
+				if !jr.Passed {
+					passed = false
+				}
+			}
+		}
+
 		res := CaseResult{
 			CaseID:    c.ID,
 			Vital:     c.Vital,
-			Passed:    v.Passed,
-			Checks:    v.Checks,
+			Passed:    passed,
+			Checks:    checks,
 			CostUSD:   obs.CostUSD,
 			LatencyMs: obs.LatencyMs,
 		}
 		sum.Results = append(sum.Results, res)
 		sum.Total++
 		sum.CostUSD += obs.CostUSD
-		if v.Passed {
+		if passed {
 			sum.Passed++
 		}
 		if c.Vital {
 			sum.VitalTotal++
-			if !v.Passed {
+			if !passed {
 				sum.VitalFailed++
 			}
 		}

@@ -14,29 +14,37 @@
 //     no longer exists (re-ingested/removed) → the citation no longer
 //     verifies (P9 feedback).
 //   - empty_corpus: an expert has no chunks at all.
+//   - corpus_contradiction: separate sources under one topic contain explicit
+//     opposite-polarity, strongly overlapping statements; they need review.
 //
-// Signals are deterministic (counts/ages/model comparison) — no LLM — so a
-// scan is cheap and reproducible. Corpus-wide semantic contradiction (B2)
-// is per-answer today and remains deferred.
+// Signals are deterministic (counts/ages/model comparison/string checks) — no
+// LLM — so scans are cheap and reproducible. Contradiction findings are review
+// candidates, never an automatic choice of which source is correct.
 package knowledge
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 )
 
 // Task types / severities / statuses (stable DB + API values).
 const (
-	TaskEmbeddingMismatch = "embedding_mismatch"
-	TaskStaleCorpus       = "stale_corpus"
-	TaskOrphanReference   = "orphan_reference"
-	TaskEmptyCorpus       = "empty_corpus"
+	TaskEmbeddingMismatch   = "embedding_mismatch"
+	TaskStaleCorpus         = "stale_corpus"
+	TaskOrphanReference     = "orphan_reference"
+	TaskEmptyCorpus         = "empty_corpus"
+	TaskCorpusContradiction = "corpus_contradiction"
 
 	SeverityLow    = "low"
 	SeverityMedium = "medium"
@@ -116,6 +124,60 @@ func NewFreshness(db *pgxpool.Pool, policy Policy, logger *zap.Logger) *Freshnes
 	return &Freshness{db: db, policy: policy, logger: logger}
 }
 
+// ScanAndMeasureAll refreshes deterministic freshness signals, then remeasures
+// only experts whose corpus changed since the last completed eval. At most one
+// expensive eval is started per scheduled sweep; the caller invokes this on a
+// daily schedule and logs the returned error.
+func (f *Freshness) ScanAndMeasureAll(ctx context.Context, measure func(context.Context, uuid.UUID) error) error {
+	if !f.Enabled() {
+		return fmt.Errorf("freshness service not enabled")
+	}
+	if _, err := f.ScanAll(ctx); err != nil {
+		return err
+	}
+	if measure == nil {
+		return nil
+	}
+
+	var expertID uuid.UUID
+	err := f.db.QueryRow(ctx, `
+		SELECT e.id
+		  FROM experts e
+		 WHERE e.deleted_at IS NULL
+		   AND EXISTS (SELECT 1 FROM course_chunks cc WHERE cc.expert_id = e.id)
+		   AND EXISTS (
+		       SELECT 1 FROM expert_capabilities ec
+		        WHERE ec.expert_id = e.id AND ec.topic IS NOT NULL AND ec.topic <> '' AND ec.topic <> 'general'
+		   )
+		   AND NOT EXISTS (
+		       SELECT 1 FROM expert_capability_eval_runs r
+		        WHERE r.expert_id = e.id AND r.status = 'running'
+		   )
+		   AND (
+		       NOT EXISTS (SELECT 1 FROM expert_capability_eval_runs r WHERE r.expert_id=e.id AND r.status='complete')
+		       OR EXISTS (
+		           SELECT 1 FROM course_chunks cc
+		            WHERE cc.expert_id=e.id AND NOT EXISTS (
+		                SELECT 1 FROM expert_capability_eval_runs r
+		                 WHERE r.expert_id=e.id AND r.status='complete'
+		                   AND COALESCE(r.corpus_updated_at, r.completed_at) >= cc.created_at
+		            )
+		       )
+		   )
+		 ORDER BY e.created_at
+		 LIMIT 1`).Scan(&expertID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("freshness: find changed expert for capability measurement: %w", err)
+	}
+	if err := measure(ctx, expertID); err != nil {
+		return fmt.Errorf("freshness: measure changed expert %s: %w", expertID, err)
+	}
+	return nil
+}
+
 // Enabled reports whether the service can operate. Nil-safe.
 func (f *Freshness) Enabled() bool { return f != nil && f.db != nil }
 
@@ -136,6 +198,11 @@ func (f *Freshness) ScanExpert(ctx context.Context, expertID uuid.UUID) (*Expert
 	if err != nil {
 		return nil, err
 	}
+	contradictions, err := f.detectCorpusContradictions(ctx, expertID)
+	if err != nil {
+		return nil, fmt.Errorf("freshness: detect corpus contradictions: %w", err)
+	}
+	signals = append(signals, contradictions...)
 	for _, s := range signals {
 		if err := f.upsertTask(ctx, expertID, s); err != nil {
 			return nil, err
@@ -192,6 +259,118 @@ func (f *Freshness) GetExpert(ctx context.Context, expertID uuid.UUID) (*ExpertF
 	}
 	ef.OpenTasks = f.countOpenTasks(ctx, expertID)
 	return ef, nil
+}
+
+// detectCorpusContradictions flags direct, deterministic polarity conflicts
+// between different source files sharing a topic. It never resolves the conflict.
+func (f *Freshness) detectCorpusContradictions(ctx context.Context, expertID uuid.UUID) ([]signal, error) {
+	rows, err := f.db.Query(ctx, `
+		WITH topics AS (
+		    SELECT topic FROM course_chunks
+		     WHERE expert_id=$1 AND topic IS NOT NULL AND topic<>''
+	     GROUP BY topic ORDER BY COUNT(*) DESC, topic LIMIT 100
+		), ranked_sources AS (
+		    SELECT cc.topic, COALESCE(cc.source_file, '') AS source_file, cc.chunk_text,
+		           ROW_NUMBER() OVER (PARTITION BY cc.topic, COALESCE(cc.source_file, '') ORDER BY cc.chunk_index, cc.id) AS source_rank,
+		           DENSE_RANK() OVER (PARTITION BY cc.topic ORDER BY COALESCE(cc.source_file, '')) AS file_rank
+		      FROM course_chunks cc JOIN topics t USING (topic)
+		     WHERE cc.expert_id=$1 AND cc.chunk_text<>''
+		)
+		SELECT topic, source_file, chunk_text FROM ranked_sources
+		 WHERE source_rank=1 AND file_rank<=16
+		 ORDER BY topic, source_file`, expertID)
+	if err != nil {
+		return nil, fmt.Errorf("query corpus statements: %w", err)
+	}
+	defer rows.Close()
+	type statement struct{ topic, source, text string }
+	byTopic := make(map[string][]statement)
+	seen := make(map[string]bool)
+	for rows.Next() {
+		var s statement
+		if err := rows.Scan(&s.topic, &s.source, &s.text); err != nil {
+			return nil, fmt.Errorf("scan corpus statement: %w", err)
+		}
+		key := s.topic + "\x00" + s.source
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		s.text = strings.TrimSpace(s.text)
+		if len(s.text) > 1200 {
+			s.text = s.text[:1200]
+		}
+		byTopic[s.topic] = append(byTopic[s.topic], s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read corpus statements: %w", err)
+	}
+	var out []signal
+	for topic, sources := range byTopic {
+		for i := 0; i < len(sources); i++ {
+			for j := i + 1; j < len(sources); j++ {
+				if sources[i].source == sources[j].source {
+					continue
+				}
+				term, ok := polarityConflict(sources[i].text, sources[j].text)
+				if !ok {
+					continue
+				}
+				keyBytes := sha256.Sum256([]byte(topic + "\x00" + sources[i].source + "\x00" + sources[j].source + "\x00" + term))
+				out = append(out, signal{
+					TaskType: TaskCorpusContradiction, Severity: SeverityHigh,
+					Title: "Knowledge sources may contradict each other",
+					Details: map[string]interface{}{
+						"topic": topic, "source_a": sources[i].source, "source_b": sources[j].source,
+						"statement_a": sources[i].text, "statement_b": sources[j].text,
+						"overlap_term": term, "resolution": "review_sources",
+					},
+					DedupeKey: hex.EncodeToString(keyBytes[:]),
+				})
+			}
+		}
+	}
+	return out, nil
+}
+
+func polarityConflict(a, b string) (string, bool) {
+	words := func(s string) []string {
+		return strings.Fields(strings.Map(func(r rune) rune {
+			if r >= 'A' && r <= 'Z' {
+				r += 'a' - 'A'
+			}
+			if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+				return r
+			}
+			return ' '
+		}, s))
+	}
+	left, right := words(a), words(b)
+	negative := func(ws []string) bool {
+		for _, w := range ws {
+			switch w {
+			case "not", "never", "cannot", "cant", "no", "isnt", "doesnt":
+				return true
+			}
+		}
+		return false
+	}
+	if negative(left) == negative(right) {
+		return "", false
+	}
+	stop := map[string]bool{"not": true, "never": true, "cannot": true, "cant": true, "no": true, "isnt": true, "doesnt": true, "this": true, "that": true, "with": true, "from": true, "into": true, "when": true, "then": true, "than": true, "which": true, "their": true, "there": true, "these": true, "those": true, "about": true, "should": true, "would": true, "could": true, "must": true, "will": true, "have": true, "has": true, "does": true, "only": true, "also": true, "used": true, "using": true, "based": true, "after": true, "before": true, "under": true, "over": true, "between": true, "each": true, "such": true, "more": true, "most": true, "some": true, "many": true, "other": true, "same": true, "different": true, "true": true, "false": true}
+	terms := make(map[string]bool, len(left))
+	for _, w := range left {
+		if len(w) >= 5 && !stop[w] {
+			terms[w] = true
+		}
+	}
+	for _, w := range right {
+		if terms[w] {
+			return w, true
+		}
+	}
+	return "", false
 }
 
 // ListTasks returns refresh tasks, filtered by status and/or expert.
@@ -321,8 +500,8 @@ func (f *Freshness) signalsFor(ef *ExpertFreshness) []signal {
 	if ef.ChunkCount == 0 {
 		out = append(out, signal{
 			TaskType: TaskEmptyCorpus, Severity: SeverityHigh,
-			Title:    "Expert has no knowledge chunks",
-			Details:  map[string]interface{}{"chunk_count": 0},
+			Title:   "Expert has no knowledge chunks",
+			Details: map[string]interface{}{"chunk_count": 0},
 		})
 		return out // nothing else is meaningful on an empty corpus
 	}
@@ -359,7 +538,7 @@ func (f *Freshness) signalsFor(ef *ExpertFreshness) []signal {
 	if ef.OrphanReferences > 0 {
 		out = append(out, signal{
 			TaskType: TaskOrphanReference, Severity: SeverityMedium,
-			Title: "Saved answers cite chunks that no longer exist",
+			Title:   "Saved answers cite chunks that no longer exist",
 			Details: map[string]interface{}{"orphan_references": ef.OrphanReferences},
 		})
 	}

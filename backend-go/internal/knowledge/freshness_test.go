@@ -58,6 +58,21 @@ func TestClassify(t *testing.T) {
 	}
 }
 
+func TestPolarityConflict(t *testing.T) {
+	// Opposite polarity + shared subject term -> flagged with a subject term.
+	if term, ok := polarityConflict("The cache stores messages for 30 seconds", "The cache does not store messages for 30 seconds"); !ok || term == "" {
+		t.Fatalf("opposite polarity overlap = (%q, %v), want a non-empty term and true", term, ok)
+	}
+	// Same polarity -> never flagged.
+	if _, ok := polarityConflict("The cache stores messages for 30 seconds", "The cache stores messages for 30 seconds"); ok {
+		t.Fatal("same-polarity statements must not be flagged")
+	}
+	// Negation but no shared subject -> not flagged.
+	if _, ok := polarityConflict("Database uses indexes for lookups", "The cache does not store sessions"); ok {
+		t.Fatal("unrelated negated statements must not be flagged")
+	}
+}
+
 func TestPolicyDefault(t *testing.T) {
 	f := NewFreshness(nil, Policy{}, nil)
 	if f.MaxAgeDays() != 180 {

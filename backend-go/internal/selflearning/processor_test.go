@@ -23,7 +23,11 @@ func TestCountTokens(t *testing.T) {
 }
 
 func TestShouldProcess(t *testing.T) {
-	long := "Alice is on a chessboard and wants to move a knight from one corner to another using valid moves"
+	// NOTE: fixtures are deliberately above the documented thresholds in
+	// processor.go (minTokensForProcessing=20 tokens, minRunesForSpacelessQuestion=
+	// 40 runes); the earlier fixtures were 19 tokens / 39 runes and failed for
+	// being just under the bar, not for any behaviour change.
+	long := "Alice is on a chessboard and wants to move a knight from one corner to another using valid moves while avoiding the opponent's pieces entirely"
 	if !shouldProcess(long) {
 		t.Errorf("long english question should be processed")
 	}
@@ -31,7 +35,7 @@ func TestShouldProcess(t *testing.T) {
 		t.Errorf("short question should be skipped")
 	}
 	// Space-less CJK question long enough by rune count must NOT be skipped.
-	cjk := "这是一个非常长的问题关于图的最短路径算法和广度优先搜索的实现细节以及复杂度分析"
+	cjk := "这是一个非常长的问题关于图的最短路径算法和广度优先搜索的实现细节以及复杂度分析并且需要给出证明"
 	if !shouldProcess(cjk) {
 		t.Errorf("long spaceless CJK question should be processed")
 	}

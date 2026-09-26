@@ -50,6 +50,18 @@ func NewL2Store(db *pgxpool.Pool, embedder ml.Embedder, logger *zap.Logger) *L2S
 // Append adds a new memory entry to L2.
 // Generates embedding for semantic search.
 func (s *L2Store) Append(ctx context.Context, entry L2Entry) error {
+	// T6 discipline gate: drop content that can never change future behaviour.
+	// Skipped silently (nil, not an error) so a caller never fails because a
+	// turn was conversational — see discipline.go for why this is conservative.
+	if keep, reason := ShouldRemember(entry.Content); !keep {
+		if s.logger != nil {
+			s.logger.Debug("L2 entry skipped by memory discipline",
+				zap.String("reason", reason),
+				zap.String("memory_type", entry.MemoryType))
+		}
+		return nil
+	}
+
 	weight := entry.Weight
 	if weight <= 0 || weight > 1 {
 		weight = 1.0

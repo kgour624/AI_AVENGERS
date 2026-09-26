@@ -198,8 +198,60 @@ def _strip_page_furniture(page_texts: List[str]) -> List[str]:
     return cleaned
 
 
+# Control characters that carry no meaning in a transcript and are a common
+# symptom of a damaged/partially-binary export (NUL-padded, truncated files).
+# Newline/tab/form-feed are intentionally kept.
+_STRIP_CONTROLS = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# Three or more consecutive newlines collapse to a paragraph break; ASR/tool
+# exports often pad with long runs of blank lines that inflate nothing useful.
+_EXCESS_BLANKS = re.compile(r"\n{3,}")
+_UIAM = "\ufffd"  # Unicode replacement character = a byte could not be decoded
+
+
+def repair_damaged_text(text: str, warnings: List[str]) -> str:
+    """Clean a transcript that was extracted from a damaged or mis-encoded file.
+
+    WHY this is central (called from _join_sections): every parser returns text
+    through here, so fixing it in one place means a NUL-padded DOCX and a
+    mis-decoded PDF get the same treatment instead of each parser drifting.
+
+    It never hides the damage: when enough of the text was damaged to matter it
+    adds a warning, so the admin sees "this transcript is degraded" rather than
+    silently receiving a thinner corpus.
+    """
+    if not text:
+        return text
+
+    stripped_controls = len(_STRIP_CONTROLS.findall(text))
+    if stripped_controls:
+        text = _STRIP_CONTROLS.sub("", text)
+
+    replacement_count = text.count(_UIAM)
+    if replacement_count:
+        # U+FFFD only appears when a decode step already lost bytes. Removing it
+        # is right (it is not real content); report it when it is more than a
+        # token smear, because a high ratio means the source was wrong.
+        meaningful = len(text) - replacement_count
+        if replacement_count >= 20 or (meaningful > 0 and replacement_count / len(text) > 0.02):
+            warnings.append(
+                f"{replacement_count} undecodable characters were removed — "
+                f"the source encoding looks damaged; verify the transcript"
+            )
+        text = text.replace(_UIAM, "")
+
+    text = _EXCESS_BLANKS.sub("\n\n", text)
+
+    if stripped_controls >= 20:
+        warnings.append(
+            f"{stripped_controls} control characters were removed — "
+            f"the file may be partially binary or truncated"
+        )
+    return text
+
+
 def _join_sections(sections: List[str], warnings: List[str]) -> str:
     text = "\n\n".join(s for s in sections if s and s.strip())
+    text = repair_damaged_text(text, warnings)
     if len(text) > MAX_EXTRACTED_CHARS:
         raise ExtractionError(
             "too_large",
