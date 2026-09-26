@@ -380,6 +380,43 @@ export const updateLLMSettings = (req: {
     .then((res) => res.data.data!)
 
 // ============================================================
+// LLM PROVIDER HEALTH (G4)
+// ============================================================
+// Two questions the LLM Settings screen has to answer: is a provider being
+// skipped right now (breaker), and is one of them answering slowly (latency).
+export interface BreakerStatus {
+  provider: string
+  // closed = working · open = skipped until retryAfterSeconds · half_open = one
+  // probe is being allowed through to find out whether it recovered.
+  state: 'closed' | 'open' | 'half_open'
+  consecutiveFailures: number
+  openedAt?: string
+  retryAfterSeconds?: number
+  lastError?: string
+}
+
+export interface ProviderLatency {
+  provider: string
+  callsTotal: number
+  samplesInWindow: number
+  p50Ms: number
+  p95Ms: number
+  maxMs: number
+  lastMs: number
+}
+
+export interface LLMHealthResponse {
+  breakers: BreakerStatus[]
+  latency: ProviderLatency[]
+  note: string
+}
+
+export const getLLMHealth = () =>
+  baseAPI
+    .get<ApiResponse<LLMHealthResponse>>('/api/v1/admin/llm-health')
+    .then((res) => res.data.data!)
+
+// ============================================================
 // MODEL TOKEN LIMITS
 // ============================================================
 // Per provider+tier caps on what this system will ask a model for — the same

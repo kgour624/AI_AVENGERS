@@ -192,6 +192,18 @@ type LLMConfig struct {
 	ModelCheap  string
 	ModelStrong string
 	ModelFast   string
+
+	// Breaker (G4 / P8): how a provider that keeps failing is taken out of
+	// rotation so a dead provider stops costing every request three attempts.
+	//
+	// BreakerConfigured distinguishes "nobody said anything" from "someone turned
+	// it off": an unconfigured deployment must get the gateway's defaults
+	// (enabled), because a silently disabled breaker is indistinguishable from
+	// working protection.
+	BreakerConfigured       bool
+	BreakerEnabled          bool
+	BreakerFailureThreshold int
+	BreakerCooldownSeconds  int
 }
 
 type MLConfig struct {
@@ -312,6 +324,13 @@ func Load() (*Config, error) {
 			ModelCheap:        v.GetString("LLM_MODEL_CHEAP"),
 			ModelStrong:       v.GetString("LLM_MODEL_STRONG"),
 			ModelFast:         v.GetString("LLM_MODEL_FAST"),
+
+			BreakerConfigured: v.IsSet("LLM_BREAKER_ENABLED") ||
+				v.IsSet("LLM_BREAKER_FAILURE_THRESHOLD") ||
+				v.IsSet("LLM_BREAKER_COOLDOWN_SECONDS"),
+			BreakerEnabled:          v.GetBool("LLM_BREAKER_ENABLED"),
+			BreakerFailureThreshold: v.GetInt("LLM_BREAKER_FAILURE_THRESHOLD"),
+			BreakerCooldownSeconds:  v.GetInt("LLM_BREAKER_COOLDOWN_SECONDS"),
 		},
 		ML: MLConfig{
 			SidecarURL:     v.GetString("ML_SIDECAR_URL"),

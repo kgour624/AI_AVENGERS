@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { StreamState } from '@/stores/streamStore'
 import { ExpertAvatar } from '@/components/expert/ExpertAvatar'
 
@@ -21,9 +22,28 @@ export function StreamingIndicator({ stream, expertCount }: { stream: StreamStat
   const respondedCount = stream.expertResponses.length
   const pendingCount = Math.max(0, expertCount - respondedCount)
 
+  // Elapsed seconds, so a wait that is running long looks like a wait rather
+  // than a hang. The learning behind this: retrieval plus generation can take
+  // tens of seconds, and a screen with no clock on it is indistinguishable from
+  // a screen that has stopped.
+  const [elapsedSeconds, setElapsedSeconds] = useState(0)
+  useEffect(() => {
+    if (pendingCount === 0) return
+    const started = Date.now()
+    const timer = setInterval(() => {
+      setElapsedSeconds(Math.floor((Date.now() - started) / 1000))
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [pendingCount])
+
   return (
     <div className="rounded-lg border border-glass-border bg-surface-raised/70 p-4 backdrop-blur-xl">
-      <p className="mb-3 text-sm text-text-secondary">{'\u26a1'} Neural Processing{'\u2026'}</p>
+      <p className="mb-3 text-sm text-text-secondary">
+        {'\u26a1'} Neural Processing{'\u2026'}
+        {pendingCount > 0 && elapsedSeconds > 0 && (
+          <span className="ml-2 text-xs text-text-disabled">{elapsedSeconds}s</span>
+        )}
+      </p>
       <div className="flex flex-wrap gap-4">
         {stream.expertResponses.map((response, i) => (
           <div key={response.expertId ?? i} className="flex flex-col items-center gap-1">
