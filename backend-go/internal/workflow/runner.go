@@ -93,6 +93,11 @@ type WorkflowRunner struct {
 	// leaves the scratch behaviour exactly as it was.
 	codebase CodebaseWorkspace
 	logger   *zap.Logger
+	// inflightRuns holds the workflows a runner is currently driving, in this
+	// process. Run() is started from two independent places — the /run endpoint
+	// and ResumeOrphanWorkflows on every server start — and neither is idempotent,
+	// so without this a workflow can be driven twice at once.
+	inflightRuns sync.Map
 }
 
 // CodebaseWorkspace is what the runner needs from the approval layer (3E).
@@ -195,6 +200,27 @@ func (r *WorkflowRunner) WithChangeRequestService(crSvc *ChangeRequestService) {
 //	Complete
 func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	log := r.logger.With(zap.String("workflow_id", workflowID.String()))
+
+	// Single-flight: exactly one runner may drive a workflow at a time.
+	//
+	// WHY this exists: /run and ResumeOrphanWorkflows (server start) can both
+	// start a runner, and a workflow sitting at 'running' between Start and its
+	// first approval gate is a valid target for either. Two runners on one
+	// workflow both plan, both wait on the same gate, and both continue the
+	// moment the client approves — the design is produced twice, and one of them
+	// can reach the handoff gate and mark the workflow completed while the other
+	// is still in an earlier phase. That is what "it went from intake straight to
+	// done" looks like from the outside.
+	//
+	// The former execMu could not have prevented this: it is declared INSIDE Run,
+	// so every call has its own mutex and it only ever serialised a run against
+	// its own change-request watcher.
+	if _, loaded := r.inflightRuns.LoadOrStore(workflowID, struct{}{}); loaded {
+		log.Warn("runner: a runner is already driving this workflow; refusing a second one")
+		return
+	}
+	defer r.inflightRuns.Delete(workflowID)
+
 	log.Info("workflow runner started")
 	observability.Global.IncWorkflowStarted()
 
@@ -547,6 +573,29 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		[]string{"architecture_decision", "data_model_proposed", "api_contract_proposed",
 			"module_design_proposed", "code_artifact_produced", "requirement_captured"}, 0)
 	artifactIDs := make([]uuid.UUID, 0, len(allArtifacts))
+
+	// Refuse to complete a workflow that never produced anything.
+	//
+	// WHY: every phase can report success while doing no work — a resumed run
+	// whose checkpoint says the experts are done skips them all, empty waves
+	// return no error, and the runner then walks to this gate. Completing here
+	// would put a green "Workflow Complete" over an empty board and zero cost,
+	// which reads as a finished job. Failing with the reason is the honest
+	// outcome, and it is visible on the workflow (failure_reason).
+	produced, producedErr := r.producedWork(ctx, workflowID)
+	if producedErr != nil {
+		log.Error("runner: could not verify that any work was produced", zap.Error(producedErr))
+		_ = r.engine.Fail(ctx, workflowID, "could not verify the work produced: "+producedErr.Error())
+		return
+	}
+	if produced == 0 {
+		log.Error("runner: refusing to complete a workflow that produced nothing",
+			zap.Int("completed_experts_this_run", len(state.CompletedExpertIDs)),
+		)
+		_ = r.engine.Fail(ctx, workflowID,
+			"no design or code artifacts were produced: every phase reported success but nothing was written, so completing would be false")
+		return
+	}
 	for _, ev := range allArtifacts {
 		artifactIDs = append(artifactIDs, ev.ID)
 	}
@@ -645,12 +694,30 @@ func (r *WorkflowRunner) executeWaves(
 				zap.String("workspace", mainWorkspace),
 			)
 		}
+		// Always set, including with nil. ProtectedPathChecker answers nil for a
+		// scratch workflow — legitimately nothing to protect — and the old code
+		// skipped the setter in that case, so a scratch run inherited whatever
+		// predicate the previous existing-codebase workflow installed on this
+		// shared merger and had its own files deleted before the merge. Passing
+		// nil clears this workflow's protection instead of inheriting one.
+		//
+		// An error here can only mean the workflow row could not be read or an
+		// existing-codebase lookup failed (the scratch path returns before it
+		// touches anything else), so the phase fails rather than merging without
+		// the guarantee it was asked for.
 		checker, err := r.codebase.ProtectedPathChecker(ctx, workflowID, mainWorkspace)
 		if err != nil {
-			r.logger.Warn("runner: protected-path checker unavailable (non-fatal)", zap.Error(err))
-		} else if checker != nil {
-			r.workspaceMerger.SetProtectedPathChecker(checker)
+			return fmt.Errorf("protected-path checker unavailable: %w", err)
 		}
+		r.workspaceMerger.SetProtectedPathChecker(workflowID.String(), checker)
+	}
+
+	// A phase with no tasks cannot be "done". Without this the wave loop below
+	// simply does not execute, executeWaves returns nil, and the phase passes as
+	// a success having called no expert — the shape of a workflow that reaches
+	// 'completed' without producing anything.
+	if len(waves) == 0 {
+		return fmt.Errorf("phase %s has no tasks to run", state.Phase)
 	}
 
 	// Experts already marked complete in runner_state (seeded on resume).
@@ -1334,6 +1401,28 @@ func (r *WorkflowRunner) waitForResume(ctx context.Context, workflowID uuid.UUID
 		case <-time.After(2 * time.Second):
 		}
 	}
+}
+
+// producedWorkTypes are the event types that mean a phase produced something a
+// human can read. requirement_captured is deliberately absent: it is posted when
+// the workflow is created, so counting it would make an empty run look
+// productive and defeat the guard that uses this list.
+var producedWorkTypes = []string{
+	"architecture_decision",
+	"data_model_proposed",
+	"api_contract_proposed",
+	"module_design_proposed",
+	"code_artifact_produced",
+	"design_section_written",
+}
+
+// producedWork counts the artifacts this workflow has actually produced.
+func (r *WorkflowRunner) producedWork(ctx context.Context, workflowID uuid.UUID) (int, error) {
+	events, err := r.store.GetByType(ctx, workflowID, producedWorkTypes, 0)
+	if err != nil {
+		return 0, err
+	}
+	return len(events), nil
 }
 
 // buildPlanContent builds the task_plan_ready event content.

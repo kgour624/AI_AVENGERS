@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"go.uber.org/zap"
 )
@@ -34,23 +35,65 @@ import (
 //     {expert_id_2}/           <- Expert 2 isolated workspace
 type WorkspaceMerger struct {
 	logger *zap.Logger
-	// protectedPath, when set, reports whether a repository path must NOT be
-	// written by the workflow. Existing-codebase workflows use it so an expert
-	// cannot overwrite a client file that was never approved for reading (3E).
-	// nil means "nothing is protected", which is the scratch behaviour.
-	protectedPath func(context.Context, string) bool
+	// mu guards protectedPath. This merger is ONE instance shared by every
+	// workflow in the process, and merges of different workflows run on
+	// different goroutines.
+	mu sync.RWMutex
+	// protectedPath maps a workflow ID to the predicate reporting whether a
+	// repository path must not be written BY THAT WORKFLOW. Existing-codebase
+	// workflows use it so an expert cannot overwrite a client file that was never
+	// approved for reading (3E). No entry means "nothing is protected", which is
+	// the scratch behaviour.
+	//
+	// WHY keyed by workflow instead of one field: a single field was the bug this
+	// replaces. An existing-codebase workflow installed its predicate; the next
+	// SCRATCH workflow legitimately has none, so it installed nothing and
+	// inherited the other workflow's predicate — which then deleted the scratch
+	// workflow's own files before they could be merged, with only a log line to
+	// show for it. One workflow's protection must never be another workflow's.
+	protectedPath map[string]func(context.Context, string) bool
 }
 
 // NewWorkspaceMerger creates a new WorkspaceMerger.
 func NewWorkspaceMerger(logger *zap.Logger) *WorkspaceMerger {
-	return &WorkspaceMerger{logger: logger}
+	return &WorkspaceMerger{
+		logger:        logger,
+		protectedPath: make(map[string]func(context.Context, string) bool),
+	}
 }
 
-// SetProtectedPathChecker installs the protected-path predicate (3E). Mirrors
-// Engine.SetEventPoster: nil is a valid "no protection needed" value, so the
-// scratch path is unchanged.
-func (m *WorkspaceMerger) SetProtectedPathChecker(fn func(context.Context, string) bool) {
-	m.protectedPath = fn
+// SetProtectedPathChecker installs a workflow's protected-path predicate (3E).
+//
+// A nil fn CLEARS that workflow's protection, and clearing is the point: the
+// scratch path calls this with nil so it can never inherit a predicate another
+// workflow installed. Pass the workflow ID so one workflow cannot apply its
+// rules to another's merge.
+func (m *WorkspaceMerger) SetProtectedPathChecker(workflowID string, fn func(context.Context, string) bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.protectedPath == nil {
+		m.protectedPath = make(map[string]func(context.Context, string) bool)
+	}
+	if fn == nil {
+		delete(m.protectedPath, workflowID)
+		return
+	}
+	m.protectedPath[workflowID] = fn
+}
+
+// protectedFor returns the predicate that applies to one workflow, or nil when
+// nothing is protected for it.
+func (m *WorkspaceMerger) protectedFor(workflowID string) func(context.Context, string) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.protectedPath[workflowID]
+}
+
+// workflowIDFromWorkspace recovers the workflow ID from a workflow workspace
+// path (/workspaces/{workflow_id}), so a merge consults the predicate that
+// belongs to the workflow it is merging.
+func workflowIDFromWorkspace(workflowWorkspace string) string {
+	return filepath.Base(strings.TrimSuffix(workflowWorkspace, "/"))
 }
 
 // MergeWave merges all expert workspaces from a completed wave into main/.
@@ -68,9 +111,13 @@ func (m *WorkspaceMerger) MergeWave(
 		return nil
 	}
 
+	// Which workflow this merge belongs to. Its protected-path predicate is
+	// chosen by this ID, never by whatever the last workflow installed.
+	workflowID := workflowIDFromWorkspace(workflowWorkspace)
+
 	// Single expert: no merge needed, just copy to main
 	if len(expertIDs) == 1 {
-		return m.copyToMain(ctx, workflowWorkspace, expertIDs[0])
+		return m.copyToMain(ctx, workflowWorkspace, expertIDs[0], workflowID)
 	}
 
 	// Multiple experts: detect conflicts first
@@ -120,7 +167,7 @@ func (m *WorkspaceMerger) MergeWave(
 
 	for _, expertID := range expertIDs {
 		expertPath := filepath.Join(workflowWorkspace, expertID)
-		if err := m.rsyncToMain(ctx, expertPath, mainPath); err != nil {
+		if err := m.rsyncToMain(ctx, expertPath, mainPath, workflowID); err != nil {
 			return fmt.Errorf("rsync expert %s to main: %w", expertID, err)
 		}
 		m.logger.Info("workspace_merger: merged expert workspace",
@@ -162,11 +209,11 @@ func (m *WorkspaceMerger) getChangedFiles(ctx context.Context, workspacePath str
 // node_modules/. node_modules is excluded because it is a per-workspace build
 // artifact: copying it would add hundreds of MB to main/ and, worse, to every
 // other expert's seed on the next wave (A11b).
-func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath string) error {
+func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath, workflowID string) error {
 	// Drop disallowed edits BEFORE the copy: rsync has no per-file filter, so
 	// the only way to keep an unapproved overwrite out of main/ is to remove it
 	// from the source first.
-	m.removeProtectedChanges(ctx, expertPath)
+	m.removeProtectedChanges(ctx, expertPath, workflowID)
 
 	cmd := exec.CommandContext(ctx, "rsync", "-a",
 		"--exclude", ".git", "--exclude", "node_modules",
@@ -184,13 +231,16 @@ func (m *WorkspaceMerger) rsyncToMain(ctx context.Context, expertPath, mainPath 
 // throw away the rest of an expert's work, and the edit is invalid on its own
 // terms — the expert could not read that file, so it has no basis for rewriting
 // it. Every removal is logged, never silent.
-func (m *WorkspaceMerger) removeProtectedChanges(ctx context.Context, expertPath string) {
-	if m.protectedPath == nil {
+func (m *WorkspaceMerger) removeProtectedChanges(ctx context.Context, expertPath, workflowID string) {
+	// Only THIS workflow's predicate may delete this expert's work. A nil
+	// predicate means nothing is protected (scratch), which is the common case.
+	protected := m.protectedFor(workflowID)
+	if protected == nil {
 		return
 	}
 
 	for _, rel := range m.dirtyFiles(ctx, expertPath) {
-		if !m.protectedPath(ctx, rel) {
+		if !protected(ctx, rel) {
 			continue
 		}
 		target := filepath.Join(expertPath, filepath.FromSlash(rel))
@@ -250,13 +300,13 @@ func (m *WorkspaceMerger) dirtyFiles(ctx context.Context, workspacePath string) 
 // the harness had any history at all depended on how many experts happened to
 // be in the wave. The §18 export pushes main/'s history; "depends on the
 // roster" is not an acceptable answer to "is there history".
-func (m *WorkspaceMerger) copyToMain(ctx context.Context, workflowWorkspace, expertID string) error {
+func (m *WorkspaceMerger) copyToMain(ctx context.Context, workflowWorkspace, expertID, workflowID string) error {
 	expertPath := filepath.Join(workflowWorkspace, expertID)
 	mainPath := filepath.Join(workflowWorkspace, "main")
 	if err := ensureGitRepo(ctx, mainPath); err != nil {
 		return fmt.Errorf("prepare main workspace: %w", err)
 	}
-	if err := m.rsyncToMain(ctx, expertPath, mainPath); err != nil {
+	if err := m.rsyncToMain(ctx, expertPath, mainPath, workflowID); err != nil {
 		return err
 	}
 	return m.commitMerge(ctx, mainPath, 1)

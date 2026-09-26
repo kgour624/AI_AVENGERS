@@ -65,11 +65,12 @@ func TestRemoveProtectedChangesDropsOnlyUnapprovedEdits(t *testing.T) {
 	dir := newExpertWorkspace(t)
 
 	merger := NewWorkspaceMerger(zap.NewNop())
-	merger.SetProtectedPathChecker(func(_ context.Context, path string) bool {
+	const workflowID = "11111111-1111-1111-1111-111111111111"
+	merger.SetProtectedPathChecker(workflowID, func(_ context.Context, path string) bool {
 		return path == "protected.go"
 	})
 
-	merger.removeProtectedChanges(context.Background(), dir)
+	merger.removeProtectedChanges(context.Background(), dir, workflowID)
 
 	if _, err := os.Stat(filepath.Join(dir, "approved.go")); err != nil {
 		t.Fatalf("approved file was removed: %v", err)
@@ -84,11 +85,60 @@ func TestRemoveProtectedChangesIsNoOpWithoutChecker(t *testing.T) {
 	dir := newExpertWorkspace(t)
 
 	// No checker installed = the scratch behaviour, which must not touch files.
-	NewWorkspaceMerger(zap.NewNop()).removeProtectedChanges(context.Background(), dir)
+	NewWorkspaceMerger(zap.NewNop()).removeProtectedChanges(context.Background(), dir, "some-workflow")
 
 	for _, name := range []string{"approved.go", "protected.go"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Fatalf("%s must survive when nothing is protected: %v", name, err)
+		}
+	}
+}
+
+// One workflow's protection must never delete another workflow's work. This is
+// the regression that made a scratch run lose the files its experts produced:
+// the merger is a single shared instance, an existing-codebase workflow had
+// installed its predicate, and the scratch workflow installed nothing, so it
+// inherited a predicate written for a different repository.
+func TestProtectedPathsDoNotLeakBetweenWorkflows(t *testing.T) {
+	gitAvailable(t)
+	dir := newExpertWorkspace(t)
+
+	merger := NewWorkspaceMerger(zap.NewNop())
+
+	// An existing-codebase workflow installs protection for its own ID...
+	const codebaseWorkflow = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	merger.SetProtectedPathChecker(codebaseWorkflow, func(_ context.Context, path string) bool {
+		return path == "protected.go"
+	})
+
+	// ...and a different (scratch) workflow, which has nothing to protect, must
+	// clear its own entry rather than inherit that predicate.
+	const scratchWorkflow = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	merger.SetProtectedPathChecker(scratchWorkflow, nil)
+
+	merger.removeProtectedChanges(context.Background(), dir, scratchWorkflow)
+
+	for _, name := range []string{"approved.go", "protected.go"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s was deleted for a workflow that never protected it: %v", name, err)
+		}
+	}
+
+	// The other workflow's own rules are untouched by that.
+	if merger.protectedFor(codebaseWorkflow) == nil {
+		t.Fatal("clearing one workflow's protection removed another's")
+	}
+}
+
+func TestWorkflowIDFromWorkspace(t *testing.T) {
+	cases := map[string]string{
+		"/workspaces/abc-123":  "abc-123",
+		"/workspaces/abc-123/": "abc-123",
+		"C:/ws/abc-123":        "abc-123",
+	}
+	for in, want := range cases {
+		if got := workflowIDFromWorkspace(in); got != want {
+			t.Fatalf("workflowIDFromWorkspace(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
