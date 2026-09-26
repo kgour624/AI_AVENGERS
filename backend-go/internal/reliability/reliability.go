@@ -1,21 +1,24 @@
 // Package reliability owns C10: reliability-as-a-product.
 //
 // WHY a dedicated package:
-//   SLO targets, the public /status surface and the audit-grade event log are
-//   one cohesive concern ("what do we promise and did we keep it"). Keeping
-//   the SLI math here (pure + tested) and the audit writes here means the
-//   public and admin surfaces are views over the same computation, not two
-//   divergent implementations.
+//
+//	SLO targets, the public /status surface and the audit-grade event log are
+//	one cohesive concern ("what do we promise and did we keep it"). Keeping
+//	the SLI math here (pure + tested) and the audit writes here means the
+//	public and admin surfaces are views over the same computation, not two
+//	divergent implementations.
 //
 // DESIGN (§3.1, C10): non-determinism is the job — the harness shifts the
-//   probability mass. This package makes the promise explicit (published
-//   targets + error budget), observable (live SLI snapshot + dependency
-//   probes) and auditable (append-only slo_events). It does not invent
-//   reliability: it reports what the existing observability counters and
-//   dependency health checks already say.
+//
+//	probability mass. This package makes the promise explicit (published
+//	targets + error budget), observable (live SLI snapshot + dependency
+//	probes) and auditable (append-only slo_events). It does not invent
+//	reliability: it reports what the existing observability counters and
+//	dependency health checks already say.
 //
 // FAIL-SAFE: dependency probes are time-bounded; an audit-write failure is
-//   logged, never surfaced (reliability reporting must not break serving).
+//
+//	logged, never surfaced (reliability reporting must not break serving).
 package reliability
 
 import (
@@ -396,8 +399,19 @@ func ErrorBudgetRemaining(errorRate, target float64) float64 {
 	if allowed <= 0 {
 		return 1.0
 	}
-	return 1.0 - (errorRate / allowed)
+	remaining := 1.0 - (errorRate / allowed)
+	// Binary floats make "exactly at budget" land at ±1e-16 instead of 0 because
+	// 1-0.995 is not representable. Snap that noise to zero so the reported
+	// boundary is the real one, not a floating-point artefact.
+	if remaining > -epsilon && remaining < epsilon {
+		return 0
+	}
+	return remaining
 }
+
+// epsilon is the budget-noise band: far below any real error-rate difference,
+// far above the ~1e-16 rounding error of the subtraction above.
+const epsilon = 1e-9
 
 // Verdict maps traffic + remaining budget to a status. Pure: no traffic →
 // unknown (never a false "ok").

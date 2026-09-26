@@ -29,7 +29,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/config"
 	"ai_avengers/backend/internal/eval"
+	"ai_avengers/backend/internal/gateway"
 )
 
 type suiteList []string
@@ -45,10 +47,14 @@ func main() {
 	var promoteBaseline bool
 	var tolerance float64
 	var model string
+	var judgeEnabled bool
+	var judgeFloor float64
 	flag.Var(&suites, "suite", "golden set name (repeatable; default = all embedded)")
 	flag.BoolVar(&promoteBaseline, "baseline", false, "promote this run as the suite baseline after a clean pass")
 	flag.Float64Var(&tolerance, "tolerance", 0.05, "max allowed score drop vs baseline before regression")
 	flag.StringVar(&model, "model", os.Getenv("LLM_MODEL_STRONG"), "model label recorded on the run")
+	flag.BoolVar(&judgeEnabled, "judge", false, "LAYER the LLM judge on top of the deterministic scorer (off by default; needs LLM_* config and costs one model call per case)")
+	flag.Float64Var(&judgeFloor, "judge-floor", 0.6, "minimum judge score (0-1) for the judge component to pass")
 	flag.Parse()
 
 	baseURL := strings.TrimSpace(os.Getenv("EVAL_BASE_URL"))
@@ -97,6 +103,21 @@ func main() {
 	}
 	store := eval.NewStore(pool)
 	runner := eval.NewRunner(model, logger)
+
+	// T3: the judge is layered, not substituted. Off by default so CI stays
+	// deterministic and free; when enabled it needs the same LLM config the
+	// server uses, so a missing key fails loudly here rather than silently
+	// skipping every judgement.
+	if judgeEnabled {
+		cfg, cfgErr := config.Load()
+		if cfgErr != nil {
+			fmt.Fprintln(os.Stderr, "judge: load LLM config:", cfgErr)
+			os.Exit(1)
+		}
+		modelGateway := gateway.NewModelGateway(cfg.LLM, logger)
+		runner.WithJudge(eval.NewModelJudge(modelGateway, judgeFloor, logger))
+		fmt.Printf("== LLM judge enabled (floor=%.2f) ==\n", judgeFloor)
+	}
 
 	failed := false
 	for _, name := range suites {

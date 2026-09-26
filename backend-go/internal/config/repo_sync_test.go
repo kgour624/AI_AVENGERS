@@ -35,3 +35,26 @@ func TestRepoSyncIntervalHours(t *testing.T) {
 		})
 	}
 }
+
+func TestFreshnessScanIntervalHours(t *testing.T) {
+	tests := []struct {
+		name        string
+		set         bool
+		value, want int
+	}{
+		{name: "unset defaults daily", want: 24},
+		{name: "zero disables", set: true, value: 0, want: 0},
+		{name: "explicit interval", set: true, value: 12, want: 12},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			v := viper.New()
+			if tc.set {
+				v.Set("FRESHNESS_SCAN_INTERVAL_HOURS", tc.value)
+			}
+			if got := freshnessScanIntervalHours(v); got != tc.want {
+				t.Fatalf("interval=%d want=%d", got, tc.want)
+			}
+		})
+	}
+}

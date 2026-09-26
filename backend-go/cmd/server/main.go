@@ -532,9 +532,38 @@ func buildRouter(
 	// I2: capability measurement. The retriever is the SAME assembler the chat and
 	// workflow paths use, so the score reflects production retrieval rather than a
 	// private copy that could drift away from it.
-	adminHandler.SetCapabilityEvaluator(
-		training.NewCapabilityEvaluator(postgres.Pool, modelGateway, contextAssembler, logger),
-	)
+	capabilityEvaluator := training.NewCapabilityEvaluator(postgres.Pool, modelGateway, contextAssembler, logger)
+	adminHandler.SetCapabilityEvaluator(capabilityEvaluator)
+
+	// T2: scheduled knowledge freshness sweep. It refreshes the deterministic
+	// staleness signals and, for experts whose corpus changed since their last
+	// completed measurement, starts at MOST ONE capability re-measure per sweep,
+	// so a nightly job cannot fan out into an unbounded number of model calls.
+	if freshnessSvc != nil && cfg.Freshness.ScanIntervalHours > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Duration(cfg.Freshness.ScanIntervalHours) * time.Hour)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					scanCtx, cancel := context.WithTimeout(ctx, 30*time.Minute)
+					err := freshnessSvc.ScanAndMeasureAll(scanCtx, func(runCtx context.Context, expertID uuid.UUID) error {
+						_, evalErr := capabilityEvaluator.RunEval(runCtx, expertID, training.CapabilityEvalRequest{Topics: 10, TopK: 5})
+						return evalErr
+					})
+					cancel()
+					if err != nil {
+						logger.Warn("scheduled freshness scan failed", zap.Error(err))
+					}
+				}
+			}
+		}()
+		logger.Info("knowledge freshness scheduler enabled", zap.Int("interval_hours", cfg.Freshness.ScanIntervalHours))
+	} else if freshnessSvc != nil {
+		logger.Info("knowledge freshness scheduler disabled (FRESHNESS_SCAN_INTERVAL_HOURS=0)")
+	}
 
 	// I4: concept relationships. ONE instance serves both uses — the admin endpoints
 	// that build and read the graph, and retrieval expansion, which reads neighbours of
@@ -994,6 +1023,7 @@ func buildRouter(
 		adminGroup.GET("/experts/:id/versions", adminHandler.ListExpertVersions)
 		adminGroup.POST("/experts/:id/versions/snapshot", adminHandler.SnapshotExpertVersion)
 		adminGroup.POST("/experts/:id/versions/:versionId/pin", adminHandler.PinExpertVersion)
+		adminGroup.POST("/experts/:id/versions/:versionId/rollback", adminHandler.RollbackExpertVersion)
 		adminGroup.GET("/experts/:id/drift", adminHandler.ListExpertDrift)
 		adminGroup.POST("/experts/:id/drift/:driftId/ack", adminHandler.AcknowledgeExpertDrift)
 		// C3: evaluation harness run view + baseline promote.

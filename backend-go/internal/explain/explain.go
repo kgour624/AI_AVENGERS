@@ -1,13 +1,14 @@
 // Package explain owns C9: the "why this answer" explainability surface.
 //
 // WHY a dedicated package:
-//   An explanation is a VIEW over stored facts — never a new LLM narration
-//   (§3.1, C9 design). The facts already live in two places: the `messages`
-//   row (decision mode, gate stopped, coverage, judge score, refusal reason,
-//   warning/questions, citations) and the C1 provenance record (signed chain,
-//   B8 claim→evidence reports, model, signature). This package joins them into
-//   one deterministic DTO so trust/debugging does not depend on a fragile or
-//   hallucination-prone summary call.
+//
+//	An explanation is a VIEW over stored facts — never a new LLM narration
+//	(§3.1, C9 design). The facts already live in two places: the `messages`
+//	row (decision mode, gate stopped, coverage, judge score, refusal reason,
+//	warning/questions, citations) and the C1 provenance record (signed chain,
+//	B8 claim→evidence reports, model, signature). This package joins them into
+//	one deterministic DTO so trust/debugging does not depend on a fragile or
+//	hallucination-prone summary call.
 //
 // AUTHORIZATION: a caller may only explain their own chat's message. Ownership
 // is a client_id match AND the C4 tenant assertion on the chat's project
@@ -259,7 +260,11 @@ func parseSources(raw json.RawMessage) []SourceRef {
 	if len(raw) == 0 {
 		return out
 	}
-	_ = json.Unmarshal(raw, &out)
+	if err := json.Unmarshal(raw, &out); err != nil || out == nil {
+		// JSON "null" (and any decode failure) leaves out nil; the contract is a
+		// non-nil empty slice so callers never have to nil-check citations.
+		return []SourceRef{}
+	}
 	return out
 }
 

@@ -320,8 +320,9 @@ func (e *CapabilityEvaluator) RunEval(ctx context.Context, expertID uuid.UUID, r
 func (e *CapabilityEvaluator) createRun(ctx context.Context, expertID uuid.UUID, topK int, graphExpansion, layerPreference bool) (uuid.UUID, error) {
 	var runID uuid.UUID
 	if err := e.db.QueryRow(ctx, `
-		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k, graph_expansion, layer_preference)
-		VALUES ($1, 'running', $2, $3, $4)
+		INSERT INTO expert_capability_eval_runs (expert_id, status, top_k, graph_expansion, layer_preference, corpus_updated_at)
+		VALUES ($1, 'running', $2, $3, $4,
+		        (SELECT MAX(created_at) FROM course_chunks WHERE expert_id=$1))
 		RETURNING id`, expertID, topK, graphExpansion, layerPreference).Scan(&runID); err != nil {
 		return uuid.Nil, fmt.Errorf("capability eval: create run: %w", err)
 	}

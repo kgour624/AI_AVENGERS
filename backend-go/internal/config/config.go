@@ -94,6 +94,10 @@ type FreshnessConfig struct {
 	// MaxCorpusAgeDays: newest chunk older than this → stale_corpus.
 	// Default 180.
 	MaxCorpusAgeDays int
+	// ScanIntervalHours: 0 disables the scheduled scan; unset defaults to
+	// 24h. The periodic sweep refreshes staleness signals and re-measures at
+	// most one stale expert's capability per run.
+	ScanIntervalHours int
 }
 
 // TenantConfig controls C4 tenant isolation.
@@ -311,6 +315,16 @@ func repoSyncIntervalHours(v *viper.Viper) int {
 	return v.GetInt("REPO_SYNC_INTERVAL_HOURS")
 }
 
+// freshnessScanIntervalHours reads the T2 scheduled knowledge scan period.
+// Unset → 24h (a daily sweep is enough for freshness). An EXPLICIT 0 disables
+// the schedule — a different statement from "no opinion" and honoured.
+func freshnessScanIntervalHours(v *viper.Viper) int {
+	if !v.IsSet("FRESHNESS_SCAN_INTERVAL_HOURS") {
+		return 24
+	}
+	return v.GetInt("FRESHNESS_SCAN_INTERVAL_HOURS")
+}
+
 func Load() (*Config, error) {
 	v := viper.New()
 
@@ -429,8 +443,9 @@ func Load() (*Config, error) {
 			IsolationEnabled: true, // C4 default on; overridden below if env set
 		},
 		Freshness: FreshnessConfig{
-			Enabled:          true, // C6 default on; overridden below if env set
-			MaxCorpusAgeDays: v.GetInt("FRESHNESS_MAX_CORPUS_AGE_DAYS"),
+			Enabled:           true, // C6 default on; overridden below if env set
+			MaxCorpusAgeDays:  v.GetInt("FRESHNESS_MAX_CORPUS_AGE_DAYS"),
+			ScanIntervalHours: freshnessScanIntervalHours(v),
 		},
 		Debate: DebateConfig{
 			Enabled: true, // C7 default on; overridden below if env set

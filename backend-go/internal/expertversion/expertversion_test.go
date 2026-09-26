@@ -22,7 +22,7 @@ func TestJaccardDistance(t *testing.T) {
 	}{
 		{"identical", []string{"a", "b"}, []string{"a", "b"}, 0},
 		{"disjoint", []string{"a"}, []string{"b"}, 1},
-		{"half", []string{"a", "b"}, []string{"a", "c"}, 0.5}, // inter1 union3
+		{"half", []string{"a", "b"}, []string{"a", "c"}, 2.0 / 3.0}, // inter1 union3 -> 1-1/3
 		{"both empty", nil, nil, 0},
 		{"one empty", []string{"a"}, nil, 1},
 	}

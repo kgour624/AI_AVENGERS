@@ -6,9 +6,10 @@
 // corpus/charter change can be flagged for re-eval (C3) before promotion.
 //
 // A Version is an immutable snapshot: hashes (corpus + charter), the
-// declared capability snapshot, and the charter text — enough to pin a
-// canonical version and roll the charter back without re-ingesting. Full
-// corpus rollback needs the original transcripts and is deferred.
+// declared capability snapshot, and the charter text. As of T4 a snapshot
+// also stores the actual chunk rows (expert_version_chunks), so Rollback can
+// restore the exact corpus — not just the charter — without the original
+// transcripts.
 //
 // All writes are best-effort at the call sites (an ingest must not fail
 // because versioning did) — the same fail-open policy as C1/B6/B8.
@@ -176,6 +177,26 @@ func (s *Service) Snapshot(ctx context.Context, expertID uuid.UUID, source, note
 		return nil, fmt.Errorf("expertversion: insert: %w", err)
 	}
 
+	// T4: capture the corpus rows so this version can be restored later.
+	// Best-effort like every other write here — an ingest must not fail because
+	// the snapshot copy did. Rollback fails loudly when a version has no stored
+	// corpus, so a missed copy surfaces at rollback time instead of silently.
+	if _, copyErr := s.db.Exec(ctx,
+		`INSERT INTO expert_version_chunks
+		     (version_id, expert_id, chunk_index, chunk_text, topic, subtopic,
+		      source_file, embedding, embedding_provider, embedding_model)
+		 SELECT $1, expert_id, chunk_index, chunk_text, topic, subtopic,
+		        source_file, embedding, embedding_provider, embedding_model
+		   FROM course_chunks
+		  WHERE expert_id = $2`,
+		v.ID, expertID,
+	); copyErr != nil {
+		s.logger.Warn("expertversion: could not capture corpus for version (rollback for this version will be unavailable)",
+			zap.String("expert_id", expertID.String()),
+			zap.String("version_id", v.ID.String()),
+			zap.Error(copyErr))
+	}
+
 	// Drift vs the previous active version (same corpus/charter families).
 	if prev != nil {
 		s.recordDrift(ctx, expertID, prev, v)
@@ -254,6 +275,88 @@ func (s *Service) Pin(ctx context.Context, expertID, versionID uuid.UUID) (*Vers
 		`UPDATE experts
 		 SET reasoning_charter=$1, clarification_charter=$2, updated_at=NOW()
 		 WHERE id=$3 AND deleted_at IS NULL`,
+		v.ReasoningCharter, string(v.ClarificationCharter), expertID,
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	v.IsActive = true
+	return v, nil
+}
+
+// Rollback restores the expert's corpus AND charter to a stored version and
+// marks that version active. It is the full counterpart to Pin, which only
+// rolls the charter back.
+//
+// WHY a hard failure on an empty snapshot: a version captured before T4 (or one
+// whose corpus copy failed) has no stored chunks. Deleting the live corpus and
+// replacing it with nothing would destroy knowledge silently, so the method
+// refuses instead. Everything runs in one transaction, so a mid-restore failure
+// leaves the corpus exactly as it was.
+func (s *Service) Rollback(ctx context.Context, expertID, versionID uuid.UUID) (*Version, error) {
+	if !s.Enabled() {
+		return nil, nil
+	}
+	v, err := s.getVersion(ctx, expertID, versionID)
+	if err != nil {
+		return nil, err
+	}
+	if v == nil {
+		return nil, nil
+	}
+
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var stored int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM expert_version_chunks WHERE version_id=$1`, versionID,
+	).Scan(&stored); err != nil {
+		return nil, fmt.Errorf("expertversion: count stored corpus: %w", err)
+	}
+	if stored == 0 {
+		return nil, fmt.Errorf("expertversion: version %d has no stored corpus to roll back to", v.VersionNumber)
+	}
+
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM course_chunks WHERE expert_id=$1`, expertID,
+	); err != nil {
+		return nil, fmt.Errorf("expertversion: clear corpus: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO course_chunks
+		     (expert_id, chunk_index, chunk_text, topic, subtopic, source_file,
+		      embedding, embedding_provider, embedding_model)
+		 SELECT expert_id, chunk_index, chunk_text, topic, subtopic, source_file,
+		        embedding, embedding_provider, embedding_model
+		   FROM expert_version_chunks
+		  WHERE version_id=$1
+		  ORDER BY chunk_index`,
+		versionID,
+	); err != nil {
+		return nil, fmt.Errorf("expertversion: restore corpus: %w", err)
+	}
+
+	// Canonical version + charter, same as Pin.
+	if _, err := tx.Exec(ctx,
+		`UPDATE expert_versions SET is_active=FALSE WHERE expert_id=$1 AND is_active`, expertID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE expert_versions SET is_active=TRUE WHERE id=$1`, versionID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE experts
+		    SET reasoning_charter=$1, clarification_charter=$2, updated_at=NOW()
+		  WHERE id=$3 AND deleted_at IS NULL`,
 		v.ReasoningCharter, string(v.ClarificationCharter), expertID,
 	); err != nil {
 		return nil, err

@@ -1327,6 +1327,41 @@ func (h *AdminHandler) PinExpertVersion(c *gin.Context) {
 	response.OK(c, v)
 }
 
+// RollbackExpertVersion POST /admin/experts/:id/versions/:versionId/rollback
+// Restores the expert's full corpus AND charter to the stored version.
+func (h *AdminHandler) RollbackExpertVersion(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	versionID, err := uuid.Parse(c.Param("versionId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid version ID")
+		return
+	}
+	if h.versions == nil {
+		response.InternalError(c)
+		return
+	}
+	v, err := h.versions.Rollback(c.Request.Context(), expertID, versionID)
+	if err != nil {
+		h.logger.Error("rollback expert version failed",
+			zap.String("expert_id", expertID.String()),
+			zap.String("version_id", versionID.String()),
+			zap.Error(err))
+		// A version captured without a stored corpus cannot be restored; that is
+		// a client-actionable state, not a server fault.
+		response.BadRequest(c, "ROLLBACK_UNAVAILABLE", err.Error())
+		return
+	}
+	if v == nil {
+		response.NotFound(c, "expert version")
+		return
+	}
+	response.OK(c, v)
+}
+
 // ListExpertDrift GET /admin/experts/:id/drift
 func (h *AdminHandler) ListExpertDrift(c *gin.Context) {
 	expertID, err := uuid.Parse(c.Param("id"))
