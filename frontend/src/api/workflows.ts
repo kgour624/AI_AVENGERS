@@ -24,6 +24,8 @@ export interface Workflow {
   // inside a connected client repository, where the readable files are a
   // human-approved working set.
   mode: 'scratch' | 'existing_codebase'
+  /** True when this workflow was asked to produce working code as well. */
+  deliverCode?: boolean
   // failureReason: why the workflow stopped, set only when status === 'failed'.
   // The engine has always recorded it; the read API did not return it, so the
   // screen could show a FAILED badge and nothing else.
@@ -90,6 +92,12 @@ export const createWorkflow = (req: {
   requirementText?: string
   /** Omitted or 'scratch' keeps the original behaviour. */
   mode?: 'scratch' | 'existing_codebase'
+  /**
+   * deliverCode asks the implementation phase for working code as well as the
+   * design documents. Omitted/false is the design-only path (§9), which is what
+   * every workflow did before this option existed.
+   */
+  deliverCode?: boolean
 }) =>
   baseAPI
     .post<ApiResponse<Workflow>>('/api/v1/workflows', req)

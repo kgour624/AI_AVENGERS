@@ -734,6 +734,12 @@ func (r *WorkflowRunner) executeWaves(
 		r.workspaceMerger.SetProtectedPathChecker(workflowID.String(), checker)
 	}
 
+	// G8: read the workflow's code request once, here, rather than on every task.
+	// executeWaves is a separate method from Run, so the workflow it belongs to is
+	// not in scope — and one query per phase is cheaper than threading a parameter
+	// through every call site for a boolean.
+	deliverCode := r.workflowDeliverCode(ctx, workflowID)
+
 	// A phase with no tasks cannot be "done". Without this the wave loop below
 	// simply does not execute, executeWaves returns nil, and the phase passes as
 	// a success having called no expert — the shape of a workflow that reaches
@@ -958,7 +964,16 @@ func (r *WorkflowRunner) executeWaves(
 							TaskDescription: t.Description,
 							WorkflowPhase:   state.Phase,
 						}
-						result, err := r.authoringRunner.Run(ctx, reqSpec)
+						// G8: a workflow that asked for working code runs the code
+						// runner here instead of the authoring one. WHY only this
+						// phase differs: §9 made design authoring the implementation
+						// phase's output, and the rest of the pipeline already
+						// speaks code_artifact_produced, so nothing else needs a
+						// special case. The code runner fails loudly when it
+						// produces nothing, so asking for code and getting none
+						// fails the task with a reason instead of quietly shipping
+						// design documents under a promise of code.
+						completed, detail, err := r.runImplementationTask(ctx, reqSpec, deliverCode)
 						if err != nil {
 							recordFailure(err.Error())
 							r.logger.Error("runner: authoring task failed",
@@ -973,10 +988,10 @@ func (r *WorkflowRunner) executeWaves(
 							errMu.Unlock()
 						} else {
 							recordSuccess(nil)
-							r.logger.Info("runner: authoring task completed",
+							r.logger.Info("runner: implementation task completed",
 								zap.String("expert", expert.Name),
-								zap.String("section", result.SectionPath),
-								zap.Bool("completed", result.Completed),
+								zap.String("produced", detail),
+								zap.Bool("completed", completed),
 							)
 							errMu.Lock()
 							state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
@@ -1564,6 +1579,54 @@ func (r *WorkflowRunner) producedWork(ctx context.Context, workflowID uuid.UUID)
 		return 0, err
 	}
 	return len(events), nil
+}
+
+// workflowDeliverCode reports whether this workflow asked for working code.
+//
+// A read failure returns false, which is the design-only path: the safer direction
+// is the behaviour the system had before the option existed, not a sudden attempt
+// to write code because a query failed.
+func (r *WorkflowRunner) workflowDeliverCode(ctx context.Context, workflowID uuid.UUID) bool {
+	if r.db == nil {
+		return false
+	}
+	var deliver bool
+	if err := r.db.QueryRow(ctx,
+		`SELECT deliver_code FROM workflows WHERE id = $1`, workflowID,
+	).Scan(&deliver); err != nil {
+		r.logger.Warn("runner: could not read deliver_code — defaulting to design only",
+			zap.String("workflow_id", workflowID.String()),
+			zap.Error(err),
+		)
+		return false
+	}
+	return deliver
+}
+
+// runImplementationTask runs one implementation task with the runner the workflow
+// asked for, and reports a one-line detail for the log.
+//
+// WHY a helper rather than two copies of the surrounding bookkeeping: the failure
+// path (record the attempt, mark the expert failed, remember the first error) and
+// the success path are identical for both runners. Duplicating them would let the
+// two drift in exactly the place where drifting loses work.
+func (r *WorkflowRunner) runImplementationTask(
+	ctx context.Context,
+	req AiderRunRequest,
+	deliverCode bool,
+) (completed bool, detail string, err error) {
+	if deliverCode {
+		res, runErr := r.aiderRunner.Run(ctx, req)
+		if runErr != nil {
+			return false, "", runErr
+		}
+		return res.Completed, fmt.Sprintf("%d commit(s) of working code", len(res.CommitSHAs)), nil
+	}
+	res, runErr := r.authoringRunner.Run(ctx, req)
+	if runErr != nil {
+		return false, "", runErr
+	}
+	return res.Completed, "design section: " + res.SectionPath, nil
 }
 
 // buildPlanContent builds the task_plan_ready event content.

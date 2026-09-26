@@ -46,7 +46,7 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 		        phase_started_at, phase_completed_at,
 		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		        cost_soft_limit_pct, cost_hard_limit_pct,
-		        generic_allowance_pct, mode, failure_reason,
+		        generic_allowance_pct, mode, deliver_code, failure_reason,
 		        created_at, updated_at
 		 FROM workflows
 		 WHERE client_id = $1
@@ -70,7 +70,7 @@ func (h *Handler) ListWorkflows(c *gin.Context) {
 			&w.PhaseStartedAt, &w.PhaseCompletedAt,
 			&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 			&w.CostSoftLimitPct, &w.CostHardLimitPct,
-			&w.GenericAllowancePct, &w.Mode, &w.FailureReason,
+			&w.GenericAllowancePct, &w.Mode, &w.DeliverCode, &w.FailureReason,
 			&w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
 			continue
@@ -102,6 +102,10 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 		// Mode selects the environment (3D). Empty means scratch, so existing
 		// clients are unaffected.
 		Mode string `json:"mode"`
+		// DeliverCode asks for working code as well as the design documents.
+		// Absent/false = design only, which is what every workflow did before this
+		// option existed.
+		DeliverCode bool `json:"deliver_code"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -123,6 +127,7 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 		SelectedExpertIDs: req.SelectedExpertIDs,
 		CostBudgetUSD:     req.CostBudgetUSD,
 		Mode:              req.Mode,
+		DeliverCode:       req.DeliverCode,
 	})
 	if err != nil {
 		h.logger.Error("create workflow failed", zap.Error(err))
