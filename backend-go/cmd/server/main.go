@@ -306,8 +306,8 @@ func main() {
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
 		Handler:      router,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 120 * time.Second, // Long for SSE streaming
-		IdleTimeout:  120 * time.Second,
+		WriteTimeout: 1800 * time.Second, // Increased to 30 mins for deep thinking SSE streaming
+		IdleTimeout:  1800 * time.Second,
 	}
 
 	// Start server in goroutine
