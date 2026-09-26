@@ -96,7 +96,16 @@ func join(v []string) string {
 // A phase with no requirement (empty Kind) selects nobody, so an unknown phase
 // cannot fall back to "all experts".
 func SelectForPhase(phase string, experts []Expert, language string) ([]Expert, error) {
-	req := RequirementForPhase(phase, language)
+	return SelectFor(RequirementForPhase(phase, language), experts, phase)
+}
+
+// SelectFor matches experts against an EXPLICIT requirement.
+//
+// WHY this exists separately: phase names are a workflow detail, and a caller
+// that reads the phase->capability mapping from configuration (so a new phase or
+// domain needs no code change) still needs the same strict matching rules. All
+// matching lives here, so the rules cannot drift between the two entry points.
+func SelectFor(req Requirement, experts []Expert, phaseLabel string) ([]Expert, error) {
 	if req.Kind == KindUnclassified {
 		return nil, nil
 	}
@@ -121,7 +130,7 @@ func SelectForPhase(phase string, experts []Expert, language string) ([]Expert, 
 		matched = append(matched, e)
 	}
 	if len(matched) == 0 {
-		return nil, &MissingExpertError{Phase: phase, Requirement: req, Have: have}
+		return nil, &MissingExpertError{Phase: phaseLabel, Requirement: req, Have: have}
 	}
 	return matched, nil
 }

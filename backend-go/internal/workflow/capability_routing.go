@@ -78,7 +78,19 @@ func (r *WorkflowRunner) expertsForPhase(
 		})
 	}
 
-	matched, err := capability.SelectForPhase(phase, in, language)
+	// Requirement from configuration when declared, else the built-in default.
+	kinds, aliases := r.capabilityOverrides(ctx)
+	req := capability.RequirementForPhase(phase, language)
+	if kind, ok := kinds[phase]; ok && kind != capability.KindUnclassified {
+		req.Kind = kind
+	}
+	if aliases != nil && req.Language != "" {
+		if folded, ok := aliases[req.Language]; ok {
+			req.Language = folded
+		}
+	}
+
+	matched, err := capability.SelectFor(req, in, phase)
 	if err != nil {
 		return nil, err
 	}
@@ -120,4 +132,41 @@ func wavesForExperts(waves []ExecutionWave, experts []workflowExpert) []Executio
 		}
 	}
 	return out
+}
+
+// capabilityOverrides reads the OPTIONAL deployment overrides from
+// system_settings.capability_overrides:
+//
+//	{"phase_kinds": {"implementation": "implementation", "qa": "testing", "...": "..."},
+//	 "language_aliases": {"c#": "csharp", "kotlin": "kotlin"}}
+//
+// WHY: the built-in defaults (capability.RequirementForPhase, LanguageAliases)
+// keep the system working out of the box, but a new phase shape or a language
+// spelling must not require a code change. Anything unset falls back to the
+// defaults, so an empty or missing row changes nothing.
+func (r *WorkflowRunner) capabilityOverrides(ctx context.Context) (map[string]capability.Kind, map[string]string) {
+	kinds := map[string]capability.Kind{}
+	aliases := map[string]string{}
+
+	var raw string
+	if err := r.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'capability_overrides'`,
+	).Scan(&raw); err != nil {
+		return kinds, aliases
+	}
+
+	var cfg struct {
+		PhaseKinds      map[string]string `json:"phase_kinds"`
+		LanguageAliases map[string]string `json:"language_aliases"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return kinds, aliases
+	}
+	for phase, kind := range cfg.PhaseKinds {
+		kinds[phase] = capability.Kind(strings.ToLower(strings.TrimSpace(kind)))
+	}
+	for from, to := range cfg.LanguageAliases {
+		aliases[capability.NormName(from)] = capability.LanguageAliases(to)
+	}
+	return kinds, aliases
 }
