@@ -217,42 +217,21 @@ func (c *DepthClassifier) ClassifyWithProgress(
 			texts = append(texts, p.Text)
 		}
 
-		response, callErr := c.requestLayers(ctx, texts)
-		result.Calls++
-		if callErr != nil {
-			// One failed batch must not discard the batches that worked.
-			c.logger.Warn("depth layers: classification call failed",
-				zap.String("expert_id", expertID.String()),
-				zap.Error(callErr))
-			result.FailedBatches++
-			if onProgress != nil {
-				if progressErr := onProgress(DepthClassifyProgress{
-					Total: len(todo), Classified: result.Classified,
-					Calls: result.Calls, Rejected: result.Rejected,
-				}); progressErr != nil {
-					return result, fmt.Errorf("depth layers: persist progress after failed batch: %w", progressErr)
-				}
-			}
-			continue
-		}
-
-		layers, rejected, parseErr := parseDepthLayers(response, len(batch))
-		if parseErr != nil {
-			c.logger.Warn("depth layers: unparseable response",
-				zap.String("expert_id", expertID.String()),
-				zap.Error(parseErr))
-			result.FailedBatches++
-			if onProgress != nil {
-				if progressErr := onProgress(DepthClassifyProgress{
-					Total: len(todo), Classified: result.Classified,
-					Calls: result.Calls, Rejected: result.Rejected,
-				}); progressErr != nil {
-					return result, fmt.Errorf("depth layers: persist progress after invalid response: %w", progressErr)
-				}
-			}
-			continue
-		}
+		// classifyBatch splits a failing batch in half and retries, so a batch
+		// the model cannot answer at 20 passages still yields its classifiable
+		// parts instead of failing all 20 chunks.
+		layers, rejected, calls, batchErr := c.classifyBatch(ctx, texts)
+		result.Calls += calls
 		result.Rejected += rejected
+		if batchErr != nil {
+			// One failed batch must not discard the batches that worked.
+			c.logger.Warn("depth layers: classification batch failed after split retries",
+				zap.String("expert_id", expertID.String()),
+				zap.Int("batch_size", len(batch)),
+				zap.Int("recovered", len(layers)),
+				zap.Error(batchErr))
+			result.FailedBatches++
+		}
 
 		for index, layer := range layers {
 			if _, err := c.db.Exec(ctx,
@@ -510,16 +489,68 @@ Passages:
 Return ONLY JSON, one entry per passage:
 {"layers":[{"n":1,"layer":2}]}`)
 
+	// 4096 (not 2048): a reasoning-style cheap model spends part of its budget on
+	// reasoning, and a 20-passage batch needs ~300 output tokens of JSON — the old
+	// 2048 could be consumed before any JSON was emitted, which is why every batch
+	// came back empty/truncated on such a provider.
 	resp, err := c.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
 		UserPrompt:  sb.String(),
-		MaxTokens:   2048,
+		MaxTokens:   4096,
 		Temperature: 0,
 	})
 	if err != nil {
 		return "", err
 	}
 	return resp.Content, nil
+}
+
+// classifyBatch labels one batch, and on failure SPLITS it in half and retries.
+//
+// WHY split instead of just failing the batch: a batch fails either because the
+// call errored (empty/truncated response) or the response was not parseable, and
+// both are more likely the larger the batch is. Retrying the whole batch re-fails
+// identically; halving it converges on the size the model can actually answer, so
+// a 20-passage batch degrades to a few small ones instead of losing all 20 chunks.
+// Recursion is bounded by the batch size (worst case: down to single passages).
+//
+// Returns layers keyed by index within texts, the number of rejected entries, the
+// model calls spent, and a non-nil error only when some part could not be
+// classified at all (any partial result is still returned so nothing good is lost).
+func (c *DepthClassifier) classifyBatch(ctx context.Context, texts []string) (map[int]int, int, int, error) {
+	response, err := c.requestLayers(ctx, texts)
+	if err == nil {
+		layers, rejected, parseErr := parseDepthLayers(response, len(texts))
+		if parseErr == nil {
+			return layers, rejected, 1, nil
+		}
+		err = parseErr
+	}
+	if len(texts) == 1 {
+		return nil, 0, 1, err
+	}
+	return c.splitBatch(ctx, texts, len(texts)/2, 1, err)
+}
+
+// splitBatch classifies the two halves and merges their results.
+func (c *DepthClassifier) splitBatch(ctx context.Context, texts []string, mid, calls int, firstErr error) (map[int]int, int, int, error) {
+	leftLayers, leftRejected, leftCalls, leftErr := c.classifyBatch(ctx, texts[:mid])
+	rightLayers, rightRejected, rightCalls, rightErr := c.classifyBatch(ctx, texts[mid:])
+	calls += leftCalls + rightCalls
+
+	merged := make(map[int]int, len(leftLayers)+len(rightLayers))
+	for index, layer := range leftLayers {
+		merged[index] = layer
+	}
+	for index, layer := range rightLayers {
+		merged[index+mid] = layer
+	}
+	rejected := leftRejected + rightRejected
+	if leftErr != nil || rightErr != nil {
+		// Report the first failure; merged still carries whatever succeeded.
+		return merged, rejected, calls, firstErr
+	}
+	return merged, rejected, calls, nil
 }
 
 // parseDepthLayers reads the model's answer into 0-based indexes.
