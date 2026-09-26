@@ -247,6 +247,10 @@ type sendMessageRequest struct {
 	// default — that would be one retrieval and one completion per participant
 	// per message.
 	ExpertID string `json:"expert_id"`
+	// FocusFile (optional): a produced file path the question is about. The
+	// file's real content is injected and its author answers, so the reply is
+	// about what was written rather than a guess from the file name.
+	FocusFile string `json:"focus_file"`
 }
 
 // Send POST /api/v1/workflow-chats/:cid/messages
@@ -274,7 +278,7 @@ func (h *ChatHandler) Send(c *gin.Context) {
 		expertID = &id
 	}
 
-	msg, err := h.svc.Send(c.Request.Context(), chatID, clientID, expertID, req.Message)
+	msg, err := h.svc.Send(c.Request.Context(), chatID, clientID, expertID, req.Message, req.FocusFile)
 	if err != nil {
 		h.respondErr(c, err, "send message")
 		return
