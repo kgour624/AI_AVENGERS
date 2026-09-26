@@ -220,6 +220,66 @@ function ApprovalGate({
         </div>
       </div>
 
+      {/* Traceability: did each artifact follow its parent completely, and what
+          did it add that the parent never asked for? Derived from the workflow's
+          own history, so no phase or domain names are hardcoded. */}
+      {(() => {
+        const reports = (blackboard?.events ?? [])
+          .filter((e) => e.eventType === 'traceability_checked')
+          .map((e) => ({ id: e.id, c: (e.content ?? {}) as Record<string, unknown> }))
+        if (reports.length === 0) return null
+        const arr = (v: unknown) => (Array.isArray(v) ? v.map((x) => String(x)) : [])
+        return (
+          <div className="mt-3 space-y-2">
+            <p className="text-[10px] font-semibold uppercase tracking-wider text-text-disabled">
+              Traceability — what followed its parent, and what did not
+            </p>
+            {reports.map(({ id, c }) => {
+              const out = arr(c.out_of_parent)
+              const missing = arr(c.uncovered_parent)
+              const pct = typeof c.coverage_pct === 'number' ? c.coverage_pct : null
+              return (
+                <div key={id} className="rounded border border-surface-border bg-surface-base/60 p-2">
+                  <p className="text-xs font-medium text-text-primary">
+                    {String(c.child_label ?? 'child')} ← {String(c.parent_label ?? 'parent')}
+                    {pct !== null && <span className="ml-2 text-text-disabled">{pct}% covered</span>}
+                  </p>
+                  {out.length > 0 && (
+                    <div className="mt-1">
+                      <span className="text-[11px] font-medium text-glow-amber">
+                        Flagged — not in the parent (you can remove these):
+                      </span>
+                      <ul className="ml-4 list-disc text-[11px] text-text-secondary">
+                        {out.map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {missing.length > 0 && (
+                    <div className="mt-1">
+                      <span className="text-[11px] font-medium text-mode-refuse">
+                        Not followed — parent items missing here:
+                      </span>
+                      <ul className="ml-4 list-disc text-[11px] text-text-secondary">
+                        {missing.map((x, i) => (
+                          <li key={i}>{x}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {out.length === 0 && missing.length === 0 && (
+                    <p className="mt-1 text-[11px] text-mode-advise">
+                      Fully followed its parent — nothing added outside, nothing missed.
+                    </p>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )
+      })()}
+
       {/* Understanding gate: EVERY expert's restatement, side by side.
           The workflow pauses here, so the client judges whether the team
           actually understood the requirement before any design is built on it.
