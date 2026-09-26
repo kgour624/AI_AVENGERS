@@ -96,6 +96,11 @@ type ModelGateway struct {
 	// C5 single choke point — every real (non-cached) call is recorded here,
 	// so a new caller cannot forget to attribute its cost.
 	usageRec usage.Recorder
+	// limitsMu guards limitsSnap, the cached read of llm_model_limits. The
+	// limits are enforced in Call/StreamCall — the same choke point as cost, so
+	// a new caller cannot spend tokens a limit was meant to cap.
+	limitsMu   sync.RWMutex
+	limitsSnap *modelLimitsSnapshot
 }
 
 // NewModelGateway creates a new model gateway.
@@ -303,13 +308,12 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 	// Returns (response, nil) on first success.
 	// Returns (nil, lastErr) if all attempts fail.
 	tryProvider := func(p LLMProvider) (*LLMResponse, error) {
-		maxTokens := req.MaxTokens
-		if maxTokens <= 0 {
-			maxTokens = 2000
-		}
-		if provMax := p.MaxTokens(req.Model); maxTokens > provMax {
-			maxTokens = provMax
-		}
+		// The ceiling: the admin's configured maximum when one is set, else the
+		// provider's own. See resolveCeiling for why the configured value wins
+		// even when it is larger.
+		limit, configured := g.resolveModelLimit(ctx, p.Name(), req.Model)
+		ceiling := resolveCeiling(p.MaxTokens(req.Model), limit.MaxOutputTokens)
+		maxTokens := effectiveOutputBudget(req.MaxTokens, ceiling)
 
 		var messages []ProviderMessage
 		if len(req.Messages) > 0 {
@@ -321,6 +325,18 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			messages = append(messages, ProviderMessage{Role: "user", Content: req.UserPrompt})
 		}
 
+		// Input guard (P3 fail-closed). Only when an input limit is configured:
+		// "not configured" means no opinion, and guessing a model's context
+		// window here would refuse requests the provider accepts today.
+		if configured && limit.MaxInputTokens > 0 {
+			if est := estimateMessagesTokens(messages); est > limit.MaxInputTokens {
+				return nil, fmt.Errorf(
+					"%w: model=%s estimated_input_tokens=%d max_input_tokens=%d — shorten the request, or raise the limit in Admin → LLM Settings",
+					ErrInputTooLong, p.Name(), est, limit.MaxInputTokens,
+				)
+			}
+		}
+
 		provReq := ProviderRequest{
 			ModelTier:   req.Model,
 			Messages:    messages,
@@ -329,6 +345,11 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 			EnableCache: req.UseCache,
 		}
 
+		// escalated: a reasoning model can spend the whole completion budget on
+		// thinking and return no visible text. Re-sending the SAME budget cannot
+		// help (which is why this used to give up immediately), but a larger one
+		// can — so escalate once to the ceiling before giving up.
+		escalated := false
 		var lastErr error
 		for attempt := 0; attempt < 3; attempt++ {
 			if attempt > 0 {
@@ -351,12 +372,25 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 				)
 				// Deterministic failure: the provider returned 200 but no usable
 				// content (typically a reasoning model whose completion budget
-				// was spent on reasoning). Re-sending the identical request
-				// cannot succeed — it only burns credits — so stop retrying.
-				// The fallback provider (when configured) still gets a turn.
+				// was spent on reasoning). An identical re-send cannot succeed,
+				// so stop retrying — but first spend the budget the caller never
+				// asked for, which is the difference between a plan and a
+				// workflow that dies at intake.
 				if errors.Is(err, providers.ErrEmptyContent) {
+					if !escalated && ceiling > provReq.MaxTokens {
+						escalated = true
+						lastErr = err
+						g.logger.Warn("LLM returned no visible text — retrying once with the full output budget",
+							zap.String("provider", p.Name()),
+							zap.Int("from_max_tokens", provReq.MaxTokens),
+							zap.Int("to_max_tokens", ceiling),
+						)
+						provReq.MaxTokens = ceiling
+						continue
+					}
 					g.logger.Warn("LLM call returned empty content — skipping retries (deterministic)",
 						zap.String("provider", p.Name()),
+						zap.Int("max_tokens", provReq.MaxTokens),
 					)
 					break
 				}
@@ -471,13 +505,22 @@ func (g *ModelGateway) GetStats() map[string]interface{} {
 func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan string, <-chan *LLMResponse, error) {
 	provider := g.getProvider(ctx)
 
-	maxTokens := req.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 2000
+	// Same ceiling rule as Call() — see resolveCeiling. No empty-content
+	// escalation here: a stream that already started cannot be re-sent as a
+	// different request without the caller losing whatever partial answer it
+	// already received.
+	limit, limitSet := g.resolveModelLimit(ctx, provider.Name(), req.Model)
+	if limitSet && limit.MaxInputTokens > 0 {
+		est := estimateTokens(req.SystemPrompt) + estimateTokens(req.UserPrompt)
+		if est > limit.MaxInputTokens {
+			return nil, nil, fmt.Errorf(
+				"%w: model=%s estimated_input_tokens=%d max_input_tokens=%d — shorten the request, or raise the limit in Admin → LLM Settings",
+				ErrInputTooLong, provider.Name(), est, limit.MaxInputTokens,
+			)
+		}
 	}
-	if provMax := provider.MaxTokens(req.Model); maxTokens > provMax {
-		maxTokens = provMax
-	}
+	ceiling := resolveCeiling(provider.MaxTokens(req.Model), limit.MaxOutputTokens)
+	maxTokens := effectiveOutputBudget(req.MaxTokens, ceiling)
 
 	var messages []ProviderMessage
 	if req.SystemPrompt != "" {

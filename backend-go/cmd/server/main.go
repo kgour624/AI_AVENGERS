@@ -990,6 +990,10 @@ func buildRouter(
 		// LLM provider + API key management (no env file needed)
 		adminGroup.GET("/llm-settings", adminHandler.GetLLMSettings)
 		adminGroup.POST("/llm-settings", adminHandler.UpdateLLMSettings)
+		// Per-model token limits. Static segments, so no clash with the
+		// /llm-settings route above.
+		adminGroup.GET("/llm-settings/model-limits", adminHandler.GetLLMModelLimits)
+		adminGroup.PUT("/llm-settings/model-limits", adminHandler.UpdateLLMModelLimits)
 		// CodeCraftAPI model catalog proxy + embedding settings
 		// WHY proxy: API key must never leave the server.
 		adminGroup.GET("/codecraftapi/models", adminHandler.GetCodeCraftModels)

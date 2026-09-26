@@ -371,6 +371,43 @@ export const updateLLMSettings = (req: {
     .then((res) => res.data.data!)
 
 // ============================================================
+// MODEL TOKEN LIMITS
+// ============================================================
+// Per provider+tier caps on what this system will ask a model for — the same
+// keys the gateway selects a model by ('strong' | 'fast' | 'cheap' | '*').
+//
+// WHY this exists: models differ in how much room they need. A reasoning model
+// spends part of its completion budget thinking before it writes any visible
+// text, so a small max_tokens returns an EMPTY answer — which is how a workflow
+// died at intake with "planning failed ... empty content in response". 0 on any
+// field means "not configured": the provider's own maximum applies.
+export interface ModelLimit {
+  provider: string
+  tier: string
+  maxInputTokens: number
+  maxOutputTokens: number
+}
+
+export interface ModelLimitsResponse {
+  limits: ModelLimit[]
+  providers: string[]
+  tiers: string[]
+  note: string
+}
+
+export const getModelLimits = () =>
+  baseAPI
+    .get<ApiResponse<ModelLimitsResponse>>('/api/v1/admin/llm-settings/model-limits')
+    .then((res) => res.data.data!)
+
+// updateModelLimits upserts the given rows and leaves the rest untouched, so
+// saving one edited row does not require resending the whole table.
+export const updateModelLimits = (limits: ModelLimit[]) =>
+  baseAPI
+    .put<ApiResponse<{ saved: number }>>('/api/v1/admin/llm-settings/model-limits', { limits })
+    .then((res) => res.data.data!)
+
+// ============================================================
 // EXPERT CATEGORIES (CT-D1, CATEGORY_TEMPLATE_HANDOFF.md §8)
 // ============================================================
 // Matches admin_handler.go's ListExpertCategories/CreateExpertCategory/
