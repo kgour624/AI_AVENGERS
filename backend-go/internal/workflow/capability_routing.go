@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/capability"
@@ -94,4 +96,28 @@ func (r *WorkflowRunner) expertsForPhase(
 		return nil, fmt.Errorf("no expert may run the %s phase", phase)
 	}
 	return out, nil
+}
+
+// wavesForExperts keeps only the tasks owned by the allowed experts, so a phase
+// runs exactly the tasks its experts may own. Waves that end up empty are
+// dropped; tasks owned by other experts are NOT reassigned (reassigning is what
+// produced the incident: a designer writing Go).
+func wavesForExperts(waves []ExecutionWave, experts []workflowExpert) []ExecutionWave {
+	allowed := make(map[uuid.UUID]bool, len(experts))
+	for _, e := range experts {
+		allowed[e.ID] = true
+	}
+	out := make([]ExecutionWave, 0, len(waves))
+	for _, w := range waves {
+		kept := make(ExecutionWave, 0, len(w))
+		for _, t := range w {
+			if allowed[t.ExpertID] {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) > 0 {
+			out = append(out, kept)
+		}
+	}
+	return out
 }

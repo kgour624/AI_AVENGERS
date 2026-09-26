@@ -586,9 +586,18 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		if err := r.mustTransition(ctx, workflowID, PhaseImplementation, log); err != nil {
 			return
 		}
+		// ROUTING (capability): code is written by an implementation expert for
+		// the language, never by whichever experts happen to exist. A designer was
+		// handed the code phase before this check existed.
+		implExperts, routeErr := r.expertsForPhase(ctx, PhaseImplementation, experts, "")
+		if routeErr != nil {
+			log.Error("runner: implementation phase blocked — required expert missing", zap.Error(routeErr))
+			_ = r.engine.Fail(ctx, workflowID, "Implementation phase: "+routeErr.Error())
+			return
+		}
 		state = seedPhase(PhaseImplementation)
 		execMu.Lock()
-		err := r.executeWaves(ctx, workflowID, waves, experts, state, uuid.Nil, "")
+		err := r.executeWaves(ctx, workflowID, wavesForExperts(waves, implExperts), implExperts, state, uuid.Nil, "")
 		execMu.Unlock()
 		if err != nil {
 			log.Error("runner: Implementation waves failed", zap.Error(err))
@@ -610,17 +619,26 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		if err := r.mustTransition(ctx, workflowID, PhaseQA, log); err != nil {
 			return
 		}
-		state = seedPhase(PhaseQA)
-		execMu.Lock()
-		err := r.executeWaves(ctx, workflowID, waves, experts, state, uuid.Nil, "")
-		execMu.Unlock()
-		if err != nil {
-			log.Error("runner: QA waves failed", zap.Error(err))
+		// ROUTING (capability): QA belongs to a TESTING expert only. With none
+		// present the phase is skipped with a clear log rather than letting a
+		// designer run tests they never owned.
+		qaExperts, qaRouteErr := r.expertsForPhase(ctx, PhaseQA, experts, "")
+		if qaRouteErr != nil {
+			log.Warn("runner: QA phase skipped — a testing expert is required",
+				zap.Error(qaRouteErr))
+		} else {
+			state = seedPhase(PhaseQA)
+			execMu.Lock()
+			err := r.executeWaves(ctx, workflowID, wavesForExperts(waves, qaExperts), qaExperts, state, uuid.Nil, "")
+			execMu.Unlock()
+			if err != nil {
+				log.Error("runner: QA waves failed", zap.Error(err))
 			// QA failure is non-fatal — code is already written
 			log.Warn("runner: QA phase had failures, continuing to handoff",
-				zap.Int("completed", len(state.CompletedExpertIDs)),
-				zap.Int("failed", len(state.FailedExpertIDs)),
-			)
+					zap.Int("completed", len(state.CompletedExpertIDs)),
+					zap.Int("failed", len(state.FailedExpertIDs)),
+				)
+			}
 		}
 		r.saveRunnerState(ctx, workflowID, &runnerState{Phase: PhaseHandoff})
 	} else {
