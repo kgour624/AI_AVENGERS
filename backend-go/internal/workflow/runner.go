@@ -38,6 +38,8 @@ type runnerState struct {
 	Phase              string   `json:"phase"`
 	CompletedExpertIDs []string `json:"completed_expert_ids"`
 	FailedExpertIDs    []string `json:"failed_expert_ids"`
+	DesignRevisionID   string   `json:"design_revision_id,omitempty"`
+	RedesignGoal       string   `json:"redesign_goal,omitempty"`
 }
 
 // WorkflowRunner drives a workflow from start to completion.
@@ -288,9 +290,11 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// paused approval gates are a different status and are not re-entered.
 	resumePhase := ""
 	var resumeCompleted []string
+	var savedState *runnerState
 	if saved, loadErr := r.loadRunnerState(ctx, workflowID); loadErr != nil {
 		log.Warn("runner: load runner_state failed (starting fresh)", zap.Error(loadErr))
 	} else if saved != nil {
+		savedState = saved
 		resumePhase = saved.Phase
 		resumeCompleted = append([]string(nil), saved.CompletedExpertIDs...)
 		log.Info("runner: resuming from checkpoint",
@@ -435,9 +439,20 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// loop (design gate already approved). On attempt==1 only, skip phases
 	// already past; later attempts (client "request changes") re-run both.
 	var state *runnerState
+	var designRevisionID uuid.UUID
+	redesignGoal := ""
+	if savedState != nil {
+		designRevisionID = parseDesignRevisionID(savedState.DesignRevisionID)
+		redesignGoal = savedState.RedesignGoal
+	}
 	runDesign := resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseDetailedDesign)
 	if runDesign {
 		for attempt := 1; attempt <= maxDesignAttempts; attempt++ {
+			if savedState == nil || savedState.DesignRevisionID != designRevisionID.String() {
+				checkpoint := &runnerState{Phase: PhaseHighLevelDesign, DesignRevisionID: designRevisionID.String(), RedesignGoal: redesignGoal}
+				r.saveRunnerState(ctx, workflowID, checkpoint)
+				savedState = checkpoint
+			}
 			skipHLD := attempt == 1 && pastPhase(PhaseHighLevelDesign)
 			skipDLD := attempt == 1 && pastPhase(PhaseDetailedDesign)
 
@@ -460,9 +475,19 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 				}
 
 				state = seedPhase(PhaseHighLevelDesign)
+				state.DesignRevisionID = designRevisionID.String()
+				state.RedesignGoal = redesignGoal
+				if savedState != nil && savedState.Phase == PhaseHighLevelDesign && savedState.DesignRevisionID == state.DesignRevisionID {
+					state.CompletedExpertIDs = append([]string(nil), savedState.CompletedExpertIDs...)
+				} else if savedState == nil || savedState.DesignRevisionID != state.DesignRevisionID {
+					state.CompletedExpertIDs = nil
+				}
+				r.saveRunnerState(ctx, workflowID, state)
+				savedState = snapshotRunnerState(state, nil)
 				execMu.Lock()
-				err := r.executeWaves(ctx, workflowID, waves, experts, state)
+				err := r.executeWaves(ctx, workflowID, waves, experts, state, designRevisionID, redesignGoal)
 				execMu.Unlock()
+				r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, nil))
 				if err != nil {
 					log.Error("runner: HLD waves failed", zap.Error(err))
 					if len(state.CompletedExpertIDs) == 0 {
@@ -486,9 +511,19 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 				}
 
 				state = seedPhase(PhaseDetailedDesign)
+				state.DesignRevisionID = designRevisionID.String()
+				state.RedesignGoal = redesignGoal
+				if savedState != nil && savedState.Phase == PhaseDetailedDesign && savedState.DesignRevisionID == state.DesignRevisionID {
+					state.CompletedExpertIDs = append([]string(nil), savedState.CompletedExpertIDs...)
+				} else if savedState == nil || savedState.DesignRevisionID != state.DesignRevisionID {
+					state.CompletedExpertIDs = nil
+				}
+				r.saveRunnerState(ctx, workflowID, state)
+				savedState = snapshotRunnerState(state, nil)
 				execMu.Lock()
-				err := r.executeWaves(ctx, workflowID, waves, experts, state)
+				err := r.executeWaves(ctx, workflowID, waves, experts, state, designRevisionID, redesignGoal)
 				execMu.Unlock()
+				r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, nil))
 				if err != nil {
 					log.Error("runner: DetailedDesign waves failed", zap.Error(err))
 					if len(state.CompletedExpertIDs) == 0 {
@@ -501,13 +536,22 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 			}
 
 			// Gate: client reads the deliverables and decides.
-			decision, gateErr := r.askDesignGate(ctx, workflowID, attempt)
+			decision, notes, approvalID, gateErr := r.askDesignGate(ctx, workflowID, attempt)
 			if gateErr != nil {
 				log.Error("runner: design gate failed", zap.Error(gateErr))
 				return
 			}
 			if decision != decisionChangesRequested {
 				break
+			}
+			// The approval id identifies this redesign across restarts, so this
+			// request cannot be confused with the initial design or its retries.
+			designRevisionID = redesignRevisionID(workflowID, approvalID)
+			redesignGoal = notes
+			if savedState == nil || savedState.DesignRevisionID != designRevisionID.String() {
+				checkpoint := &runnerState{Phase: PhaseHighLevelDesign, DesignRevisionID: designRevisionID.String(), RedesignGoal: redesignGoal}
+				r.saveRunnerState(ctx, workflowID, checkpoint)
+				savedState = checkpoint
 			}
 			if attempt == maxDesignAttempts {
 				log.Warn("runner: design re-run limit reached, proceeding",
@@ -544,7 +588,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		}
 		state = seedPhase(PhaseImplementation)
 		execMu.Lock()
-		err := r.executeWaves(ctx, workflowID, waves, experts, state)
+		err := r.executeWaves(ctx, workflowID, waves, experts, state, uuid.Nil, "")
 		execMu.Unlock()
 		if err != nil {
 			log.Error("runner: Implementation waves failed", zap.Error(err))
@@ -568,7 +612,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		}
 		state = seedPhase(PhaseQA)
 		execMu.Lock()
-		err := r.executeWaves(ctx, workflowID, waves, experts, state)
+		err := r.executeWaves(ctx, workflowID, waves, experts, state, uuid.Nil, "")
 		execMu.Unlock()
 		if err != nil {
 			log.Error("runner: QA waves failed", zap.Error(err))
@@ -669,6 +713,8 @@ func (r *WorkflowRunner) executeWaves(
 	waves []ExecutionWave,
 	experts []workflowExpert,
 	state *runnerState,
+	revisionID uuid.UUID,
+	redesignGoal string,
 ) error {
 	expertMap := make(map[string]workflowExpert, len(experts))
 	for _, e := range experts {
@@ -840,7 +886,11 @@ func (r *WorkflowRunner) executeWaves(
 				// (workflow, phase, expert) counts as evidence, and it is unique
 				// on exactly that triple, so a resume cannot produce the same
 				// work twice.
-				attempt, decision, claimErr := r.taskAttempts.Claim(ctx, workflowID, state.Phase, expert.ID)
+				claimRevisionID := revisionID
+				if claimRevisionID == uuid.Nil {
+					claimRevisionID = RevisionInitial
+				}
+				attempt, decision, claimErr := r.taskAttempts.Claim(ctx, workflowID, state.Phase, expert.ID, claimRevisionID)
 				if claimErr != nil {
 					r.logger.Error("runner: could not claim this unit of work",
 						zap.String("expert", expert.Name),
@@ -961,7 +1011,7 @@ func (r *WorkflowRunner) executeWaves(
 							Expert:          expert,
 							TaskID:          uuid.Nil,
 							TaskTitle:       t.Title,
-							TaskDescription: t.Description,
+							TaskDescription: withChangeGoal(t.Description, redesignGoal),
 							WorkflowPhase:   state.Phase,
 						}
 						// G8: a workflow that asked for working code runs the code
@@ -1015,7 +1065,7 @@ func (r *WorkflowRunner) executeWaves(
 						Expert:          expert,
 						TaskID:          uuid.Nil,
 						TaskTitle:       t.Title,
-						TaskDescription: t.Description,
+						TaskDescription: withChangeGoal(t.Description, redesignGoal),
 						WorkflowPhase:   state.Phase,
 					})
 					if err != nil {
@@ -1057,7 +1107,7 @@ func (r *WorkflowRunner) executeWaves(
 						Expert:          expert,
 						TaskID:          uuid.Nil,
 						TaskTitle:       t.Title,
-						TaskDescription: t.Description,
+						TaskDescription: withChangeGoal(t.Description, redesignGoal),
 						// WorkflowPhase: passed so AgentLoop knows design vs implementation.
 						// Design phases: Gates 1+2+3 active.
 						// Implementation phase: Gate 1 only, generic BLOCKED.
@@ -1066,6 +1116,8 @@ func (r *WorkflowRunner) executeWaves(
 						AllExperts: experts,
 						// GenericAllowancePct: 0 means trained + peer only.
 						GenericAllowancePct: genericAllowancePct,
+						RevisionID:          revisionID,
+						Attempt:             attemptNumber(attempt),
 					})
 					if err != nil {
 						recordFailure(err.Error())
@@ -1248,6 +1300,8 @@ func snapshotRunnerState(state *runnerState, mu *sync.Mutex) *runnerState {
 		Phase:              state.Phase,
 		CompletedExpertIDs: append([]string(nil), state.CompletedExpertIDs...),
 		FailedExpertIDs:    append([]string(nil), state.FailedExpertIDs...),
+		DesignRevisionID:   state.DesignRevisionID,
+		RedesignGoal:       state.RedesignGoal,
 	}
 }
 
@@ -1295,6 +1349,24 @@ func (r *WorkflowRunner) saveRunnerState(ctx context.Context, workflowID uuid.UU
 	if err != nil {
 		r.logger.Warn("runner: save state failed", zap.Error(err))
 	}
+}
+
+func parseDesignRevisionID(value string) uuid.UUID {
+	if value == "" {
+		return uuid.Nil
+	}
+	id, err := uuid.Parse(value)
+	if err != nil {
+		return uuid.Nil
+	}
+	return id
+}
+
+func withChangeGoal(description, changeGoal string) string {
+	if strings.TrimSpace(changeGoal) == "" {
+		return description
+	}
+	return fmt.Sprintf("%s\n\nCLIENT-REQUESTED REDESIGN:\n%s", description, strings.TrimSpace(changeGoal))
 }
 
 // loadRunnerState reads the last checkpoint from workflows.runner_state.
@@ -1457,7 +1529,7 @@ func (r *WorkflowRunner) askDesignGate(
 	ctx context.Context,
 	workflowID uuid.UUID,
 	attempt int,
-) (string, error) {
+) (string, string, uuid.UUID, error) {
 	summary := "Design phases complete. Read the deliverables, then Approve to start " +
 		"implementation — or Request Changes to have the design produced again " +
 		"(optionally allowing some generic knowledge)."
@@ -1465,48 +1537,55 @@ func (r *WorkflowRunner) askDesignGate(
 		summary = fmt.Sprintf("Design re-run #%d complete. %s", attempt, summary)
 	}
 
-	if _, err := r.tools.AskClient(ctx, AskClientRequest{
+	approvalID, err := r.tools.AskClient(ctx, AskClientRequest{
 		WorkflowID:   workflowID,
 		FromExpertID: uuid.Nil,
 		GateName:     "detailed_design",
 		Summary:      summary,
-	}); err != nil {
+	})
+	if err != nil {
 		_ = r.engine.Fail(ctx, workflowID, "design AskClient failed")
-		return "", fmt.Errorf("design gate: %w", err)
+		return "", "", uuid.Nil, fmt.Errorf("design gate: %w", err)
 	}
 
 	if err := r.waitForResume(ctx, workflowID); err != nil {
-		return "", fmt.Errorf("design gate wait: %w", err)
+		return "", "", approvalID, fmt.Errorf("design gate wait: %w", err)
 	}
 
-	decision := r.lastApprovalStatus(ctx, workflowID)
+	decision, notes := r.lastApprovalDecision(ctx, workflowID, approvalID)
 	r.logger.Info("runner: design gate answered",
 		zap.String("workflow_id", workflowID.String()),
 		zap.Int("attempt", attempt),
 		zap.String("decision", decision),
 	)
-	return decision, nil
+	return decision, notes, approvalID, nil
 }
 
-// lastApprovalStatus returns the status of the most recent approval row for a
-// workflow, e.g. "approved" | "changes_requested" | "rejected".
+// lastApprovalDecision returns the status and notes from the latest design gate.
 //
 // Returns "" on error, which the caller treats as "not a re-run request" —
 // failing to read the decision must not trap the workflow in the design loop.
-func (r *WorkflowRunner) lastApprovalStatus(ctx context.Context, workflowID uuid.UUID) string {
+func (r *WorkflowRunner) lastApprovalDecision(ctx context.Context, workflowID, approvalID uuid.UUID) (string, string) {
 	var status string
+	var responseJSON []byte
 	err := r.db.QueryRow(ctx,
-		`SELECT status FROM approval_requests
-		 WHERE workflow_id = $1
-		 ORDER BY requested_at DESC
-		 LIMIT 1`,
-		workflowID,
-	).Scan(&status)
+		`SELECT status, client_response FROM approval_requests
+		 WHERE workflow_id = $1 AND id = $2 AND gate_name = 'detailed_design'`,
+		workflowID, approvalID,
+	).Scan(&status, &responseJSON)
 	if err != nil {
 		r.logger.Warn("runner: could not read approval decision", zap.Error(err))
-		return ""
+		return "", ""
 	}
-	return status
+	var clientResponse struct {
+		Notes string `json:"notes"`
+	}
+	if len(responseJSON) > 0 {
+		if err := json.Unmarshal(responseJSON, &clientResponse); err != nil {
+			r.logger.Warn("runner: could not parse client approval notes", zap.Error(err))
+		}
+	}
+	return status, strings.TrimSpace(clientResponse.Notes)
 }
 
 // loadGenericAllowancePct reads the client's generic ceiling for a workflow.
@@ -1667,12 +1746,12 @@ func buildPlanContent(tasks []TaskSpec, experts []workflowExpert) map[string]int
 
 // watchForChangeRequest polls for pending change requests while the workflow is
 // running. When it finds one it:
-//   1. Determines which experts are relevant (LLM call — cheap model).
-//   2. Marks the request as running.
-//   3. Re-runs the design phases for those experts (same loop as the initial
-//      design, reusing RestartPhase + executeWaves).
-//   4. Presents the same approval gate the initial design uses.
-//   5. Marks the request as completed.
+//  1. Determines which experts are relevant (LLM call — cheap model).
+//  2. Marks the request as running.
+//  3. Re-runs the design phases for those experts (same loop as the initial
+//     design, reusing RestartPhase + executeWaves).
+//  4. Presents the same approval gate the initial design uses.
+//  5. Marks the request as completed.
 //
 // This runs as a goroutine alongside the main Run() goroutine. It exits when
 // ctx is cancelled or the workflow reaches a terminal state.
@@ -1683,7 +1762,7 @@ func buildPlanContent(tasks []TaskSpec, experts []workflowExpert) map[string]int
 // and consistent with waitForResume's polling pattern. The latency (up to 3s)
 // is acceptable for a human-initiated action.
 //
-// WHY NOT BLOCK Run() ON CHANGE REQUESTS
+// # WHY NOT BLOCK Run() ON CHANGE REQUESTS
 //
 // Run() drives the workflow state machine forward. A change request can arrive
 // at any point — including while the workflow is paused at an approval gate.
@@ -1869,8 +1948,8 @@ func (r *WorkflowRunner) watchForChangeRequest(
 			continue
 		}
 
-		hldState := &runnerState{Phase: PhaseHighLevelDesign}
-		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, hldState); err != nil {
+		hldState := &runnerState{Phase: PhaseHighLevelDesign, DesignRevisionID: cr.ID.String(), RedesignGoal: cr.ChangeGoal}
+		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, hldState, cr.ID, cr.ChangeGoal); err != nil {
 			log.Error("watcher: HLD waves failed", zap.Error(err))
 			if len(hldState.CompletedExpertIDs) == 0 {
 				execMu.Unlock()
@@ -1885,8 +1964,8 @@ func (r *WorkflowRunner) watchForChangeRequest(
 			_ = crSvc.MarkCompleted(ctx, cr.ID)
 			continue
 		}
-		ddState := &runnerState{Phase: PhaseDetailedDesign}
-		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, ddState); err != nil {
+		ddState := &runnerState{Phase: PhaseDetailedDesign, DesignRevisionID: cr.ID.String(), RedesignGoal: cr.ChangeGoal}
+		if err := r.executeWaves(ctx, workflowID, relevantWaves, relevantExperts, ddState, cr.ID, cr.ChangeGoal); err != nil {
 			log.Error("watcher: DetailedDesign waves failed", zap.Error(err))
 			if len(ddState.CompletedExpertIDs) == 0 {
 				execMu.Unlock()
