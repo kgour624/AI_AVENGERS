@@ -255,7 +255,7 @@ func (a *Assembler) Assemble(
 		// Production chat retrieval: the unexpanded path, deliberately. Graph expansion
 		// is opt-in (GetCourseChunksExpanded) so it can be measured against this path
 		// before it becomes the default.
-		c, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK, false)
+		c, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK, false, RetrievalPreference{})
 		chunksCh <- chunksResult{c, err}
 	}()
 	go func() {
@@ -667,7 +667,24 @@ func (a *Assembler) GetCourseChunksForWorkflow(
 	if topK <= 0 {
 		topK = 5
 	}
-	return a.getCourseChunks(ctx, expertID, taskDescription, topK, false)
+	return a.getCourseChunks(ctx, expertID, taskDescription, topK, false, RetrievalPreference{})
+}
+
+// GetCourseChunksWithPreference is the preference-aware variant: it biases the
+// ranking toward a section or a depth layer WITHOUT removing anything, so it is
+// opt-in — a caller that has a reason to prefer part of the material asks for it,
+// and every other caller keeps the plain search untouched.
+func (a *Assembler) GetCourseChunksWithPreference(
+	ctx context.Context,
+	expertID uuid.UUID,
+	question string,
+	topK int,
+	pref RetrievalPreference,
+) ([]chinawall.CourseChunk, error) {
+	if topK <= 0 {
+		topK = 5
+	}
+	return a.getCourseChunks(ctx, expertID, question, topK, false, pref)
 }
 
 // GetCourseChunksExpanded is GetCourseChunksForWorkflow with concept-graph expansion
@@ -686,7 +703,7 @@ func (a *Assembler) GetCourseChunksExpanded(
 	if topK <= 0 {
 		topK = 5
 	}
-	return a.getCourseChunks(ctx, expertID, taskDescription, topK, true)
+	return a.getCourseChunks(ctx, expertID, taskDescription, topK, true, RetrievalPreference{})
 }
 
 // GetProjectMemoryText loads project L1/L2 memory for a workflow expert and
@@ -889,7 +906,7 @@ func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, que
 // Step 2: Keyword search -> top 10 candidates (exact)
 // Step 3: Merge + deduplicate
 // Step 4: Rerank merged set -> top K
-func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int, expand bool) ([]chinawall.CourseChunk, error) {
+func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int, expand bool, pref RetrievalPreference) ([]chinawall.CourseChunk, error) {
 	// Step 1: Vector search — one RANKED list.
 	embedding, err := a.embedder.EmbedSingle(ctx, question)
 	if err != nil {
@@ -899,7 +916,8 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	// Feature #23: source_file and chunk_index are selected so the citation modal can
 	// name the transcript and the position.
 	vectorRows, err := a.db.Query(ctx,
-		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
+		`SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index,
+		        COALESCE(section_path,''), COALESCE(layer,0)
 		 FROM course_chunks
 		 WHERE expert_id=$1
 		 ORDER BY embedding <=> $2
@@ -917,6 +935,11 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		Topic      string
 		SourceFile string // Feature #23: transcript filename
 		ChunkIndex int    // Feature #23: position in transcript
+		// SectionPath and Layer (G6): the two labels a retrieval preference can
+		// nudge with. Read here rather than joined later, so the boost costs no
+		// extra query.
+		SectionPath string
+		Layer       int
 	}
 
 	byID := make(map[uuid.UUID]rawChunk)
@@ -924,7 +947,8 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 
 	for vectorRows.Next() {
 		var c rawChunk
-		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
+		if err := vectorRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex,
+			&c.SectionPath, &c.Layer); err != nil {
 			continue
 		}
 		if _, dup := byID[c.ID]; dup {
@@ -948,7 +972,8 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	terms := salientTerms(question)
 	if len(terms) > 0 {
 		const keywordSQL = `
-			SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
+			SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index,
+			       COALESCE(section_path,''), COALESCE(layer,0)
 			  FROM course_chunks
 			 WHERE expert_id = $1
 			   AND chunk_text_tsv @@ to_tsquery('english', array_to_string($2::text[], ' | '))
@@ -959,7 +984,8 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 			defer keywordRows.Close()
 			for keywordRows.Next() {
 				var c rawChunk
-				if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
+				if err := keywordRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex,
+					&c.SectionPath, &c.Layer); err != nil {
 					continue
 				}
 				if _, dup := byID[c.ID]; !dup {
@@ -992,10 +1018,12 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 			// the question: DISTINCT ON (topic) keeps the set bounded at one row per
 			// neighbour, so expansion adds recall without flooding the reranker.
 			const neighbourSQL = `
-				SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index
+				SELECT id, chunk_text, COALESCE(topic,''), COALESCE(source_file,''), chunk_index,
+				       COALESCE(section_path,''), COALESCE(layer,0)
 				  FROM (
 				      SELECT DISTINCT ON (topic)
 				             id, chunk_text, topic, source_file, chunk_index,
+				             COALESCE(section_path,'') AS section_path, COALESCE(layer,0) AS layer,
 				             embedding <=> $2 AS dist
 				        FROM course_chunks
 				       WHERE expert_id = $1
@@ -1009,7 +1037,8 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 				defer neighbourRows.Close()
 				for neighbourRows.Next() {
 					var c rawChunk
-					if err := neighbourRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex); err != nil {
+					if err := neighbourRows.Scan(&c.ID, &c.Text, &c.Topic, &c.SourceFile, &c.ChunkIndex,
+						&c.SectionPath, &c.Layer); err != nil {
 						continue
 					}
 					if _, dup := byID[c.ID]; !dup {
@@ -1046,7 +1075,15 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		texts[i] = c.Text
 	}
 
-	reranked, err := a.sidecar.Rerank(ctx, question, texts, limit)
+	// Ask the reranker for more than the caller wants. WHY: the preference is
+	// applied AFTER reranking, and with only `limit` candidates ranked, the
+	// best-matching chunk may already have been left out — a boost cannot promote
+	// what it never received.
+	pool := limit * retrievalPoolFactor
+	if pool > len(candidates) {
+		pool = len(candidates)
+	}
+	reranked, err := a.sidecar.Rerank(ctx, question, texts, pool)
 	if err != nil {
 		// Fallback: return top K without reranking.
 		//
@@ -1058,11 +1095,22 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 			zap.Int("candidates", len(candidates)),
 			zap.Error(err),
 		)
-		var chunks []chinawall.CourseChunk
+		// With no reranking there is no score signal at all, so the fused order is
+		// the only ranking there is — which is exactly where a preference is worth
+		// the most: it is the one thing that can still tell two 0.5-scored
+		// candidates apart.
+		scores := make([]float64, len(candidates))
+		matches := make([]bool, len(candidates))
 		for i, c := range candidates {
-			if i >= limit {
+			scores[i] = 0.5
+			matches[i] = pref.Matches(c.SectionPath, c.Layer)
+		}
+		var chunks []chinawall.CourseChunk
+		for _, i := range applyPreferenceBoost(scores, matches, pref.effectiveBoost()) {
+			if len(chunks) >= limit {
 				break
 			}
+			c := candidates[i]
 			// Feature #23: Include SourceFile and ChunkIndex in fallback path
 			chunks = append(chunks, chinawall.CourseChunk{
 				ID:          c.ID,
@@ -1076,20 +1124,39 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		return chunks, nil
 	}
 
-	var chunks []chinawall.CourseChunk
+	// Build the reranked set, then apply the preference as a nudge.
+	scores := make([]float64, 0, len(reranked))
+	// The reranker's own score is kept for reporting: the preference changes the
+	// ORDER, it does not change what the model judged, and a caller comparing
+	// scores across two runs must not see an inflated number as a better match.
+	rawScores := make([]float32, 0, len(reranked))
+	matches := make([]bool, 0, len(reranked))
+	byPosition := make(map[int]rawChunk, len(reranked))
 	for _, r := range reranked {
 		if r.Index < len(candidates) {
 			c := candidates[r.Index]
-			// Feature #23: Include SourceFile and ChunkIndex in reranked results
-			chunks = append(chunks, chinawall.CourseChunk{
-				ID:          c.ID,
-				Text:        c.Text,
-				Topic:       c.Topic,
-				RerankScore: r.Score,
-				SourceFile:  c.SourceFile,
-				ChunkIndex:  c.ChunkIndex,
-			})
+			scores = append(scores, float64(r.Score))
+			rawScores = append(rawScores, r.Score)
+			matches = append(matches, pref.Matches(c.SectionPath, c.Layer))
+			byPosition[len(scores)-1] = c
 		}
+	}
+
+	var chunks []chinawall.CourseChunk
+	for _, pos := range applyPreferenceBoost(scores, matches, pref.effectiveBoost()) {
+		if len(chunks) >= limit {
+			break
+		}
+		c := byPosition[pos]
+		// Feature #23: Include SourceFile and ChunkIndex in reranked results
+		chunks = append(chunks, chinawall.CourseChunk{
+			ID:          c.ID,
+			Text:        c.Text,
+			Topic:       c.Topic,
+			RerankScore: rawScores[pos],
+			SourceFile:  c.SourceFile,
+			ChunkIndex:  c.ChunkIndex,
+		})
 	}
 	return chunks, nil
 }
