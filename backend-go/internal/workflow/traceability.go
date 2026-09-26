@@ -36,12 +36,12 @@ type TraceLink struct {
 
 // TraceabilityReport is the comparison result for one parent/child pair.
 type TraceabilityReport struct {
-	ParentLabel string        `json:"parent_label"`
-	ChildLabel  string        `json:"child_label"`
-	Links       []TraceLink   `json:"links"`
-	OutOfParent []string      `json:"out_of_parent"`
-	Uncovered   []string      `json:"uncovered_parent"`
-	CoveragePct float64       `json:"coverage_pct"`
+	ParentLabel string      `json:"parent_label"`
+	ChildLabel  string      `json:"child_label"`
+	Links       []TraceLink `json:"links"`
+	OutOfParent []string    `json:"out_of_parent"`
+	Uncovered   []string    `json:"uncovered_parent"`
+	CoveragePct float64     `json:"coverage_pct"`
 }
 
 const traceabilitySystemPrompt = `You compare a CHILD artifact against its PARENT artifact to prove the child stayed inside the parent.
@@ -183,4 +183,143 @@ func (r *WorkflowRunner) latestArtifactContent(ctx context.Context, workflowID u
 		}
 	}
 	return string(latest.Content), len(latest.Content) > 0
+}
+
+// structuralEvents are workflow plumbing, not artifacts. This is NOT a domain
+// list: it names the machinery every workflow has (status, questions, approvals,
+// the traceability report itself) so the chain is built from whatever artifacts
+// the experts actually produced, for ANY domain.
+var structuralEvents = map[string]bool{
+	"task_status_changed": true,
+	"task_plan_ready":     true,
+	"question_to_client":  true,
+	"question_to_expert":  true,
+	"client_response":     true,
+	"resolution":          true,
+	"review_comment":      true,
+	"amendment_proposed":  true,
+	"amendment_approved":  true,
+	"amendment_rejected":  true,
+	"acceptance_proposed": true,
+	"acceptance_approved": true,
+	"acceptance_rejected": true,
+	"debate_round":        true,
+	TraceabilityEvent:     true,
+	"phase_transition":    true,
+	"workflow_started":    true,
+	"workflow_completed":  true,
+	"workflow_failed":     true,
+}
+
+// runTraceabilityChain walks the workflow's own artifact history and compares
+// each artifact with the one before it that a DIFFERENT expert produced.
+//
+// WHY no phase names here: a workflow may be system design -> LLD -> code, or
+// data model -> pipeline, or product spec -> API, or anything else. Naming HLD or
+// LLD in this code would make the guarantee work for exactly one kind of project,
+// so the chain is derived from what was produced and who produced it.
+func (r *WorkflowRunner) runTraceabilityChain(ctx context.Context, workflowID uuid.UUID) {
+	events, err := r.store.GetSince(ctx, workflowID, 0, 500)
+	if err != nil {
+		r.logger.Warn("traceability: could not read artifact history",
+			zap.String("workflow_id", workflowID.String()), zap.Error(err))
+		return
+	}
+
+	type artifact struct {
+		EventType  string
+		ExpertID   uuid.UUID
+		ExpertName string
+		Body       string
+	}
+	var chain []artifact
+	for _, e := range events {
+		if e.PostedByExpertID == nil || structuralEvents[e.EventType] {
+			continue
+		}
+		body, ok := artifactBody(e.Content)
+		if !ok {
+			continue
+		}
+		// Collapse repeats: keep only the newest body per (type, expert) so the
+		// chain compares distinct steps of the work, not every re-post.
+		replaced := false
+		for i := range chain {
+			if chain[i].EventType == e.EventType && chain[i].ExpertID == *e.PostedByExpertID {
+				chain[i].Body = body
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			chain = append(chain, artifact{EventType: e.EventType, ExpertID: *e.PostedByExpertID, Body: body})
+		}
+	}
+	if len(chain) < 2 {
+		return
+	}
+
+	for i := 1; i < len(chain); i++ {
+		parent, child := chain[i-1], chain[i]
+		if parent.ExpertID == child.ExpertID {
+			// Same expert refining its own artifact: not a hand-off between
+			// different kinds of work, so there is no cross-domain chain to check.
+			continue
+		}
+		rep, checkErr := checkTraceability(ctx, r.gateway,
+			parent.EventType, parent.Body, child.EventType, child.Body)
+		if checkErr != nil {
+			r.logger.Warn("traceability: chain check failed",
+				zap.String("workflow_id", workflowID.String()),
+				zap.String("parent", parent.EventType), zap.String("child", child.EventType),
+				zap.Error(checkErr))
+			continue
+		}
+		r.persistTraceability(ctx, workflowID, rep)
+	}
+}
+
+// artifactBody extracts the human-meaningful text of an artifact event, trying
+// the keys producers actually use. Returns false for events that carry no body.
+func artifactBody(raw []byte) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		text := strings.TrimSpace(string(raw))
+		return text, len(text) > 40
+	}
+	for _, key := range []string{"content", "text", "design", "lld", "body", "summary", "statement", "description"} {
+		if v, ok := m[key].(string); ok && strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v), true
+		}
+	}
+	// No single body key: fall back to the whole object when it is substantive.
+	text := strings.TrimSpace(string(raw))
+	return text, len(text) > 80
+}
+
+func (r *WorkflowRunner) persistTraceability(ctx context.Context, workflowID uuid.UUID, rep *TraceabilityReport) {
+	if rep == nil {
+		return
+	}
+	if len(rep.OutOfParent) > 0 || len(rep.Uncovered) > 0 {
+		r.logger.Warn("traceability: child is outside or incomplete vs its parent",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("parent", rep.ParentLabel),
+			zap.String("child", rep.ChildLabel),
+			zap.Int("out_of_parent", len(rep.OutOfParent)),
+			zap.Int("uncovered_parent", len(rep.Uncovered)),
+			zap.Float64("coverage_pct", rep.CoveragePct))
+	}
+	content, _ := json.Marshal(rep)
+	if _, err := r.store.Post(ctx, blackboard.PostRequest{
+		WorkflowID: workflowID,
+		EventType:  TraceabilityEvent,
+		Content:    json.RawMessage(content),
+	}); err != nil {
+		r.logger.Warn("traceability: could not persist report",
+			zap.String("workflow_id", workflowID.String()), zap.Error(err))
+	}
 }
