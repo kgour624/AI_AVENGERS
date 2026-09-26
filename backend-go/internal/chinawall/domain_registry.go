@@ -74,8 +74,23 @@ func (r *DomainRegistry) Init(ctx context.Context) error {
 // Get returns the DomainProfile for the given domain.
 // Falls back to BaseProfile if domain is not found.
 // O(1) — hot path, called for every question.
-func (r *DomainRegistry) Get(domain string) *DomainProfile {
+// normDomainKey canonicalises a domain so "system design", "System Design" and
+// "system_design" are the SAME profile key.
+//
+// WHY (production incident): an expert whose domain was stored as "system design"
+// (space) never matched the tuned profile registered as "system_design"
+// (underscore) — the strict BaseProfile was used instead, and the expert refused
+// questions in its own domain. The mismatch was invisible because an unknown
+// domain falls back silently.
+func normDomainKey(domain string) string {
 	key := strings.ToLower(strings.TrimSpace(domain))
+	key = strings.ReplaceAll(key, "-", "_")
+	key = strings.Join(strings.Fields(key), "_") // spaces (incl. runs) -> underscore
+	return key
+}
+
+func (r *DomainRegistry) Get(domain string) *DomainProfile {
+	key := normDomainKey(domain)
 
 	r.mu.RLock()
 	profile, ok := r.profiles[key]
@@ -84,8 +99,12 @@ func (r *DomainRegistry) Get(domain string) *DomainProfile {
 	if !ok {
 		// Unknown domain — use strict base profile as safety net.
 		// WHY: Better to refuse than to hallucinate for unknown domains.
-		r.logger.Debug("domain_registry: unknown domain, using base profile",
+		// Warn, not Debug: an unknown domain silently swaps in the strict
+		// BaseProfile, which is exactly how a tuned expert ended up refusing its
+		// own domain (spaces vs underscores in the domain key). Visible now.
+		r.logger.Warn("domain_registry: unknown domain, using strict base profile",
 			zap.String("domain", domain),
+			zap.String("normalized", key),
 		)
 		return BaseProfile
 	}
@@ -97,7 +116,7 @@ func (r *DomainRegistry) Get(domain string) *DomainProfile {
 //   - Admin panel when updating domain config
 //   - AI update path when conversation patterns suggest rule changes
 func (r *DomainRegistry) Upsert(ctx context.Context, profile *DomainProfile) error {
-	key := strings.ToLower(strings.TrimSpace(profile.Domain))
+	key := normDomainKey(profile.Domain)
 
 	configJSON, err := json.Marshal(profile)
 	if err != nil {
@@ -128,7 +147,7 @@ func (r *DomainRegistry) Upsert(ctx context.Context, profile *DomainProfile) err
 // to BaseProfile until loadAll() is called again.
 // Use when you want to force a reload without restarting.
 func (r *DomainRegistry) Invalidate(domain string) {
-	key := strings.ToLower(strings.TrimSpace(domain))
+	key := normDomainKey(domain)
 	r.mu.Lock()
 	delete(r.profiles, key)
 	r.mu.Unlock()
@@ -143,7 +162,7 @@ func (r *DomainRegistry) Invalidate(domain string) {
 // existing profile or from BaseProfile's defaults) must use this
 // instead of Get.
 func (r *DomainRegistry) GetExact(domain string) *DomainProfile {
-	key := strings.ToLower(strings.TrimSpace(domain))
+	key := normDomainKey(domain)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.profiles[key]
@@ -231,7 +250,7 @@ func (r *DomainRegistry) loadAll(ctx context.Context) error {
 			continue // Non-fatal: skip corrupt row, use BaseProfile for this domain
 		}
 
-		newMap[strings.ToLower(domain)] = &profile
+		newMap[normDomainKey(domain)] = &profile
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("rows error: %w", err)
