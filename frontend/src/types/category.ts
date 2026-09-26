@@ -17,9 +17,22 @@ export interface CategoryTemplateSection {
   required: boolean
 }
 
+/** One named answer format inside a category (T-CAT), e.g. "Code" / "Approach". */
+export interface CategoryTemplate {
+  name: string
+  sections: CategoryTemplateSection[]
+}
+
 export interface CategoryTemplateSchema {
   /** Empty/omitted sections = no structured template, flat-text fallback (CT-L2). */
-  sections: CategoryTemplateSection[]
+  sections?: CategoryTemplateSection[]
+  /**
+   * T-CAT: named variants. When present these win over `sections`, so the SAME
+   * expert can answer a different shape per question (code vs approach).
+   */
+  templates?: CategoryTemplate[]
+  /** Which variant is used when the caller does not pick one. */
+  default?: string
 }
 
 /**

@@ -472,6 +472,9 @@ func buildRouter(
 	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
+	// T-CAT: expose the expert's category answer formats to clients so the chat
+	// can offer a per-question format selector.
+	expertHandler.SetCategoryRegistry(categoryRegistry)
 	byoHandler := byoexpert.NewHandler(byoSvc, logger)
 	explainSvc := explain.NewService(postgres.Pool, provSvc, tenantSvc, logger)
 	explainHandler := explain.NewHandler(explainSvc, logger)
@@ -880,6 +883,7 @@ func buildRouter(
 			experts.GET("", expertHandler.ListActive)
 			experts.GET("/:id", expertHandler.GetByID)
 			experts.GET("/:id/topics", expertHandler.GetTopics)
+			experts.GET("/:id/answer-formats", expertHandler.AnswerFormats)
 		}
 		// C8: bring-your-own-expert (tenant self-service). Static segments
 		// only (no wildcard) so it cannot collide with /experts/:id.

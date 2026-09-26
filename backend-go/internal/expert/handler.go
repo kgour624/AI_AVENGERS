@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
+	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/response"
 	"ai_avengers/backend/internal/tenant"
 )
@@ -32,11 +33,62 @@ type Handler struct {
 	db     *pgxpool.Pool
 	tenant *tenant.Service // C4: nil-safe — unwired → global scope, no filter
 	logger *zap.Logger
+	// categoryReg (T-CAT): nil-safe. When wired, the client can discover the
+	// named answer formats of the expert's category so the chat can offer a
+	// per-question selector. Nil → no formats are exposed, and every answer
+	// keeps using the category default (flat text when there is no category).
+	categoryReg *category.Registry
 }
+
+// SetCategoryRegistry wires the category registry for the read-only
+// answer-formats endpoint.
+func (h *Handler) SetCategoryRegistry(r *category.Registry) { h.categoryReg = r }
 
 // NewHandler creates a new expert handler.
 func NewHandler(db *pgxpool.Pool, tenantSvc *tenant.Service, logger *zap.Logger) *Handler {
 	return &Handler{db: db, tenant: tenantSvc, logger: logger}
+}
+
+// AnswerFormats GET /experts/:id/answer-formats
+//
+// Returns the named answer formats available for this expert's category, so the
+// chat can show a per-question selector (T-CAT). Always 200 with an empty list
+// when the expert has no category or the category has no named variants — an
+// expert in the legacy single-template shape simply has nothing to choose.
+func (h *Handler) AnswerFormats(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	ctx := c.Request.Context()
+
+	var categoryID *uuid.UUID
+	if err := h.db.QueryRow(ctx,
+		`SELECT category_id FROM experts WHERE id=$1 AND deleted_at IS NULL`, expertID,
+	).Scan(&categoryID); err != nil {
+		// Unknown expert is not an error for this optional affordance.
+		response.OK(c, gin.H{"category": "", "default": "", "formats": []string{}})
+		return
+	}
+	if categoryID == nil || h.categoryReg == nil {
+		response.OK(c, gin.H{"category": "", "default": "", "formats": []string{}})
+		return
+	}
+	cat := h.categoryReg.Get(*categoryID)
+	if cat == nil {
+		response.OK(c, gin.H{"category": "", "default": "", "formats": []string{}})
+		return
+	}
+	formats := cat.TemplateNames()
+	if formats == nil {
+		formats = []string{}
+	}
+	response.OK(c, gin.H{
+		"category": cat.Name,
+		"default":  cat.TemplateSchema.Default,
+		"formats":  formats,
+	})
 }
 
 // ListActive GET /experts
