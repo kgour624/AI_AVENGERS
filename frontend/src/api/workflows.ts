@@ -273,6 +273,24 @@ export const generateCodebasePatch = (workflowId: string) =>
  * through the shared axios instance would push it through the camelCase response
  * transform. Auth still goes through the same access token.
  */
+/**
+ * getCodebasePatchText fetches the same patch the download button serves, as
+ * text, so the review screen can show it. WHY a separate raw fetch: the download
+ * path is an attachment meant to be saved, and reading it as a blob would show
+ * the reviewer nothing.
+ */
+export async function getCodebasePatchText(workflowId: string): Promise<string> {
+  const token = useAuthStore.getState().accessToken
+  const base = import.meta.env.VITE_API_URL ?? ''
+  const res = await fetch(`${base}/api/v1/workflows/${workflowId}/codebase/patch/download`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+  })
+  if (!res.ok) {
+    throw new Error(`patch ${res.status}`)
+  }
+  return res.text()
+}
+
 export async function downloadCodebasePatch(workflowId: string): Promise<Blob> {
   const token = useAuthStore.getState().accessToken
   const base = import.meta.env.VITE_API_URL ?? ''
