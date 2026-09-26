@@ -88,6 +88,16 @@ type Workflow struct {
 	// than errors — the Codebase tab is gated on Mode, so it never rendered, and
 	// a failed run could not state its cause anywhere on screen.
 	Mode          string    `json:"mode"`
+	// DeliverCode: this workflow asked for WORKING CODE, not only the design
+	// documents §9 made the default output of the implementation phase.
+	//
+	// WHY a per-workflow choice rather than a new default: §9 retired the
+	// application-code path deliberately, and switching it back on silently would
+	// override a recorded decision. As an option it does something the doc never
+	// argued against — a client whose deliverable IS a patch to their repository
+	// can ask for code, while every other workflow keeps writing design. Default
+	// false (design only), which is exactly the behaviour before this column.
+	DeliverCode   bool      `json:"deliver_code"`
 	FailureReason *string   `json:"failure_reason"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
@@ -116,6 +126,9 @@ type CreateRequest struct {
 	// Mode is the environment. Empty means ModeScratch, so every existing
 	// caller keeps the behaviour it had before modes existed.
 	Mode string
+	// DeliverCode asks for working code as well as the design documents. False is
+	// the design-only path §9 chose, and what every existing caller gets.
+	DeliverCode bool
 }
 
 // CostLimitResult is returned by UpdateCostSpent.
@@ -223,23 +236,23 @@ func (e *Engine) Create(ctx context.Context, req CreateRequest) (*Workflow, erro
 	err = e.db.QueryRow(ctx,
 		`INSERT INTO workflows
 			(client_id, project_id, title, status, current_phase,
-			 selected_expert_ids, cost_budget_usd, mode)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+			 selected_expert_ids, cost_budget_usd, mode, deliver_code)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		 RETURNING id, client_id, project_id, title, status, current_phase,
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
-		           generic_allowance_pct, mode,
+		           generic_allowance_pct, mode, deliver_code,
 		           created_at, updated_at`,
 		req.ClientID, req.ProjectID, req.Title,
 		StatusDraft, PhaseIntake,
-		string(expertIDsJSON), budget, mode,
+		string(expertIDsJSON), budget, mode, req.DeliverCode,
 	).Scan(
 		&w.ID, &w.ClientID, &w.ProjectID, &w.Title, &w.Status, &w.CurrentPhase,
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct, &w.Mode,
+		&w.GenericAllowancePct, &w.Mode, &w.DeliverCode,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
@@ -273,7 +286,7 @@ func (e *Engine) Start(ctx context.Context, workflowID uuid.UUID) (*Workflow, er
 		           phase_started_at, phase_completed_at,
 		           selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		           cost_soft_limit_pct, cost_hard_limit_pct,
-		           generic_allowance_pct, mode, failure_reason,
+		           generic_allowance_pct, mode, deliver_code, failure_reason,
 		           created_at, updated_at`,
 		StatusRunning, PhaseIntake, now,
 		workflowID, StatusDraft,
@@ -282,7 +295,7 @@ func (e *Engine) Start(ctx context.Context, workflowID uuid.UUID) (*Workflow, er
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct, &w.Mode, &w.FailureReason,
+		&w.GenericAllowancePct, &w.Mode, &w.DeliverCode, &w.FailureReason,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
@@ -495,7 +508,7 @@ func (e *Engine) GetByID(ctx context.Context, workflowID uuid.UUID) (*Workflow, 
 		        phase_started_at, phase_completed_at,
 		        selected_expert_ids, cost_budget_usd, cost_spent_usd,
 		        cost_soft_limit_pct, cost_hard_limit_pct,
-		        generic_allowance_pct, mode, failure_reason,
+		        generic_allowance_pct, mode, deliver_code, failure_reason,
 		        created_at, updated_at
 		 FROM workflows WHERE id = $1`,
 		workflowID,
@@ -504,7 +517,7 @@ func (e *Engine) GetByID(ctx context.Context, workflowID uuid.UUID) (*Workflow, 
 		&w.PhaseStartedAt, &w.PhaseCompletedAt,
 		&expertIDsRaw, &w.CostBudgetUSD, &w.CostSpentUSD,
 		&w.CostSoftLimitPct, &w.CostHardLimitPct,
-		&w.GenericAllowancePct, &w.Mode, &w.FailureReason,
+		&w.GenericAllowancePct, &w.Mode, &w.DeliverCode, &w.FailureReason,
 		&w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {

@@ -26,6 +26,11 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   // the project's connected repository, where the readable files are a set the
   // client approves — not the whole repo.
   const [mode, setMode] = useState<'scratch' | 'existing_codebase'>('scratch')
+  // G8: ask the implementation phase for working code. Default OFF — the design
+  // documents are what §9 chose, and code generation needs the code service to be
+  // configured; a workflow that asks for code and cannot get it fails loudly, so
+  // this must be a deliberate choice rather than a default.
+  const [deliverCode, setDeliverCode] = useState(false)
   const [selectedExpertIds, setSelectedExpertIds] = useState<string[]>([])
   const [budget, setBudget] = useState('10')
   const [error, setError] = useState<string | null>(null)
@@ -70,6 +75,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
         costBudgetUsd: parseFloat(budget) || 10,
         requirementText: requirement.trim() || undefined,
         mode,
+        deliverCode,
       })
       // Launching straight into a run is right for scratch and wrong for an
       // existing codebase: the approved readable set is what the runner seeds the
@@ -245,6 +251,24 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
             {error}
           </p>
         )}
+
+        <label className="mb-3 flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={deliverCode}
+            onChange={(e) => setDeliverCode(e.target.checked)}
+          />
+          <span className="text-[11px] text-text-secondary">
+            Also produce working code, not only the design documents.
+            <span className="mt-0.5 block text-text-disabled">
+              Use this when the deliverable is code — in an existing-codebase workflow the patch
+              to your repository is the point. Needs the code service to be running: a workflow
+              that asks for code and cannot produce it fails with that reason instead of quietly
+              shipping design only.
+            </span>
+          </span>
+        </label>
 
         <div className="flex justify-end gap-2">
           <Button variant="ghost" onClick={handleClose} disabled={createMut.isPending}>Cancel</Button>
