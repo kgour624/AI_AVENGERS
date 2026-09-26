@@ -44,6 +44,12 @@ export interface SendMessageOptions {
    * (message/handler.go's SendMessageRequest).
    */
   replyToMessageId?: string
+  /**
+   * T-CAT: optional named answer format of the expert's category ("Code",
+   * "Approach"). undefined = the category's default, which is what every
+   * pre-existing caller sends.
+   */
+  templateName?: string
   /** CT-L6: explicit opt-in only, ignored if replyToMessageId is unset. */
   includeFullThread?: boolean
 }
@@ -101,7 +107,8 @@ export function useSSEStream() {
   const { startStream, setError } = useStreamStore()
 
   const sendMessage = async (options: SendMessageOptions) => {
-    const { chatId, message, expertIds, file, replyToMessageId, includeFullThread } = options
+    const { chatId, message, expertIds, file, replyToMessageId, includeFullThread, templateName } =
+      options
 
     startStream(chatId)
 
@@ -118,6 +125,7 @@ export function useSSEStream() {
       // c.PostForm just like message/expert_ids on this same branch.
       if (replyToMessageId) formData.append('reply_to_message_id', replyToMessageId)
       if (includeFullThread) formData.append('include_full_thread', 'true')
+      if (templateName) formData.append('template_name', templateName)
       body = formData
       // WHY no Content-Type set for FormData: the browser sets the
       // multipart boundary itself. Setting it manually (as plain
@@ -129,6 +137,7 @@ export function useSSEStream() {
         expert_ids: expertIds,
         ...(replyToMessageId ? { reply_to_message_id: replyToMessageId } : {}),
         ...(includeFullThread ? { include_full_thread: true } : {}),
+        ...(templateName ? { template_name: templateName } : {}),
       })
       headers['Content-Type'] = 'application/json'
     }

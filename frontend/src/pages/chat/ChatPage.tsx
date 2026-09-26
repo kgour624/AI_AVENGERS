@@ -226,10 +226,19 @@ export default function ChatPage() {
     expertIds: string[],
     file?: File,
     replyToMessageId?: string,
-    includeFullThread?: boolean
+    includeFullThread?: boolean,
+    templateName?: string
   ) {
     setPendingUserText(text)
-    await sendMessage({ chatId: chat.id, message: text, expertIds, file, replyToMessageId, includeFullThread })
+    await sendMessage({
+      chatId: chat.id,
+      message: text,
+      expertIds,
+      file,
+      replyToMessageId,
+      includeFullThread,
+      templateName,
+    })
 
     // WHY re-read stream status via getState() rather than the `stream`
     // closure variable: sendMessage's promise resolves after the SSE

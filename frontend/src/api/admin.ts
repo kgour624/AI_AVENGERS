@@ -593,6 +593,28 @@ export const updateExpertCategory = (categoryId: string, req: UpdateExpertCatego
     .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/expert-categories/${categoryId}`, req)
     .then((res) => res.data.data!)
 
+// T-CAT: membership of a category. An expert's category_id is what makes the
+// structured template apply at answer time, so this is the step that was
+// missing (every expert was left NULL -> flat text).
+export interface CategoryExpert {
+  id: string
+  name: string
+  domain: string
+}
+
+export const getCategoryExperts = (categoryId: string) =>
+  baseAPI
+    .get<ApiResponse<CategoryExpert[]>>(`/api/v1/admin/expert-categories/${categoryId}/experts`)
+    .then((res) => res.data.data ?? [])
+
+export const setCategoryExperts = (categoryId: string, expertIds: string[]) =>
+  baseAPI
+    .put<ApiResponse<{ assigned: number; removed: number }>>(
+      `/api/v1/admin/expert-categories/${categoryId}/experts`,
+      { expert_ids: expertIds },
+    )
+    .then((res) => res.data.data!)
+
 // ============================================================
 // DOMAIN PROFILES (China Wall per-domain config, admin-configurable)
 // ============================================================

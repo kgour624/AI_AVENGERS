@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { useDropzone } from 'react-dropzone'
+import { getExpertAnswerFormats } from '@/api/experts'
 import { ExpertPicker } from '@/components/expert/ExpertPicker'
 import { Button } from '@/components/ui/Button'
 import { Tooltip } from '@/components/ui/Tooltip'
@@ -99,7 +101,8 @@ export interface MessageInputProps {
     expertIds: string[],
     file?: File,
     replyToMessageId?: string,
-    includeFullThread?: boolean
+    includeFullThread?: boolean,
+    templateName?: string
   ) => void
   isSending: boolean
 }
@@ -118,6 +121,26 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
 
   // CT-D4: reply state, isolated per-chat via replyStore (CT-L10 —
   // does not touch streamStore or the message list at all).
+  // T-CAT: per-question answer format. Formats come from the FIRST selected
+  // expert's category — if several experts are selected with different
+  // categories, the first is authoritative for this picker (the backend still
+  // applies each expert's own category default when none is chosen).
+  const firstSelectedId = Array.from(selectedIds)[0]
+  const { data: formatInfo } = useQuery({
+    queryKey: ['expert-answer-formats', firstSelectedId],
+    queryFn: () => getExpertAnswerFormats(firstSelectedId!),
+    enabled: Boolean(firstSelectedId),
+  })
+  const formats = formatInfo?.formats ?? []
+  const defaultFormat = formatInfo?.default ?? ''
+  const [selectedFormat, setSelectedFormat] = useState('')
+
+  // Reset the picker whenever the expert set changes; the backend default
+  // applies until the user picks something.
+  useEffect(() => {
+    setSelectedFormat('')
+  }, [firstSelectedId])
+
   const replyState = useReplyStore((s) => s.replies.get(chatId))
   // replyTarget: hoisted so the null-check is a single, well-narrowed binding.
   // TS does not carry `replyState.target` narrowing into the .filter()
@@ -182,12 +205,20 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     const trimmed = message.trim()
     if (!trimmed || selectedIds.size === 0 || isSending) return
 
+    // T-CAT: only send a format when the user (or the category default) actually
+    // chose one; empty = backend uses the category default.
+    const formatToSend =
+      (selectedFormat && formats.some((f) => f === selectedFormat) ? selectedFormat : undefined) ??
+      formats.find((f) => f.toLowerCase() === defaultFormat.toLowerCase()) ??
+      undefined
+
     onSend(
       trimmed,
       Array.from(selectedIds),
       attachedFile ?? undefined,
       replyTarget?.messageId,
-      replyState?.includeFullThread
+      replyState?.includeFullThread,
+      formatToSend
     )
     setMessage('')
     setAttachedFile(null)
@@ -323,6 +354,23 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
         )}
       >
         <input {...getInputProps()} />
+
+        {formats.length >= 2 && (
+          <div className="mb-1 flex items-center gap-2 text-xs text-text-secondary">
+            <span>Answer format</span>
+            <select
+              value={selectedFormat || defaultFormat}
+              onChange={(e) => setSelectedFormat(e.target.value)}
+              className="rounded-md border border-surface-border bg-surface-overlay px-2 py-1 text-xs text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+            >
+              {formats.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
 
         <textarea
           ref={textareaRef}

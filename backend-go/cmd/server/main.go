@@ -29,12 +29,12 @@ import (
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/db"
 	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/entitlement"
 	"ai_avengers/backend/internal/eval"
-	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
-	"ai_avengers/backend/internal/docextract"
+	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/knowledge"
@@ -472,6 +472,9 @@ func buildRouter(
 	messageHandler := message.NewHandler(postgres.Pool, chatSvc, orch, modelGateway, embedder, memManager, provSvc, tenantSvc, logger)
 	ratingHandler := rating.NewHandler(ratingSvc, logger)
 	expertHandler := expert.NewHandler(postgres.Pool, tenantSvc, logger)
+	// T-CAT: expose the expert's category answer formats to clients so the chat
+	// can offer a per-question format selector.
+	expertHandler.SetCategoryRegistry(categoryRegistry)
 	byoHandler := byoexpert.NewHandler(byoSvc, logger)
 	explainSvc := explain.NewService(postgres.Pool, provSvc, tenantSvc, logger)
 	explainHandler := explain.NewHandler(explainSvc, logger)
@@ -880,6 +883,7 @@ func buildRouter(
 			experts.GET("", expertHandler.ListActive)
 			experts.GET("/:id", expertHandler.GetByID)
 			experts.GET("/:id/topics", expertHandler.GetTopics)
+			experts.GET("/:id/answer-formats", expertHandler.AnswerFormats)
 		}
 		// C8: bring-your-own-expert (tenant self-service). Static segments
 		// only (no wildcard) so it cannot collide with /experts/:id.
@@ -1111,6 +1115,8 @@ func buildRouter(
 		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)
 		adminGroup.GET("/expert-categories/:id", adminHandler.GetExpertCategory)
 		adminGroup.PATCH("/expert-categories/:id", adminHandler.UpdateExpertCategory)
+		adminGroup.GET("/expert-categories/:id/experts", adminHandler.ListCategoryExperts)
+		adminGroup.PUT("/expert-categories/:id/experts", adminHandler.SetCategoryExperts)
 		// Domain profiles (China Wall per-domain config) — admin-configurable,
 		// no redeploy needed. Includes MaxTokensFlat/MaxTokensStructured
 		// (2026-09-08 addition, see chinawall/domain_profile.go's field docs).
