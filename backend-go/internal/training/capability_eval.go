@@ -844,12 +844,31 @@ func (e *CapabilityEvaluator) storeResult(ctx context.Context, runID, expertID u
 			(run_id, case_id, expert_id, topic, level, retrieved_ids, hit_rank,
 			 cited, grounded, refused, passed, answer, failure_reason)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-		runID, c.ID, expertID, c.Topic, c.Level, r.RetrievedIDs, r.HitRank,
+		runID, c.ID, expertID, c.Topic, c.Level, nonNilIDs(r.RetrievedIDs), r.HitRank,
 		r.Cited, r.Grounded, r.Refused, r.Passed, r.Answer, r.FailureReason,
 	); err != nil {
 		return fmt.Errorf("capability eval: store result: %w", err)
 	}
 	return nil
+}
+
+// nonNilIDs converts a nil slice to an empty one.
+//
+// WHY this exists (incident 2026-09-26): a case that fails retrieval — or whose
+// retrieved context is empty — returns BEFORE the code that fills RetrievedIDs,
+// leaving it nil. A nil []uuid.UUID reaches pgx as SQL NULL, and
+// expert_capability_results.retrieved_ids is NOT NULL, so the INSERT raised
+// SQLSTATE 23502, the eval run aborted, and the ingestion screen froze at 86%
+// because the failure never reached the UI.
+//
+// The column means "the chunks retrieval returned", and "none" is legitimately
+// an empty array — never NULL. Converting here (not only at the one call site)
+// makes EVERY future caller immune, including ones added later.
+func nonNilIDs(ids []uuid.UUID) []uuid.UUID {
+	if ids == nil {
+		return []uuid.UUID{}
+	}
+	return ids
 }
 
 // summarise aggregates the pass, writes the measured verdict back onto the
