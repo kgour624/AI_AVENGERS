@@ -62,7 +62,7 @@ export default function ProjectPage() {
         to="/"
         className="mb-3 inline-flex items-center gap-1 text-sm text-text-secondary hover:text-text-primary"
       >
-        {'\u2190'} Back to Projects
+        {'←'} Back to Projects
       </Link>
       <div className="flex items-start justify-between">
         <div>

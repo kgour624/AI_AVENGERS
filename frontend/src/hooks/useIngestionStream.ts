@@ -106,29 +106,29 @@ export function describeJobEvent(ev: IngestionJobEvent): { type: string; message
       if (resumed) {
         return {
           type: 'update',
-          message: `\u25b6 Resumed from checkpoint (${str(d, 'resumed_from') || 'unknown'}) \u2014 ${workers} workers`,
+          message: `▶ Resumed from checkpoint (${str(d, 'resumed_from') || 'unknown'}) — ${workers} workers`,
         }
       }
       return {
         type: 'update',
-        message: `\u25b6 Run started \u2014 ${num(d, 'transcript_chars').toLocaleString()} chars, ${workers} workers`,
+        message: `▶ Run started — ${num(d, 'transcript_chars').toLocaleString()} chars, ${workers} workers`,
       }
     }
     case 'stage_started':
-      return { type: 'update', message: `${ev.stage} \u2014 ${str(d, 'detail') || 'started'}` }
+      return { type: 'update', message: `${ev.stage} — ${str(d, 'detail') || 'started'}` }
     case 'stage_done': {
       const ms = num(d, 'duration_ms')
       const chunks = num(d, 'chunks')
       const fromCheckpoint = d.from_checkpoint === true ? ' (from checkpoint)' : ''
       return {
         type: 'update',
-        message: `${ev.stage} done in ${ms}ms${chunks ? ` \u2014 ${chunks} chunks` : ''}${fromCheckpoint}`,
+        message: `${ev.stage} done in ${ms}ms${chunks ? ` — ${chunks} chunks` : ''}${fromCheckpoint}`,
       }
     }
     case 'batch_done':
       return {
         type: 'update',
-        message: `${ev.stage} batch ${num(d, 'batches_done')}/${num(d, 'batches_total')} \u2014 ${num(d, 'chunks_done')}/${num(d, 'chunks_total')} chunks (${num(d, 'workers')} workers)`,
+        message: `${ev.stage} batch ${num(d, 'batches_done')}/${num(d, 'batches_total')} — ${num(d, 'chunks_done')}/${num(d, 'chunks_total')} chunks (${num(d, 'workers')} workers)`,
       }
     case 'chunk_stored':
       return {
@@ -141,26 +141,26 @@ export function describeJobEvent(ev: IngestionJobEvent): { type: string; message
       if (d.ok === true) {
         return {
           type: 'verified',
-          message: `DB verified \u2014 ${reality.chunks ?? 0} chunks, ${reality.topics ?? 0} topics, ${reality.general_chunks ?? 0} general`,
+          message: `DB verified — ${reality.chunks ?? 0} chunks, ${reality.topics ?? 0} topics, ${reality.general_chunks ?? 0} general`,
         }
       }
       return {
         type: 'mismatch',
-        message: `DB MISMATCH \u2014 claimed ${claim.chunks ?? 0} chunks/${claim.topics ?? 0} topics, DB has ${reality.chunks ?? 0}/${reality.topics ?? 0} (general ${reality.general_chunks ?? 0}, null embeddings ${reality.null_embeddings ?? 0})`,
+        message: `DB MISMATCH — claimed ${claim.chunks ?? 0} chunks/${claim.topics ?? 0} topics, DB has ${reality.chunks ?? 0}/${reality.topics ?? 0} (general ${reality.general_chunks ?? 0}, null embeddings ${reality.null_embeddings ?? 0})`,
       }
     }
     case 'paused':
       return {
         type: 'paused',
-        message: `\u23f8 PAUSED \u2014 ${str(d, 'reason') || 'waiting for admin action'}`,
+        message: `⏸ PAUSED — ${str(d, 'reason') || 'waiting for admin action'}`,
       }
     case 'failed':
-      return { type: 'failed', message: `\u274c FAILED \u2014 ${str(d, 'reason') || 'unknown error'}` }
+      return { type: 'failed', message: `❌ FAILED — ${str(d, 'reason') || 'unknown error'}` }
     case 'complete': {
       const ms = num(d, 'duration_ms')
       return {
         type: 'complete',
-        message: `\u2705 Complete \u2014 ${num(d, 'chunks_this_run')} chunks this run, corpus ${num(d, 'corpus_total')}, ${(ms / 1000).toFixed(1)}s, smoke test ${d.smoke_test_passed === true ? 'passed' : 'failed'}`,
+        message: `✅ Complete — ${num(d, 'chunks_this_run')} chunks this run, corpus ${num(d, 'corpus_total')}, ${(ms / 1000).toFixed(1)}s, smoke test ${d.smoke_test_passed === true ? 'passed' : 'failed'}`,
       }
     }
     // I3: the ingest-time capability measurement and the training gate. Both are
@@ -172,7 +172,7 @@ export function describeJobEvent(ev: IngestionJobEvent): { type: string; message
       if (status === 'failed') {
         return {
           type: 'mismatch',
-          message: `\u26a0\ufe0f Capability measurement failed \u2014 ${str(d, 'error') || 'unknown error'}`,
+          message: `⚠️ Capability measurement failed — ${str(d, 'error') || 'unknown error'}`,
         }
       }
       return {

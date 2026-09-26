@@ -142,7 +142,7 @@ export default function ResetPasswordPage() {
 
           <p className="mt-5 text-center text-xs text-text-disabled">
             <Link to="/login" className="text-glow-purple/80 transition-colors hover:text-glow-purple">
-              {'\u2190'} Back to Login
+              {'←'} Back to Login
             </Link>
           </p>
         </div>

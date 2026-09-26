@@ -82,7 +82,7 @@ function ExpertRow({
   return (
     <div className="mt-1 flex items-center justify-between">
       <p className="text-xs text-text-secondary">
-        {latestJob.status === 'complete' ? '\u2705' : isWarning ? '\u26a0\ufe0f' : latestJob.status === 'failed' ? '\u274c' : latestJob.status === 'paused' ? '\u23f8' : '\u23f3'}{' '}
+        {latestJob.status === 'complete' ? '✅' : isWarning ? '⚠️' : latestJob.status === 'failed' ? '❌' : latestJob.status === 'paused' ? '⏸' : '⏳'}{' '}
         {stageLabel}
         {latestJob.processedChunks > 0 && (
           <span className="ml-1 text-text-disabled">
@@ -185,7 +185,7 @@ function AdminExperts() {
                   {trainingStatusLabel(expert.trainingStatus)}
                 </Badge>
                 <Badge variant={expert.isActive ? 'brand' : 'neutral'}>
-                  {expert.isActive ? '\u2705 Active' : '\u23f8 Disabled'}
+                  {expert.isActive ? '✅ Active' : '⏸ Disabled'}
                 </Badge>
               </div>
             </div>
@@ -234,7 +234,7 @@ function AdminExperts() {
                     onClick={() => handleRegenerateCharter(expert.id)}
                     className="border-amber-500/50 text-amber-400 hover:bg-amber-500/10"
                   >
-                    {regeneratingIds.has(expert.id) ? '\u23f3 Generating...' : '\u26a1 Regenerate Charter'}
+                    {regeneratingIds.has(expert.id) ? '⏳ Generating...' : '⚡ Regenerate Charter'}
                   </Button>
                   <RegenFeedback feedback={regenFeedback[expert.id]} />
                 </div>

@@ -76,7 +76,7 @@ export default function ForgotPasswordPage() {
 
           {submitted ? (
             <div className="rounded-md border border-mode-advise/30 bg-mode-advise/10 px-4 py-3 text-center">
-              <p className="text-sm font-medium text-mode-advise">{'\u2709\ufe0f'} Check your inbox</p>
+              <p className="text-sm font-medium text-mode-advise">{'✉️'} Check your inbox</p>
               <p className="mt-1 text-xs text-text-secondary">
                 If that email is registered, a reset link has been sent.
                 Contact your admin if you don’t receive it.
@@ -110,7 +110,7 @@ export default function ForgotPasswordPage() {
 
           <p className="mt-5 text-center text-xs text-text-disabled">
             <Link to="/login" className="text-glow-purple/80 transition-colors hover:text-glow-purple">
-              {'\u2190'} Back to Login
+              {'←'} Back to Login
             </Link>
           </p>
         </div>

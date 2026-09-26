@@ -226,7 +226,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
                     'flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded border text-[9px]',
                     selected ? 'border-brand bg-brand text-white' : 'border-surface-border'
                   )}>
-                    {selected && '\u2713'}
+                    {selected && '✓'}
                   </span>
                   <span className="font-medium">{expert.name}</span>
                   <span className="ml-auto text-text-disabled">{expert.domain}</span>

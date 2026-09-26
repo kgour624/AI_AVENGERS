@@ -98,11 +98,11 @@ export interface Expert extends PublicExpert {
  */
 export function trainingStatusLabel(status: Expert['trainingStatus']): string {
   switch (status) {
-    case 'trained':    return '\u2705 Trained'
-    case 'ingesting':  return '\u23f3 Ingesting'
-    case 'deprecated': return '\u26a0\ufe0f Deprecated'
+    case 'trained':    return '✅ Trained'
+    case 'ingesting':  return '⏳ Ingesting'
+    case 'deprecated': return '⚠️ Deprecated'
     case 'draft':
-    default:           return '\u270f\ufe0f Draft'
+    default:           return '✏️ Draft'
   }
 }
 
@@ -272,35 +272,35 @@ export function getModeBadgeConfig(mode: ResponseMode): ModeBadgeConfig {
     case 'ADVISE':
       return {
         color: 'text-mode-advise',
-        icon: '\u2705',
+        icon: '✅',
         label: 'ADVISE',
         bgClass: 'bg-mode-advise/10 border-mode-advise/30',
       }
     case 'ASK':
       return {
         color: 'text-mode-ask',
-        icon: '\u2753',
+        icon: '❓',
         label: 'ASK',
         bgClass: 'bg-mode-ask/10 border-mode-ask/30',
       }
     case 'WARN':
       return {
         color: 'text-mode-warn',
-        icon: '\u26A0\uFE0F',
+        icon: '⚠️',
         label: 'WARN',
         bgClass: 'bg-mode-warn/10 border-mode-warn/30',
       }
     case 'PUSH_BACK':
       return {
         color: 'text-mode-pushback',
-        icon: '\uD83D\uDD04',
+        icon: '🔄',
         label: 'PUSH BACK',
         bgClass: 'bg-mode-pushback/10 border-mode-pushback/30',
       }
     case 'REFUSE':
       return {
         color: 'text-mode-refuse',
-        icon: '\uD83D\uDEAB',
+        icon: '🚫',
         label: 'REFUSE',
         bgClass: 'bg-mode-refuse/10 border-mode-refuse/30',
       }

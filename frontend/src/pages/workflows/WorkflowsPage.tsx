@@ -73,7 +73,7 @@ function WorkflowsPage() {
                 </Link>
                 <p className="mt-0.5 text-xs text-text-disabled">
                   {wf.currentPhase.replace(/_/g, ' ')}
-                  {' \u00b7 '}
+                  {' · '}
                   ${wf.costSpentUsd.toFixed(4)} / ${wf.costBudgetUsd.toFixed(2)}
                 </p>
               </div>

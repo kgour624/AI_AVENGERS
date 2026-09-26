@@ -52,7 +52,7 @@ function CancelWorkflowButton({ workflowId, workflowTitle }: { workflowId: strin
         className="flex items-center gap-1.5 rounded-md border border-mode-refuse/60 bg-mode-refuse/10 px-3 py-1.5 text-xs font-medium text-mode-refuse hover:bg-mode-refuse/20 transition-colors"
         title="Cancel this workflow"
       >
-        <span>{'\u23f9'}</span>
+        <span>{'⏹'}</span>
         <span>Cancel Workflow</span>
       </button>
     )
@@ -162,7 +162,7 @@ function ApprovalGate({
   return (
     <div className="mt-4 rounded-lg border border-glow-amber/40 bg-glow-amber/10 p-4">
       <p className="text-sm font-semibold text-glow-amber">
-        {'\u23f8'} Waiting for Approval
+        {'⏸'} Waiting for Approval
         {gateName && (
           <span className="ml-2 text-xs font-normal text-text-disabled">({gateName})</span>
         )}
@@ -263,7 +263,7 @@ function ApprovalGate({
           disabled={!!loading || sent}
           className="rounded bg-mode-advise px-4 py-1.5 text-xs font-semibold text-white hover:opacity-90 disabled:opacity-50"
         >
-          {loading === 'approve' ? 'Approving...' : '\u2713 Approve'}
+          {loading === 'approve' ? 'Approving...' : '✓ Approve'}
         </button>
         <button
           onClick={() => respond('request_changes')}
@@ -272,7 +272,7 @@ function ApprovalGate({
         >
           {loading === 'request_changes'
             ? 'Sending...'
-            : `\u21ba Request Changes & Re-run (${genericPct}% generic)`}
+            : `↻ Request Changes & Re-run (${genericPct}% generic)`}
         </button>
       </div>
     </div>
@@ -780,7 +780,7 @@ function KanbanPage() {
       {!stream.isFailed && workflow?.status !== 'failed' && (stream.isDone || workflow?.status === 'completed') && (
         <div className="mt-4 rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-4">
           <div className="flex items-center justify-between gap-4">
-            <p className="text-sm font-medium text-mode-advise">{'\u2705'} Workflow Complete</p>
+            <p className="text-sm font-medium text-mode-advise">{'✅'} Workflow Complete</p>
             <DownloadDesignPackageButton
               workflowTitle={workflow?.title ?? 'workflow'}
               events={events}

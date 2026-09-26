@@ -267,7 +267,7 @@ export default function ChatPage() {
           to={`/projects/${projectId}`}
           className="text-sm text-text-secondary hover:text-text-primary"
         >
-          {'\u2190'} Back to Project
+          {'←'} Back to Project
         </Link>
         {isEditingTitle ? (
           <input
@@ -297,7 +297,7 @@ export default function ChatPage() {
               title="Rename chat"
               aria-label="Rename chat"
             >
-              {'\u270f\ufe0f'}
+              {'✏️'}
             </button>
           </div>
         )}
@@ -317,7 +317,7 @@ export default function ChatPage() {
               onClick={() => { setShowSearch(false); setSearchQuery('') }}
               className="text-xs text-text-secondary hover:text-text-primary"
               title="Close search"
-            >{'\u2715'}</button>
+            >{'✕'}</button>
           </div>
         ) : (
           <button
@@ -325,7 +325,7 @@ export default function ChatPage() {
             className="flex items-center gap-1.5 rounded-md border border-surface-border bg-surface-overlay px-3 py-1.5 text-sm text-text-secondary hover:text-text-primary hover:border-brand/40 transition-colors"
             title="Search in chat"
           >
-            <span>{'\ud83d\udd0d'}</span>
+            <span>{'🔍'}</span>
             <span>Search</span>
           </button>
         )}

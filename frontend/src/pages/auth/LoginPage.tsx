@@ -112,7 +112,7 @@ export default function LoginPage() {
           {/* Brand */}
           <div className="mb-6 text-center">
             <h1 className="holo-text mb-1 text-3xl font-bold tracking-[0.12em] uppercase">
-              {'\u26A1'} AI Avengers
+              {'⚡'} AI Avengers
             </h1>
             <p className="text-xs font-medium uppercase tracking-[0.2em] text-text-disabled">
               Neural Command Center
@@ -126,7 +126,7 @@ export default function LoginPage() {
           {resetSuccess && (
             <div className="mb-4 rounded-md border border-mode-advise/30 bg-mode-advise/10 px-3 py-2 text-center">
               <p className="text-xs text-mode-advise">
-                {'\u2705'} Password reset successful. Please sign in.
+                {'✅'} Password reset successful. Please sign in.
               </p>
             </div>
           )}
@@ -143,7 +143,7 @@ export default function LoginPage() {
             <Input
               label="Password"
               type="password" name="password" autoComplete="current-password"
-              placeholder="{'\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022'}"
+              placeholder="{'••••••••'}"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               disabled={isSubmitting} required
