@@ -18,9 +18,10 @@ import (
 
 // CourseChunk is a retrieved chunk with its rerank score.
 // WHY SourceFile and ChunkIndex added (Feature #23, 2026-09-23):
-//   Citation modal showed chunk text but NOT which transcript it came from.
-//   Users couldn't tell if a citation was from "React Hooks" or "State Management".
-//   ChunkIndex helps locate the exact position in the source transcript.
+//
+//	Citation modal showed chunk text but NOT which transcript it came from.
+//	Users couldn't tell if a citation was from "React Hooks" or "State Management".
+//	ChunkIndex helps locate the exact position in the source transcript.
 type CourseChunk struct {
 	ID          uuid.UUID
 	Text        string
@@ -63,10 +64,11 @@ type EnforceResult struct {
 
 // Citation links a claim to a source chunk.
 // WHY SourceName and ChunkIndex added (Feature #23, 2026-09-23):
-//   Frontend CitationChip modal showed chunk text + score, but NOT which
-//   transcript the citation came from. Users couldn't tell if a citation
-//   was from "React Hooks" or "State Management" transcript.
-//   ChunkIndex helps users locate the exact position: "Chunk #42 of 150".
+//
+//	Frontend CitationChip modal showed chunk text + score, but NOT which
+//	transcript the citation came from. Users couldn't tell if a citation
+//	was from "React Hooks" or "State Management" transcript.
+//	ChunkIndex helps users locate the exact position: "Chunk #42 of 150".
 type Citation struct {
 	ChunkID uuid.UUID `json:"chunk_id"`
 	Text    string    `json:"text"`
@@ -88,16 +90,18 @@ type Citation struct {
 // Layer 4: Strip uncited claims — regex
 //
 // DOMAIN BEHAVIOR:
-//   Each layer's behavior is controlled by DomainProfile, not hardcoded booleans.
-//   registry.Get(expertDomain) → *DomainProfile → controls all 4 layers.
-//   Unknown domain → BaseProfile (strict defaults, safe fallback).
+//
+//	Each layer's behavior is controlled by DomainProfile, not hardcoded booleans.
+//	registry.Get(expertDomain) → *DomainProfile → controls all 4 layers.
+//	Unknown domain → BaseProfile (strict defaults, safe fallback).
 //
 // CONFLICT RESOLUTION (base wall safety net):
-//   Domain rules apply first.
-//   IF Layer 4 output is empty AND profile.StripMode == FULL_STRIP:
-//     → retry with BaseProfile (domain rules over-relaxed the wall)
-//   IF profile.StripMode == CODE_EXEMPT AND output has code block:
-//     → valid output, domain rules win
+//
+//	Domain rules apply first.
+//	IF Layer 4 output is empty AND profile.StripMode == FULL_STRIP:
+//	  → retry with BaseProfile (domain rules over-relaxed the wall)
+//	IF profile.StripMode == CODE_EXEMPT AND output has code block:
+//	  → valid output, domain rules win
 //
 // WHY 4 layers:
 // Single layer is not enough. LLMs are trained to be helpful
@@ -213,15 +217,28 @@ func (e *Enforcer) Enforce(
 			zap.Float32("best_score", bestScore),
 			zap.Float64("threshold", threshold),
 		)
-		// With a generic allowance the expert may still answer (its general
-		// knowledge is allowed), so a low relevance score is no longer fatal —
-		// only a run with NO allowance escalates here.
-		if !allowGeneric {
+		// A low reranker score is NOT, by itself, proof the expert cannot answer.
+		// For APPLY_PRINCIPLES domains (system design, DSA, coding) questions are
+		// answered by applying the principles in the corpus, and a design
+		// question can legitimately score low against the wording that was
+		// ingested. Hard-refusing there threw away answers a trained expert
+		// produced correctly — the production regression where a system-design
+		// expert refused its own domain even with generic allowance at 0%.
+		// Only LITERAL_MATCH domains (medical/legal/finance), where the answer
+		// must be found verbatim, keep the strict score gate.
+		if !allowGeneric && profile.CoverageMode != CoverageModeApplyPrinciples {
 			if attempt >= e.cfg.MaxRetries {
 				return e.buildRefusal("insufficient_relevance",
 					fmt.Sprintf("Best relevance score %.2f below threshold %.2f", bestScore, threshold)), nil
 			}
 			return &EnforceResult{Status: "retry", LayerFailed: 1}, nil
+		}
+		if profile.CoverageMode == CoverageModeApplyPrinciples {
+			e.logger.Info("Layer 1: low reranker score on a principle-transfer domain — answering from the best available chunks",
+				zap.String("expert", expertName),
+				zap.String("domain", expertDomain),
+				zap.Float32("best_score", bestScore),
+				zap.Float64("threshold", threshold))
 		}
 	}
 
@@ -264,11 +281,20 @@ func (e *Enforcer) Enforce(
 	}
 
 	if coverage == "PARTIAL" && attempt >= 3 {
-		return &EnforceResult{
-			Status:   "partial",
-			Coverage: "PARTIAL",
-			Reason:   "Partial coverage after multiple attempts",
-		}, nil
+		// The decision engine turns "partial" into a refusal ("Cannot provide a
+		// complete answer"). For an APPLY_PRINCIPLES domain a partial match is
+		// normal and the expert must still answer from what it has — otherwise a
+		// trained system-design expert is refused on a question it can solve.
+		if profile.CoverageMode != CoverageModeApplyPrinciples {
+			return &EnforceResult{
+				Status:   "partial",
+				Coverage: "PARTIAL",
+				Reason:   "Partial coverage after multiple attempts",
+			}, nil
+		}
+		e.logger.Info("Layer 2: PARTIAL coverage on a principle-transfer domain — answering instead of refusing",
+			zap.String("expert", expertName),
+			zap.String("domain", expertDomain))
 	}
 
 	// LAYER 3: Generate with mandatory citations
@@ -618,23 +644,28 @@ func IsProblemSolvingDomain(domain string) bool {
 // Uses Chain-of-Thought prompting (Byte by Byte AI course improvement).
 //
 // TWO MODES:
-// 1. Problem-solving mode (DSA/coding): checks if expert can APPLY principles
-//    to solve the problem. Correct for DSA — principles must transfer to new problems.
-// 2. Factual mode (default): checks if chunks CONTAIN the answer.
-//    Correct for medical/legal/domain-fact experts.
+//  1. Problem-solving mode (DSA/coding): checks if expert can APPLY principles
+//     to solve the problem. Correct for DSA — principles must transfer to new problems.
+//  2. Factual mode (default): checks if chunks CONTAIN the answer.
+//     Correct for medical/legal/domain-fact experts.
 //
 // WHY two modes:
-//   A DSA expert trained on "two pointers, sliding window, prefix sum" SHOULD
-//   solve "Longest Common Prefix" by applying string traversal principles.
-//   Asking "does the transcript mention Longest Common Prefix?" is wrong —
-//   it would refuse every new problem, defeating the purpose of DSA education.
+//
+//	A DSA expert trained on "two pointers, sliding window, prefix sum" SHOULD
+//	solve "Longest Common Prefix" by applying string traversal principles.
+//	Asking "does the transcript mention Longest Common Prefix?" is wrong —
+//	it would refuse every new problem, defeating the purpose of DSA education.
+//
 // checkCoverage asks cheap LLM if chunks can answer the question.
 // Uses Chain-of-Thought prompting.
 //
 // CoverageModeApplyPrinciples: checks if expert can APPLY principles to solve.
-//   Correct for DSA, coding — principles transfer to new problems.
+//
+//	Correct for DSA, coding — principles transfer to new problems.
+//
 // CoverageModeLiteralMatch: checks if chunks CONTAIN the answer.
-//   Correct for medical, legal, finance — facts must be in transcript.
+//
+//	Correct for medical, legal, finance — facts must be in transcript.
 func (e *Enforcer) checkCoverage(ctx context.Context, question string, chunks []CourseChunk, mode CoverageMode) (string, error) {
 	var sb strings.Builder
 	sb.WriteString("Question: " + question + "\n\nAvailable Knowledge:\n")
@@ -936,26 +967,27 @@ COURSE CONTENT:
 // generateStructured generates a structured answer section-by-section.
 //
 // DESIGN DECISION (2026-09-16):
-//   Previous approach: one LLM call requesting ALL sections as a single
-//   JSON object. This failed reliably because:
-//   1. DeepSeek and reasoning models emit <think> blocks before JSON.
-//      Even after stripping, the JSON was often malformed or truncated.
-//   2. 5 heavy sections (prose + full code + test cases) in one JSON
-//      object routinely exceeded 32K tokens, truncating mid-JSON.
-//   3. JSON format forced the model to escape code (\n, \") — LLMs
-//      are unreliable at this, producing invalid JSON on complex code.
 //
-//   New approach: one LLM call PER SECTION, sequentially.
-//   WHY sequential not parallel:
-//   - User reads Pattern → Idea → Code → Walkthrough → TestCases in order.
-//     Sequential streaming lets them read each section as it arrives.
-//   - Each section is independently China-Wall enforced with citations.
-//   - No JSON format — plain text per section, no escaping issues.
-//   - Any model works: DeepSeek, Claude, Gemini — all return plain text.
+//	Previous approach: one LLM call requesting ALL sections as a single
+//	JSON object. This failed reliably because:
+//	1. DeepSeek and reasoning models emit <think> blocks before JSON.
+//	   Even after stripping, the JSON was often malformed or truncated.
+//	2. 5 heavy sections (prose + full code + test cases) in one JSON
+//	   object routinely exceeded 32K tokens, truncating mid-JSON.
+//	3. JSON format forced the model to escape code (\n, \") — LLMs
+//	   are unreliable at this, producing invalid JSON on complex code.
 //
-//   SOLID: Single Responsibility — each section call has one job.
-//   OCP: New section types extend by adding a case, not modifying core.
-//   LSP: TemplateSectionResult contract unchanged — callers unaffected.
+//	New approach: one LLM call PER SECTION, sequentially.
+//	WHY sequential not parallel:
+//	- User reads Pattern → Idea → Code → Walkthrough → TestCases in order.
+//	  Sequential streaming lets them read each section as it arrives.
+//	- Each section is independently China-Wall enforced with citations.
+//	- No JSON format — plain text per section, no escaping issues.
+//	- Any model works: DeepSeek, Claude, Gemini — all return plain text.
+//
+//	SOLID: Single Responsibility — each section call has one job.
+//	OCP: New section types extend by adding a case, not modifying core.
+//	LSP: TemplateSectionResult contract unchanged — callers unaffected.
 func (e *Enforcer) generateStructured(
 	ctx context.Context,
 	question string,
@@ -1191,16 +1223,18 @@ func (e *Enforcer) buildSectionPrompt(
 // UX: Users should see clean text, not technical IDs.
 //
 // MENTAL MODEL:
-//   Input:  "Use bcrypt [CHUNK_abc-123] for passwords"
-//   Output: "Use bcrypt for passwords"
+//
+//	Input:  "Use bcrypt [CHUNK_abc-123] for passwords"
+//	Output: "Use bcrypt for passwords"
 //
 // CROSS-QUESTION:
-//   Q: Why not remove during generation?
-//   A: LLM needs them for citation tracking, remove after extraction
 //
-//   Q: What if chunk ID is in code block?
-//   A: Regex removes all [CHUNK_xxx] tokens, including in code
-//      (code blocks should never have chunk IDs anyway)
+//	Q: Why not remove during generation?
+//	A: LLM needs them for citation tracking, remove after extraction
+//
+//	Q: What if chunk ID is in code block?
+//	A: Regex removes all [CHUNK_xxx] tokens, including in code
+//	   (code blocks should never have chunk IDs anyway)
 func (e *Enforcer) cleanChunkIDs(answer string) string {
 	pattern := regexp.MustCompile(`\[CHUNK_[a-f0-9-]+\]`)
 	return pattern.ReplaceAllString(answer, "")
@@ -1208,9 +1242,10 @@ func (e *Enforcer) cleanChunkIDs(answer string) string {
 
 // extractCitations finds [CHUNK_uuid] references in the answer.
 // WHY SourceName and ChunkIndex added (Feature #23, 2026-09-23):
-//   Frontend CitationChip modal needs to show which transcript a citation
-//   came from, not just the chunk text. "Source: react_hooks_part1.txt, Chunk #42"
-//   is much more useful than just showing 200 chars of text with no context.
+//
+//	Frontend CitationChip modal needs to show which transcript a citation
+//	came from, not just the chunk text. "Source: react_hooks_part1.txt, Chunk #42"
+//	is much more useful than just showing 200 chars of text with no context.
 func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citation {
 	pattern := regexp.MustCompile(`\[CHUNK_([a-f0-9-]+)\]`)
 	matches := pattern.FindAllStringSubmatch(answer, -1)
@@ -1256,12 +1291,14 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 // markdown/code structure.
 //
 // StripModeCodeExempt: fenced code blocks kept unconditionally.
-//   Code is the APPLICATION of cited principles — no per-line citations needed.
-//   Explanation before/after the code block cites which principles are applied.
-//   Explanation lines also kept — citations appear at start, not per-sentence.
+//
+//	Code is the APPLICATION of cited principles — no per-line citations needed.
+//	Explanation before/after the code block cites which principles are applied.
+//	Explanation lines also kept — citations appear at start, not per-sentence.
 //
 // StripModeFull: every sentence without citation is stripped.
-//   Correct for medical/legal/finance — strict grounding required.
+//
+//	Correct for medical/legal/finance — strict grounding required.
 func (e *Enforcer) stripUncited(answer string, mode StripMode) (string, int) {
 	citationPattern := regexp.MustCompile(`\[CHUNK_[a-f0-9-]+\]`)
 	sentences := splitSentences(answer)
