@@ -8,6 +8,7 @@ import {
   updateEmbeddingSettings,
   getModelLimits,
   updateModelLimits,
+  getLLMHealth,
 } from '@/api/admin'
 import type { ModelLimit } from '@/api/admin'
 import type { CodeCraftModel } from '@/types/codecraftapi'
@@ -88,6 +89,15 @@ function AdminLLMSettings() {
   const [cavotiModelCheap, setCavotiModelCheap] = useState('')
   const [cavotiModelStrong, setCavotiModelStrong] = useState('')
   const [cavotiModelFast, setCavotiModelFast] = useState('')
+
+  // Provider health (G4). Refetched on a timer: a breaker that opened a minute
+  // ago is exactly the thing an admin opens this page to see, and a stale
+  // snapshot would say "working" while every call is being skipped.
+  const { data: health } = useQuery({
+    queryKey: ['admin', 'llm-health'],
+    queryFn: getLLMHealth,
+    refetchInterval: 15000,
+  })
 
   // Model token limits state. Drafts are keyed by provider|tier and only hold
   // the rows the admin has actually touched, so an untouched table saves nothing.
@@ -487,6 +497,100 @@ function AdminLLMSettings() {
               Save Embedding Settings
             </Button>
           </div>
+
+          {/* Provider health: is anything being skipped, and is anything slow? */}
+          <Card>
+            <p className="text-sm font-medium text-text-primary mb-1">Provider health</p>
+            <p className="text-xs text-text-secondary mb-3">
+              A provider that keeps failing is skipped for a short while instead of being
+              asked again on every request — the request goes to the fallback provider when one
+              is configured. Latency is the recent p50/p95 per provider; percentiles rather than
+              an average, because one slow call in twenty is exactly what an average hides.
+            </p>
+
+            {(!health || (health.breakers.length === 0 && health.latency.length === 0)) && (
+              <p className="text-xs text-text-disabled">
+                No calls have been made since the server started, so there is nothing to report
+                yet.
+              </p>
+            )}
+
+            {health && health.breakers.length > 0 && (
+              <div className="mb-4 overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-text-disabled">
+                      <th className="py-1 pr-3 font-medium">Provider</th>
+                      <th className="py-1 pr-3 font-medium">State</th>
+                      <th className="py-1 pr-3 font-medium">Failures</th>
+                      <th className="py-1 font-medium">Last error</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {health.breakers.map((b) => (
+                      <tr key={b.provider}>
+                        <td className="py-1 pr-3 text-text-secondary">{b.provider}</td>
+                        <td className="py-1 pr-3">
+                          <span
+                            className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                              b.state === 'open'
+                                ? 'bg-mode-refuse/15 text-mode-refuse'
+                                : b.state === 'half_open'
+                                  ? 'bg-glow-amber/15 text-glow-amber'
+                                  : 'bg-mode-advise/15 text-mode-advise'
+                            }`}
+                          >
+                            {b.state === 'open'
+                              ? `skipped — next try in ${b.retryAfterSeconds ?? 0}s`
+                              : b.state === 'half_open'
+                                ? 'testing recovery'
+                                : 'working'}
+                          </span>
+                        </td>
+                        <td className="py-1 pr-3 text-text-secondary">{b.consecutiveFailures}</td>
+                        <td className="py-1 text-text-disabled">
+                          {b.lastError ? b.lastError.slice(0, 120) : '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {health && health.latency.length > 0 && (
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="text-left text-text-disabled">
+                      <th className="py-1 pr-3 font-medium">Provider</th>
+                      <th className="py-1 pr-3 font-medium">Calls</th>
+                      <th className="py-1 pr-3 font-medium">p50</th>
+                      <th className="py-1 pr-3 font-medium">p95</th>
+                      <th className="py-1 font-medium">Slowest</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {health.latency.map((l) => (
+                      <tr key={l.provider}>
+                        <td className="py-1 pr-3 text-text-secondary">{l.provider}</td>
+                        <td className="py-1 pr-3 text-text-secondary">{l.callsTotal}</td>
+                        <td className="py-1 pr-3 text-text-secondary">
+                          {(l.p50Ms / 1000).toFixed(1)}s
+                        </td>
+                        <td className="py-1 pr-3 text-text-secondary">
+                          {(l.p95Ms / 1000).toFixed(1)}s
+                        </td>
+                        <td className="py-1 text-text-secondary">{(l.maxMs / 1000).toFixed(1)}s</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {health?.note && <p className="mt-2 text-[10px] text-text-disabled">{health.note}</p>}
+          </Card>
 
           {/* Per-model token limits.
               WHY this screen and not env vars: the right number depends on the

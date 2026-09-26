@@ -600,6 +600,21 @@ func buildRouter(
 	// only thing that may declare a unit of work finished, so a stale checkpoint
 	// can no longer skip work that never happened.
 	wfRunner.SetTaskAttemptStore(workflow.NewTaskAttemptStore(postgres.Pool, logger))
+	// G4 / P8: the provider breaker. Defaults unless the environment says
+	// otherwise, so a deployment that configures nothing still stops hammering a
+	// dead provider on every request.
+	breakerCfg := gateway.DefaultBreakerConfig()
+	if cfg.LLM.BreakerConfigured {
+		breakerCfg.Enabled = cfg.LLM.BreakerEnabled
+	}
+	if cfg.LLM.BreakerFailureThreshold > 0 {
+		breakerCfg.FailureThreshold = cfg.LLM.BreakerFailureThreshold
+	}
+	if cfg.LLM.BreakerCooldownSeconds > 0 {
+		breakerCfg.Cooldown = time.Duration(cfg.LLM.BreakerCooldownSeconds) * time.Second
+	}
+	modelGateway.SetBreakerConfig(breakerCfg)
+
 	// G3: the same claim verifier and quality rubric the chat path uses, applied to
 	// what the workflow produces. The reference material comes from the same
 	// assembler the gates already use, so "an expert's training material" has one
@@ -1006,6 +1021,7 @@ func buildRouter(
 		adminGroup.POST("/llm-settings", adminHandler.UpdateLLMSettings)
 		// Per-model token limits. Static segments, so no clash with the
 		// /llm-settings route above.
+		adminGroup.GET("/llm-health", adminHandler.GetLLMHealth)
 		adminGroup.GET("/llm-settings/model-limits", adminHandler.GetLLMModelLimits)
 		adminGroup.PUT("/llm-settings/model-limits", adminHandler.UpdateLLMModelLimits)
 		// CodeCraftAPI model catalog proxy + embedding settings

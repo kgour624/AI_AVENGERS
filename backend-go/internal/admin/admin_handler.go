@@ -3491,6 +3491,21 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 	})
 }
 
+// GetLLMHealth GET /admin/llm-health
+//
+// Reports the two questions a provider health surface has to answer: is anything
+// being skipped right now (breaker), and is anything answering slowly (latency).
+// Both come from the gateway's own choke point, so they describe real calls
+// rather than a separate probe that could disagree with reality.
+func (h *AdminHandler) GetLLMHealth(c *gin.Context) {
+	response.OK(c, map[string]interface{}{
+		"breakers": h.gateway.BreakerSnapshot(),
+		"latency":  h.gateway.LatencySnapshot(),
+		"note": "Latency is percentiles over the last 200 calls per provider. " +
+			"A provider the breaker is skipping records no timing, because it was not called.",
+	})
+}
+
 // GetLLMModelLimits GET /admin/llm-settings/model-limits
 //
 // Returns every configured per-model token limit. An empty list is a valid

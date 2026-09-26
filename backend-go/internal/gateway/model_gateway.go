@@ -101,6 +101,15 @@ type ModelGateway struct {
 	// a new caller cannot spend tokens a limit was meant to cap.
 	limitsMu   sync.RWMutex
 	limitsSnap *modelLimitsSnapshot
+	// breaker remembers which providers are currently failing, so a provider
+	// that is down is skipped instead of costing every request three failed
+	// attempts first (P8).
+	breaker *Breaker
+	// latencyMu guards latency, the per-provider rolling call durations. The
+	// numbers exist because "is it up" is only half the question: a provider that
+	// answers in 40s is unusable in a way a health flag cannot express.
+	latencyMu sync.Mutex
+	latency   map[string]*latencyWindow
 }
 
 // NewModelGateway creates a new model gateway.
@@ -122,10 +131,32 @@ func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},
-		logger: logger,
+		logger:  logger,
+		breaker: NewBreaker(DefaultBreakerConfig(), logger),
+		latency: make(map[string]*latencyWindow),
 	}
 	g.totalCost.Store(float64(0))
 	return g
+}
+
+// SetBreakerConfig replaces the breaker's configuration. Called from main.go
+// with the environment's settings; the default (enabled, 3 failures, 60s) is
+// installed at construction so a deployment that configures nothing still gets
+// the protection.
+func (g *ModelGateway) SetBreakerConfig(cfg BreakerConfig) {
+	if g.breaker == nil {
+		g.breaker = NewBreaker(cfg, g.logger)
+		return
+	}
+	g.breaker.cfg = cfg
+}
+
+// BreakerSnapshot reports each provider's breaker state for the admin surface.
+func (g *ModelGateway) BreakerSnapshot() []BreakerStatus {
+	if g == nil || g.breaker == nil {
+		return nil
+	}
+	return g.breaker.Snapshot()
 }
 
 // SetDB wires the database pool for runtime settings override.
@@ -441,13 +472,30 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 		return nil, lastErr
 	}
 
-	// Try primary provider first.
-	result, err := tryProvider(primary)
-	if err == nil {
-		return result, nil
+	// Try the primary provider, unless the breaker has taken it out of rotation.
+	var err error
+	if allowed, reason := g.breaker.Allow(primary.Name()); !allowed {
+		// WHY skip entirely rather than try: the failure is already known. Three
+		// more attempts plus 1s and 2s of backoff would only re-learn it, while
+		// adding load to a provider that is already struggling.
+		g.logger.Warn("LLM provider skipped by the breaker",
+			zap.String("provider", primary.Name()),
+			zap.String("reason", reason),
+		)
+		err = fmt.Errorf("provider %s skipped: %s", primary.Name(), reason)
+	} else {
+		callStart := time.Now()
+		result, callErr := tryProvider(primary)
+		g.recordLatency(primary.Name(), float64(time.Since(callStart).Milliseconds()))
+		if callErr == nil {
+			g.breaker.RecordSuccess(primary.Name())
+			return result, nil
+		}
+		g.breaker.RecordFailure(primary.Name(), callErr)
+		err = callErr
 	}
 
-	// Primary failed all 3 attempts. Try fallback if configured.
+	// Primary unavailable. Try fallback if configured.
 	// getFallbackProvider() returns nil when no fallback is set —
 	// in that case we return the primary's error unchanged (backward compatible).
 	fallback := g.getFallbackProvider(ctx)
@@ -462,16 +510,32 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 		return nil, fmt.Errorf("all LLM attempts failed: %w", err)
 	}
 
+	// The fallback has its own breaker entry: two providers can be unwell
+	// independently, and a fallback that is down must not become a second source
+	// of three-second waits.
+	if allowed, fbReason := g.breaker.Allow(fallback.Name()); !allowed {
+		g.logger.Error("fallback LLM provider is also skipped by its breaker",
+			zap.String("fallback", fallback.Name()),
+			zap.String("reason", fbReason),
+		)
+		return nil, fmt.Errorf("all LLM attempts failed (primary: %s, fallback: %s skipped: %s): %w",
+			primary.Name(), fallback.Name(), fbReason, err)
+	}
+
 	g.logger.Warn("primary LLM provider failed — trying fallback",
 		zap.String("primary", primary.Name()),
 		zap.String("fallback", fallback.Name()),
 		zap.Error(err),
 	)
 
+	fallbackStart := time.Now()
 	result, fallbackErr := tryProvider(fallback)
+	g.recordLatency(fallback.Name(), float64(time.Since(fallbackStart).Milliseconds()))
 	if fallbackErr == nil {
+		g.breaker.RecordSuccess(fallback.Name())
 		return result, nil
 	}
+	g.breaker.RecordFailure(fallback.Name(), fallbackErr)
 
 	g.logger.Error("both primary and fallback LLM providers failed",
 		zap.String("primary", primary.Name()),
@@ -505,6 +569,28 @@ func (g *ModelGateway) GetStats() map[string]interface{} {
 func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan string, <-chan *LLMResponse, error) {
 	provider := g.getProvider(ctx)
 
+	// Breaker gate (P8). Skipping a provider that is known to be failing matters
+	// most on this path: streaming is what the chat screen uses, and before this
+	// it had no fallback at all — a dead primary simply ended the conversation.
+	if allowed, reason := g.breaker.Allow(provider.Name()); !allowed {
+		fallback := g.getFallbackProvider(ctx)
+		if fallback == nil || fallback.Name() == provider.Name() {
+			return nil, nil, fmt.Errorf("provider %s skipped: %s", provider.Name(), reason)
+		}
+		if fbAllowed, fbReason := g.breaker.Allow(fallback.Name()); !fbAllowed {
+			return nil, nil, fmt.Errorf(
+				"provider %s skipped (%s) and the fallback %s is skipped too (%s)",
+				provider.Name(), reason, fallback.Name(), fbReason,
+			)
+		}
+		g.logger.Warn("stream: primary skipped by the breaker — using the fallback",
+			zap.String("primary", provider.Name()),
+			zap.String("fallback", fallback.Name()),
+			zap.String("reason", reason),
+		)
+		provider = fallback
+	}
+
 	// Same ceiling rule as Call() — see resolveCeiling. No empty-content
 	// escalation here: a stream that already started cannot be re-sent as a
 	// different request without the caller losing whatever partial answer it
@@ -536,9 +622,35 @@ func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan s
 		EnableCache: req.UseCache,
 	}
 
+	streamStart := time.Now()
 	rawTokenCh, rawRespCh, err := provider.StreamCall(ctx, provReq)
 	if err != nil {
-		return nil, nil, fmt.Errorf("stream call failed: %w", err)
+		g.breaker.RecordFailure(provider.Name(), err)
+
+		// A stream that never started produced no partial answer, so the same
+		// request can be served by the other provider without the caller losing
+		// anything. A stream that fails MID-FLIGHT is deliberately NOT retried:
+		// by then the caller has shown partial text, and silently starting again
+		// would duplicate it on screen.
+		if fallback := g.getFallbackProvider(ctx); fallback != nil && fallback.Name() != provider.Name() {
+			if fbAllowed, _ := g.breaker.Allow(fallback.Name()); fbAllowed {
+				g.logger.Warn("stream: primary stream failed to start — trying the fallback",
+					zap.String("primary", provider.Name()),
+					zap.String("fallback", fallback.Name()),
+					zap.Error(err),
+				)
+				tokens, resp, fbErr := fallback.StreamCall(ctx, provReq)
+				if fbErr == nil {
+					g.breaker.RecordSuccess(fallback.Name())
+					provider, rawTokenCh, rawRespCh, err = fallback, tokens, resp, nil
+				} else {
+					g.breaker.RecordFailure(fallback.Name(), fbErr)
+				}
+			}
+		}
+		if err != nil {
+			return nil, nil, fmt.Errorf("stream call failed: %w", err)
+		}
 	}
 
 	// Wrap rawRespCh to accumulate cost + update stats, same as Call().
@@ -549,8 +661,17 @@ func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan s
 		defer close(respCh)
 		provResp, ok := <-rawRespCh
 		if !ok || provResp == nil {
+			// The stream ended without a final response. That is a provider
+			// failure, not an empty answer, and it counts against the breaker —
+			// otherwise a provider that accepts streams and then drops them would
+			// look perfectly healthy.
+			g.breaker.RecordFailure(provider.Name(), fmt.Errorf("stream ended without a final response"))
 			return
 		}
+		g.breaker.RecordSuccess(provider.Name())
+		// Full stream duration, measured the same way as a non-streamed call, so
+		// the percentiles on the status screen mean one thing.
+		g.recordLatency(provider.Name(), float64(time.Since(streamStart).Milliseconds()))
 		inCost, outCost := provider.CostPer1K(req.Model)
 		cost := float64(provResp.InputTokens)/1000*inCost +
 			float64(provResp.OutputTokens)/1000*outCost
