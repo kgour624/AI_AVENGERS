@@ -13,6 +13,7 @@ import (
 // No defaults for secrets — fail fast if missing.
 type Config struct {
 	Server              ServerConfig
+	Repo                RepoConfig
 	Database            DatabaseConfig
 	Redis               RedisConfig
 	JWT                 JWTConfig
@@ -206,6 +207,18 @@ type LLMConfig struct {
 	BreakerCooldownSeconds  int
 }
 
+// RepoConfig holds the repository-sync schedule.
+//
+// WHY a schedule exists at all: a client's repository moves without telling us,
+// and the only way to notice was a human pressing "Sync Now" — so an expert's
+// view of the code went stale silently. The sync is read-only against the
+// provider and reuses the same path the button uses.
+type RepoConfig struct {
+	// SyncIntervalHours: 0 disables the schedule (the button still works).
+	// A non-zero value is the period between sweeps.
+	SyncIntervalHours int
+}
+
 type MLConfig struct {
 	SidecarURL     string
 	TimeoutSeconds int
@@ -272,6 +285,20 @@ type LogConfig struct {
 
 // Load reads configuration from environment variables.
 // Panics if required values are missing — fail fast on startup.
+// repoSyncIntervalHours reads the scheduled repository sync period.
+//
+// Unset means the default 6h — often enough that an expert is not answering from
+// a week-old copy of the code, rare enough that a client's Git provider sees only
+// a handful of requests a day. An EXPLICIT 0 turns the schedule off, which is a
+// different statement from "no opinion" and is honoured: a deployment that wants
+// the schedule gone must be able to say so.
+func repoSyncIntervalHours(v *viper.Viper) int {
+	if !v.IsSet("REPO_SYNC_INTERVAL_HOURS") {
+		return 6
+	}
+	return v.GetInt("REPO_SYNC_INTERVAL_HOURS")
+}
+
 func Load() (*Config, error) {
 	v := viper.New()
 
@@ -331,6 +358,9 @@ func Load() (*Config, error) {
 			BreakerEnabled:          v.GetBool("LLM_BREAKER_ENABLED"),
 			BreakerFailureThreshold: v.GetInt("LLM_BREAKER_FAILURE_THRESHOLD"),
 			BreakerCooldownSeconds:  v.GetInt("LLM_BREAKER_COOLDOWN_SECONDS"),
+		},
+		Repo: RepoConfig{
+			SyncIntervalHours: repoSyncIntervalHours(v),
 		},
 		ML: MLConfig{
 			SidecarURL:     v.GetString("ML_SIDECAR_URL"),

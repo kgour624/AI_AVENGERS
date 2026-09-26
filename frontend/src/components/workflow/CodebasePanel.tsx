@@ -8,6 +8,7 @@ import {
   generateCodebasePatch,
   getCodebaseFiles,
   getCodebasePatch,
+  getCodebasePatchText,
   runWorkflow,
   startWorkflow,
   suggestCodebaseFiles,
@@ -16,6 +17,7 @@ import {
 } from '@/api/workflows'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
+import { PatchDiff } from '@/components/workflow/PatchDiff'
 import { Card } from '@/components/ui/Card'
 
 /**
@@ -95,6 +97,15 @@ export function CodebasePanel({
     queryKey: ['workflow', workflowId, 'codebase', 'patch'],
     queryFn: () => getCodebasePatch(workflowId),
     retry: false,
+  })
+
+  // The diff is fetched only when a reviewer asks for it: the delivery record
+  // (file list, sizes) is cheap and always shown, the full diff is not.
+  const [showPatchDiff, setShowPatchDiff] = useState(false)
+  const { data: patchText, isLoading: patchTextLoading } = useQuery({
+    queryKey: ['workflow', workflowId, 'codebase', 'patch-text'],
+    queryFn: () => getCodebasePatchText(workflowId),
+    enabled: showPatchDiff && !!delivery?.generatedAt,
   })
 
   const patchMutation = useMutation({
@@ -387,6 +398,28 @@ export function CodebasePanel({
                   </li>
                 ))}
               </ul>
+            )}
+
+            {/* Reviewing is the step that decides whether the work is accepted,
+                so the diff belongs here rather than only in a downloaded file. */}
+            <button
+              onClick={() => setShowPatchDiff((v) => !v)}
+              className="mt-2 text-[11px] font-medium uppercase tracking-wider text-brand hover:underline"
+            >
+              {showPatchDiff ? 'Hide the diff' : 'Review the diff'}
+            </button>
+            {showPatchDiff && (
+              <div className="mt-2">
+                {patchTextLoading ? (
+                  <p className="text-xs text-text-disabled">Loading the diff…</p>
+                ) : patchText == null ? (
+                  <p className="text-xs text-mode-refuse">
+                    Could not read the patch. That is a failure to load it, not an empty change.
+                  </p>
+                ) : (
+                  <PatchDiff patch={patchText} />
+                )}
+              </div>
             )}
           </div>
         )}

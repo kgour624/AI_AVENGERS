@@ -488,6 +488,45 @@ func buildRouter(
 	relSvc.RegisterProbe("ml_sidecar", mlClient.HealthCheck)
 	relHandler := reliability.NewHandler(relSvc, "1.0.0", logger)
 	repoHandler := repo.NewHandler(repoSvc, tenantSvc, logger)
+
+	// Scheduled repository re-sync (G6 / A10). A client's repository moves without
+	// telling us, and the only way to notice was a human pressing "Sync Now" — so
+	// an expert could answer from a week-old copy of the code and nothing said so.
+	// The sweep uses the same path the button uses; it is read-only against the
+	// provider. See RepoConfig for the interval and why unset means 6h, not off.
+	if cfg.Repo.SyncIntervalHours > 0 {
+		go func() {
+			ticker := time.NewTicker(time.Duration(cfg.Repo.SyncIntervalHours) * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				connections, err := repoSvc.ListSyncableConnections(context.Background())
+				if err != nil {
+					logger.Warn("repo sync scheduler: could not list connections", zap.Error(err))
+					continue
+				}
+				started := 0
+				for _, id := range connections {
+					if err := repoSvc.SyncRepo(context.Background(), id); err != nil {
+						logger.Warn("repo sync scheduler: could not start a sync",
+							zap.String("connection_id", id.String()),
+							zap.Error(err),
+						)
+						continue
+					}
+					started++
+				}
+				logger.Info("repo sync scheduler: sweep finished",
+					zap.Int("connections", len(connections)),
+					zap.Int("started", started),
+				)
+			}
+		}()
+		logger.Info("repo sync scheduler enabled",
+			zap.Int("interval_hours", cfg.Repo.SyncIntervalHours),
+		)
+	} else {
+		logger.Info("repo sync scheduler disabled (REPO_SYNC_INTERVAL_HOURS=0); the Sync Now button still works")
+	}
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, docExtractor, logger)
 
 	// I2: capability measurement. The retriever is the SAME assembler the chat and

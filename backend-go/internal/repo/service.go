@@ -608,6 +608,36 @@ func (s *Service) saveConnection(
 
 // SyncRepo starts background repo sync.
 // Returns immediately — sync runs in goroutine.
+// ListSyncableConnections returns the connections a scheduled sweep should
+// refresh: those with a usable token and no sync already running.
+//
+// WHY sync_status is filtered out: the schedule fires on a timer rather than on
+// demand, so it can easily meet a long sync started by the previous sweep.
+// Starting a second one would clone the same repository twice and have both runs
+// writing the same rows. Oldest-synced first, so an interrupted sweep still makes
+// progress on the connections that have waited longest.
+func (s *Service) ListSyncableConnections(ctx context.Context) ([]uuid.UUID, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT id FROM repo_connections
+		 WHERE COALESCE(access_token, '') <> ''
+		   AND sync_status <> 'syncing'
+		 ORDER BY last_sync_at ASC NULLS FIRST`)
+	if err != nil {
+		return nil, fmt.Errorf("list syncable connections: %w", err)
+	}
+	defer rows.Close()
+
+	var out []uuid.UUID
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan connection id: %w", err)
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 func (s *Service) SyncRepo(ctx context.Context, connectionID uuid.UUID) error {
 	// Update status to syncing
 	_, err := s.db.Exec(ctx,
