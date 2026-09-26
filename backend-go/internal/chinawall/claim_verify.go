@@ -98,7 +98,13 @@ func (e *Enforcer) verifyClaims(
 	// P9/P3 post-process: no span → unverifiable; empty chunk evidence on
 	// "supported" → demote to unverifiable; clamp confidence; cap list.
 	normalized := normalizeClaimReports(answer, reports)
-	annotated := annotateUnverified(answer, normalized)
+	// The answer is returned EXACTLY as generated. No [UNVERIFIED]/[REFUTED]
+	// labels and no verification footer are ever written into a response: the
+	// client asked for them to be removed outright, and a labelled answer reads
+	// as self-contradictory. The claim reports below are still computed and
+	// returned as metadata (the Evidence & audit view reads them), but they no
+	// longer alter the text the user sees.
+	annotated := answer
 
 	e.logger.Info("claim verify",
 		zap.Int("candidates", len(candidates)),
@@ -352,59 +358,15 @@ func normalizeClaimReports(answer string, reports []ClaimReport) []ClaimReport {
 	return out
 }
 
-// annotateUnverified labels refuted/unverifiable claims in the answer
-// body and appends a short verification footer. Supported claims stay
-// untouched. Deterministic rewrite — unit-tested.
-func annotateUnverified(answer string, reports []ClaimReport) string {
-	if len(reports) == 0 {
-		return answer
-	}
-	out := answer
-	// Replace longer claims first so nested/overlapping text is stable.
-	ordered := make([]ClaimReport, len(reports))
-	copy(ordered, reports)
-	for i := 0; i < len(ordered); i++ {
-		for j := i + 1; j < len(ordered); j++ {
-			if len(ordered[j].Claim) > len(ordered[i].Claim) {
-				ordered[i], ordered[j] = ordered[j], ordered[i]
-			}
-		}
-	}
-
-	var unverifiable, refuted int
-	for _, r := range ordered {
-		switch r.Verdict {
-		case ClaimUnverifiable:
-			unverifiable++
-			if r.Claim != "" && strings.Contains(out, r.Claim) {
-				out = strings.Replace(out, r.Claim, "[UNVERIFIED] "+r.Claim, 1)
-			}
-		case ClaimRefuted:
-			refuted++
-			if r.Claim != "" && strings.Contains(out, r.Claim) {
-				out = strings.Replace(out, r.Claim, "[REFUTED] "+r.Claim, 1)
-			}
-		}
-	}
-
-	if unverifiable == 0 && refuted == 0 {
-		return out
-	}
-	var footer strings.Builder
-	footer.WriteString("\n\n---\nVerification: ")
-	parts := []string{}
-	if supported := countVerdict(reports, ClaimSupported); supported > 0 {
-		parts = append(parts, fmt.Sprintf("%d supported", supported))
-	}
-	if unverifiable > 0 {
-		parts = append(parts, fmt.Sprintf("%d unverifiable (labelled)", unverifiable))
-	}
-	if refuted > 0 {
-		parts = append(parts, fmt.Sprintf("%d refuted (labelled)", refuted))
-	}
-	footer.WriteString(strings.Join(parts, ", "))
-	footer.WriteString(". Labels mark claims without span-anchored evidence in the training material.")
-	return out + footer.String()
+// annotateUnverified is now a PASSTHROUGH: a response is never modified with
+// [UNVERIFIED]/[REFUTED] labels or a verification footer.
+//
+// WHY it still exists instead of being deleted: callers and tests referenced it,
+// and keeping the name documents the removal decision in one place. The claim
+// reports are still produced as metadata (Evidence & audit), but the text the
+// user sees is exactly what the model wrote.
+func annotateUnverified(answer string, _ []ClaimReport) string {
+	return answer
 }
 
 func chunksForVerification(chunks []CourseChunk, citations []Citation) []CourseChunk {

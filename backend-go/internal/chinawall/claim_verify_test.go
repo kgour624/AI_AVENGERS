@@ -101,12 +101,17 @@ func TestAnnotateUnverified(t *testing.T) {
 	reports := []ClaimReport{{
 		Claim: claim, Verdict: ClaimUnverifiable, SpanStart: 0, SpanEnd: len(claim),
 	}}
+	// Labels are REMOVED by product decision: a response must never contain
+	// [UNVERIFIED]/[REFUTED] or a verification footer.
 	out := annotateUnverified(ans, reports)
-	if !strings.Contains(out, "[UNVERIFIED] "+claim) {
-		t.Errorf("missing label: %s", out)
+	if strings.Contains(out, "[UNVERIFIED]") || strings.Contains(out, "[REFUTED]") {
+		t.Errorf("answer must not carry verification labels: %s", out)
 	}
-	if !strings.Contains(out, "Verification:") {
-		t.Errorf("missing footer: %s", out)
+	if strings.Contains(out, "Verification:") {
+		t.Errorf("answer must not carry a verification footer: %s", out)
+	}
+	if out != ans {
+		t.Errorf("answer must be returned unchanged, got: %s", out)
 	}
 }
 
