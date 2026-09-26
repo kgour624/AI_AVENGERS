@@ -292,6 +292,9 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 		Slug        string `json:"slug" binding:"required"`
 		Domain      string `json:"domain" binding:"required"`
 		Description string `json:"description"`
+		// Optional — migration 059: "full_strip" (Strict, default) or
+		// "code_exempt" (VIP Pass: fenced code is kept even when uncited).
+		StripMode *string `json:"strip_mode"`
 		// Optional — migration 006 config fields
 		ModelTier         *string  `json:"model_tier"`
 		Temperature       *float64 `json:"temperature"`
@@ -337,6 +340,10 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 	// used as the hot-path lookup elsewhere in this codebase.
 	if req.CategoryID != nil && h.categoryReg.Get(*req.CategoryID) == nil {
 		response.BadRequest(c, "INVALID_CATEGORY_ID", "category_id does not reference an existing category")
+		return
+	}
+	if req.StripMode != nil && !validExpertStripModes[*req.StripMode] {
+		response.BadRequest(c, "INVALID_STRIP_MODE", "strip_mode must be full_strip or code_exempt")
 		return
 	}
 
@@ -395,7 +402,18 @@ func (h *AdminHandler) CreateExpert(c *gin.Context) {
 		response.InternalError(c)
 		return
 	}
+	// Strip mode is per-expert and defaults to strict. Set after the insert
+	// rather than threading another positional argument through it; a failure is
+	// logged, not fatal, so an expert is never lost over this setting.
+	if req.StripMode != nil {
+		if _, modeErr := h.db.Exec(c.Request.Context(),
+			`UPDATE experts SET strip_mode = $1 WHERE id = $2`, *req.StripMode, id); modeErr != nil {
+			h.logger.Warn("could not set expert strip_mode",
+				zap.String("expert_id", id.String()), zap.Error(modeErr))
+		}
+	}
 	response.Created(c, map[string]interface{}{"id": id, "slug": req.Slug})
+
 }
 
 // validTrainingStatuses is the set of allowed training_status values.
@@ -4261,3 +4279,8 @@ func (h *AdminHandler) SetGateThreshold(c *gin.Context) {
 	}
 	response.OK(c, row)
 }
+
+// validExpertStripModes are the allowed experts.strip_mode values (migration 059).
+// Deliberately separate from validStripModes (domain-profile values, uppercase).
+// "full_strip" = strict (uncited sentences stripped); "code_exempt" = VIP pass.
+var validExpertStripModes = map[string]bool{"full_strip": true, "code_exempt": true}
