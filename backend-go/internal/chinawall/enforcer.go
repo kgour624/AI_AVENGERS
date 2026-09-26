@@ -237,14 +237,30 @@ func (e *Enforcer) Enforce(
 
 	if coverage == "NO" {
 		if !allowGeneric {
-			// Tell the client exactly what would unblock this — the refusal is
-			// actionable instead of a dead end.
-			return e.buildRefusal("not_covered",
-				fmt.Sprintf("Content does not cover this question. Generic knowledge is disabled (allowance 0%%); raise the answer basis to allow up to %d%%.", maxGenericAllowancePct)), nil
+			// APPLY_PRINCIPLES exists precisely for domains whose questions are
+			// answered by APPLYING principles rather than by finding the answer
+			// verbatim in the corpus (system design, DSA, coding). A literal
+			// "NO" there is a mis-signal, so it must not hard-refuse — this is
+			// what made a trained system-design expert refuse its own domain's
+			// question. LITERAL_MATCH domains (medical/legal/finance) keep the
+			// strict refusal.
+			if profile.CoverageMode == CoverageModeApplyPrinciples {
+				e.logger.Info("Layer 2: coverage NO on a principle-transfer domain — continuing as PARTIAL",
+					zap.String("expert", expertName),
+					zap.String("domain", expertDomain),
+					zap.String("coverage_mode", string(profile.CoverageMode)))
+				coverage = "PARTIAL"
+			} else {
+				// Tell the client exactly what would unblock this — the refusal
+				// is actionable instead of a dead end.
+				return e.buildRefusal("not_covered",
+					fmt.Sprintf("Content does not cover this question. Generic knowledge is disabled (allowance 0%%); raise the answer basis to allow up to %d%%.", maxGenericAllowancePct)), nil
+			}
+		} else {
+			e.logger.Info("Layer 2 allowed the question via generic allowance",
+				zap.String("expert", expertName),
+				zap.Float64("generic_allowance_pct", genericAllowancePct))
 		}
-		e.logger.Info("Layer 2 allowed the question via generic allowance",
-			zap.String("expert", expertName),
-			zap.Float64("generic_allowance_pct", genericAllowancePct))
 	}
 
 	if coverage == "PARTIAL" && attempt >= 3 {

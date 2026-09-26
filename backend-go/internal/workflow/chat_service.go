@@ -549,6 +549,14 @@ func (s *WorkflowChatService) Send(
 	}
 
 	systemPrompt := s.buildSystemPrompt(expert, gateResult, genericPct)
+	// Ground the expert in the files that ACTUALLY exist. Without this it only
+	// sees design sections (empty for a code-producing run), guesses paths from
+	// the client's message, and reports it cannot read its own output — the
+	// production bug where a completed workflow's files were unreadable in chat.
+	if files := workspaceFiles(s.workspaceRoot, ch.WorkflowID); len(files) > 0 {
+		systemPrompt += "\n\nFILES THAT ACTUALLY EXIST IN THIS WORKFLOW:\n- " + strings.Join(files, "\n- ") +
+			"\nRead any of them with read_design(path). Never claim a file cannot be read without first calling read_design on a path from this list."
+	}
 	toolCatalogue := promptCatalogue(s.tools.ForExpert(expert))
 	userPrompt := s.buildUserPrompt(deliverable, sectionList, history, question)
 

@@ -9,7 +9,9 @@ import { deleteMessage, updateMessage } from '@/api/messages'
 import type { ChatLoaderData } from '@/types/project'
 import type { ExpertResponse as ExpertResponseType } from '@/types/expert'
 import { useSSEStream } from '@/hooks/useSSEStream'
+import type { SendMessageOptions } from '@/hooks/useSSEStream'
 import { useStreamStore } from '@/stores/streamStore'
+import { Button } from '@/components/ui/Button'
 import { MessageInput } from '@/components/chat/MessageInput'
 import { ExpertResponse } from '@/components/chat/ExpertResponse'
 import { SynthesisPanel } from '@/components/chat/SynthesisPanel'
@@ -102,6 +104,8 @@ export default function ChatPage() {
   const { sendMessage } = useSSEStream()
   const revalidator = useRevalidator()
   const [pendingUserText, setPendingUserText] = useState<string | null>(null)
+  // Last request, kept so a failed answer offers a one-click Retry.
+  const [lastSend, setLastSend] = useState<SendMessageOptions | null>(null)
   const [isEditingTitle, setIsEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState(chat.title)
   const [isSavingTitle, setIsSavingTitle] = useState(false)
@@ -230,8 +234,10 @@ export default function ChatPage() {
     templateName?: string,
     genericAllowancePct?: number
   ) {
-    setPendingUserText(text)
-    await sendMessage({
+    // Remember exactly what was sent so a failed answer can be retried with one
+    // click instead of the user retyping the whole question (or re-attaching the
+    // same files).
+    const payload: SendMessageOptions = {
       chatId: chat.id,
       message: text,
       expertIds,
@@ -240,7 +246,10 @@ export default function ChatPage() {
       includeFullThread,
       templateName,
       genericAllowancePct,
-    })
+    }
+    setLastSend(payload)
+    setPendingUserText(text)
+    await sendMessage(payload)
 
     // WHY re-read stream status via getState() rather than the `stream`
     // closure variable: sendMessage's promise resolves after the SSE
@@ -464,9 +473,24 @@ export default function ChatPage() {
           {stream?.synthesis && <SynthesisPanel synthesis={stream.synthesis} />}
 
           {stream?.status === 'error' && (
-            <p className="rounded-md border border-mode-refuse/30 bg-mode-refuse/5 p-3 text-sm text-mode-refuse">
-              {stream.error}
-            </p>
+            <div className="flex items-center justify-between gap-3 rounded-md border border-mode-refuse/30 bg-mode-refuse/5 p-3">
+              <p className="text-sm text-mode-refuse">{stream.error}</p>
+              {lastSend && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => {
+                    // Retry = resend the SAME request (same question, experts,
+                    // files, format and basis). Clearing the failed stream first
+                    // so the panel returns to a clean state.
+                    clearStream(chat.id)
+                    void sendMessage(lastSend)
+                  }}
+                >
+                  ↻ Retry
+                </Button>
+              )}
+            </div>
           )}
         </div>
 
