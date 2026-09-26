@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -16,6 +17,7 @@ import (
 	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/ml"
@@ -25,6 +27,71 @@ import (
 	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/usage"
 )
+
+// Attachment limits for the chat. WHY 2MB: a chat attachment is context, not a
+// corpus upload — 2MB covers real PDFs/DOCX/XLSX specs while keeping the prompt
+// bounded. Files above the cap are reported back in the message, never silently
+// dropped.
+const (
+	maxAttachmentBytes        = 2 * 1024 * 1024
+	maxAttachmentsPerMessage  = 5
+	maxAttachmentCharsInTotal = 60000
+)
+
+// extractAttachments turns every uploaded file into text using the SAME
+// extractor the training ingestion uses (docextract -> ml-sidecar /extract).
+//
+// WHY this replaced the old io.ReadAll: the previous code treated the upload as
+// plain text, so a PDF/DOCX/XLSX arrived as binary bytes and the expert answered
+// from garbage. A nil extractor (sidecar not configured) still handles the
+// plain-text formats.
+func (h *Handler) extractAttachments(c *gin.Context) string {
+	if h.extractor == nil {
+		return ""
+	}
+	form, err := c.MultipartForm()
+	if err != nil || form == nil {
+		return ""
+	}
+	files := form.File["file"]
+	if len(files) == 0 {
+		return ""
+	}
+	if len(files) > maxAttachmentsPerMessage {
+		files = files[:maxAttachmentsPerMessage]
+	}
+	var sb strings.Builder
+	for _, header := range files {
+		if header.Size > maxAttachmentBytes {
+			fmt.Fprintf(&sb, "\n\n[Attached file skipped: %s — larger than %d MB]",
+				header.Filename, maxAttachmentBytes/(1024*1024))
+			continue
+		}
+		opened, openErr := header.Open()
+		if openErr != nil {
+			continue
+		}
+		data, readErr := io.ReadAll(opened)
+		opened.Close()
+		if readErr != nil {
+			continue
+		}
+		result, extractErr := h.extractor.Extract(c.Request.Context(), header.Filename, data)
+		if extractErr != nil {
+			// Surface the reason (unsupported_format, pdf_encrypted, ...) so the
+			// user knows the file was not read instead of getting a silent answer.
+			fmt.Fprintf(&sb, "\n\n[Attached file could not be read: %s — %s]",
+				header.Filename, extractErr.Error())
+			continue
+		}
+		fmt.Fprintf(&sb, "\n\n[Attached file: %s]\n%s", header.Filename, result.Text)
+		if sb.Len() >= maxAttachmentCharsInTotal {
+			sb.WriteString("\n\n[Further attachments omitted: context limit reached]")
+			break
+		}
+	}
+	return sb.String()
+}
 
 // SendMessageRequest is the input for sending a message.
 type SendMessageRequest struct {
@@ -44,6 +111,10 @@ type SendMessageRequest struct {
 	// expert's category to use (e.g. "Code" vs "Approach"). Empty = the
 	// category's default variant, which is what every pre-existing client sends.
 	TemplateName string `json:"template_name,omitempty"`
+	// GenericAllowancePct (0-30): how much general knowledge this message may
+	// use when the trained chunks do not cover the question. 0/absent = strict
+	// China Wall (refuse), which is what every pre-existing client sends.
+	GenericAllowancePct float64 `json:"generic_allowance_pct,omitempty"`
 }
 
 // SSEEvent types for streaming
@@ -67,8 +138,11 @@ type Handler struct {
 	chatSvc      *chat.Service
 	orchestrator *orchestrator.Orchestrator
 	gateway      *gateway.ModelGateway
-	embedder     ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
-	memManager   *memory.Manager
+	// extractor (nil-safe) turns an attached PDF/DOCX/XLSX/... into text using
+	// the same ml-sidecar path as training ingestion.
+	extractor  *docextract.Extractor
+	embedder   ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	memManager *memory.Manager
 	// prov (C1): optional signed provenance chain recorder. Nil-safe — when
 	// unset, answers are still saved, only the provenance chain is skipped.
 	prov *provenance.Service
@@ -81,6 +155,9 @@ type Handler struct {
 // NewHandler creates a new message handler.
 // embedder satisfies ml.Embedder — either *ml.SidecarClient (default) or
 // *ml.DynamicEmbedder (when CodeCraftAPI embeddings are enabled).
+// SetExtractor wires the document extractor used for chat attachments.
+func (h *Handler) SetExtractor(e *docextract.Extractor) { h.extractor = e }
+
 func NewHandler(
 	db *pgxpool.Pool,
 	chatSvc *chat.Service,
@@ -123,11 +200,12 @@ func NewHandler(
 // Mental execution:
 // Client sends: "How should I design the user table?"
 // SSE stream:
-//   data: {"type":"thinking","expert":"DB Expert","gate":1}
-//   data: {"type":"thinking","expert":"DB Expert","gate":5}
-//   data: {"type":"chunk","expert":"DB Expert","content":"Use UUID..."}
-//   data: {"type":"complete","expert":"DB Expert","mode":"ADVISE"}
-//   data: {"type":"done"}
+//
+//	data: {"type":"thinking","expert":"DB Expert","gate":1}
+//	data: {"type":"thinking","expert":"DB Expert","gate":5}
+//	data: {"type":"chunk","expert":"DB Expert","content":"Use UUID..."}
+//	data: {"type":"complete","expert":"DB Expert","mode":"ADVISE"}
+//	data: {"type":"done"}
 func (h *Handler) Send(c *gin.Context) {
 	clientID := c.MustGet("user_id").(uuid.UUID)
 	chatID, err := uuid.Parse(c.Param("id"))
@@ -158,16 +236,17 @@ func (h *Handler) Send(c *gin.Context) {
 		// same way message/expert_ids are read on this branch.
 		req.ReplyToMessageID = c.PostForm("reply_to_message_id")
 		req.IncludeFullThread = c.PostForm("include_full_thread") == "true"
-		// Handle file upload
-		if file, header, err := c.Request.FormFile("file"); err == nil {
-			defer file.Close()
-			if header.Size < 1*1024*1024 { // Max 1MB for context
-				if content, err := io.ReadAll(file); err == nil {
-					fileContent = fmt.Sprintf("\n\n[Attached file: %s]\n%s",
-						header.Filename, string(content))
-				}
+		if v := c.PostForm("template_name"); v != "" {
+			req.TemplateName = v
+		}
+		if v := c.PostForm("generic_allowance_pct"); v != "" {
+			// A malformed value is treated as 0 (strict) rather than failing the
+			// whole message — the safe direction.
+			if pct, convErr := strconv.ParseFloat(v, 64); convErr == nil {
+				req.GenericAllowancePct = pct
 			}
 		}
+		fileContent = h.extractAttachments(c)
 	} else {
 		if err := c.ShouldBindJSON(&req); err != nil {
 			response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -352,16 +431,17 @@ func (h *Handler) Send(c *gin.Context) {
 
 		// Run orchestrator
 		orchestratorReq := orchestrator.OrchestratorRequest{
-			ProjectID:         ch.ProjectID,
-			ClientID:          clientID,
-			ChatID:            chatID,
-			Message:           fullMessage,
-			ExpertIDs:         expertIDs,
-			TurnNumber:        turnNumber,
-			ReplyToMessageID:  replyToMessageID,
-			IncludeFullThread: req.IncludeFullThread,
-			UserMessageID:     userMsgID,
-			TemplateName:      req.TemplateName,
+			ProjectID:           ch.ProjectID,
+			ClientID:            clientID,
+			ChatID:              chatID,
+			Message:             fullMessage,
+			ExpertIDs:           expertIDs,
+			TurnNumber:          turnNumber,
+			ReplyToMessageID:    replyToMessageID,
+			IncludeFullThread:   req.IncludeFullThread,
+			UserMessageID:       userMsgID,
+			TemplateName:        req.TemplateName,
+			GenericAllowancePct: req.GenericAllowancePct,
 		}
 		if tokenCh != nil {
 			orchestratorReq.TokenCh = tokenCh

@@ -45,6 +45,10 @@ type Expert struct {
 	// category has ask_structure_permission=true. false for every
 	// non-categorized expert or category without the flag (CT-L2).
 	AskStructurePermission bool
+	// GenericAllowancePct (0-30): how much general knowledge this request may
+	// use when the trained chunks do not cover the question. 0 = strict China
+	// Wall (refuse). Same concept as workflows.generic_allowance_pct.
+	GenericAllowancePct float64
 }
 
 // DecisionResult is the output of the 5-gate system.
@@ -180,7 +184,7 @@ func (e *Engine) Process(
 	// case Enforce() takes its existing flat-text path unchanged (CT-L2).
 	enforceResult, err := e.chinaWall.Enforce(
 		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, replyContext, attempt,
-		expert.TemplateSections, expert.DefaultLanguage, tokenCh,
+		expert.TemplateSections, expert.DefaultLanguage, expert.GenericAllowancePct, tokenCh,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gate 5 failed: %w", err)
@@ -198,7 +202,7 @@ func (e *Engine) Process(
 			//
 			// tokenCh is passed through (not nil) so streaming continues
 			// on retry — user sees continuous token flow, not frozen stream.
-		return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil, tokenCh)
+			return e.Process(ctx, question, expert, chunks, projectSummary, replyContext, attempt+1, nil, tokenCh)
 		}
 		return &DecisionResult{
 			Mode:        ModeREFUSE,
@@ -642,5 +646,3 @@ func minInt(a, b int) int {
 	}
 	return b
 }
-
-

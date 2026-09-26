@@ -28,20 +28,20 @@ type CourseChunk struct {
 	RerankScore float32
 	// SourceFile: original transcript filename (e.g. "react_hooks_part1.txt")
 	// Empty string if chunk has no source_file (legacy data, repo chunks, etc.)
-	SourceFile  string
+	SourceFile string
 	// ChunkIndex: 0-based position in the original transcript
 	// Helps users locate "this is chunk #42 out of 150 in that transcript"
-	ChunkIndex  int
+	ChunkIndex int
 }
 
 // EnforceResult is the output of China Wall enforcement.
 type EnforceResult struct {
-	Status      string     // success | retry | refused | partial
+	Status      string // success | retry | refused | partial
 	Answer      string
 	Citations   []Citation
-	Coverage    string     // YES | PARTIAL | NO
+	Coverage    string // YES | PARTIAL | NO
 	Confidence  float64
-	LayerFailed int        // 0 = all passed
+	LayerFailed int // 0 = all passed
 	Reason      string
 	// TemplateSections is set ONLY when the expert's category has a
 	// non-empty template_schema (CT-B, CATEGORY_TEMPLATE_HANDOFF.md §4).
@@ -117,6 +117,25 @@ func NewEnforcer(cfg config.ChinaWallConfig, gw *gateway.ModelGateway, mlClient 
 	return &Enforcer{cfg: cfg, gateway: gw, ml: mlClient, logger: logger, registry: registry}
 }
 
+// maxGenericAllowancePct caps the client-supplied generic ceiling, mirroring the
+// workflow's 0-30% rule. Above this the "generic" share would dominate the
+// answer and the China Wall would no longer mean anything.
+const maxGenericAllowancePct = 30
+
+// genericKnowledgeRule is the instruction appended to the domain profile when a
+// generic allowance is set. Kept beside the cap so the rule and the number can
+// never drift apart.
+func genericKnowledgeRule(pct float64) string {
+	return fmt.Sprintf(`
+
+GENERIC KNOWLEDGE (allowed up to %.0f%%):
+- The trained chunks above are still the primary source; use them first.
+- If they do not cover part of the question, you MAY answer that part from general knowledge.
+- Tag every such part with [GENERIC] so it is visibly not from the corpus.
+- Keep generic content under %.0f%% of your answer.
+- Never attach a citation to a generic part, and never invent one.`, pct, pct)
+}
+
 // Enforce runs all 4 layers for a question + chunks.
 // Returns success with cited answer, or refusal with explanation.
 func (e *Enforcer) Enforce(
@@ -140,6 +159,12 @@ func (e *Enforcer) Enforce(
 	// through from expert.TemplateSections/expert.DefaultLanguage.
 	templateSections []category.TemplateSection,
 	defaultLanguage string,
+	// genericAllowancePct (0-30): the client's generic ceiling, the same
+	// concept workflows.generic_allowance_pct already uses. 0 (the default)
+	// preserves the strict China Wall exactly: no chunk coverage -> refuse.
+	// >0 lets the expert answer the uncovered part from general knowledge,
+	// tagged [GENERIC] and capped, instead of refusing the whole question.
+	genericAllowancePct float64,
 	// tokenCh: non-nil enables streaming for Gate 5 generation.
 	// nil = blocking Call() (backward compatible, used by smoke test etc.).
 	tokenCh chan<- string,
@@ -148,6 +173,14 @@ func (e *Enforcer) Enforce(
 	// O(1) lookup. Falls back to BaseProfile for unknown domains.
 	// WHY registry not hardcoded: domain behavior is DB-driven, no redeploy needed.
 	profile := e.registry.Get(expertDomain)
+
+	if genericAllowancePct < 0 {
+		genericAllowancePct = 0
+	}
+	if genericAllowancePct > maxGenericAllowancePct {
+		genericAllowancePct = maxGenericAllowancePct
+	}
+	allowGeneric := genericAllowancePct > 0
 
 	// LAYER 1: Reranker threshold
 	// Priority: domain profile override > config default > relaxed (last retry).
@@ -180,11 +213,16 @@ func (e *Enforcer) Enforce(
 			zap.Float32("best_score", bestScore),
 			zap.Float64("threshold", threshold),
 		)
-		if attempt >= e.cfg.MaxRetries {
-			return e.buildRefusal("insufficient_relevance",
-				fmt.Sprintf("Best relevance score %.2f below threshold %.2f", bestScore, threshold)), nil
+		// With a generic allowance the expert may still answer (its general
+		// knowledge is allowed), so a low relevance score is no longer fatal —
+		// only a run with NO allowance escalates here.
+		if !allowGeneric {
+			if attempt >= e.cfg.MaxRetries {
+				return e.buildRefusal("insufficient_relevance",
+					fmt.Sprintf("Best relevance score %.2f below threshold %.2f", bestScore, threshold)), nil
+			}
+			return &EnforceResult{Status: "retry", LayerFailed: 1}, nil
 		}
-		return &EnforceResult{Status: "retry", LayerFailed: 1}, nil
 	}
 
 	// LAYER 2: Coverage check
@@ -198,7 +236,15 @@ func (e *Enforcer) Enforce(
 	}
 
 	if coverage == "NO" {
-		return e.buildRefusal("not_covered", "Content does not cover this question"), nil
+		if !allowGeneric {
+			// Tell the client exactly what would unblock this — the refusal is
+			// actionable instead of a dead end.
+			return e.buildRefusal("not_covered",
+				fmt.Sprintf("Content does not cover this question. Generic knowledge is disabled (allowance 0%%); raise the answer basis to allow up to %d%%.", maxGenericAllowancePct)), nil
+		}
+		e.logger.Info("Layer 2 allowed the question via generic allowance",
+			zap.String("expert", expertName),
+			zap.Float64("generic_allowance_pct", genericAllowancePct))
 	}
 
 	if coverage == "PARTIAL" && attempt >= 3 {
@@ -211,6 +257,15 @@ func (e *Enforcer) Enforce(
 
 	// LAYER 3: Generate with mandatory citations
 	// Behavior controlled by profile.CitationMode and profile.SystemPromptExt.
+	// With a generic allowance, extend a COPY of the profile — the registry's
+	// profile is shared across every concurrent question and must never be
+	// mutated (a mutation here would leak one client's allowance into everyone
+	// else's prompts).
+	if allowGeneric {
+		withGeneric := *profile
+		withGeneric.SystemPromptExt += genericKnowledgeRule(genericAllowancePct)
+		profile = &withGeneric
+	}
 	generated, err := e.generateWithCitations(ctx, question, chunks, expertName, reasoningCharter, replyContext, profile, templateSections, defaultLanguage, tokenCh)
 	if err != nil {
 		return nil, fmt.Errorf("generation failed: %w", err)
@@ -1167,9 +1222,9 @@ func (e *Enforcer) extractCitations(answer string, chunks []CourseChunk) []Citat
 		if chunk, ok := chunkMap[chunkIDStr]; ok {
 			chunkID, _ := uuid.Parse(chunkIDStr)
 			citations = append(citations, Citation{
-				ChunkID:    chunkID,
-				Text:       chunk.Text[:minInt(200, len(chunk.Text))],
-				Score:      chunk.RerankScore,
+				ChunkID: chunkID,
+				Text:    chunk.Text[:minInt(200, len(chunk.Text))],
+				Score:   chunk.RerankScore,
 				// Feature #23: Include source transcript name and chunk position
 				// so frontend can display "Source: react_hooks.txt, Chunk #42"
 				// instead of just showing chunk text with no context.
