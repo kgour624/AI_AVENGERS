@@ -339,6 +339,15 @@ func (g *ModelGateway) Call(ctx context.Context, req LLMRequest) (*LLMResponse, 
 	// Returns (response, nil) on first success.
 	// Returns (nil, lastErr) if all attempts fail.
 	tryProvider := func(p LLMProvider) (*LLMResponse, error) {
+		if pricingProvider, ok := p.(interface{ RefreshPricing(context.Context) error }); ok {
+			if err := pricingProvider.RefreshPricing(ctx); err != nil {
+				g.logger.Warn("provider pricing refresh failed; retaining last known rates",
+					zap.String("provider", p.Name()),
+					zap.Error(err),
+				)
+			}
+		}
+
 		// The ceiling: the admin's configured maximum when one is set, else the
 		// provider's own. See resolveCeiling for why the configured value wins
 		// even when it is larger.
@@ -622,6 +631,15 @@ func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan s
 		EnableCache: req.UseCache,
 	}
 
+	if pricingProvider, ok := provider.(interface{ RefreshPricing(context.Context) error }); ok {
+		if err := pricingProvider.RefreshPricing(ctx); err != nil {
+			g.logger.Warn("provider pricing refresh failed; retaining last known rates",
+				zap.String("provider", provider.Name()),
+				zap.Error(err),
+			)
+		}
+	}
+
 	streamStart := time.Now()
 	rawTokenCh, rawRespCh, err := provider.StreamCall(ctx, provReq)
 	if err != nil {
@@ -639,6 +657,14 @@ func (g *ModelGateway) StreamCall(ctx context.Context, req LLMRequest) (<-chan s
 					zap.String("fallback", fallback.Name()),
 					zap.Error(err),
 				)
+				if pricingProvider, ok := fallback.(interface{ RefreshPricing(context.Context) error }); ok {
+					if pricingErr := pricingProvider.RefreshPricing(ctx); pricingErr != nil {
+						g.logger.Warn("fallback provider pricing refresh failed; retaining last known rates",
+							zap.String("provider", fallback.Name()),
+							zap.Error(pricingErr),
+						)
+					}
+				}
 				tokens, resp, fbErr := fallback.StreamCall(ctx, provReq)
 				if fbErr == nil {
 					g.breaker.RecordSuccess(fallback.Name())

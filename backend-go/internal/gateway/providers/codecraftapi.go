@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	gtypes "ai_avengers/backend/internal/gateway/types"
 )
@@ -21,25 +24,42 @@ import (
 // Zero new response-parsing code needed.
 //
 // WHY model names come from constructor (not hardcoded):
-//   CodeCraftAPI exposes a live model catalog via GET /v1/models.
-//   Admin selects which model to use per tier from the admin panel.
-//   Hardcoding would require a code change every time admin wants a different model.
-//   Constructor receives admin-configured names; empty string is valid at construction
-//   time (admin may not have configured yet) — Call() will get a 400 from CodeCraftAPI
-//   which surfaces to the admin as an actionable error.
 //
-// WHY CostPer1K returns 0, 0:
-//   CodeCraftAPI pricing is not publicly documented at integration time.
-//   Returning fabricated numbers would corrupt cost tracking.
-//   Admin checks their CodeCraftAPI dashboard for actual costs.
+//	CodeCraftAPI exposes a live model catalog via GET /v1/models.
+//	Admin selects which model to use per tier from the admin panel.
+//	Hardcoding would require a code change every time admin wants a different model.
+//	Constructor receives admin-configured names; empty string is valid at construction
+//	time (admin may not have configured yet) — Call() will get a 400 from CodeCraftAPI
+//	which surfaces to the admin as an actionable error.
+//
+// Pricing is loaded from CodeCraftAPI's documented /models catalog. Unknown
+// model IDs remain unpriced rather than being assigned a guessed rate.
 type CodeCraftAPIProvider struct {
-	apiKey      string
-	baseURL     string // trimmed of trailing slash, e.g. "https://codecraftapi.com/v1"
-	modelCheap  string // admin-configured model name for cheap tier
-	modelStrong string // admin-configured model name for strong tier
-	modelFast   string // admin-configured model name for fast tier
-	httpClient  *http.Client
+	apiKey         string
+	baseURL        string // trimmed of trailing slash, e.g. "https://codecraftapi.com/v1"
+	modelCheap     string // admin-configured model name for cheap tier
+	modelStrong    string // admin-configured model name for strong tier
+	modelFast      string // admin-configured model name for fast tier
+	httpClient     *http.Client
+	pricingMu      sync.RWMutex
+	pricing        map[string]modelPricing
+	pricingTriedAt time.Time
 }
+
+// modelPricing stores the CodeCraftAPI catalog's USD price per 1,000 tokens.
+type modelPricing struct {
+	InputPer1K  float64 `json:"input_per_1k"`
+	OutputPer1K float64 `json:"output_per_1k"`
+}
+
+type codeCraftModelCatalog struct {
+	Data []struct {
+		ID      string        `json:"id"`
+		Pricing *modelPricing `json:"pricing"`
+	} `json:"data"`
+}
+
+const codeCraftPricingCacheTTL = 5 * time.Minute
 
 // NewCodeCraftAPIProvider creates a new CodeCraftAPIProvider.
 //
@@ -85,10 +105,73 @@ func (p *CodeCraftAPIProvider) ModelName(tier gtypes.ModelType) string {
 	}
 }
 
-// CostPer1K returns 0, 0 because CodeCraftAPI pricing is not publicly
-// documented at integration time. Admin checks their CodeCraftAPI dashboard.
-func (p *CodeCraftAPIProvider) CostPer1K(_ gtypes.ModelType) (float64, float64) {
-	return 0, 0
+// CostPer1K returns the published per-model rate for the configured tier.
+// Zero is returned only when that model is absent from the latest known catalog.
+func (p *CodeCraftAPIProvider) CostPer1K(tier gtypes.ModelType) (float64, float64) {
+	p.pricingMu.RLock()
+	price, ok := p.pricing[p.ModelName(tier)]
+	p.pricingMu.RUnlock()
+	if !ok {
+		return 0, 0
+	}
+	return price.InputPer1K, price.OutputPer1K
+}
+
+// RefreshPricing reads exact per-model prices from CodeCraftAPI's documented
+// GET /models catalog. A failed refresh preserves the last known good rates.
+func (p *CodeCraftAPIProvider) RefreshPricing(ctx context.Context) error {
+	p.pricingMu.RLock()
+	fresh := !p.pricingTriedAt.IsZero() && time.Since(p.pricingTriedAt) < codeCraftPricingCacheTTL
+	p.pricingMu.RUnlock()
+	if fresh {
+		return nil
+	}
+
+	p.pricingMu.Lock()
+	defer p.pricingMu.Unlock()
+	if !p.pricingTriedAt.IsZero() && time.Since(p.pricingTriedAt) < codeCraftPricingCacheTTL {
+		return nil
+	}
+	// Bound retries after an upstream failure too. Preserve any old price map,
+	// and don't make every request wait on a catalog endpoint that is down.
+	p.pricingTriedAt = time.Now()
+
+	refreshCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(refreshCtx, http.MethodGet, p.baseURL+"/models", nil)
+	if err != nil {
+		return fmt.Errorf("codecraftapi pricing: build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	resp, err := p.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("codecraftapi pricing: fetch catalog: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("codecraftapi pricing: catalog returned status %d", resp.StatusCode)
+	}
+
+	var catalog codeCraftModelCatalog
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&catalog); err != nil {
+		return fmt.Errorf("codecraftapi pricing: decode catalog: %w", err)
+	}
+	if len(catalog.Data) == 0 {
+		return fmt.Errorf("codecraftapi pricing: catalog contains no models")
+	}
+
+	prices := make(map[string]modelPricing, len(catalog.Data))
+	for _, model := range catalog.Data {
+		if model.ID != "" && model.Pricing != nil &&
+			model.Pricing.InputPer1K >= 0 && model.Pricing.OutputPer1K >= 0 {
+			prices[model.ID] = *model.Pricing
+		}
+	}
+	if len(prices) == 0 {
+		return fmt.Errorf("codecraftapi pricing: catalog contains no model IDs")
+	}
+	p.pricing = prices
+	return nil
 }
 
 // MaxTokens returns the per-call ceiling for CodeCraftAPI.
@@ -108,10 +191,11 @@ func (p *CodeCraftAPIProvider) MaxTokens(_ gtypes.ModelType) int { return 21000 
 // (array check first) plus reasoning_content fallback for DeepSeek-style models.
 //
 // WHY not StandardExtractContent:
-//   CodeCraftAPI is a semi-raw proxy — it does NOT normalize inner payload.
-//   Claude Opus 5 via CodeCraftAPI returns content as [{type:text,text:...}].
-//   DeepSeek-V4-Flash via CodeCraftAPI returns content="", reasoning_content="...".
-//   Both cases must be handled here so any model in the catalog works.
+//
+//	CodeCraftAPI is a semi-raw proxy — it does NOT normalize inner payload.
+//	Claude Opus 5 via CodeCraftAPI returns content as [{type:text,text:...}].
+//	DeepSeek-V4-Flash via CodeCraftAPI returns content="", reasoning_content="...".
+//	Both cases must be handled here so any model in the catalog works.
 func (p *CodeCraftAPIProvider) ExtractContent(raw json.RawMessage, reasoningContent string) string {
 	if len(raw) == 0 {
 		return reasoningContent
@@ -149,15 +233,16 @@ func (p *CodeCraftAPIProvider) ExtractContent(raw json.RawMessage, reasoningCont
 func (p *CodeCraftAPIProvider) ExtractStreamToken(content, reasoningContent string) string {
 	return gtypes.StandardExtractStreamToken(content, reasoningContent)
 }
-//
+
 // Uses doOpenAICompatibleCall() from common.go — CodeCraftAPI uses the
 // same OpenAI-compatible response format as OpenRouter/DeepSeek/Gemini.
 //
 // WHY no prompt caching (EnableCache not handled):
-//   CodeCraftAPI's support for Anthropic-style cache_control headers is
-//   unknown at integration time. Adding cache_control to an API that
-//   doesn't support it could break the call. Omitting it is safe —
-//   worst case is no caching, not a broken call.
+//
+//	CodeCraftAPI's support for Anthropic-style cache_control headers is
+//	unknown at integration time. Adding cache_control to an API that
+//	doesn't support it could break the call. Omitting it is safe —
+//	worst case is no caching, not a broken call.
 func (p *CodeCraftAPIProvider) Call(ctx context.Context, req gtypes.ProviderRequest) (*gtypes.ProviderResponse, error) {
 	var msgs []map[string]string
 	for _, m := range req.Messages {
