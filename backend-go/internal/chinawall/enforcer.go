@@ -169,6 +169,10 @@ func (e *Enforcer) Enforce(
 	// >0 lets the expert answer the uncovered part from general knowledge,
 	// tagged [GENERIC] and capped, instead of refusing the whole question.
 	genericAllowancePct float64,
+	// expertStripMode (migration 059): the expert's own "code_exempt" (VIP pass)
+	// or "full_strip" (strict). Empty = keep the domain profile's choice, so an
+	// unset column behaves exactly as before.
+	expertStripMode string,
 	// tokenCh: non-nil enables streaming for Gate 5 generation.
 	// nil = blocking Call() (backward compatible, used by smoke test etc.).
 	tokenCh chan<- string,
@@ -185,6 +189,17 @@ func (e *Enforcer) Enforce(
 		genericAllowancePct = maxGenericAllowancePct
 	}
 	allowGeneric := genericAllowancePct > 0
+
+	// Per-expert VIP pass / strict. Applied to a COPY: the registry profile is
+	// shared by every concurrent request and must never be mutated.
+	if mode := strings.ToUpper(strings.TrimSpace(expertStripMode)); mode != "" {
+		switch StripMode(mode) {
+		case StripModeCodeExempt, StripModeFull:
+			withStrip := *profile
+			withStrip.StripMode = StripMode(mode)
+			profile = &withStrip
+		}
+	}
 
 	// LAYER 1: Reranker threshold
 	// Priority: domain profile override > config default > relaxed (last retry).
