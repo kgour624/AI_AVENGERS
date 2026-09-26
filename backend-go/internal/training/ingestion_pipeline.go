@@ -925,6 +925,19 @@ func (p *IngestionPipeline) IngestTranscript(
 	} else {
 		p.storeCapabilities(ctx, expertID, capabilities)
 	}
+
+	// Then derive the capability NUMBERS from the whole corpus, overriding
+	// whatever the run just wrote.
+	//
+	// WHY unconditionally, and after the write above: the builder only ever sees
+	// this run's chunks, and in append mode (the default) the corpus is the union
+	// of every run. Without this step a topic touched by the newest course keeps
+	// only the newest course's chunk_count, the topics the newest run never
+	// mentions keep stale numbers, and the capability table stops matching the
+	// corpus counts the expert row reports. Same function the reconcile action
+	// and the LLM-failure fallback use, so all three can never disagree.
+	p.buildCapabilitiesFromChunks(ctx, expertID)
+
 	ptimer.Stop("capability_build")
 	p.emit(ctx, jobID, expertID, "capability_build", jobevents.KindStageDone, map[string]interface{}{
 		"duration_ms": time.Since(capabilityStarted).Milliseconds(),
@@ -1256,16 +1269,16 @@ func (p *IngestionPipeline) storeChunks(
 		var sb strings.Builder
 		sb.WriteString(`INSERT INTO course_chunks
 			(expert_id, chunk_text, chunk_index, topic, subtopic, source_file, embedding, chunk_hash,
-			 embedding_provider, embedding_model)
+			 embedding_provider, embedding_model, section_path)
 		 VALUES `)
-		args := make([]interface{}, 0, (batchEnd-batchStart)*10)
+		args := make([]interface{}, 0, (batchEnd-batchStart)*11)
 		for i := batchStart; i < batchEnd; i++ {
 			if i > batchStart {
 				sb.WriteString(",")
 			}
 			base := len(args)
-			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
-				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10))
+			sb.WriteString(fmt.Sprintf("($%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d,$%d)",
+				base+1, base+2, base+3, base+4, base+5, base+6, base+7, base+8, base+9, base+10, base+11))
 
 			topic := topics[i].Topic
 			subtopic := ""
@@ -1275,7 +1288,7 @@ func (p *IngestionPipeline) storeChunks(
 			args = append(args,
 				expertID, chunks[i].Text, chunks[i].Index, topic, subtopic,
 				sourceFile, pgvector.NewVector(embeddings[i]), chunks[i].ChunkHash,
-				embedProvider, embedModelArg,
+				embedProvider, embedModelArg, chunks[i].SectionPath,
 			)
 		}
 		sb.WriteString(` ON CONFLICT (expert_id, chunk_hash) DO NOTHING`)
@@ -1561,13 +1574,16 @@ func errorString(err error) string {
 	return err.Error()
 }
 
-// buildCapabilitiesFromChunks populates expert_capabilities from course_chunks
-// topic data without LLM analysis. Used as fallback when capability build fails.
+// buildCapabilitiesFromChunks (re)derives expert_capabilities from the topics the
+// corpus actually holds, without LLM analysis.
 //
-// Delegates to upsertCapabilitiesFromChunks (reconcile.go) so the reconcile action
-// and the ingestion fallback can never disagree about what a chunk-derived
-// capability is. Best-effort by contract: it logs and returns, because a failed
-// fallback must not fail an otherwise-complete run.
+// Two callers, one definition: the fallback when the capability build fails, and
+// the end of every successful ingest — where it corrects the per-run numbers the
+// builder wrote with corpus-wide ones. Delegates to
+// upsertCapabilitiesFromChunks (reconcile.go) so the reconcile action, the
+// fallback and the ingest step can never disagree about what a chunk-derived
+// capability is. Best-effort by contract: it logs and returns, because neither a
+// failed fallback nor a failed correction may fail an otherwise-complete run.
 func (p *IngestionPipeline) buildCapabilitiesFromChunks(ctx context.Context, expertID uuid.UUID) {
 	written, err := upsertCapabilitiesFromChunks(ctx, p.db, p.logger, expertID)
 	if err != nil {

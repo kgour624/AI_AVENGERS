@@ -138,11 +138,20 @@ export const updateExpert = (expertId: string, req: UpdateExpertRequest) =>
     .patch<ApiResponse<{ status: string }>>(`/api/v1/admin/experts/${expertId}`, req)
     .then((res) => res.data.data!)
 
-export const ingestTranscript = (expertId: string, file: File) => {
+// replaceExisting=true REPLACES the expert's whole corpus instead of adding to
+// it. Default false (append) per the design doc §5.4.
+//
+// WHY the flag has to exist: append mode dedups on chunk_hash, so re-ingesting
+// the same course through a changed chunker adds a second copy with different
+// hashes rather than replacing the first — the corpus doubles and retrieval gets
+// noisier while the job still reports success. Replacing is the only way to move
+// an expert onto new chunking, so the choice is explicit here.
+export const ingestTranscript = (expertId: string, file: File, replaceExisting = false) => {
   const formData = new FormData()
   // WHY "transcript", not "file": confirmed against
   // AdminHandler.IngestTranscript's real `c.Request.FormFile("transcript")`.
   formData.append('transcript', file)
+  formData.append('replace_existing', replaceExisting ? 'true' : 'false')
   return baseAPI
     .post<ApiResponse<{ jobId: string; status: string; message: string; expertId: string }>>(
       `/api/v1/admin/experts/${expertId}/ingest`,
