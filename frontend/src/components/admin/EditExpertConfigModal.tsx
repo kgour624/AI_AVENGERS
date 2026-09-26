@@ -60,6 +60,12 @@ export function EditExpertConfigModal({
     queryFn: getExpertCategories,
   })
 
+  // VIP pass / strict (migration 059). Prefilled when the API exposes the
+  // expert's current mode; always sent on save because this control is only
+  // touched deliberately.
+  const [stripMode, setStripMode] = useState<'full_strip' | 'code_exempt'>(
+    (expert as { stripMode?: 'full_strip' | 'code_exempt' }).stripMode ?? 'full_strip'
+  )
   const [error, setError] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
 
@@ -110,6 +116,7 @@ export function EditExpertConfigModal({
         // CategoryID). Omitting the field when categoryId is empty
         // leaves the expert's existing category untouched.
         ...(categoryId ? { categoryId } : {}),
+        stripMode,
       })
       onSaved()
       handleClose()
@@ -261,6 +268,24 @@ export function EditExpertConfigModal({
                 {cat.name}
               </option>
             ))}
+          </select>
+        </div>
+
+        {/* Answer strictness: VIP pass (code exempt) vs strict (full strip) */}
+        <div className="flex flex-col gap-1.5">
+          <label className="text-sm text-text-secondary">
+            Answer strictness
+            <span className="ml-1 text-xs text-text-disabled">
+              (VIP Pass keeps code blocks even without citations)
+            </span>
+          </label>
+          <select
+            value={stripMode}
+            onChange={(e) => setStripMode(e.target.value as 'full_strip' | 'code_exempt')}
+            className={selectClass}
+          >
+            <option value="full_strip">Strict (Full Strip) — citations needed for every sentence</option>
+            <option value="code_exempt">VIP Pass (Code Exempt) — code blocks kept without citations</option>
           </select>
         </div>
 
