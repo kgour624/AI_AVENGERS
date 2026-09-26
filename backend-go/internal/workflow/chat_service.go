@@ -126,6 +126,10 @@ type ChatParticipant struct {
 // here, which the Store does not expose (it has Post / GetByType / GetSince).
 // Carrying an unused dependency would suggest a coupling that does not exist.
 // The two reads live in deliverableContext and citedEvents.
+// maxFocusFileChars bounds the content of a client-selected file that is pasted
+// into the prompt, so one large file cannot consume the whole context window.
+const maxFocusFileChars = 20000
+
 type WorkflowChatService struct {
 	db            *pgxpool.Pool
 	store         *blackboard.Store
@@ -486,6 +490,7 @@ func (s *WorkflowChatService) Send(
 	chatID, clientID uuid.UUID,
 	expertID *uuid.UUID,
 	question string,
+	focusFile string,
 ) (*WorkflowChatMessage, error) {
 	question = strings.TrimSpace(question)
 	if question == "" {
@@ -495,6 +500,23 @@ func (s *WorkflowChatService) Send(
 	ch, err := s.GetChat(ctx, chatID, clientID)
 	if err != nil {
 		return nil, err
+	}
+
+	// A question scoped to one generated file: pull the file's real content and
+	// its owner. The owner answers, and the content is injected so the answer is
+	// about what was actually written instead of a guess from the file name.
+	focus := strings.TrimSpace(focusFile)
+	focusContent := ""
+	if focus != "" {
+		content, owner, ok := lookupArtifact(ctx, s.store, ch.WorkflowID, focus)
+		if !ok {
+			return nil, fmt.Errorf("send: file %q has no stored content in this workflow", focus)
+		}
+		focusContent = content
+		if owner != nil && expertID == nil {
+			// The expert who wrote the file answers questions about it.
+			expertID = owner
+		}
 	}
 
 	responderID, err := s.resolveResponder(ctx, ch, expertID)
@@ -557,6 +579,20 @@ func (s *WorkflowChatService) Send(
 		systemPrompt += "\n\nFILES THAT ACTUALLY EXIST IN THIS WORKFLOW:\n- " + strings.Join(files, "\n- ") +
 			"\nRead any of them with read_design(path). Never claim a file cannot be read without first calling read_design on a path from this list."
 	}
+	// Scope the answer to the selected file: it is the subject of the question,
+	// so give the expert its exact content (truncated to a bounded window) and
+	// say so plainly. A file with no stored content never reaches here — the
+	// caller gets an explicit error instead of a guess.
+	if focus != "" && focusContent != "" {
+		excerpt := focusContent
+		if len(excerpt) > maxFocusFileChars {
+			excerpt = excerpt[:maxFocusFileChars] + "\n...[truncated]"
+		}
+		systemPrompt += "\n\nTHE CLIENT SELECTED THIS FILE:\n" + focus +
+			"\nIts author is " + expert.Name + ".\nAnswer about THIS file using the content below. Do not claim you cannot open it.\n\n```\n" +
+			excerpt + "\n```"
+	}
+
 	toolCatalogue := promptCatalogue(s.tools.ForExpert(expert))
 	userPrompt := s.buildUserPrompt(deliverable, sectionList, history, question)
 

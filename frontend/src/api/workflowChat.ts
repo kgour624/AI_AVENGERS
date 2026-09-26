@@ -119,11 +119,34 @@ export const removeChatParticipant = (chatId: string, expertId: string) =>
 
 // expertId addresses one participant. Omit for the default responder — the
 // pinned deliverable's author (§6.3).
-export const sendWorkflowChatMessage = (chatId: string, message: string, expertId?: string) =>
+/** A file the workflow actually produced, with the expert that produced it. */
+export interface WorkflowFile {
+  path: string
+  expertId?: string
+  operation?: string
+  hasContent: boolean
+}
+
+/**
+ * The authoritative produced-file list (from the code_artifact_produced events),
+ * so the chat can offer a file picker and route the question to the file's author.
+ */
+export const getWorkflowFiles = (workflowId: string) =>
+  baseAPI
+    .get<ApiResponse<WorkflowFile[]>>(`/api/v1/workflows/${workflowId}/files`)
+    .then((res) => res.data.data ?? [])
+
+export const sendWorkflowChatMessage = (
+  chatId: string,
+  message: string,
+  expertId?: string,
+  focusFile?: string,
+) =>
   baseAPI
     .post<ApiResponse<WorkflowChatMessage>>(`/api/v1/workflow-chats/${chatId}/messages`, {
       message,
       expertId,
+      ...(focusFile ? { focusFile } : {}),
     })
     .then((res) => res.data.data!)
 

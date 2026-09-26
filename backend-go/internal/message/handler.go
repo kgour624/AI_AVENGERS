@@ -501,7 +501,7 @@ func (h *Handler) Send(c *gin.Context) {
 				// falls back to "content" above otherwise.
 				"template_sections": expertResp.TemplateSections,
 				// B8: claim→evidence reports; nil/omitted when verify off.
-				// Content already carries [UNVERIFIED]/[REFUTED] labels.
+				// Verification labels are never written into content (removed by product decision).
 				"claims": expertResp.Claims,
 			})
 

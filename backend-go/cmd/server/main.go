@@ -968,6 +968,10 @@ func buildRouter(
 			workflows.POST("/:id/run", wfHandler.RunWorkflow(wfRunner))
 			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
 			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
+			// Authoritative produced-file list (path + owning expert + has
+			// content) so the chat can offer a file picker and route a question
+			// to the expert who actually wrote the file.
+			workflows.GET("/:id/files", wfHandler.ListFiles)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
 			workflows.POST("/:id/cancel", wfHandler.CancelWorkflow)
 			workflows.POST("/:id/tasks/:taskId/retry", wfHandler.RetryTask)
