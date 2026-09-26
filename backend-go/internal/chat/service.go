@@ -581,7 +581,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 		response.BadRequest(c, "INVALID_ID", "invalid chat ID")
 		return
 	}
-	messages, err := h.svc.ListMessages(c.Request.Context(), chatID, clientID, 50, 0)
+	messages, err := h.svc.ListMessages(c.Request.Context(), chatID, clientID, 1000, 0)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			response.NotFound(c, "chat")
