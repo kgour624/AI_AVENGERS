@@ -445,6 +445,43 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		designRevisionID = parseDesignRevisionID(savedState.DesignRevisionID)
 		redesignGoal = savedState.RedesignGoal
 	}
+	// --- Phase: Understanding (every expert restates; the client approves) ---
+	//
+	// WHY before design and why blocking: the client used to approve a plan without
+	// ever seeing what the experts THOUGHT they were asked to build, so a
+	// misunderstanding could only surface after the design existed. Each expert now
+	// states its reading in plain words, the client adds what was missing, the
+	// experts restate, and only then does design start.
+	runUnderstanding := resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseUnderstanding)
+	if runUnderstanding {
+		if strings.TrimSpace(requirementText) == "" {
+			log.Error("runner: understanding phase needs the requirement text")
+			_ = r.engine.Fail(ctx, workflowID, "Understanding phase: requirement not available")
+			return
+		}
+		for attempt := 1; attempt <= maxUnderstandingAttempts; attempt++ {
+			arts, capErr := r.captureUnderstandings(ctx, workflowID, experts, requirementText)
+			if capErr != nil {
+				log.Error("runner: understanding phase failed", zap.Error(capErr))
+				_ = r.engine.Fail(ctx, workflowID, "Understanding phase: "+capErr.Error())
+				return
+			}
+			decision, notes, gateErr := r.askUnderstandingGate(ctx, workflowID, arts, attempt)
+			if gateErr != nil {
+				log.Error("runner: understanding gate failed", zap.Error(gateErr))
+				_ = r.engine.Fail(ctx, workflowID, "Understanding gate failed")
+				return
+			}
+			if decision != decisionChangesRequested {
+				break
+			}
+			if strings.TrimSpace(notes) != "" {
+				requirementText = requirementText + " CLIENT ADDED INFO: " + notes
+			}
+		}
+		log.Info("runner: understanding approved, starting design")
+	}
+
 	runDesign := resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseDetailedDesign)
 	if runDesign {
 		for attempt := 1; attempt <= maxDesignAttempts; attempt++ {
@@ -633,8 +670,8 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 			execMu.Unlock()
 			if err != nil {
 				log.Error("runner: QA waves failed", zap.Error(err))
-			// QA failure is non-fatal — code is already written
-			log.Warn("runner: QA phase had failures, continuing to handoff",
+				// QA failure is non-fatal — code is already written
+				log.Warn("runner: QA phase had failures, continuing to handoff",
 					zap.Int("completed", len(state.CompletedExpertIDs)),
 					zap.Int("failed", len(state.FailedExpertIDs)),
 				)
@@ -1570,7 +1607,7 @@ func (r *WorkflowRunner) askDesignGate(
 		return "", "", approvalID, fmt.Errorf("design gate wait: %w", err)
 	}
 
-	decision, notes := r.lastApprovalDecision(ctx, workflowID, approvalID)
+	decision, notes := r.lastApprovalDecision(ctx, workflowID, approvalID, "detailed_design")
 	r.logger.Info("runner: design gate answered",
 		zap.String("workflow_id", workflowID.String()),
 		zap.Int("attempt", attempt),
@@ -1583,13 +1620,13 @@ func (r *WorkflowRunner) askDesignGate(
 //
 // Returns "" on error, which the caller treats as "not a re-run request" —
 // failing to read the decision must not trap the workflow in the design loop.
-func (r *WorkflowRunner) lastApprovalDecision(ctx context.Context, workflowID, approvalID uuid.UUID) (string, string) {
+func (r *WorkflowRunner) lastApprovalDecision(ctx context.Context, workflowID, approvalID uuid.UUID, gate string) (string, string) {
 	var status string
 	var responseJSON []byte
 	err := r.db.QueryRow(ctx,
 		`SELECT status, client_response FROM approval_requests
-		 WHERE workflow_id = $1 AND id = $2 AND gate_name = 'detailed_design'`,
-		workflowID, approvalID,
+		 WHERE workflow_id = $1 AND id = $2 AND gate_name = $3`,
+		workflowID, approvalID, gate,
 	).Scan(&status, &responseJSON)
 	if err != nil {
 		r.logger.Warn("runner: could not read approval decision", zap.Error(err))

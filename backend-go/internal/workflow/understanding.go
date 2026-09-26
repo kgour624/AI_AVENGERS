@@ -192,7 +192,7 @@ func (r *WorkflowRunner) askUnderstandingGate(
 	if err := r.waitForResume(ctx, workflowID); err != nil {
 		return "", "", fmt.Errorf("understanding gate wait: %w", err)
 	}
-	decision, notes := r.lastApprovalDecision(ctx, workflowID, approvalID)
+	decision, notes := r.lastApprovalDecision(ctx, workflowID, approvalID, "understanding")
 	r.logger.Info("runner: understanding gate answered",
 		zap.String("workflow_id", workflowID.String()),
 		zap.Int("attempt", attempt),
