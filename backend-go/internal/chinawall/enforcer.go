@@ -217,28 +217,23 @@ func (e *Enforcer) Enforce(
 			zap.Float32("best_score", bestScore),
 			zap.Float64("threshold", threshold),
 		)
-		// A low reranker score is NOT, by itself, proof the expert cannot answer.
-		// For APPLY_PRINCIPLES domains (system design, DSA, coding) questions are
-		// answered by applying the principles in the corpus, and a design
-		// question can legitimately score low against the wording that was
-		// ingested. Hard-refusing there threw away answers a trained expert
-		// produced correctly — the production regression where a system-design
-		// expert refused its own domain even with generic allowance at 0%.
-		// Only LITERAL_MATCH domains (medical/legal/finance), where the answer
-		// must be found verbatim, keep the strict score gate.
-		if !allowGeneric && profile.CoverageMode != CoverageModeApplyPrinciples {
+		// 0% means trained-corpus-only for EVERY domain, including
+		// APPLY_PRINCIPLES. Do not let domain mode silently grant generic
+		// knowledge; only the user's explicit positive allowance may cross this
+		// gate. At >0, principle-transfer domains may continue using the best
+		// available chunks plus the separately tagged/capped generic portion.
+		if !allowGeneric {
 			if attempt >= e.cfg.MaxRetries {
 				return e.buildRefusal("insufficient_relevance",
 					fmt.Sprintf("Best relevance score %.2f below threshold %.2f", bestScore, threshold)), nil
 			}
 			return &EnforceResult{Status: "retry", LayerFailed: 1}, nil
 		}
-		if profile.CoverageMode == CoverageModeApplyPrinciples {
-			e.logger.Info("Layer 1: low reranker score on a principle-transfer domain — answering from the best available chunks",
-				zap.String("expert", expertName),
-				zap.String("domain", expertDomain),
-				zap.Float32("best_score", bestScore),
-				zap.Float64("threshold", threshold))
+		if allowGeneric && profile.CoverageMode == CoverageModeApplyPrinciples {
+			e.logger.Info("Layer 1: low reranker score — continuing within explicit generic allowance",
+				zap.String("expert", expertName), zap.String("domain", expertDomain),
+				zap.Float32("best_score", bestScore), zap.Float64("threshold", threshold),
+				zap.Float64("generic_allowance_pct", genericAllowancePct))
 		}
 	}
 
@@ -254,25 +249,10 @@ func (e *Enforcer) Enforce(
 
 	if coverage == "NO" {
 		if !allowGeneric {
-			// APPLY_PRINCIPLES exists precisely for domains whose questions are
-			// answered by APPLYING principles rather than by finding the answer
-			// verbatim in the corpus (system design, DSA, coding). A literal
-			// "NO" there is a mis-signal, so it must not hard-refuse — this is
-			// what made a trained system-design expert refuse its own domain's
-			// question. LITERAL_MATCH domains (medical/legal/finance) keep the
-			// strict refusal.
-			if profile.CoverageMode == CoverageModeApplyPrinciples {
-				e.logger.Info("Layer 2: coverage NO on a principle-transfer domain — continuing as PARTIAL",
-					zap.String("expert", expertName),
-					zap.String("domain", expertDomain),
-					zap.String("coverage_mode", string(profile.CoverageMode)))
-				coverage = "PARTIAL"
-			} else {
-				// Tell the client exactly what would unblock this — the refusal
-				// is actionable instead of a dead end.
-				return e.buildRefusal("not_covered",
-					fmt.Sprintf("Content does not cover this question. Generic knowledge is disabled (allowance 0%%); raise the answer basis to allow up to %d%%.", maxGenericAllowancePct)), nil
-			}
+			// 0% is strict for APPLY_PRINCIPLES too. A positive allowance is the
+			// only opt-in to answering uncovered content from general knowledge.
+			return e.buildRefusal("not_covered",
+				fmt.Sprintf("Content does not cover this question. Generic knowledge is disabled (allowance 0%%); raise the answer basis to allow up to %d%%.", maxGenericAllowancePct)), nil
 		} else {
 			e.logger.Info("Layer 2 allowed the question via generic allowance",
 				zap.String("expert", expertName),
@@ -281,11 +261,9 @@ func (e *Enforcer) Enforce(
 	}
 
 	if coverage == "PARTIAL" && attempt >= 3 {
-		// The decision engine turns "partial" into a refusal ("Cannot provide a
-		// complete answer"). For an APPLY_PRINCIPLES domain a partial match is
-		// normal and the expert must still answer from what it has — otherwise a
-		// trained system-design expert is refused on a question it can solve.
-		if profile.CoverageMode != CoverageModeApplyPrinciples {
+		// Only an explicit positive allowance lets an APPLY_PRINCIPLES domain
+		// answer after repeated PARTIAL coverage; at 0%, preserve strict mode.
+		if !allowGeneric || profile.CoverageMode != CoverageModeApplyPrinciples {
 			return &EnforceResult{
 				Status:   "partial",
 				Coverage: "PARTIAL",

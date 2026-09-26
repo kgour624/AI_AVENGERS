@@ -110,6 +110,28 @@ func TestAnnotateUnverified(t *testing.T) {
 	}
 }
 
+func TestGenericClaimIsNotReLabeledUnverified(t *testing.T) {
+	answer := "Trained fact. [GENERIC] React can use a controlled input for the form."
+	claims := extractMaterialClaims(answer)
+	for _, claim := range claims {
+		if strings.Contains(claim, "[GENERIC]") {
+			t.Fatalf("generic claim must not be sent to corpus-only verifier: %q", claim)
+		}
+	}
+	reports := []ClaimReport{{
+		Claim:     "React can use a controlled input for the form.",
+		Verdict:   ClaimSupported, // even if a verifier/model returns this optimistically
+		SpanStart: 0, SpanEnd: len("React can use a controlled input for the form."),
+	}}
+	normalized := normalizeClaimReports(answer, reports)
+	if normalized[0].Verdict != ClaimSupported {
+		t.Fatalf("explicitly allowed generic content must not be demoted, got %q", normalized[0].Verdict)
+	}
+	if got := annotateUnverified(answer, normalized); got != answer {
+		t.Fatalf("generic-labelled answer should keep its [GENERIC] label, got %q", got)
+	}
+}
+
 func TestNormalizeVerdict(t *testing.T) {
 	if normalizeVerdict("SUPPORTED") != ClaimSupported {
 		t.Error("supported")

@@ -18,9 +18,9 @@ import (
 type ClaimVerdict string
 
 const (
-	ClaimSupported     ClaimVerdict = "supported"
-	ClaimRefuted       ClaimVerdict = "refuted"
-	ClaimUnverifiable  ClaimVerdict = "unverifiable"
+	ClaimSupported    ClaimVerdict = "supported"
+	ClaimRefuted      ClaimVerdict = "refuted"
+	ClaimUnverifiable ClaimVerdict = "unverifiable"
 )
 
 // ClaimReport is one material claim mapped to evidence (P9 span anchors).
@@ -38,7 +38,7 @@ type ClaimReport struct {
 
 // ClaimVerifyResult is the Layer-4.5 output (B8).
 type ClaimVerifyResult struct {
-	Claims       []ClaimReport
+	Claims []ClaimReport
 	// Annotated answer: unverifiable/refuted claims labelled inline; a
 	// short verification footer for observability. Empty Claims → Answer
 	// is returned unchanged (no annotations).
@@ -148,6 +148,24 @@ func extractMaterialClaims(answer string) []string {
 		}
 		// Drop pure list markers / markers we already inject.
 		if strings.HasPrefix(t, "[UNVERIFIED]") || strings.HasPrefix(t, "[REFUTED]") {
+			continue
+		}
+		// A claim explicitly tagged [GENERIC] is intentionally outside the
+		// training corpus (the client allowed this via the 0-30% control). Do not
+		// feed it to a corpus-only verifier and then relabel it [UNVERIFIED] —
+		// that contradicts the user's explicit allowance. The [GENERIC] marker is
+		// its provenance label; corpus-derived claims in the same answer are still
+		// extracted and verified normally.
+		if strings.Contains(t, "[GENERIC]") {
+			continue
+		}
+		// Generic content is explicitly permitted by the client's 0-30% control
+		// and already carries its own provenance label. Comparing it only to
+		// training chunks would mechanically mark every allowed generic claim
+		// [UNVERIFIED], contradicting the permission and confusing the client.
+		// Leave [GENERIC] claims labelled as such; verify corpus-sourced claims
+		// normally.
+		if strings.Contains(t, "[GENERIC]") {
 			continue
 		}
 		key := strings.ToLower(t)
@@ -261,9 +279,9 @@ func parseClaimVerifyResponse(raw string, candidates []string) ([]ClaimReport, e
 		if !ok {
 			// Missing index → P3 unverifiable
 			out = append(out, ClaimReport{
-				Claim:      claim,
-				Verdict:    ClaimUnverifiable,
-				Confidence: 0,
+				Claim:         claim,
+				Verdict:       ClaimUnverifiable,
+				Confidence:    0,
 				Justification: "missing from verifier output",
 			})
 			continue
@@ -312,8 +330,15 @@ func normalizeClaimReports(answer string, reports []ClaimReport) []ClaimReport {
 				r.Justification = joinJust(r.Justification, "claim span not found in answer")
 			}
 		}
-		// Supported with zero chunk evidence → demote (P9).
-		if r.Verdict == ClaimSupported && len(r.ChunkIDs) == 0 {
+		// P9 evidence gate applies only to corpus-supported claims. Generic claims
+		// are explicitly marked [GENERIC] by the generator when allowance > 0;
+		// they are not supposed to cite a training chunk, so calling them
+		// [UNVERIFIED] here is a false contradiction that makes a correctly
+		// allowed answer look broken. Keep the label distinction: generic means
+		// outside-corpus by consent; unverifiable means a corpus claim whose
+		// evidence could not be checked.
+		isGeneric := strings.Contains(answer, "[GENERIC]") && strings.Contains(answer, r.Claim)
+		if r.Verdict == ClaimSupported && len(r.ChunkIDs) == 0 && !isGeneric {
 			r.Verdict = ClaimUnverifiable
 			r.Justification = joinJust(r.Justification, "no chunk evidence")
 		}
