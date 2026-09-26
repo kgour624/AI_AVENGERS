@@ -12,6 +12,98 @@ import (
 	"unicode"
 )
 
+// headingRe matches a markdown ATX heading line: up to six hashes, a space, and
+// the title. Anchored per line with (?m).
+var headingRe = regexp.MustCompile(`(?m)^[ \t]*(#{1,6})[ \t]+(.*?)[ \t]*$`)
+
+// docSection is one heading-delimited part of a document.
+//
+// path is the heading trail the part belongs to ("RAG > Chunking"); it is empty
+// for text that appears before any heading, and for a document with no headings
+// at all — which is the whole transcript case, where behaviour must not change.
+type docSection struct {
+	path string
+	body string
+}
+
+// splitSections splits a document into its heading-delimited parts, in order.
+//
+// WHY headings, and why now: the chunker below packs text to a size target, which
+// is the right unit for retrieval but ignores the one structure a course
+// transcript actually has — its sections. Packing to size alone lets one chunk
+// straddle two unrelated topics, so a retrieval hit can come back carrying half
+// of the previous section, and nothing in the row records which section it came
+// from, so no filter can be applied later. Splitting on the document's own
+// headings first keeps every chunk inside one section and gives each chunk a
+// section path to store.
+//
+// The heading line itself is kept at the start of its section body on purpose:
+// the chunk that opens a section then contains the words the section is about,
+// which is what makes a retrieval hit recognisable to a reader and to the
+// embedding model. Later chunks of the same section carry the path as metadata.
+func splitSections(text string) []docSection {
+	locs := headingRe.FindAllStringSubmatchIndex(text, -1)
+	if len(locs) == 0 {
+		return []docSection{{path: "", body: text}}
+	}
+
+	var out []docSection
+	var stack []string
+
+	if locs[0][0] > 0 {
+		if pre := strings.TrimSpace(text[:locs[0][0]]); pre != "" {
+			out = append(out, docSection{path: "", body: pre})
+		}
+	}
+
+	for i, loc := range locs {
+		level := loc[3] - loc[2] // number of hashes
+		title := strings.TrimSpace(text[loc[4]:loc[5]])
+
+		for len(stack) < level {
+			stack = append(stack, "")
+		}
+		stack = stack[:level]
+		stack[level-1] = title
+
+		end := len(text)
+		if i+1 < len(locs) {
+			end = locs[i+1][0]
+		}
+		rest := strings.TrimSpace(text[loc[1]:end])
+		if rest == "" {
+			// A heading with nothing under it is a table of contents entry, not
+			// content. Skipping it avoids a chunk that is only a title.
+			continue
+		}
+		out = append(out, docSection{
+			path: joinSectionPath(stack),
+			body: strings.TrimSpace(text[loc[0]:loc[1]]) + "\n\n" + rest,
+		})
+	}
+
+	if len(out) == 0 {
+		// Every heading was bare (or the document is headings only). Never
+		// return nothing: falling back to the whole text keeps the corpus
+		// complete, and a missing corpus is worse than an unsectioned one.
+		return []docSection{{path: "", body: text}}
+	}
+	return out
+}
+
+// joinSectionPath renders the heading trail, skipping levels that were never
+// named. An h3 that jumps straight to an h5 keeps just its own title rather than
+// inventing placeholders for the levels in between.
+func joinSectionPath(stack []string) string {
+	parts := make([]string, 0, len(stack))
+	for _, p := range stack {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	return strings.Join(parts, " > ")
+}
+
 // TextChunk represents a single chunk of text with metadata.
 //
 // ChunkHash: SHA-256 (hex) of the normalized chunk text. Used by the
@@ -21,12 +113,20 @@ import (
 // This means trivial whitespace or case differences do NOT produce a
 // different hash, but any real content change does.
 type TextChunk struct {
-	Text       string
-	Index      int
-	StartChar  int
-	EndChar    int
+	Text      string
+	Index     int
+	StartChar int
+	EndChar   int
+	// TokenCount is the estimated size used by the size targets.
 	TokenCount int
 	ChunkHash  string
+	// SectionPath is the heading trail this chunk came from ("RAG > Chunking").
+	//
+	// Empty when the source had no headings (a plain transcript) or the chunk is
+	// preamble. Stored so a later retrieval step can filter or cite by section —
+	// the design doc's metadata-filter stage runs before retrieval, and it can
+	// only do that if the metadata is kept at ingest time.
+	SectionPath string
 }
 
 // ChunkerConfig holds chunking parameters.
@@ -97,11 +197,23 @@ func (c *TextChunker) Chunk(text string) []TextChunk {
 	if text == "" {
 		return nil
 	}
-	pieces := c.recursiveSplit(text, c.separators)
-	if len(pieces) == 0 {
-		return nil
+
+	// Chunk each section on its own, so a chunk can never span two sections.
+	// A document without headings yields exactly one section with an empty path,
+	// which reproduces the previous behaviour exactly.
+	var chunks []TextChunk
+	for _, sec := range splitSections(text) {
+		pieces := c.recursiveSplit(sec.body, c.separators)
+		if len(pieces) == 0 {
+			continue
+		}
+		for _, ch := range c.mergeIntoChunks(pieces) {
+			ch.Index = len(chunks)
+			ch.SectionPath = sec.path
+			chunks = append(chunks, ch)
+		}
 	}
-	chunks := c.mergeIntoChunks(pieces)
+
 	// Populate ChunkHash on every chunk. Keeping this here (rather than
 	// making the caller compute it) guarantees no chunk ever leaves the
 	// chunker without a hash, which is what the ingestion pipeline relies on.

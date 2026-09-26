@@ -827,17 +827,36 @@ func (r *Reconciler) resolveRun(ctx context.Context, expertID uuid.UUID, req Rec
 	return result, nil
 }
 
-// upsertCapabilitiesFromChunks populates expert_capabilities from chunk topics
-// without an LLM, returning how many topics were written.
+// upsertCapabilitiesFromChunks populates expert_capabilities from the chunk topics
+// that are actually in the corpus, returning how many topics were written.
 //
-// Shared by the ingestion fallback and the reconcile action so there is ONE
-// definition of what "capabilities from chunks" means; two copies would drift, and
-// the drift would stay invisible until an expert's topics stopped matching the
-// chunks behind them.
+// Shared by the ingestion fallback, the reconcile action, and the end of every
+// ingest, so there is ONE definition of what "capabilities from chunks" means;
+// two copies would drift, and the drift would stay invisible until an expert's
+// topics stopped matching the chunks behind them.
+//
+// WHY the numbers here must come from the whole corpus and not from the run being
+// ingested: the builder above is handed only the current run's chunks, and its
+// upsert OVERWRITES each topic's chunk_count with that run's count. Ingest a
+// second course and every topic touched by it silently loses the chunks the first
+// course contributed, while the topics the second run never mentioned keep their
+// old rows. The result was a capability table whose sum and topic count disagreed
+// with the corpus the expert's totals report (observed: 905 chunks / 77 topics on
+// this table against 1674 / 118 in course_chunks), and every measurement built on
+// it — coverage bands, thin topics, the declared depth — inherited the error.
+//
+// depth_level and complexity_ceiling are recomputed here for the same reason: the
+// band is shown beside the count, so a band derived from a different number is a
+// contradiction the reader cannot resolve. The keyword-boosted variant the
+// builder used to add is superseded by this band.
 //
 // It never deletes. A capability topic that no longer matches any chunk might be an
 // LLM-normalised name rather than a stale row, so automatic pruning could destroy
 // real data — the audit reports those rows instead.
+//
+// The LLM-written columns (can_handle, cannot_handle, example_questions) are
+// deliberately absent from the ON CONFLICT list: this function owns the derived
+// numbers and nothing else.
 func upsertCapabilitiesFromChunks(ctx context.Context, db *pgxpool.Pool, logger *zap.Logger, expertID uuid.UUID) (int, error) {
 	rows, err := db.Query(ctx, `
 		SELECT topic, COUNT(*) as chunk_count
@@ -870,13 +889,20 @@ func upsertCapabilitiesFromChunks(ctx context.Context, db *pgxpool.Pool, logger 
 
 	written := 0
 	for _, t := range topics {
+		// Both the band and its label come from the count the corpus reports,
+		// so the three values on the screen can never disagree.
+		level := depthLevelForChunkCount(t.count)
 		if _, err := db.Exec(ctx, `
 			INSERT INTO expert_capabilities
 				(expert_id, topic, depth_level, chunk_count, complexity_ceiling)
-			 VALUES ($1, $2, 1, $3, 'basic')
+			 VALUES ($1, $2, $3, $4, $5)
 			 ON CONFLICT (expert_id, topic) DO UPDATE SET
-				chunk_count = EXCLUDED.chunk_count,
-				updated_at  = NOW()`, expertID, t.topic, t.count); err != nil {
+				chunk_count        = EXCLUDED.chunk_count,
+				depth_level        = EXCLUDED.depth_level,
+				complexity_ceiling = EXCLUDED.complexity_ceiling,
+				updated_at         = NOW()`,
+			expertID, t.topic, level, t.count, depthLevelToComplexity(level),
+		); err != nil {
 			logger.Warn("upsert capability failed (non-fatal)",
 				zap.String("expert_id", expertID.String()),
 				zap.String("topic", t.topic),

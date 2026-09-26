@@ -1115,13 +1115,30 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 	// extraction is a decode, so this column ends up holding the same content
 	// one step later than before.
 
+	// replace_existing=true replaces the expert's whole corpus instead of adding
+	// to it. Read from the multipart form (the file upload already parsed it).
+	// A malformed value is treated as false — the safe default.
+	replaceExisting := false
+	if v := strings.TrimSpace(c.PostForm("replace_existing")); v != "" {
+		replaceExisting, _ = strconv.ParseBool(v)
+	}
+
 	// Mark expert as training
 	_, _ = h.db.Exec(c.Request.Context(),
 		`UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
 
 	// Start background ingestion
 	// WHY goroutine: Ingestion takes minutes. Client gets job ID immediately.
-	// WHY replaceExisting=false: append mode per DOMAIN_EXPERT_COLLABORATION_DESIGN.md §5.4.
+	// replaceExisting is false (append) unless the request asks to replace.
+	//
+	// WHY the choice has to be reachable now: append mode dedups on chunk_hash, so
+	// re-ingesting through a CHANGED chunker does not replace anything — it adds a
+	// second copy of the same course with different hashes, and the corpus gets
+	// worse (duplicate retrieval hits) while looking like a successful re-ingest.
+	// Replacing is the only way to move an expert onto new chunking, so it is a
+	// request field: replace_existing=true deletes the expert's chunks before
+	// storing, and the admin screen warns before using it.
+	// The default stays append: DOMAIN_EXPERT_COLLABORATION_DESIGN.md §5.4.
 	// Admin uploading a new transcript adds to the corpus; full-retrain (true) is a
 	// separate explicit operation reserved for Phase B.
 	//
@@ -1162,7 +1179,7 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 			jobID, expertID, expertName,
 			transcript,
 			header.Filename,
-			false, // replaceExisting=false → append mode
+			replaceExisting, // from the request; false = append (the default)
 		)
 		if err != nil {
 			if errors.Is(err, training.ErrJobPaused) {

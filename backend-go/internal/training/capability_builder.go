@@ -148,22 +148,7 @@ func (b *CapabilityBuilder) analyzeTopicCapability(ctx context.Context, topic st
 // More chunks = more content = deeper coverage.
 // Content analysis adjusts for quality.
 func (b *CapabilityBuilder) calculateDepthLevel(chunks []TextChunk) int {
-	chunkCount := len(chunks)
-
-	// Base level from chunk count
-	baseLevel := 1
-	switch {
-	case chunkCount >= 50:
-		baseLevel = 5
-	case chunkCount >= 30:
-		baseLevel = 4
-	case chunkCount >= 15:
-		baseLevel = 3
-	case chunkCount >= 5:
-		baseLevel = 2
-	default:
-		baseLevel = 1
-	}
+	baseLevel := depthLevelForChunkCount(len(chunks))
 
 	// Adjust based on content depth keywords
 	allText := strings.Builder{}
@@ -204,6 +189,30 @@ func (b *CapabilityBuilder) calculateDepthLevel(chunks []TextChunk) int {
 	}
 
 	return baseLevel
+}
+
+// depthLevelForChunkCount is the declared depth band for a chunk count: 5 at 50+,
+// 4 at 30-49, 3 at 15-29, 2 at 5-14, 1 below that.
+//
+// Pure, and the single definition of the band. WHY it matters that it is
+// separable: the same number is shown next to the chunk count on the capability
+// screen, so the band has to be recomputable from the count the user can see. It
+// used to be computed only from the chunks of the run being ingested, which meant
+// a topic spanning two courses kept the band of whichever run touched it last
+// while the count beside it said something else.
+func depthLevelForChunkCount(chunkCount int) int {
+	switch {
+	case chunkCount >= 50:
+		return 5
+	case chunkCount >= 30:
+		return 4
+	case chunkCount >= 15:
+		return 3
+	case chunkCount >= 5:
+		return 2
+	default:
+		return 1
+	}
 }
 
 // extractCapabilities uses LLM to identify specific can/cannot handle items.

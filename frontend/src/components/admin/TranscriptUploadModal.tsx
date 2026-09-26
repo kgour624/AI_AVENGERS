@@ -76,6 +76,11 @@ export function TranscriptUploadModal({
   onIngestStarted,
 }: TranscriptUploadModalProps) {
   const [file, setFile] = useState<File | null>(null)
+  // Append is the default and the safe choice: it adds this document to whatever
+  // the expert already knows. Replacing throws the existing corpus away first,
+  // and it is the ONLY way to apply a changed chunker without doubling the
+  // corpus — so it is offered, but never as the default.
+  const [replaceExisting, setReplaceExisting] = useState(false)
 
   const onDrop = useCallback((accepted: File[]) => {
     const f = accepted[0]
@@ -128,7 +133,7 @@ export function TranscriptUploadModal({
       if (file.size > 50 * 1024 * 1024) {
         throw new Error('File must be under 50MB')
       }
-      return ingestTranscript(expertId, file)
+      return ingestTranscript(expertId, file, replaceExisting)
     },
     onSuccess: (data) => {
       onIngestStarted(data.jobId)
@@ -166,6 +171,24 @@ export function TranscriptUploadModal({
         </p>
       )}
 
+      <label className="mt-3 flex items-start gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          className="mt-0.5"
+          checked={replaceExisting}
+          onChange={(e) => setReplaceExisting(e.target.checked)}
+        />
+        <span className="text-[11px] text-text-secondary">
+          Replace the existing corpus instead of adding to it.
+          <span className="mt-0.5 block text-text-disabled">
+            Use this when the expert's content has been re-chunked or you are re-uploading
+            the same course: adding a second copy leaves both in the corpus and the expert
+            retrieves from duplicates. Everything this expert has learned from previously
+            uploaded documents is removed.
+          </span>
+        </span>
+      </label>
+
       {mutation.isError && (
         <p className="mt-2 text-sm text-mode-refuse">{describeUploadError(mutation.error)}</p>
       )}
@@ -175,7 +198,7 @@ export function TranscriptUploadModal({
           Cancel
         </Button>
         <Button onClick={() => mutation.mutate()} disabled={!file} isLoading={mutation.isPending}>
-          Start Ingestion
+          {replaceExisting ? 'Replace & Train' : 'Start Ingestion'}
         </Button>
       </div>
     </Modal>
