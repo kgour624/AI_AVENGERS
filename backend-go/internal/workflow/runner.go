@@ -643,6 +643,15 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 				return
 			}
 		}
+		// TRACEABILITY: prove the code stayed inside the design it came from.
+		// out_of_parent = content the design never asked for (flagged so the client
+		// can have it removed); uncovered_parent = design items the code missed.
+		// Recorded as evidence; it never blocks a completed build by itself.
+		r.runTraceability(ctx, workflowID,
+			[]string{"architecture_decision", "module_design_proposed", "api_contract_proposed", "data_model_proposed"},
+			[]string{"code_artifact_produced"},
+			"design (HLD/LLD)", "generated code")
+
 		// Boundary: design+impl done → next is QA.
 		r.saveRunnerState(ctx, workflowID, &runnerState{Phase: PhaseQA})
 		resumePhase = PhaseQA
