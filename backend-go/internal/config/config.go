@@ -30,6 +30,7 @@ type Config struct {
 	Versioning          VersioningConfig
 	Tenant              TenantConfig
 	Freshness           FreshnessConfig
+	MultiCritic         MultiCriticConfig
 	Debate              DebateConfig
 	ByoExpert           ByoExpertConfig
 	Reliability         ReliabilityConfig
@@ -63,6 +64,17 @@ type ByoExpertConfig struct {
 }
 
 // DebateConfig controls C7 adversarial review on high-stakes artifacts.
+// MultiCriticConfig controls the second review of an artifact (A5).
+type MultiCriticConfig struct {
+	// Enabled: review every artifact with a second critic on a different model.
+	// Default true; explicit false is the kill switch.
+	Enabled bool
+	// SecondModel: the tier the second critic speaks on ("strong" | "fast" |
+	// "cheap"). Empty → the package default (fast), which is deliberately not the
+	// tier the first critic uses.
+	SecondModel string
+}
+
 type DebateConfig struct {
 	// Enabled: after mandatory reviewers approve a high-stakes artifact,
 	// run attack→defend→verdict (bounded hops). Absent env → true (IsSet
@@ -424,6 +436,10 @@ func Load() (*Config, error) {
 			Enabled: true, // C7 default on; overridden below if env set
 			MaxHops: v.GetInt("DEBATE_MAX_HOPS"),
 		},
+		MultiCritic: MultiCriticConfig{
+			Enabled:     true, // A5 default on; overridden below if env set
+			SecondModel: v.GetString("MULTI_CRITIC_SECOND_MODEL"),
+		},
 		ByoExpert: ByoExpertConfig{
 			Enabled:           true, // C8 default on; overridden below if env set
 			DefaultMaxExperts: v.GetInt("BYO_EXPERT_DEFAULT_MAX"),
@@ -484,6 +500,10 @@ func Load() (*Config, error) {
 		cfg.ByoExpert.Enabled = v.GetBool("BYO_EXPERT_ENABLED")
 	}
 	// C10: same IsSet pattern — absent → true; explicit false is the kill switch.
+	if v.IsSet("MULTI_CRITIC_ENABLED") {
+		cfg.MultiCritic.Enabled = v.GetBool("MULTI_CRITIC_ENABLED")
+	}
+
 	if v.IsSet("RELIABILITY_ENABLED") {
 		cfg.Reliability.Enabled = v.GetBool("RELIABILITY_ENABLED")
 	}

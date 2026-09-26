@@ -588,6 +588,14 @@ func buildRouter(
 		Enabled: cfg.Debate.Enabled,
 		MaxHops: cfg.Debate.MaxHops,
 	})
+	// A5: a second critic on a different model. The gate that decides whether work
+	// ships was one call to the cheapest tier; now the same reviewer is asked
+	// twice, and a split is treated as "changes requested" rather than approval.
+	// Kill switch = MULTI_CRITIC_ENABLED=false.
+	wfCrossVerifier.SetMultiCriticPolicy(workflow.MultiCriticPolicy{
+		Enabled:      cfg.MultiCritic.Enabled,
+		SecondCritic: gateway.ModelType(cfg.MultiCritic.SecondModel),
+	})
 
 	// wfSections moved up from where it used to be constructed (previously only
 	// needed by the chat wiring below) because AuthoringRunner needs it too, and
