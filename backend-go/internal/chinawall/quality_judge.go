@@ -48,21 +48,47 @@ func (e *Enforcer) judgeAnswer(
 	chunks []CourseChunk,
 	floor float64,
 ) QualityVerdict {
-	// Overall=0 + Pass=true: ship the answer (fail-open) but leave
-	// QualityScore at 0 so observability does not pretend the judge ran.
+	// A nil Enforcer has nothing to ask and no logger to complain with. The
+	// remaining guards — no gateway, empty answer — live in judgeTextWithLLM, so
+	// the chat path and the artifact path cannot disagree about what a missing
+	// model or an empty answer means.
+	if e == nil {
+		return QualityVerdict{
+			Overall:  0,
+			Pass:     true,
+			Method:   "fail_open",
+			Feedback: "judge unavailable — kept original answer",
+		}
+	}
+	return judgeTextWithLLM(ctx, e.gateway, e.logger, question, answer, chunks, floor)
+}
+
+// judgeTextWithLLM scores a piece of text against a question and reference
+// chunks.
+//
+// WHY a free function: the workflow path judges an artifact with the same rubric
+// (G3). One definition means an artifact and a chat answer are graded by the same
+// standard — two prompts would drift, and the drift would be invisible because
+// both would look reasonable on their own.
+func judgeTextWithLLM(
+	ctx context.Context,
+	gw *gateway.ModelGateway,
+	logger *zap.Logger,
+	question string,
+	answer string,
+	chunks []CourseChunk,
+	floor float64,
+) QualityVerdict {
 	failOpen := QualityVerdict{
 		Overall:  0,
 		Pass:     true,
 		Method:   "fail_open",
 		Feedback: "judge unavailable — kept original answer",
 	}
-	if e == nil || e.gateway == nil {
+	if gw == nil {
 		return failOpen
 	}
 	if strings.TrimSpace(answer) == "" {
-		// Empty answers never reach here in the flat success path, but
-		// if they did the wall already refused. Fail-open would pass an
-		// empty answer — so fail-closed only for the empty case.
 		return QualityVerdict{
 			Overall:  0,
 			Pass:     false,
@@ -93,7 +119,7 @@ Rules:
 		question, ref, answer,
 	)
 
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
+	resp, err := gw.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelFast, // divergent from ModelStrong generator
 		SystemPrompt: systemPrompt,
 		UserPrompt:   userPrompt,
@@ -101,13 +127,13 @@ Rules:
 		Temperature:  0.0,
 	})
 	if err != nil {
-		e.logger.Warn("quality judge call failed — fail-open", zap.Error(err))
+		logger.Warn("quality judge call failed — fail-open", zap.Error(err))
 		return failOpen
 	}
 
 	v, parseErr := parseQualityVerdict(resp.Content, floor)
 	if parseErr != nil {
-		e.logger.Warn("quality judge parse failed — fail-open",
+		logger.Warn("quality judge parse failed — fail-open",
 			zap.Error(parseErr),
 			zap.String("raw", truncateForLog(resp.Content, 200)),
 		)

@@ -596,6 +596,20 @@ func buildRouter(
 	// 3E: the runner seeds only the approved working set into the workspace and
 	// keeps unapproved repository paths out of the merge.
 	wfRunner.SetCodebaseWorkspace(wfCodebaseSvc)
+	// G2: the idempotency ledger. One row per (workflow, phase, expert) is the
+	// only thing that may declare a unit of work finished, so a stale checkpoint
+	// can no longer skip work that never happened.
+	wfRunner.SetTaskAttemptStore(workflow.NewTaskAttemptStore(postgres.Pool, logger))
+	// G3: the same claim verifier and quality rubric the chat path uses, applied to
+	// what the workflow produces. The reference material comes from the same
+	// assembler the gates already use, so "an expert's training material" has one
+	// definition in the system.
+	wfRunner.SetArtifactVerification(workflow.NewArtifactVerificationService(
+		bbStore,
+		chinawall.NewArtifactVerifier(modelGateway, logger),
+		contextAssembler,
+		logger,
+	))
 
 	// Workflow chat (docs/COLLABORATIVE_DESIGN_ARCHITECTURE.md §6).
 	//

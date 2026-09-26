@@ -1,5 +1,5 @@
 import { useParams, useNavigate } from 'react-router-dom'
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getBlackboard, getWorkflow, respondToApproval, cancelWorkflow, retryTask } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
@@ -11,6 +11,7 @@ import { Skeleton } from '@/components/ui/Skeleton'
 import { Tabs, type TabItem } from '@/components/ui/Tabs'
 import { cn } from '@/utils/cn'
 import { WorkflowChatPanel } from '@/components/workflow/WorkflowChatPanel'
+import { ArtifactProof, parseArtifactVerification, type ArtifactVerification } from '@/components/workflow/ArtifactProof'
 import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
 import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
@@ -377,11 +378,16 @@ function ArtifactsPanel({
   expertNames,
   filterExpertId,
   onClearFilter,
+  verifications,
 }: {
   events: BlackboardEvent[]
   expertNames: Map<string, string>
   filterExpertId: string | null
   onClearFilter: () => void
+  // Keyed by the artifact event id the verification refers to. A missing entry
+  // means "not checked" and the proof block says so — it never shows a pass for
+  // a check that never ran.
+  verifications: Map<string, ArtifactVerification>
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
@@ -455,6 +461,7 @@ function ArtifactsPanel({
                       'system'}
                   </span>
                 </div>
+                <ArtifactProof verification={verifications.get(selected.id)} />
                 {Object.entries(selected.content ?? {}).map(([key, value]) => (
                   <div key={key} className="mb-3">
                     {/* baseAPI's response interceptor camelizes every key, so a
@@ -540,6 +547,19 @@ function KanbanPage() {
   // read the same list (no three copies of `blackboard?.events ?? []`).
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('board')
   const events = blackboard?.events ?? []
+
+  // Verification verdicts, keyed by the artifact they belong to, so the
+  // Deliverables screen can show the proof next to the deliverable. A missing
+  // entry is shown as "not checked" — the panel never invents a pass.
+  const artifactVerifications = useMemo(() => {
+    const map = new Map<string, ArtifactVerification>()
+    for (const e of events) {
+      if (e.eventType !== 'artifact_verification') continue
+      const parsed = parseArtifactVerification(e)
+      if (parsed) map.set(parsed.artifactEventId, parsed)
+    }
+    return map
+  }, [events])
   // Mirrors ArtifactsPanel's filter so the tab count matches what it renders.
   const artifactCount = events.filter(
     (e) => ARTIFACT_TYPES.has(e.eventType) && (!filterExpertId || e.postedByExpertId === filterExpertId)
@@ -695,6 +715,7 @@ function KanbanPage() {
               expertNames={expertNames}
               filterExpertId={filterExpertId}
               onClearFilter={() => setFilterExpertId(null)}
+              verifications={artifactVerifications}
             />
           ))}
 

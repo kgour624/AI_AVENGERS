@@ -120,15 +120,24 @@ func extractMaterialClaims(answer string) []string {
 	// Reuse sentence split that preserves markdown (same as Layer 4).
 	units := splitSentences(answer)
 	var out []string
-	inCode := false
 	seen := map[string]bool{}
+	// fenceMarkers counts ``` seen so far. WHY a counter and not a toggle on
+	// units that begin with a fence: a short snippet usually arrives as ONE unit
+	// containing both the opening and the closing fence. Toggling on that unit
+	// flipped the flag to "in code" and nothing ever flipped it back, so every
+	// material claim AFTER the first code block in an answer was silently
+	// dropped from verification — an answer looked verified while its second half
+	// was never checked. Counting markers makes the state correct for both shapes.
+	fenceMarkers := 0
 	for _, u := range units {
 		t := strings.TrimSpace(u)
-		if strings.HasPrefix(t, "```") {
-			inCode = !inCode
+		if t == "" {
 			continue
 		}
-		if inCode || t == "" {
+		startedInCode := fenceMarkers%2 == 1
+		containsFence := strings.Contains(t, "```")
+		fenceMarkers += strings.Count(t, "```")
+		if startedInCode || containsFence {
 			continue
 		}
 		if isHeadingOrTransition(t) {
@@ -154,11 +163,23 @@ func extractMaterialClaims(answer string) []string {
 	return out
 }
 
-func (e *Enforcer) llmVerifyClaims(
+// verifyClaimsWithLLM asks the model to judge a set of candidate claims against
+// reference chunks.
+//
+// WHY it is a free function rather than a method: the workflow path needs exactly
+// this judgement for a design artifact (G3), and a second copy of the prompt would
+// mean two definitions of what "supported" means — the drift would show up as an
+// artifact passing in one place and failing in the other with no way to tell which
+// was right. The chat Enforcer and the artifact verifier both call this.
+func verifyClaimsWithLLM(
 	ctx context.Context,
+	gw *gateway.ModelGateway,
 	candidates []string,
 	chunks []CourseChunk,
 ) ([]ClaimReport, error) {
+	if gw == nil {
+		return nil, fmt.Errorf("claim verify: no gateway")
+	}
 	ref := buildClaimReference(chunks)
 	var candSB strings.Builder
 	for i, c := range candidates {
@@ -183,7 +204,7 @@ Rules:
 
 	userPrompt := fmt.Sprintf("REFERENCE:\n%s\n\nCANDIDATES:\n%s", ref, candSB.String())
 
-	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
+	resp, err := gw.Call(ctx, gateway.LLMRequest{
 		Model:        gateway.ModelCheap, // batched, cheap (P4/P11)
 		SystemPrompt: systemPrompt,
 		UserPrompt:   userPrompt,
@@ -194,6 +215,15 @@ Rules:
 		return nil, err
 	}
 	return parseClaimVerifyResponse(resp.Content, candidates)
+}
+
+// llmVerifyClaims keeps the Enforcer-facing name for the chat path.
+func (e *Enforcer) llmVerifyClaims(
+	ctx context.Context,
+	candidates []string,
+	chunks []CourseChunk,
+) ([]ClaimReport, error) {
+	return verifyClaimsWithLLM(ctx, e.gateway, candidates, chunks)
 }
 
 type claimVerifyLLMItem struct {

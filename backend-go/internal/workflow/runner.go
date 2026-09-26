@@ -98,6 +98,15 @@ type WorkflowRunner struct {
 	// and ResumeOrphanWorkflows on every server start — and neither is idempotent,
 	// so without this a workflow can be driven twice at once.
 	inflightRuns sync.Map
+	// taskAttempts is the idempotency ledger: one row per (workflow, phase,
+	// expert), and the only thing allowed to say a unit of work is finished.
+	// Optional; when unset the runner just runs the work (see Claim).
+	taskAttempts *TaskAttemptStore
+	// artifactVerification measures what a wave produced (G3). Optional, and
+	// deliberately separate from crossVerifier: that one can block, this one only
+	// reports, so "the reviewer approved it" and "the evidence backs it" stay two
+	// different statements.
+	artifactVerification *ArtifactVerificationService
 }
 
 // CodebaseWorkspace is what the runner needs from the approval layer (3E).
@@ -116,6 +125,19 @@ type CodebaseWorkspace interface {
 // optional setters: nil is a valid "no codebase environment" value.
 func (r *WorkflowRunner) SetCodebaseWorkspace(cw CodebaseWorkspace) {
 	r.codebase = cw
+}
+
+// SetTaskAttemptStore wires the idempotency ledger (G2). nil leaves the runner
+// running every unit of work, which is the safe direction: doing work twice is
+// recoverable, skipping work that never happened is not.
+func (r *WorkflowRunner) SetTaskAttemptStore(s *TaskAttemptStore) {
+	r.taskAttempts = s
+}
+
+// SetArtifactVerification wires the artifact verifier (G3). nil disables it and
+// nothing claims otherwise: the workflow simply carries no verdicts.
+func (r *WorkflowRunner) SetArtifactVerification(v *ArtifactVerificationService) {
+	r.artifactVerification = v
 }
 
 // defaultMaxWaveTasks bounds how many expert tasks in one wave run at once.
@@ -802,13 +824,111 @@ func (r *WorkflowRunner) executeWaves(
 					return
 				}
 
-				// Pod-restart recovery: skip experts already completed in this phase.
-				if _, done := alreadyDone[expert.ID.String()]; done {
-					r.logger.Info("runner: skipping already-completed expert",
+				// The ledger decides whether this unit of work may run.
+				//
+				// WHY not the checkpoint alone: runner_state's list is a hint
+				// written after the fact, and a stale one made the runner skip
+				// experts that had produced nothing — every phase reported
+				// success and the workflow completed over an empty board with
+				// zero LLM calls. Only the attempt row for THIS
+				// (workflow, phase, expert) counts as evidence, and it is unique
+				// on exactly that triple, so a resume cannot produce the same
+				// work twice.
+				attempt, decision, claimErr := r.taskAttempts.Claim(ctx, workflowID, state.Phase, expert.ID)
+				if claimErr != nil {
+					r.logger.Error("runner: could not claim this unit of work",
 						zap.String("expert", expert.Name),
 						zap.String("phase", state.Phase),
+						zap.Error(claimErr),
 					)
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = claimErr
+					}
+					state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
+					errMu.Unlock()
+					r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
 					return
+				}
+				// recordSuccess marks this unit finished. The artifact event id
+				// is recorded when the executor knows it, so the ledger points
+				// at the thing that was produced rather than just asserting it.
+				recordSuccess := func(artifactEventID *uuid.UUID) {
+					if err := r.taskAttempts.Succeed(ctx, attempt, artifactEventID); err != nil {
+						r.logger.Warn("runner: could not record this unit as finished",
+							zap.String("expert", expert.Name),
+							zap.Error(err),
+						)
+					}
+				}
+				recordFailure := func(reason string) {
+					if err := r.taskAttempts.Fail(ctx, attempt, reason); err != nil {
+						r.logger.Warn("runner: could not record this unit as failed",
+							zap.String("expert", expert.Name),
+							zap.Error(err),
+						)
+					}
+				}
+
+				switch decision {
+				case DecisionSkipDone:
+					_, checkpointClaimed := alreadyDone[expert.ID.String()]
+					r.logger.Info("runner: skipping an expert this phase already produced",
+						zap.String("expert", expert.Name),
+						zap.String("phase", state.Phase),
+						zap.Bool("checkpoint_agreed", checkpointClaimed),
+					)
+					// Keep the checkpoint list complete for the handoff summary
+					// and the produced-work count.
+					errMu.Lock()
+					if !containsID(state.CompletedExpertIDs, expert.ID.String()) {
+						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
+					}
+					errMu.Unlock()
+					r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
+					return
+
+				case DecisionAbandoned:
+					// NOT a skip. A silent skip is indistinguishable from work
+					// that never happened, which is the failure this ledger
+					// exists to stop. The expert is marked failed with the
+					// reason the ledger kept, so the phase (and then the
+					// workflow) fails with something a human can read.
+					reason := "attempt budget exhausted"
+					if attempt != nil && attempt.Error != "" {
+						reason = fmt.Sprintf("%s: %s", reason, attempt.Error)
+					}
+					r.logger.Error("runner: giving up on this unit of work",
+						zap.String("expert", expert.Name),
+						zap.String("phase", state.Phase),
+						zap.Int("attempts", maxTaskAttempts),
+					)
+					errMu.Lock()
+					if firstErr == nil {
+						firstErr = fmt.Errorf("%w: %s (%s)", ErrAttemptsExhausted, expert.Name, reason)
+					}
+					state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
+					errMu.Unlock()
+					r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
+					return
+
+				case DecisionRetry:
+					if _, checkpointClaimed := alreadyDone[expert.ID.String()]; checkpointClaimed {
+						// The exact bug this ledger was introduced to stop: the
+						// checkpoint said this expert was finished, and there is
+						// no success to show for it. Name it in the log so it is
+						// diagnosable instead of silent.
+						r.logger.Warn("runner: checkpoint claimed this expert was done but nothing was produced — running it now",
+							zap.String("expert", expert.Name),
+							zap.String("phase", state.Phase),
+						)
+					} else {
+						r.logger.Info("runner: running this unit of work",
+							zap.String("expert", expert.Name),
+							zap.String("phase", state.Phase),
+							zap.Int("attempt", attemptNumber(attempt)),
+						)
+					}
 				}
 
 				// Route to appropriate executor based on phase.
@@ -840,6 +960,7 @@ func (r *WorkflowRunner) executeWaves(
 						}
 						result, err := r.authoringRunner.Run(ctx, reqSpec)
 						if err != nil {
+							recordFailure(err.Error())
 							r.logger.Error("runner: authoring task failed",
 								zap.String("expert", expert.Name),
 								zap.Error(err),
@@ -851,6 +972,7 @@ func (r *WorkflowRunner) executeWaves(
 							state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
 							errMu.Unlock()
 						} else {
+							recordSuccess(nil)
 							r.logger.Info("runner: authoring task completed",
 								zap.String("expert", expert.Name),
 								zap.String("section", result.SectionPath),
@@ -882,6 +1004,7 @@ func (r *WorkflowRunner) executeWaves(
 						WorkflowPhase:   state.Phase,
 					})
 					if err != nil {
+						recordFailure(err.Error())
 						r.logger.Error("runner: qa task failed",
 							zap.String("expert", expert.Name),
 							zap.Error(err),
@@ -893,6 +1016,7 @@ func (r *WorkflowRunner) executeWaves(
 						state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
 						errMu.Unlock()
 					} else {
+						recordSuccess(nil)
 						r.logger.Info("runner: qa task completed",
 							zap.String("expert", expert.Name),
 							zap.Int("proposed", qaResult.ProposedCount),
@@ -910,7 +1034,10 @@ func (r *WorkflowRunner) executeWaves(
 					}
 				} else {
 					// Design phases: Use AgentLoop (blackboard-based, existing code).
-					_, err := r.agentLoop.Run(ctx, AgentLoopRequest{
+					// The result carries the artifact's event id, which is the
+					// best possible evidence for the ledger: it points at the
+					// thing that was produced, not merely at "no error".
+					loopRes, err := r.agentLoop.Run(ctx, AgentLoopRequest{
 						WorkflowID:      workflowID,
 						Expert:          expert,
 						TaskID:          uuid.Nil,
@@ -926,6 +1053,7 @@ func (r *WorkflowRunner) executeWaves(
 						GenericAllowancePct: genericAllowancePct,
 					})
 					if err != nil {
+						recordFailure(err.Error())
 						r.logger.Error("runner: task failed",
 							zap.String("expert", expert.Name),
 							zap.Error(err),
@@ -937,6 +1065,11 @@ func (r *WorkflowRunner) executeWaves(
 						state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
 						errMu.Unlock()
 					} else {
+						var artifactEventID *uuid.UUID
+						if loopRes != nil {
+							artifactEventID = loopRes.ArtifactEventID
+						}
+						recordSuccess(artifactEventID)
 						errMu.Lock()
 						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
 						errMu.Unlock()
@@ -1022,6 +1155,14 @@ func (r *WorkflowRunner) executeWaves(
 					zap.Error(cvErr),
 				)
 			}
+		}
+
+		// Measure the artifacts this wave produced, after the review gate has had
+		// its say: an artifact that was revised should be judged in its revised
+		// form, and one that was blocked never reaches here (the branch above
+		// returns). Non-fatal by construction — the service logs and returns.
+		if r.artifactVerification != nil {
+			r.artifactVerification.VerifyWaveArtifacts(ctx, workflowID, experts, lastSeqBefore)
 		}
 	}
 
