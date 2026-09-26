@@ -12,9 +12,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 
-	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
+	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
@@ -26,12 +26,12 @@ import (
 
 // OrchestratorRequest is the input to the orchestrator.
 type OrchestratorRequest struct {
-	ProjectID   uuid.UUID
-	ClientID    uuid.UUID
-	ChatID      uuid.UUID
-	Message     string
-	ExpertIDs   []uuid.UUID
-	TurnNumber  int
+	ProjectID  uuid.UUID
+	ClientID   uuid.UUID
+	ChatID     uuid.UUID
+	Message    string
+	ExpertIDs  []uuid.UUID
+	TurnNumber int
 	// ReplyToMessageID/IncludeFullThread (CT-C1/C2): nil/false for every
 	// fresh (non-reply) question — the existing behavior for every
 	// request sent before this feature. Passed through to
@@ -46,6 +46,9 @@ type OrchestratorRequest struct {
 	// reply-to-the-ASK can walk one more parent level and recover the
 	// original question (decision/engine.go's gateStructurePermission).
 	UserMessageID uuid.UUID
+	// TemplateName (T-CAT): optional named answer format from the expert's
+	// category ("Code" / "Approach" / ...). Empty = the category default.
+	TemplateName string
 	// TokenCh: when non-nil, Gate 5 generation streams tokens here.
 	// message/handler.go creates this channel and forwards tokens to SSE.
 	// nil = blocking (used by tests, smoke test, non-streaming callers).
@@ -67,17 +70,17 @@ type OrchestratorResponse struct {
 
 // ExpertResponse is one expert's response.
 type ExpertResponse struct {
-	ExpertID    uuid.UUID            `json:"expert_id"`
-	ExpertName  string               `json:"expert_name"`
-	Domain      string               `json:"domain"`
+	ExpertID    uuid.UUID             `json:"expert_id"`
+	ExpertName  string                `json:"expert_name"`
+	Domain      string                `json:"domain"`
 	Mode        decision.ResponseMode `json:"mode"`
-	Content     string               `json:"content"`
-	Citations   []chinawall.Citation `json:"citations"`
-	Confidence  float64              `json:"confidence"`
-	GateStopped int                  `json:"gate_stopped"`
-	Warning     string               `json:"warning,omitempty"`
-	Questions   []string             `json:"questions,omitempty"`
-	Error       string               `json:"error,omitempty"`
+	Content     string                `json:"content"`
+	Citations   []chinawall.Citation  `json:"citations"`
+	Confidence  float64               `json:"confidence"`
+	GateStopped int                   `json:"gate_stopped"`
+	Warning     string                `json:"warning,omitempty"`
+	Questions   []string              `json:"questions,omitempty"`
+	Error       string                `json:"error,omitempty"`
 	// TemplateSections (CT-B4): populated only when this expert has a
 	// category with a non-empty template_schema. nil for every flat-text
 	// expert response (CT-L2) — frontend (CT-D5, not yet built) must
@@ -230,7 +233,7 @@ type Orchestrator struct {
 	// WHY 3: single admin user, 3 concurrent experts is the realistic max.
 	// Higher = goroutine explosion under LLM latency. Lower = unnecessary queuing.
 	expertMaxConcurrency int
-	logger      *zap.Logger
+	logger               *zap.Logger
 }
 
 // NewOrchestrator creates a new orchestrator.
@@ -257,7 +260,7 @@ func NewOrchestrator(
 		// WHY these numbers: LLM providers typically allow 5-10 RPM per key.
 		// 2 req/s = 120 RPM, well within provider limits.
 		// Burst=5 allows short spikes (e.g. user sends 3 messages quickly).
-		expertLimiter:        ratelimit.NewTokenBucketLimiter(5, 2.0),
+		expertLimiter: ratelimit.NewTokenBucketLimiter(5, 2.0),
 		// WHY 3: single admin user, 3 concurrent experts is the realistic max.
 		// Prevents goroutine explosion when LLM calls take 2-10s each.
 		expertMaxConcurrency: 3,
@@ -466,8 +469,12 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	if o.categoryRegistry != nil && expert.CategoryID != nil {
 		if cat := o.categoryRegistry.Get(*expert.CategoryID); cat != nil {
 			askStructurePermission = cat.AskStructurePermission
-			if len(cat.TemplateSchema.Sections) > 0 {
-				templateSections = cat.TemplateSchema.Sections
+			// ResolveSections also handles the named-variant case, so the same
+			// expert can answer "Code" or "Approach" per request; an unknown or
+			// empty name falls back to the category default, then to the legacy
+			// single template — never an error.
+			if sections, _ := cat.ResolveSections(req.TemplateName); len(sections) > 0 {
+				templateSections = sections
 				defaultLanguage = cat.DefaultLanguage
 			}
 		}
@@ -570,21 +577,21 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	}
 
 	return ExpertResponse{
-		ExpertID:    expert.ID,
-		ExpertName:  expert.Name,
-		Domain:      expert.Domain,
-		Mode:        result.Mode,
-		Content:     result.Content,
-		Citations:   result.Citations,
-		Confidence:  result.Confidence,
-		GateStopped: result.GateStopped,
-		Warning:     result.Warning,
-		Questions:   result.Questions,
+		ExpertID:         expert.ID,
+		ExpertName:       expert.Name,
+		Domain:           expert.Domain,
+		Mode:             result.Mode,
+		Content:          result.Content,
+		Citations:        result.Citations,
+		Confidence:       result.Confidence,
+		GateStopped:      result.GateStopped,
+		Warning:          result.Warning,
+		Questions:        result.Questions,
 		TemplateSections: result.TemplateSections,
-		Claims:      result.Claims,
-		Coverage:     result.Coverage,
-		QualityScore: result.QualityScore,
-		Reason:       result.Reason,
+		Claims:           result.Claims,
+		Coverage:         result.Coverage,
+		QualityScore:     result.QualityScore,
+		Reason:           result.Reason,
 		// ReplyToUserMessageID (CT-C4): only set when this IS a
 		// structure-permission ASK (sentinel GateStopped==-1, see
 		// decision/engine.go's gateStructurePermission). userMsgID copy

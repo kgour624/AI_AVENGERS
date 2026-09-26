@@ -28,8 +28,8 @@ import (
 
 // SendMessageRequest is the input for sending a message.
 type SendMessageRequest struct {
-	Message   string      `json:"message" binding:"required"`
-	ExpertIDs []string    `json:"expert_ids" binding:"required,min=1"`
+	Message   string   `json:"message" binding:"required"`
+	ExpertIDs []string `json:"expert_ids" binding:"required,min=1"`
 	// ReplyToMessageID (CT-C1): optional. When set, this message is a
 	// reply to a specific prior message (CT-L6: pins exactly that one
 	// message by default). nil/absent = fresh question, the existing
@@ -40,16 +40,20 @@ type SendMessageRequest struct {
 	// only the single pinned message is used as reply context — never
 	// automatic full-chain inclusion. Ignored if ReplyToMessageID is empty.
 	IncludeFullThread bool `json:"include_full_thread,omitempty"`
+	// TemplateName (T-CAT): optional. Chooses which named answer format of the
+	// expert's category to use (e.g. "Code" vs "Approach"). Empty = the
+	// category's default variant, which is what every pre-existing client sends.
+	TemplateName string `json:"template_name,omitempty"`
 }
 
 // SSEEvent types for streaming
 const (
-	SSEThinking   = "thinking"
-	SSEChunk      = "chunk"
-	SSEComplete   = "complete"
-	SSESynthesis  = "synthesis"
-	SSEDone       = "done"
-	SSEError      = "error"
+	SSEThinking  = "thinking"
+	SSEChunk     = "chunk"
+	SSEComplete  = "complete"
+	SSESynthesis = "synthesis"
+	SSEDone      = "done"
+	SSEError     = "error"
 )
 
 // Handler handles message sending with SSE streaming.
@@ -357,6 +361,7 @@ func (h *Handler) Send(c *gin.Context) {
 			ReplyToMessageID:  replyToMessageID,
 			IncludeFullThread: req.IncludeFullThread,
 			UserMessageID:     userMsgID,
+			TemplateName:      req.TemplateName,
 		}
 		if tokenCh != nil {
 			orchestratorReq.TokenCh = tokenCh
@@ -401,16 +406,16 @@ func (h *Handler) Send(c *gin.Context) {
 			}
 			// Send complete expert response
 			sendSSE(w, SSEComplete, map[string]interface{}{
-				"expert_id":   expertResp.ExpertID,
-				"expert_name": expertResp.ExpertName,
-				"domain":      expertResp.Domain,
-				"mode":        expertResp.Mode,
-				"content":     expertResp.Content,
-				"citations":   citations,
-				"confidence":  expertResp.Confidence,
+				"expert_id":    expertResp.ExpertID,
+				"expert_name":  expertResp.ExpertName,
+				"domain":       expertResp.Domain,
+				"mode":         expertResp.Mode,
+				"content":      expertResp.Content,
+				"citations":    citations,
+				"confidence":   expertResp.Confidence,
 				"gate_stopped": expertResp.GateStopped,
-				"warning":     expertResp.Warning,
-				"questions":   expertResp.Questions,
+				"warning":      expertResp.Warning,
+				"questions":    expertResp.Questions,
 				// CT-B4: nil/omitted for every flat-text expert response (CT-L2).
 				// Frontend (CT-D5, not yet built) renders this when present,
 				// falls back to "content" above otherwise.
@@ -455,8 +460,8 @@ func (h *Handler) Send(c *gin.Context) {
 		}
 
 		sendSSE(w, SSEDone, map[string]interface{}{
-			"turn_number":  turnNumber,
-			"duration_ms":  orchestratorResp.DurationMs,
+			"turn_number": turnNumber,
+			"duration_ms": orchestratorResp.DurationMs,
 			// message_ids: expert_id -> saved message_id.
 			// Frontend uses this to render the Reply button immediately
 			// after SSEDone, without a separate API call to fetch message_id.
@@ -503,13 +508,13 @@ func (h *Handler) saveAssistantMessage(
 	// identically to the live stream.
 	expertID := resp.ExpertID
 	savedID, err := h.chatSvc.SaveMessage(ctx, chat.Message{
-		ChatID:              chatID,
-		Role:                "assistant",
-		Content:             resp.Content,
-		TurnNumber:          turnNumber,
-		ExpertID:            &expertID,
-		DecisionMode:        string(resp.Mode),
-		Confidence:          resp.Confidence,
+		ChatID:       chatID,
+		Role:         "assistant",
+		Content:      resp.Content,
+		TurnNumber:   turnNumber,
+		ExpertID:     &expertID,
+		DecisionMode: string(resp.Mode),
+		Confidence:   resp.Confidence,
 		// Persist Gate 3 WARN text and Gate 1 ASK questions
 		// so they survive page reloads (Bug 3 fix)
 		WarningText:         resp.Warning,
@@ -519,7 +524,7 @@ func (h *Handler) saveAssistantMessage(
 		// NULL - this silently broke the rating->chunk-boost feedback
 		// loop (rating/handler.go's updateChunkBoosts reads citations
 		// back from a saved message to know which chunks to boost).
-		Citations:           resp.Citations,
+		Citations: resp.Citations,
 		// CT-C4: when this response IS a structure-permission ASK
 		// (orchestrator.go's structurePermissionAskParent sentinel),
 		// this sets the ASK message's OWN reply_to_message_id back to
@@ -527,13 +532,13 @@ func (h *Handler) saveAssistantMessage(
 		// one more parent level and recover the original question
 		// (decision/engine.go's gateStructurePermission). nil for every
 		// other response — identical to before this feature existed.
-		ReplyToMessageID:    resp.ReplyToUserMessageID,
+		ReplyToMessageID: resp.ReplyToUserMessageID,
 		// nil for every flat-text response (CT-L2) - resp.TemplateSections
 		// is only non-nil for a categorized expert's structured answer.
 		// pgx encodes a nil []chinawall.TemplateSectionResult as SQL NULL
 		// for the JSONB column (interface{} field, same pattern already
 		// used for Citations above), never an empty-but-present JSON value.
-		TemplateSections:    resp.TemplateSections,
+		TemplateSections: resp.TemplateSections,
 		// C9: persist the B6 judge score, China Wall coverage verdict and
 		// Gate-5 refusal reason so the "why this answer" view is assembled
 		// from stored facts (never a fresh LLM narration).

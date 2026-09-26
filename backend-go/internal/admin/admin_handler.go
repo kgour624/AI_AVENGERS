@@ -36,10 +36,10 @@ import (
 // AdminHandler handles all admin panel HTTP requests.
 // All routes require admin role (enforced by AdminMiddleware).
 type AdminHandler struct {
-	db          *pgxpool.Pool
-	gateway     *gateway.ModelGateway
-	embedder    ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
-	ingestion   *training.IngestionPipeline
+	db        *pgxpool.Pool
+	gateway   *gateway.ModelGateway
+	embedder  ml.Embedder // ml.Embedder interface: sidecar or CodeCraftAPI, resolved at call time
+	ingestion *training.IngestionPipeline
 	// reconcile audits an expert's corpus against the run ledger and repairs the
 	// derived state (Phase D). Built here from the same pool + embedder the
 	// pipeline uses, so a repair cannot embed with a different model than
@@ -75,7 +75,7 @@ type AdminHandler struct {
 	// freshness (C6): knowledge staleness/refresh tasks. Nil-safe.
 	freshness *knowledge.Freshness
 	// byo (C8): tenant self-service expert entitlement + audit. Nil-safe.
-	byo    *byoexpert.Service
+	byo *byoexpert.Service
 	// events (T1): durable ingestion timeline. Powers the live SSE stream
 	// (true push, not a 1s snapshot poll) and the history endpoint. Nil-safe:
 	// when unwired, StreamIngestionJob falls back to snapshot-only updates.
@@ -178,11 +178,11 @@ func (h *AdminHandler) SetDepthClassifier(c *training.DepthClassifier) {
 //   Clients must NOT see model_tier, temperature, loop_pattern, etc.
 //   These are internal config. Separation enforces this at the type level.
 type adminExpertRow struct {
-	ID                 uuid.UUID       `json:"id"`
-	Name               string          `json:"name"`
-	Slug               string          `json:"slug"`
-	Domain             string          `json:"domain"`
-	Description        string          `json:"description"`
+	ID          uuid.UUID `json:"id"`
+	Name        string    `json:"name"`
+	Slug        string    `json:"slug"`
+	Domain      string    `json:"domain"`
+	Description string    `json:"description"`
 	// ReasoningCharter fix (2026-09-08): previously never SELECTed here,
 	// so the admin "Edit Charter" modal always opened with an empty
 	// textarea even though the charter WAS saved correctly in the DB by
@@ -190,22 +190,22 @@ type adminExpertRow struct {
 	// Step 7 UPDATE). The gap was purely on the read side: this list
 	// endpoint is the only place AdminExperts.tsx sources expert data
 	// from, and it silently omitted the column.
-	ReasoningCharter   string          `json:"reasoning_charter"`
-	TotalChunks        int             `json:"total_chunks"`
-	TotalTopics        int             `json:"total_topics"`
-	AvgDepth           float64         `json:"avg_depth_level"`
-	AvgRating          float64         `json:"avg_rating"`
-	TotalRatings       int             `json:"total_ratings"`
-	IsActive           bool            `json:"is_active"`
-	IsTraining         bool            `json:"is_training"`
+	ReasoningCharter string  `json:"reasoning_charter"`
+	TotalChunks      int     `json:"total_chunks"`
+	TotalTopics      int     `json:"total_topics"`
+	AvgDepth         float64 `json:"avg_depth_level"`
+	AvgRating        float64 `json:"avg_rating"`
+	TotalRatings     int     `json:"total_ratings"`
+	IsActive         bool    `json:"is_active"`
+	IsTraining       bool    `json:"is_training"`
 	// Migration 006 fields
-	ModelTier          string          `json:"model_tier"`
-	Temperature        float64         `json:"temperature"`
-	TopP               float64         `json:"top_p"`
-	LoopPattern        string          `json:"loop_pattern"`
-	MaxLoopIterations  int             `json:"max_loop_iterations"`
-	AllowedTools       json.RawMessage `json:"allowed_tools"`
-	TrainingStatus     string          `json:"training_status"`
+	ModelTier         string          `json:"model_tier"`
+	Temperature       float64         `json:"temperature"`
+	TopP              float64         `json:"top_p"`
+	LoopPattern       string          `json:"loop_pattern"`
+	MaxLoopIterations int             `json:"max_loop_iterations"`
+	AllowedTools      json.RawMessage `json:"allowed_tools"`
+	TrainingStatus    string          `json:"training_status"`
 	// CategoryID (migration 010, CT-A4): nullable. FIX (2026-09-08): this
 	// field existed on the DB row and was already PATCH-able via
 	// UpdateExpert (category_id below), but was never SELECTed/returned
@@ -215,9 +215,9 @@ type adminExpertRow struct {
 	// this admin UI existed) was invisible and uncorrectable from the
 	// panel. Read-side gap only, same class of bug as ReasoningCharter
 	// above.
-	CategoryID         *uuid.UUID      `json:"category_id"`
-	CreatedAt          time.Time       `json:"created_at"`
-	UpdatedAt          time.Time       `json:"updated_at"`
+	CategoryID *uuid.UUID `json:"category_id"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
 }
 
 // ListExperts GET /admin/experts
@@ -662,10 +662,10 @@ func (h *AdminHandler) GetExpertCategory(c *gin.Context) {
 // with no clear error at the point the mistake was actually made.
 type templateSchemaInput struct {
 	Sections []struct {
-		Key         string `json:"key"`
-		Label       string `json:"label"`
-		Type        string `json:"type"`
-		Required    bool   `json:"required"`
+		Key      string `json:"key"`
+		Label    string `json:"label"`
+		Type     string `json:"type"`
+		Required bool   `json:"required"`
 		// Description (2026-09-08 RCA fix): optional. See
 		// category.TemplateSection.Description's doc comment for the
 		// full root-cause explanation - this is the admin-facing input
@@ -861,16 +861,16 @@ func (h *AdminHandler) UpdateExpertCategory(c *gin.Context) {
 // the admin HTTP contract is explicit and stable even if the internal
 // struct's Go-side shape changes.
 type domainProfileRow struct {
-	Domain              string                    `json:"domain"`
-	Gate1Skip           bool                      `json:"gate1_skip"`
-	CoverageMode        chinawall.CoverageMode    `json:"coverage_mode"`
-	CitationMode        chinawall.CitationMode    `json:"citation_mode"`
-	StripMode           chinawall.StripMode       `json:"strip_mode"`
-	SystemPromptExt     string                    `json:"system_prompt_ext"`
-	DomainKeywords      []string                  `json:"domain_keywords"`
-	CustomRules         []chinawall.DomainRule    `json:"custom_rules"`
-	MaxTokensFlat       int                       `json:"max_tokens_flat"`
-	MaxTokensStructured int                       `json:"max_tokens_structured"`
+	Domain              string                 `json:"domain"`
+	Gate1Skip           bool                   `json:"gate1_skip"`
+	CoverageMode        chinawall.CoverageMode `json:"coverage_mode"`
+	CitationMode        chinawall.CitationMode `json:"citation_mode"`
+	StripMode           chinawall.StripMode    `json:"strip_mode"`
+	SystemPromptExt     string                 `json:"system_prompt_ext"`
+	DomainKeywords      []string               `json:"domain_keywords"`
+	CustomRules         []chinawall.DomainRule `json:"custom_rules"`
+	MaxTokensFlat       int                    `json:"max_tokens_flat"`
+	MaxTokensStructured int                    `json:"max_tokens_structured"`
 }
 
 func toDomainProfileRow(p *chinawall.DomainProfile) domainProfileRow {
@@ -1262,6 +1262,114 @@ func (h *AdminHandler) ListExpertVersions(c *gin.Context) {
 		return
 	}
 	response.OK(c, versions)
+}
+
+// ListCategoryExperts GET /admin/expert-categories/:id/experts
+// Returns the experts currently assigned to a category.
+//
+// WHY this pair exists (production incident): the category page let admins build
+// a template but had NO way to put an expert INTO the category, so every expert
+// stayed category_id = NULL and the structured template was never used — answers
+// silently fell back to flat text.
+func (h *AdminHandler) ListCategoryExperts(c *gin.Context) {
+	categoryID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid category ID")
+		return
+	}
+	rows, err := h.db.Query(c.Request.Context(), `
+		SELECT id, name, COALESCE(domain,'')
+		  FROM experts
+		 WHERE category_id = $1 AND deleted_at IS NULL
+		 ORDER BY name`, categoryID)
+	if err != nil {
+		h.logger.Error("list category experts failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	defer rows.Close()
+	type member struct {
+		ID     uuid.UUID `json:"id"`
+		Name   string    `json:"name"`
+		Domain string    `json:"domain"`
+	}
+	out := []member{}
+	for rows.Next() {
+		var m member
+		if err := rows.Scan(&m.ID, &m.Name, &m.Domain); err != nil {
+			h.logger.Error("scan category expert failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+		out = append(out, m)
+	}
+	response.OK(c, out)
+}
+
+// SetCategoryExperts PUT /admin/expert-categories/:id/experts
+// Body: {"expert_ids":["<uuid>", ...]} — REPLACE semantics: the listed experts
+// are assigned to the category and every other expert currently in it is
+// unassigned, so the body is the full membership the UI shows.
+func (h *AdminHandler) SetCategoryExperts(c *gin.Context) {
+	categoryID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid category ID")
+		return
+	}
+	if h.categoryReg != nil && h.categoryReg.Get(categoryID) == nil {
+		response.BadRequest(c, "INVALID_CATEGORY_ID", "category does not exist")
+		return
+	}
+	var body struct {
+		ExpertIDs []uuid.UUID `json:"expert_ids"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		response.BadRequest(c, "INVALID_BODY", "expert_ids must be a list of expert UUIDs")
+		return
+	}
+	if body.ExpertIDs == nil {
+		body.ExpertIDs = []uuid.UUID{}
+	}
+
+	ctx := c.Request.Context()
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		h.logger.Error("assign experts: begin failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	defer tx.Rollback(ctx)
+
+	assigned := int64(0)
+	if len(body.ExpertIDs) > 0 {
+		tag, err := tx.Exec(ctx, `
+			UPDATE experts SET category_id = $1, updated_at = NOW()
+			 WHERE id = ANY($2) AND deleted_at IS NULL`, categoryID, body.ExpertIDs)
+		if err != nil {
+			h.logger.Error("assign experts failed", zap.Error(err))
+			response.InternalError(c)
+			return
+		}
+		assigned = tag.RowsAffected()
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE experts SET category_id = NULL, updated_at = NOW()
+		 WHERE category_id = $1 AND NOT (id = ANY($2))`, categoryID, body.ExpertIDs)
+	if err != nil {
+		h.logger.Error("unassign experts failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	removed := tag.RowsAffected()
+	if err := tx.Commit(ctx); err != nil {
+		h.logger.Error("assign experts: commit failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	h.logger.Info("category experts updated",
+		zap.String("category_id", categoryID.String()),
+		zap.Int64("assigned", assigned), zap.Int64("removed", removed))
+	response.OK(c, gin.H{"assigned": assigned, "removed": removed})
 }
 
 // SnapshotExpertVersion POST /admin/experts/:id/versions/snapshot
@@ -2474,10 +2582,10 @@ func (h *AdminHandler) MeasureExpertCapability(c *gin.Context) {
 	}
 
 	request := training.CapabilityEvalRequest{
-		Topics:         dto.Topics,
-		TopK:           dto.TopK,
-		Regenerate:     dto.Regenerate,
-		GraphExpansion: dto.GraphExpansion,
+		Topics:          dto.Topics,
+		TopK:            dto.TopK,
+		Regenerate:      dto.Regenerate,
+		GraphExpansion:  dto.GraphExpansion,
 		LayerPreference: dto.LayerPreference,
 	}
 
@@ -3166,21 +3274,21 @@ func (h *AdminHandler) GetIngestionJobs(c *gin.Context) {
 	defer rows.Close()
 
 	type jobRow struct {
-		ID                      uuid.UUID  `json:"id"`
-		Status                  string     `json:"status"`
-		SourcePath              string     `json:"source_path"`
-		TotalChunks             int        `json:"total_chunks"`
-		ProcessedChunks         int        `json:"processed_chunks"`
-		ErrorMessage            string     `json:"error_message,omitempty"`
-		StartedAt               *time.Time `json:"started_at"`
-		CompletedAt             *time.Time `json:"completed_at"`
-		CreatedAt               time.Time  `json:"created_at"`
+		ID              uuid.UUID  `json:"id"`
+		Status          string     `json:"status"`
+		SourcePath      string     `json:"source_path"`
+		TotalChunks     int        `json:"total_chunks"`
+		ProcessedChunks int        `json:"processed_chunks"`
+		ErrorMessage    string     `json:"error_message,omitempty"`
+		StartedAt       *time.Time `json:"started_at"`
+		CompletedAt     *time.Time `json:"completed_at"`
+		CreatedAt       time.Time  `json:"created_at"`
 		// Migration 007 fields
-		CurrentStage            string     `json:"current_stage"`
-		StageDetail             string     `json:"stage_detail"`
-		CostUsd                 float64    `json:"cost_usd"`
-		EstimatedSecondsRemaining *int     `json:"estimated_seconds_remaining"`
-		ResumedFromCheckpoint   bool       `json:"resumed_from_checkpoint"`
+		CurrentStage              string  `json:"current_stage"`
+		StageDetail               string  `json:"stage_detail"`
+		CostUsd                   float64 `json:"cost_usd"`
+		EstimatedSecondsRemaining *int    `json:"estimated_seconds_remaining"`
+		ResumedFromCheckpoint     bool    `json:"resumed_from_checkpoint"`
 	}
 	var jobs []jobRow
 	for rows.Next() {
@@ -3324,14 +3432,14 @@ func (h *AdminHandler) GetStats(c *gin.Context) {
 			"total":  totalExperts,
 			"active": activeExperts,
 		},
-		"clients":          totalClients,
-		"projects":         totalProjects,
-		"messages":         totalMessages,
-		"total_chunks":     totalChunks,
-		"violations":       violationCount,
-		"avg_rating":       fmt.Sprintf("%.2f", avgRating),
-		"llm_total_calls":  gwStats["total_calls"],
-		"llm_total_cost":   gwStats["total_cost"],
+		"clients":         totalClients,
+		"projects":        totalProjects,
+		"messages":        totalMessages,
+		"total_chunks":    totalChunks,
+		"violations":      violationCount,
+		"avg_rating":      fmt.Sprintf("%.2f", avgRating),
+		"llm_total_calls": gwStats["total_calls"],
+		"llm_total_cost":  gwStats["total_cost"],
 	})
 }
 
@@ -3545,7 +3653,7 @@ func (h *AdminHandler) GetLLMSettings(c *gin.Context) {
 		"fallback_provider":   fallbackProvider,
 		"available_providers": []string{"openrouter", "deepseek", "anthropic", "gemini", "codecraftapi", "cavoti"},
 		"api_keys_configured": maskedKeys,
-		"note": "API keys are masked. To update, POST to this endpoint with new values.",
+		"note":                "API keys are masked. To update, POST to this endpoint with new values.",
 	})
 }
 
@@ -3648,7 +3756,7 @@ func (h *AdminHandler) UpdateLLMModelLimits(c *gin.Context) {
 // Takes effect immediately (no restart needed).
 func (h *AdminHandler) UpdateLLMSettings(c *gin.Context) {
 	var req struct {
-		Provider         string            `json:"provider"`
+		Provider string `json:"provider"`
 		// FallbackProvider: optional. When set, Call() tries this provider
 		// if the primary fails all 3 attempts. Empty string = no fallback.
 		// Set to "" explicitly to clear an existing fallback.
@@ -3968,10 +4076,10 @@ func (h *AdminHandler) GetEmbeddingSettings(c *gin.Context) {
 	}
 
 	response.OK(c, map[string]interface{}{
-		"embedding_provider":   embeddingProvider,
-		"embedding_model":      embeddingModel,
+		"embedding_provider":  embeddingProvider,
+		"embedding_model":     embeddingModel,
 		"available_providers": []string{"sidecar", "codecraftapi"},
-		"note": "Changing embedding provider requires re-ingesting ALL transcripts. Existing vectors will be incompatible.",
+		"note":                "Changing embedding provider requires re-ingesting ALL transcripts. Existing vectors will be incompatible.",
 	})
 }
 

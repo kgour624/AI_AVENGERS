@@ -29,12 +29,12 @@ import (
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/db"
 	"ai_avengers/backend/internal/decision"
+	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/entitlement"
 	"ai_avengers/backend/internal/eval"
-	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/expert"
 	"ai_avengers/backend/internal/expertversion"
-	"ai_avengers/backend/internal/docextract"
+	"ai_avengers/backend/internal/explain"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/knowledge"
@@ -1111,6 +1111,8 @@ func buildRouter(
 		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)
 		adminGroup.GET("/expert-categories/:id", adminHandler.GetExpertCategory)
 		adminGroup.PATCH("/expert-categories/:id", adminHandler.UpdateExpertCategory)
+		adminGroup.GET("/expert-categories/:id/experts", adminHandler.ListCategoryExperts)
+		adminGroup.PUT("/expert-categories/:id/experts", adminHandler.SetCategoryExperts)
 		// Domain profiles (China Wall per-domain config) — admin-configurable,
 		// no redeploy needed. Includes MaxTokensFlat/MaxTokensStructured
 		// (2026-09-08 addition, see chinawall/domain_profile.go's field docs).

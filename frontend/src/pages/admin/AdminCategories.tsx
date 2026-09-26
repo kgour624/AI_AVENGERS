@@ -4,6 +4,9 @@ import {
   getExpertCategories,
   createExpertCategory,
   updateExpertCategory,
+  getAdminExperts,
+  getCategoryExperts,
+  setCategoryExperts,
 } from '@/api/admin'
 import type { ExpertCategory } from '@/types/category'
 import { CATEGORY_SECTION_TYPES, TEST_CASE_BUCKETS } from '@/types/category'
@@ -55,6 +58,89 @@ function slugify(name: string): string {
     .trim()
     .replace(/[^a-z0-9\s-]/g, '')
     .replace(/\s+/g, '-')
+}
+
+/**
+ * T-CAT: assign experts to a category from the category page.
+ *
+ * WHY this exists (production incident): an expert only answers with a
+ * category's format when experts.category_id points at it, but the category
+ * page had no way to set that — so the template was built and never used, and
+ * every answer silently fell back to flat text. Assignment lived only inside
+ * each expert's edit modal, where it was easy to miss.
+ */
+function CategoryExpertsPicker({ categoryId }: { categoryId: string }) {
+  const queryClient = useQueryClient()
+  const { data: allExperts } = useQuery({ queryKey: ['admin', 'experts'], queryFn: getAdminExperts })
+  const { data: members, isLoading } = useQuery({
+    queryKey: ['admin', 'category-experts', categoryId],
+    queryFn: () => getCategoryExperts(categoryId),
+  })
+  const [selected, setSelected] = useState<Set<string> | null>(null)
+  const [msg, setMsg] = useState('')
+
+  // null = "not edited yet, show what the server has"; any Set = the user's
+  // pending selection. Keeps the checkbox list in sync after a save without an
+  // effect that would fight the user's clicks.
+  const currentIds = selected ?? new Set((members ?? []).map((m) => m.id))
+
+  const save = useMutation({
+    mutationFn: () => setCategoryExperts(categoryId, Array.from(currentIds)),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['admin', 'category-experts', categoryId] })
+      queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
+      setSelected(null)
+      setMsg('Saved')
+    },
+    onError: (err) => setMsg(handleAPIError(err)),
+  })
+
+  function toggle(id: string) {
+    const next = new Set(currentIds)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    setSelected(next)
+    setMsg('')
+  }
+
+  return (
+    <div className="rounded-md border border-surface-border p-3">
+      <p className="mb-1 text-sm font-medium text-text-primary">Experts in this category</p>
+      <p className="mb-2 text-[11px] text-text-disabled">
+        Only assigned experts answer with this category&apos;s format. Experts left out keep
+        flat-text answers.
+      </p>
+      {isLoading ? (
+        <Skeleton className="h-10" />
+      ) : (
+        <div className="max-h-48 space-y-1 overflow-y-auto">
+          {(allExperts ?? []).map((ex) => (
+            <label key={ex.id} className="flex items-center gap-2 text-xs text-text-secondary">
+              <input type="checkbox" checked={currentIds.has(ex.id)} onChange={() => toggle(ex.id)} />
+              {ex.name}
+              {ex.categoryId === categoryId && <Badge variant="brand">in category</Badge>}
+            </label>
+          ))}
+          {(allExperts ?? []).length === 0 && (
+            <p className="text-xs text-text-disabled">No experts yet.</p>
+          )}
+        </div>
+      )}
+      <div className="mt-2 flex items-center gap-2">
+        <Button
+          type="button"
+          size="sm"
+          variant="secondary"
+          isLoading={save.isPending}
+          onClick={() => save.mutate()}
+        >
+          Save experts
+        </Button>
+        <span className="text-xs text-text-disabled">{currentIds.size} selected</span>
+        {msg && <span className="text-xs text-text-secondary">{msg}</span>}
+      </div>
+    </div>
+  )
 }
 
 function AdminCategories() {
@@ -373,6 +459,8 @@ function AdminCategories() {
               ))}
             </div>
           </div>
+
+          {editingId && <CategoryExpertsPicker categoryId={editingId} />}
 
           {error && <p className="text-xs text-mode-refuse">{error}</p>}
           <div className="flex justify-end gap-2">

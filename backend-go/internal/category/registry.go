@@ -55,9 +55,75 @@ type TemplateSection struct {
 	Description string `json:"description,omitempty"`
 }
 
-// TemplateSchema is the full JSONB shape stored on expert_categories.template_schema.
-type TemplateSchema struct {
+// Template is one named answer format inside a category (e.g. "Code",
+// "Approach"). A category may hold several so the SAME expert can answer in a
+// different shape per question — the admin's "sometimes code, sometimes
+// approach" requirement.
+type Template struct {
+	Name     string            `json:"name"`
 	Sections []TemplateSection `json:"sections"`
+}
+
+// TemplateSchema is the full JSONB shape stored on expert_categories.template_schema.
+//
+// Two shapes are accepted, and BOTH are valid:
+//   - Sections: the original single template (migration 010). Kept so existing
+//     categories and the admin UI keep working untouched.
+//   - Templates + Default: named variants. When present, Templates wins and
+//     Sections is treated as legacy/unused.
+//
+// Parsed from one JSONB column, so adding variants needs NO migration.
+type TemplateSchema struct {
+	Sections  []TemplateSection `json:"sections,omitempty"`
+	Templates []Template        `json:"templates,omitempty"`
+	// Default names the variant used when the caller does not pick one.
+	Default string `json:"default,omitempty"`
+}
+
+// ResolveSections returns the sections to answer with, and the template name
+// actually used ("" for the legacy single template).
+//
+// Resolution order — first match wins, and a miss is never an error (an empty
+// result simply means flat text, the same safe default as "no category"):
+//  1. the requested template name, case-insensitively
+//  2. the schema's declared Default
+//  3. the first variant that actually has sections
+//  4. the legacy Sections array
+func (c *Category) ResolveSections(requested string) ([]TemplateSection, string) {
+	if c == nil {
+		return nil, ""
+	}
+	if len(c.TemplateSchema.Templates) > 0 {
+		want := strings.TrimSpace(requested)
+		if want == "" {
+			want = strings.TrimSpace(c.TemplateSchema.Default)
+		}
+		for _, t := range c.TemplateSchema.Templates {
+			if strings.EqualFold(strings.TrimSpace(t.Name), want) && len(t.Sections) > 0 {
+				return t.Sections, t.Name
+			}
+		}
+		for _, t := range c.TemplateSchema.Templates {
+			if len(t.Sections) > 0 {
+				return t.Sections, t.Name
+			}
+		}
+	}
+	return c.TemplateSchema.Sections, ""
+}
+
+// TemplateNames lists the available variant names (for the admin/chat picker).
+func (c *Category) TemplateNames() []string {
+	if c == nil {
+		return nil
+	}
+	out := make([]string, 0, len(c.TemplateSchema.Templates))
+	for _, t := range c.TemplateSchema.Templates {
+		if strings.TrimSpace(t.Name) != "" {
+			out = append(out, t.Name)
+		}
+	}
+	return out
 }
 
 // Category is the in-memory representation of an expert_categories row.
@@ -94,9 +160,9 @@ type Registry struct {
 	db     *pgxpool.Pool
 	logger *zap.Logger
 
-	mu       sync.RWMutex
-	byID     map[uuid.UUID]*Category
-	bySlug   map[string]*Category // key: lowercase slug
+	mu     sync.RWMutex
+	byID   map[uuid.UUID]*Category
+	bySlug map[string]*Category // key: lowercase slug
 }
 
 // NewRegistry creates a category registry. Call Init() before use.
