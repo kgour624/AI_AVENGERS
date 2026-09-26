@@ -30,12 +30,32 @@ type WorkflowFile struct {
 	HasContent bool       `json:"has_content"`
 }
 
-// artifactPayload mirrors the content written by publishCodeArtifacts.
-type artifactPayload struct {
-	FilePath  string `json:"file_path"`
-	Filename  string `json:"filename"`
-	Content   string `json:"content"`
-	Operation string `json:"operation"`
+// artifactPathAndBody reads the path/operation when the producer supplied them
+// and the body any artifact carries. Generic on purpose: the same function serves
+// code files, documents, SQL, specs and anything else an expert posts, so no
+// event type is special-cased.
+func artifactPathAndBody(raw []byte) (path string, operation string, hasBody bool) {
+	if len(raw) == 0 {
+		return "", "", false
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		body, ok := artifactBody(raw)
+		return "", "", ok && body != ""
+	}
+	if v, ok := m["file_path"].(string); ok {
+		path = strings.TrimSpace(v)
+	}
+	if path == "" {
+		if v, ok := m["filename"].(string); ok {
+			path = strings.TrimSpace(v)
+		}
+	}
+	if v, ok := m["operation"].(string); ok {
+		operation = strings.TrimSpace(v)
+	}
+	body, ok := artifactBody(raw)
+	return path, operation, ok && strings.TrimSpace(body) != ""
 }
 
 // ListFiles GET /workflows/:id/files
@@ -63,7 +83,7 @@ func (h *Handler) ListFiles(c *gin.Context) {
 // path, first producer winning (later waves that merely modify the file do not
 // steal ownership from the expert who created it).
 func (h *Handler) workflowFiles(ctx context.Context, workflowID uuid.UUID) ([]WorkflowFile, error) {
-	events, err := h.store.GetByType(ctx, workflowID, []string{"code_artifact_produced"}, 0)
+	events, err := h.store.GetSince(ctx, workflowID, 0, 500)
 	if err != nil {
 		return nil, err
 	}
@@ -71,25 +91,29 @@ func (h *Handler) workflowFiles(ctx context.Context, workflowID uuid.UUID) ([]Wo
 	out := []WorkflowFile{}
 	seen := make(map[string]bool, len(events))
 	for _, e := range events {
-		var p artifactPayload
-		if len(e.Content) > 0 {
-			if err := json.Unmarshal(e.Content, &p); err != nil {
-				continue
-			}
+		// ANY artifact an expert produced counts here — not only code. A data
+		// workflow's SQL/YAML, a product workflow's spec, and a design workflow's
+		// document all appear, because the rule is "expert posted it and it has a
+		// body", not "its event type is code_artifact_produced".
+		if e.PostedByExpertID == nil || structuralEvents[e.EventType] {
+			continue
 		}
-		path := strings.TrimSpace(p.FilePath)
+		path, operation, hasBody := artifactPathAndBody(e.Content)
+		if !hasBody {
+			continue
+		}
 		if path == "" {
-			path = strings.TrimSpace(p.Filename)
+			path = e.EventType
 		}
-		if path == "" || seen[path] {
+		if seen[path] {
 			continue
 		}
 		seen[path] = true
 		out = append(out, WorkflowFile{
 			Path:       path,
 			ExpertID:   e.PostedByExpertID,
-			Operation:  p.Operation,
-			HasContent: strings.TrimSpace(p.Content) != "",
+			Operation:  operation,
+			HasContent: hasBody,
 		})
 	}
 	return out, nil
@@ -107,7 +131,7 @@ func lookupArtifact(ctx context.Context, store *blackboard.Store, workflowID uui
 	if store == nil {
 		return "", nil, false
 	}
-	events, err := store.GetByType(ctx, workflowID, []string{"code_artifact_produced"}, 0)
+	events, err := store.GetSince(ctx, workflowID, 0, 500)
 	if err != nil {
 		return "", nil, false
 	}
@@ -116,18 +140,16 @@ func lookupArtifact(ctx context.Context, store *blackboard.Store, workflowID uui
 		return "", nil, false
 	}
 	for _, e := range events {
-		var p artifactPayload
-		if len(e.Content) > 0 {
-			if err := json.Unmarshal(e.Content, &p); err != nil {
-				continue
-			}
+		if e.PostedByExpertID == nil || structuralEvents[e.EventType] {
+			continue
 		}
-		got := strings.TrimSpace(p.FilePath)
+		got, _, hasBody := artifactPathAndBody(e.Content)
 		if got == "" {
-			got = strings.TrimSpace(p.Filename)
+			got = e.EventType
 		}
-		if got == want && strings.TrimSpace(p.Content) != "" {
-			return p.Content, e.PostedByExpertID, true
+		if got == want && hasBody {
+			body, _ := artifactBody(e.Content)
+			return body, e.PostedByExpertID, true
 		}
 	}
 	return "", nil, false

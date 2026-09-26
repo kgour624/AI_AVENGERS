@@ -49,6 +49,9 @@ type Expert struct {
 	// use when the trained chunks do not cover the question. 0 = strict China
 	// Wall (refuse). Same concept as workflows.generic_allowance_pct.
 	GenericAllowancePct float64
+	// ExpertStripMode (migration 059): the expert's own VIP-pass/strict choice.
+	// "" = not set, use the domain profile's StripMode.
+	ExpertStripMode string
 }
 
 // DecisionResult is the output of the 5-gate system.
@@ -184,7 +187,8 @@ func (e *Engine) Process(
 	// case Enforce() takes its existing flat-text path unchanged (CT-L2).
 	enforceResult, err := e.chinaWall.Enforce(
 		ctx, question, chunks, expert.Name, expert.Domain, expert.ReasoningCharter, replyContext, attempt,
-		expert.TemplateSections, expert.DefaultLanguage, expert.GenericAllowancePct, tokenCh,
+		expert.TemplateSections, expert.DefaultLanguage, expert.GenericAllowancePct,
+		expert.ExpertStripMode, tokenCh,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("gate 5 failed: %w", err)

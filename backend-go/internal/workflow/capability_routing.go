@@ -1,0 +1,172 @@
+package workflow
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+
+	"github.com/google/uuid"
+
+	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/capability"
+)
+
+// loadCapabilityDeclarations reads the capability/language each domain has
+// declared in domain_profiles.config.
+//
+// WHY the profile row and not the expert: capability is a property of the DOMAIN
+// ("go programming" writes Go), so declaring it once covers every expert of that
+// domain, and a new domain is onboarded by adding a profile row — no Go change.
+// Missing keys leave the domain unclassified, which never satisfies a code or QA
+// requirement (an unclassified expert must not be mistaken for a programmer).
+func (r *WorkflowRunner) loadCapabilityDeclarations(ctx context.Context) map[string]capability.Declaration {
+	out := map[string]capability.Declaration{}
+	rows, err := r.db.Query(ctx, `SELECT domain, config FROM domain_profiles`)
+	if err != nil {
+		r.logger.Warn("capability: could not read domain profiles", zap.Error(err))
+		return out
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var domain string
+		var raw []byte
+		if err := rows.Scan(&domain, &raw); err != nil {
+			continue
+		}
+		var cfg struct {
+			Capability string `json:"capability"`
+			Language   string `json:"language"`
+		}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &cfg); err != nil {
+				continue
+			}
+		}
+		out[capability.NormName(domain)] = capability.Declaration{
+			Kind:     capability.Kind(strings.ToLower(strings.TrimSpace(cfg.Capability))),
+			Language: capability.LanguageAliases(cfg.Language),
+		}
+	}
+	return out
+}
+
+// expertsForPhase narrows the workflow's experts to those allowed to run a
+// phase, per the declared capabilities.
+//
+// WHY it returns an error instead of falling back to "all experts": the incident
+// this fixes was exactly that fallback — a workflow with only system-design
+// experts ran its implementation phase and produced Go code none of them owned.
+// Blocking with the reason ("implementation phase needs a Go implementation
+// expert") is the correct, actionable behaviour.
+func (r *WorkflowRunner) expertsForPhase(
+	ctx context.Context,
+	phase string,
+	experts []workflowExpert,
+	language string,
+) ([]workflowExpert, error) {
+	decls := r.loadCapabilityDeclarations(ctx)
+
+	in := make([]capability.Expert, 0, len(experts))
+	for _, e := range experts {
+		in = append(in, capability.Expert{
+			ID:          e.ID.String(),
+			Name:        e.Name,
+			Declaration: decls[capability.NormName(e.Domain)],
+		})
+	}
+
+	// Requirement from configuration when declared, else the built-in default.
+	kinds, aliases := r.capabilityOverrides(ctx)
+	req := capability.RequirementForPhase(phase, language)
+	if kind, ok := kinds[phase]; ok && kind != capability.KindUnclassified {
+		req.Kind = kind
+	}
+	if aliases != nil && req.Language != "" {
+		if folded, ok := aliases[req.Language]; ok {
+			req.Language = folded
+		}
+	}
+
+	matched, err := capability.SelectFor(req, in, phase)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[string]bool, len(matched))
+	for _, m := range matched {
+		allowed[m.ID] = true
+	}
+	out := make([]workflowExpert, 0, len(matched))
+	for _, e := range experts {
+		if allowed[e.ID.String()] {
+			out = append(out, e)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no expert may run the %s phase", phase)
+	}
+	return out, nil
+}
+
+// wavesForExperts keeps only the tasks owned by the allowed experts, so a phase
+// runs exactly the tasks its experts may own. Waves that end up empty are
+// dropped; tasks owned by other experts are NOT reassigned (reassigning is what
+// produced the incident: a designer writing Go).
+func wavesForExperts(waves []ExecutionWave, experts []workflowExpert) []ExecutionWave {
+	allowed := make(map[uuid.UUID]bool, len(experts))
+	for _, e := range experts {
+		allowed[e.ID] = true
+	}
+	out := make([]ExecutionWave, 0, len(waves))
+	for _, w := range waves {
+		kept := make(ExecutionWave, 0, len(w))
+		for _, t := range w {
+			if allowed[t.ExpertID] {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) > 0 {
+			out = append(out, kept)
+		}
+	}
+	return out
+}
+
+// capabilityOverrides reads the OPTIONAL deployment overrides from
+// system_settings.capability_overrides:
+//
+//	{"phase_kinds": {"implementation": "implementation", "qa": "testing", "...": "..."},
+//	 "language_aliases": {"c#": "csharp", "kotlin": "kotlin"}}
+//
+// WHY: the built-in defaults (capability.RequirementForPhase, LanguageAliases)
+// keep the system working out of the box, but a new phase shape or a language
+// spelling must not require a code change. Anything unset falls back to the
+// defaults, so an empty or missing row changes nothing.
+func (r *WorkflowRunner) capabilityOverrides(ctx context.Context) (map[string]capability.Kind, map[string]string) {
+	kinds := map[string]capability.Kind{}
+	aliases := map[string]string{}
+
+	var raw string
+	if err := r.db.QueryRow(ctx,
+		`SELECT value FROM system_settings WHERE key = 'capability_overrides'`,
+	).Scan(&raw); err != nil {
+		return kinds, aliases
+	}
+
+	var cfg struct {
+		PhaseKinds      map[string]string `json:"phase_kinds"`
+		LanguageAliases map[string]string `json:"language_aliases"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return kinds, aliases
+	}
+	for phase, kind := range cfg.PhaseKinds {
+		kinds[phase] = capability.Kind(strings.ToLower(strings.TrimSpace(kind)))
+	}
+	for from, to := range cfg.LanguageAliases {
+		aliases[capability.NormName(from)] = capability.LanguageAliases(to)
+	}
+	return kinds, aliases
+}

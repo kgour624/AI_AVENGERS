@@ -17,6 +17,7 @@ import (
 // Phase constants — must match CHECK constraint in migration 006.
 const (
 	PhaseIntake          = "intake"
+	PhaseUnderstanding   = "understanding"
 	PhaseHighLevelDesign = "high_level_design"
 	PhaseDetailedDesign  = "detailed_design"
 	PhaseImplementation  = "implementation"
@@ -48,6 +49,7 @@ const (
 // Used by TransitionPhase to validate the requested next phase.
 var phaseOrder = []string{
 	PhaseIntake,
+	PhaseUnderstanding,
 	PhaseHighLevelDesign,
 	PhaseDetailedDesign,
 	PhaseImplementation,

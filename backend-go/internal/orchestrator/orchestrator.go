@@ -184,6 +184,9 @@ type expertRecord struct {
 	ClarificationCharter map[string][]string
 	// CategoryID (CT-B4): nullable per CT-L2. nil means flat-text expert.
 	CategoryID *uuid.UUID
+	// StripMode (migration 059): per-expert "full_strip" (strict) or
+	// "code_exempt" (VIP pass). Empty falls back to the domain profile.
+	StripMode string
 }
 
 // Orchestrator coordinates multiple domain experts for a single request.
@@ -889,11 +892,12 @@ func (o *Orchestrator) loadExperts(ctx context.Context, expertIDs []uuid.UUID) (
 		var e expertRecord
 		var clarJSON []byte
 		err := o.db.QueryRow(ctx,
-			`SELECT id, name, domain, COALESCE(reasoning_charter,''), clarification_charter, category_id
+			`SELECT id, name, domain, COALESCE(reasoning_charter,''), clarification_charter, category_id,
+			        COALESCE(strip_mode, '')
 			 FROM experts
 			 WHERE id=$1 AND is_active=TRUE AND is_training=FALSE AND deleted_at IS NULL`,
 			id,
-		).Scan(&e.ID, &e.Name, &e.Domain, &e.ReasoningCharter, &clarJSON, &e.CategoryID)
+		).Scan(&e.ID, &e.Name, &e.Domain, &e.ReasoningCharter, &clarJSON, &e.CategoryID, &e.StripMode)
 		if err != nil {
 			o.logger.Warn("expert not found or inactive", zap.String("id", id.String()))
 			continue

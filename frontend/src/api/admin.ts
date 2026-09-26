@@ -84,6 +84,11 @@ export interface CreateExpertRequest {
   // on the wire — baseAPI's snakeifyKeys request interceptor converts
   // this camelCase key automatically, same as every other field here.
   categoryId?: string
+  // Migration 059: per-expert strictness.
+  //   full_strip  = strict (every uncited sentence stripped) — default
+  //   code_exempt = VIP pass (fenced code kept uncited) — for coding experts
+  // snake_case on the wire; the request interceptor converts camelCase below.
+  stripMode?: 'full_strip' | 'code_exempt'
   // Migration 006 config fields — all optional, backend defaults apply when omitted.
   // Defaults: modelTier='strong', temperature=0.30, topP=0.50,
   //           loopPattern='react', maxLoopIterations=5, allowedTools=[]
@@ -111,6 +116,9 @@ export const createExpert = (req: CreateExpertRequest) =>
  */
 export interface UpdateExpertRequest {
   name?: string
+  // Migration 059: per-expert strictness ("full_strip" | "code_exempt").
+  stripMode?: 'full_strip' | 'code_exempt'
+
   description?: string
   isActive?: boolean
   reasoningCharter?: string

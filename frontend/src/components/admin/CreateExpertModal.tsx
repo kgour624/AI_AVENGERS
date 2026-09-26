@@ -43,6 +43,10 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
   const [slug, setSlug] = useState('')
   const [slugEdited, setSlugEdited] = useState(false)
   const [domain, setDomain] = useState('')
+  // VIP pass vs strict, chosen per expert (migration 059). Default strict.
+  //   full_strip  = every sentence without a citation is stripped
+  //   code_exempt = fenced code blocks survive uncited (for coding experts)
+  const [stripMode, setStripMode] = useState<'full_strip' | 'code_exempt'>('full_strip')
   const [description, setDescription] = useState('')
 
   // Advanced config fields — defaults match backend migration 006 defaults
@@ -117,6 +121,7 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
         name: name.trim(),
         slug: slug.trim(),
         domain: domain.trim(),
+        stripMode,
         description: description.trim() || undefined,
         categoryId: categoryId || undefined,
         modelTier,
@@ -163,6 +168,23 @@ export function CreateExpertModal({ isOpen, onClose, onCreated }: CreateExpertMo
           onChange={(e) => setDomain(e.target.value)}
           placeholder="system_design"
         />
+
+        <div className="flex flex-col gap-1">
+          <label className="text-xs font-medium text-text-secondary">
+            Answer strictness
+          </label>
+          <select
+            value={stripMode}
+            onChange={(e) => setStripMode(e.target.value as 'full_strip' | 'code_exempt')}
+            className="rounded-md border border-surface-border bg-surface-overlay px-2 py-1.5 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+          >
+            <option value="full_strip">Strict (Full Strip) — citations needed for every sentence</option>
+            <option value="code_exempt">VIP Pass (Code Exempt) — code blocks kept without citations</option>
+          </select>
+          <p className="text-[11px] text-text-disabled">
+            VIP Pass is for experts whose job is to write code; everything else stays strict.
+          </p>
+        </div>
 
         {/* CT-D2: optional category dropdown. Not required (CT-L2 —
             category_id is nullable, flat-text is the safe default). */}
