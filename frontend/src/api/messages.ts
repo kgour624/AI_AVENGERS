@@ -38,3 +38,74 @@ export const updateMessage = (messageId: string, content: string) =>
   baseAPI
     .patch<ApiResponse<{ status: string }>>(`/api/v1/messages/${messageId}`, { content })
     .then((res) => res.data.data!)
+
+// ============================================================
+// ANSWER EXPLANATION (C9)
+// ============================================================
+// Everything the system knows about why an answer looks the way it does: which
+// gates ran and stopped where, which sources were used, how the claims were
+// verified, the quality verdict, and the integrity chain when one exists.
+//
+// WHY a type per section rather than one big blob: the screen must be able to say
+// "this part did not run" for each section separately. A single optional bag
+// would flatten "checked and clean" together with "never checked", which is the
+// distinction this project keeps paying for.
+export interface ExplanationMessageFacts {
+  id: string
+  chatId: string
+  role: string
+  expertId?: string
+  mode: string
+  gateStopped: number
+  confidence?: number
+}
+
+export interface ExplanationDecisionFacts {
+  route?: string
+  reason?: string
+  domain?: string
+  genericAllowancePct?: number
+}
+
+export interface ExplanationGateStep {
+  gate: number
+  name?: string
+  passed: boolean
+  detail?: string
+}
+
+export interface ExplanationSourceRef {
+  chunkId: string
+  topic?: string
+  sourceFile?: string
+  rerankScore?: number
+}
+
+export interface ExplanationQualityFacts {
+  score?: number
+  verdict?: string
+  method?: string
+  attempts?: number
+}
+
+export interface ExplanationIntegrityFacts {
+  chain?: string
+  verified?: boolean
+}
+
+export interface AnswerExplanation {
+  message: ExplanationMessageFacts
+  decision: ExplanationDecisionFacts
+  gates: ExplanationGateStep[]
+  refusal?: Record<string, unknown>
+  sources: ExplanationSourceRef[]
+  claims?: unknown
+  quality: ExplanationQualityFacts
+  integrity?: ExplanationIntegrityFacts
+  expert?: Record<string, unknown>
+}
+
+export const getMessageExplanation = (messageId: string) =>
+  baseAPI
+    .get<ApiResponse<AnswerExplanation>>(`/api/v1/messages/${messageId}/explanation`)
+    .then((res) => res.data.data!)
