@@ -127,8 +127,16 @@ func NewToolRegistry(workspaceRoot string, logger *zap.Logger) *ToolRegistry {
 		Handler:     toolListSections,
 	})
 	r.register(Tool{
+		Name: "list_files",
+		Description: "List EVERY file that actually exists in this workflow's workspace, including generated " +
+			"code (design spine, sections, source files, tests). Use this before read_design: list_sections only " +
+			"lists design sections, so code files must be discovered here or you will guess a path that does not exist.",
+		InputSchema: `{}`,
+		Handler:     toolListFiles,
+	})
+	r.register(Tool{
 		Name:        "read_design",
-		Description: "Read a design file by its path (from list_sections, or \"final.md\" for the spine).",
+		Description: "Read ANY file in the workflow workspace by its path (from list_files, list_sections, or \"final.md\").",
 		InputSchema: `{"path": "string, required"}`,
 		Handler:     toolReadDesign,
 	})
@@ -338,10 +346,10 @@ func normalizeDeepSeekToolTokens(content string) string {
 	}
 
 	const (
-		callsEnd   = "<｜tool▁calls▁end｜>"
-		callBegin  = "<｜tool▁call▁begin｜>"
-		callEnd    = "<｜tool▁call▁end｜>"
-		separator  = "<｜tool▁separator｜>"
+		callsEnd  = "<｜tool▁calls▁end｜>"
+		callBegin = "<｜tool▁call▁begin｜>"
+		callEnd   = "<｜tool▁call▁end｜>"
+		separator = "<｜tool▁separator｜>"
 	)
 
 	var out strings.Builder
@@ -547,6 +555,45 @@ func designPath(workspaceRoot string, workflowID uuid.UUID, relPath string) (str
 		return "", fmt.Errorf("path escapes the design workspace: %s", relPath)
 	}
 	return full, nil
+}
+
+// workspaceFiles lists the files that ACTUALLY exist in a workflow's merged
+// workspace, relative to its main/ root, excluding VCS/tool caches.
+//
+// WHY this exists (production incident): the workflow chat could only list
+// *design sections* (blackboard rows). For a run whose output is generated code
+// (hld/*.go), that list is empty, so the expert guessed paths from the client's
+// message, hit a file that was listed in the UI but missing on disk, and told
+// the client it could not read any of its own files. Listing the disk truth is
+// what makes "ask me about the files you produced" work.
+func workspaceFiles(workspaceRoot string, workflowID uuid.UUID) []string {
+	root := filepath.Join(workspaceRoot, workflowID.String(), "main")
+	out := []string{}
+	_ = filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if info.IsDir() {
+			name := info.Name()
+			if name == ".git" || strings.HasPrefix(name, ".aider") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	sortStrings(out)
+	return out
+}
+
+func toolListFiles(_ context.Context, l *toolLoopContext, _ json.RawMessage) (any, error) {
+	files := workspaceFiles(l.workspaceRoot, l.workflowID)
+	return map[string]any{"files": files, "count": len(files)}, nil
 }
 
 func toolReadDesign(ctx context.Context, l *toolLoopContext, input json.RawMessage) (any, error) {
@@ -869,10 +916,10 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		EventType:        "design_conflict_raised",
 		PostedByExpertID: &l.expert.ID,
 		Content: map[string]any{
-			"chat_id":        l.chatID,
-			"statement_id":   args.StatementID,
-			"my_position":    args.Position,
-			"reason":         args.Reason,
+			"chat_id":         l.chatID,
+			"statement_id":    args.StatementID,
+			"my_position":     args.Position,
+			"reason":          args.Reason,
 			"other_expert_id": args.OtherExpertID,
 		},
 	})
@@ -1044,8 +1091,8 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 		}
 
 		resp, llmErr := l.gw.Call(ctx, gateway.LLMRequest{
-			Model:        gateway.ModelFast,
-			WorkflowID:   &l.workflowID,
+			Model:      gateway.ModelFast,
+			WorkflowID: &l.workflowID,
 			SystemPrompt: fmt.Sprintf("You are %s, a domain expert in %s. %s\n\n%s",
 				candidate.expert.Name, candidate.expert.Domain,
 				candidate.expert.ReasoningCharter,
@@ -1074,13 +1121,13 @@ func toolRaiseConflict(ctx context.Context, l *toolLoopContext, input json.RawMe
 			},
 		})
 		return map[string]any{
-			"raised":           true,
-			"event_id":         ev.ID,
-			"auto_resolved":    true,
-			"resolved_by":      candidate.expert.Name,
-			"resolution":       resp.Content,
-			"skipped_experts":  skippedMessages,
-			"note":             "Auto-resolved by rank. Client will see this in DECISIONS.md.",
+			"raised":          true,
+			"event_id":        ev.ID,
+			"auto_resolved":   true,
+			"resolved_by":     candidate.expert.Name,
+			"resolution":      resp.Content,
+			"skipped_experts": skippedMessages,
+			"note":            "Auto-resolved by rank. Client will see this in DECISIONS.md.",
 		}, nil
 	}
 
@@ -1160,10 +1207,10 @@ func escalateConflictToClient(
 
 	// System escalation → posted_by_client=true (satisfies poster CHECK).
 	escEv, err := l.store.Post(ctx, blackboard.PostRequest{
-		WorkflowID:     l.workflowID,
-		EventType:      "design_conflict_escalated",
-		PostedByClient: true,
-		Content:        content,
+		WorkflowID:         l.workflowID,
+		EventType:          "design_conflict_escalated",
+		PostedByClient:     true,
+		Content:            content,
 		ReferencesEventIDs: []uuid.UUID{conflictEventID},
 	})
 	if err != nil {
@@ -1176,14 +1223,14 @@ func escalateConflictToClient(
 		GateName:   designConflictGate,
 		Summary:    summary,
 		ArtifactContent: map[string]any{
-			"conflict_event_id":    conflictEventID.String(),
-			"escalation_event_id":  escEv.ID.String(),
-			"statement_id":         statementID,
-			"reason":               reason,
-			"skipped_experts":      skippedExperts,
-			"chat_id":              l.chatID.String(),
-			"raised_by_expert_id":  l.expert.ID.String(),
-			"raised_by_expert":     l.expert.Name,
+			"conflict_event_id":   conflictEventID.String(),
+			"escalation_event_id": escEv.ID.String(),
+			"statement_id":        statementID,
+			"reason":              reason,
+			"skipped_experts":     skippedExperts,
+			"chat_id":             l.chatID.String(),
+			"raised_by_expert_id": l.expert.ID.String(),
+			"raised_by_expert":    l.expert.Name,
 		},
 		CitedEventIDs: []uuid.UUID{conflictEventID, escEv.ID},
 	})

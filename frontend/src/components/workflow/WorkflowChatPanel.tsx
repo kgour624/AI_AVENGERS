@@ -330,10 +330,14 @@ function ChatThread({
   })
 
   return (
-    <div className="flex h-full flex-col">
+    // min-h-0 on both the column and the scroll area: a flex child defaults to
+    // min-height:auto, so without it the message list grows the page instead of
+    // scrolling and a long chat has no scrollbar at all. Cap the panel height so
+    // the composer stays reachable.
+    <div className="flex h-full max-h-[70vh] min-h-0 flex-col">
       <ParticipantsRow chatId={chatId} availableExperts={availableExperts} />
 
-      <div className="flex-1 space-y-2 overflow-y-auto p-3">
+      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
         {isLoading && <p className="text-xs text-text-disabled">Loading...</p>}
         {!isLoading && messages.length === 0 && (
           <p className="text-center text-xs text-text-disabled">
