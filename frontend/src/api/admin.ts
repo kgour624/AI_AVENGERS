@@ -961,10 +961,18 @@ export interface CapabilityEvalReport {
    * mode cannot judge the delta.
    */
   graphExpansion: boolean
+  /** Which retrieval path this run used, alongside graphExpansion. */
+  layerPreference?: boolean
   /** Why a failed pass failed, so the screen that offered the button can explain it. */
   errorMessage?: string
   /** Absent until both modes have completed a pass. */
   comparison?: CapabilityModeComparison
+  /**
+   * The same comparison for the depth preference: plain retrieval against retrieval
+   * nudged by the depth the question was asked at. Separate from `comparison` so two
+   * experiments are never read as one.
+   */
+  preferenceComparison?: CapabilityModeComparison
 }
 
 /**
@@ -1002,6 +1010,12 @@ export interface CapabilityEvalStartOptions {
    * attributable instead of a guess.
    */
   graphExpansion?: boolean
+  /**
+   * layerPreference nudges the ranking toward the depth the question was asked at.
+   * Measured, never assumed: run Measure and then this, and the screen compares them
+   * on the same stored questions.
+   */
+  layerPreference?: boolean
 }
 
 /** Reads the latest pass. Returns measured:false when there has never been one. */
@@ -1027,6 +1041,7 @@ export const startCapabilityEval = (expertId: string, options: CapabilityEvalSta
         top_k: options.topK ?? 0,
         regenerate: options.regenerate ?? false,
         graph_expansion: options.graphExpansion ?? false,
+        layer_preference: options.layerPreference ?? false,
       },
     )
     .then((res) => res.data.data!)

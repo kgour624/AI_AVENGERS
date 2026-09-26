@@ -2376,6 +2376,11 @@ type capabilityEvalRequestDTO struct {
 	// path is what production uses until a measurement says otherwise, and a pass
 	// records which path it used so the two are never compared against each other.
 	GraphExpansion bool `json:"graph_expansion"`
+
+	// LayerPreference retrieves with the ranking nudged toward the depth the
+	// question was asked at. Off by default for the same reason: it is measured
+	// before it is believed.
+	LayerPreference bool `json:"layer_preference"`
 }
 
 // MeasureExpertCapability POST /admin/experts/:id/capability-eval
@@ -2438,6 +2443,7 @@ func (h *AdminHandler) MeasureExpertCapability(c *gin.Context) {
 		TopK:           dto.TopK,
 		Regenerate:     dto.Regenerate,
 		GraphExpansion: dto.GraphExpansion,
+		LayerPreference: dto.LayerPreference,
 	}
 
 	// Detached context with a deadline: the pass must outlive this request, and a

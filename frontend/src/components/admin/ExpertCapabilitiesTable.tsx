@@ -123,16 +123,19 @@ function measuredLabel(level: number | undefined): { text: string; className: st
  * expensive feature earns its place, and "made no difference" is a legitimate, useful
  * answer that should be neither dressed up as a win nor hidden.
  */
-function describeLinkVerdict(verdict: string): { text: string; className: string } {
+function describeComparisonVerdict(
+  verdict: string,
+  subject: string,
+): { text: string; className: string } {
   switch (verdict) {
     case 'improved':
-      return { text: 'Concept links helped', className: 'text-mode-advise' }
+      return { text: `${subject} helped`, className: 'text-mode-advise' }
     case 'regressed':
-      return { text: 'Concept links made it worse', className: 'text-mode-refuse' }
+      return { text: `${subject} made it worse`, className: 'text-mode-refuse' }
     case 'unchanged':
-      return { text: 'Concept links made no difference', className: 'text-text-secondary' }
+      return { text: `${subject} made no difference`, className: 'text-text-secondary' }
     default:
-      return { text: 'Concept links: not comparable yet', className: 'text-glow-amber' }
+      return { text: `${subject}: not comparable yet`, className: 'text-glow-amber' }
   }
 }
 
@@ -200,8 +203,8 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
   // make "which run did I just start?" ambiguous, and the whole point is that the two
   // runs are compared against each other.
   const measureMutation = useMutation({
-    mutationFn: (graphExpansion: boolean) =>
-      startCapabilityEval(expert.id, { graphExpansion }),
+    mutationFn: (options: { graphExpansion: boolean; layerPreference: boolean }) =>
+      startCapabilityEval(expert.id, options),
     onSuccess: () => {
       setMeasureError(null)
       setAwaitingReport(true)
@@ -389,7 +392,9 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                         variant="secondary"
                         isLoading={measureMutation.isPending}
                         disabled={isMeasuring}
-                        onClick={() => measureMutation.mutate(false)}
+                        onClick={() =>
+                          measureMutation.mutate({ graphExpansion: false, layerPreference: false })
+                        }
                       >
                         {report ? 'Re-measure' : 'Measure'}
                       </Button>
@@ -398,7 +403,9 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                         variant="secondary"
                         isLoading={measureMutation.isPending}
                         disabled={isMeasuring || (conceptGraph?.count ?? 0) === 0}
-                        onClick={() => measureMutation.mutate(true)}
+                        onClick={() =>
+                          measureMutation.mutate({ graphExpansion: true, layerPreference: false })
+                        }
                         title={
                           (conceptGraph?.count ?? 0) === 0
                             ? 'Find concept links first — expanding with none would add nothing'
@@ -406,6 +413,27 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                         }
                       >
                         Measure with links
+                      </Button>
+                      {/* The depth nudge is measured the same way as the links: run it
+                          once, and the screen compares it with the plain pass on the
+                          same stored questions. Gated on classified layers, because a
+                          nudge with nothing to nudge toward would report "no
+                          difference" and teach the wrong lesson. */}
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        isLoading={measureMutation.isPending}
+                        disabled={isMeasuring || (depthLayers?.classified ?? 0) === 0}
+                        onClick={() =>
+                          measureMutation.mutate({ graphExpansion: false, layerPreference: true })
+                        }
+                        title={
+                          (depthLayers?.classified ?? 0) === 0
+                            ? 'Classify the content layers first — a preference with no classified layers would do nothing'
+                            : 'Measure again, preferring the depth each question was asked at'
+                        }
+                      >
+                        Measure with depth preference
                       </Button>
                     </div>
                   </div>
@@ -429,8 +457,12 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                     <>
                       <p className="mt-2 text-[10px] text-text-disabled">
                         This run retrieved{' '}
-                        {report.graphExpansion ? 'WITH concept links' : 'without concept links'} —
-                        the comparison above is only ever against a run of the same kind.
+                        {report.graphExpansion
+                          ? 'WITH concept links'
+                          : report.layerPreference
+                            ? 'WITH the depth preference'
+                            : 'without concept links or a depth preference'}{' '}
+                        — the comparison above is only ever against a run of the same kind.
                       </p>
                       <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-text-secondary">
                         <span>
@@ -486,10 +518,11 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                       <p
                         className={cn(
                           'text-[11px] font-medium',
-                          describeLinkVerdict(report.comparison.verdict).className,
+                          describeComparisonVerdict(report.comparison.verdict, 'Concept links')
+                            .className,
                         )}
                       >
-                        {describeLinkVerdict(report.comparison.verdict).text}
+                        {describeComparisonVerdict(report.comparison.verdict, 'Concept links').text}
                       </p>
                       <p className="mt-0.5 text-[10px] text-text-secondary">
                         {report.comparison.detail}
@@ -501,6 +534,41 @@ export function ExpertCapabilitiesTable({ expert }: ExpertCapabilitiesTableProps
                         To find out whether the concept links help, run Measure and then Measure
                         with links. They answer the same stored questions, so the two passes can be
                         compared fairly.
+                      </p>
+                    )
+                  )}
+
+                  {/* The depth-preference experiment, reported separately so it can
+                      never be mistaken for the link result. */}
+                  {report?.preferenceComparison ? (
+                    <div className="mt-2 rounded border border-border bg-bg-secondary/40 p-2">
+                      <p
+                        className={cn(
+                          'text-[11px] font-medium',
+                          describeComparisonVerdict(
+                            report.preferenceComparison.verdict,
+                            'The depth preference',
+                          ).className,
+                        )}
+                      >
+                        {
+                          describeComparisonVerdict(
+                            report.preferenceComparison.verdict,
+                            'The depth preference',
+                          ).text
+                        }
+                      </p>
+                      <p className="mt-0.5 text-[10px] text-text-secondary">
+                        {report.preferenceComparison.detail}
+                      </p>
+                    </div>
+                  ) : (
+                    !report?.comparison &&
+                    report && (
+                      <p className="mt-2 text-[10px] text-text-disabled">
+                        The depth preference is measured the same way: run Measure and then Measure
+                        with depth preference, and the two passes are compared on the questions
+                        they share.
                       </p>
                     )
                   )}

@@ -302,3 +302,36 @@ func TestMinimumComparableCasesIsMeaningful(t *testing.T) {
 		t.Fatalf("minimumComparableCases = %d, want at least 3", minimumComparableCases)
 	}
 }
+
+// The measurement only means something if the hypothesis is explicit, so it is
+// pinned here: a question asked at level N is measured against a nudge toward layer
+// N. A level nobody declared gets NO preference — guessing a depth and then
+// measuring against the guess would prove nothing about the material.
+func TestPreferenceForLevel(t *testing.T) {
+	tests := []struct {
+		name      string
+		level     int
+		wantLayer int
+	}{
+		{name: "surface question prefers surface chunks", level: 1, wantLayer: 1},
+		{name: "working question prefers working chunks", level: 2, wantLayer: 2},
+		{name: "deep question prefers deep chunks", level: 3, wantLayer: 3},
+		{name: "unknown level gets no preference", level: 0, wantLayer: 0},
+		{name: "out-of-range level gets no preference", level: 7, wantLayer: 0},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pref := preferenceForLevel(tc.level)
+			if pref.Layer != tc.wantLayer {
+				t.Fatalf("preferenceForLevel(%d).Layer = %d, want %d", tc.level, pref.Layer, tc.wantLayer)
+			}
+			if tc.wantLayer == 0 && pref.Active() {
+				t.Fatal("an unknown level must produce an inactive preference, not a default guess")
+			}
+			if tc.wantLayer != 0 && !pref.Active() {
+				t.Fatal("a declared level must produce an active preference")
+			}
+		})
+	}
+}
