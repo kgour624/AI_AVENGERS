@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   createWorkflowChat,
@@ -6,6 +6,7 @@ import {
   getWorkflowChat,
   listWorkflowChatMessages,
   sendWorkflowChatMessage,
+  getWorkflowFiles,
   addChatParticipant,
   removeChatParticipant,
   setKnowledgeMode,
@@ -306,7 +307,29 @@ function ChatThread({
   const queryClient = useQueryClient()
   const [draft, setDraft] = useState('')
   const [toExpertId, setToExpertId] = useState('')
+  const [focusFile, setFocusFile] = useState('')
   const [error, setError] = useState<string | null>(null)
+
+  // Files the workflow ACTUALLY produced (from the artifact events), each with
+  // the expert who produced it — so a question about a file goes to that expert
+  // and the file's real content is used, instead of guessing from the name.
+  const { data: files = [] } = useQuery({
+    queryKey: ['workflow-files', workflowId],
+    queryFn: () => getWorkflowFiles(workflowId),
+    enabled: Boolean(workflowId),
+  })
+  const selectedFile = files.find((f) => f.path === focusFile)
+  // With a file selected, only its author can answer: the list is filtered so
+  // another expert cannot be picked by mistake.
+  const expertOptions =
+    focusFile && selectedFile?.expertId
+      ? availableExperts.filter((e) => e.id === selectedFile.expertId)
+      : availableExperts
+
+  useEffect(() => {
+    if (focusFile && selectedFile?.expertId) setToExpertId(selectedFile.expertId)
+    if (!focusFile) setToExpertId('')
+  }, [focusFile, selectedFile?.expertId])
 
   const { data: messages = [], isLoading } = useQuery({
     queryKey: queryKeys.workflowChats.messages(chatId),
@@ -316,7 +339,8 @@ function ChatThread({
   // Send is synchronous server-side (the tool loop runs before it responds),
   // so there is no streaming state to manage here — just a pending mutation.
   const sendMut = useMutation({
-    mutationFn: () => sendWorkflowChatMessage(chatId, draft.trim(), toExpertId || undefined),
+    mutationFn: () =>
+      sendWorkflowChatMessage(chatId, draft.trim(), toExpertId || undefined, focusFile || undefined),
     onSuccess: () => {
       setDraft('')
       setError(null)
@@ -354,15 +378,51 @@ function ChatThread({
       )}
 
       <div className="flex items-end gap-2 border-t border-surface-border p-2">
-        {availableExperts.length > 0 && (
+        {files.length > 0 && (
+          <select
+            value={focusFile}
+            onChange={(e) => setFocusFile(e.target.value)}
+            className="max-w-[190px] rounded border border-surface-overlay bg-surface-base px-1.5 py-1.5 text-xs text-text-secondary"
+            title="Ask about one generated file (its author answers, using the file's real content)"
+          >
+            <option value="">whole deliverable</option>
+            {availableExperts.map((expert) => {
+              const owned = files.filter((f) => f.expertId === expert.id)
+              if (owned.length === 0) return null
+              return (
+                <optgroup key={expert.id} label={expert.name}>
+                  {owned.map((f) => (
+                    <option key={f.path} value={f.path}>
+                      {f.path}
+                      {f.hasContent ? '' : ' (no content stored)'}
+                    </option>
+                  ))}
+                </optgroup>
+              )
+            })}
+            {files.some((f) => !f.expertId) && (
+              <optgroup label="unattributed">
+                {files
+                  .filter((f) => !f.expertId)
+                  .map((f) => (
+                    <option key={f.path} value={f.path}>
+                      {f.path}
+                    </option>
+                  ))}
+              </optgroup>
+            )}
+          </select>
+        )}
+        {expertOptions.length > 0 && (
           <select
             value={toExpertId}
             onChange={(e) => setToExpertId(e.target.value)}
-            className="rounded border border-surface-overlay bg-surface-base px-1.5 py-1.5 text-xs text-text-secondary"
+            disabled={Boolean(focusFile && selectedFile?.expertId)}
+            className="rounded border border-surface-overlay bg-surface-base px-1.5 py-1.5 text-xs text-text-secondary disabled:opacity-60"
             title="Which expert answers (default: the deliverable's author)"
           >
             <option value="">default</option>
-            {availableExperts.map((e) => (
+            {expertOptions.map((e) => (
               <option key={e.id} value={e.id}>{e.name}</option>
             ))}
           </select>
