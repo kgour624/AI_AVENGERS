@@ -388,7 +388,7 @@ export default function ChatPage() {
                             m.content
                           )}
                         </div>
-                        <div className="absolute -top-6 right-0 hidden group-hover:flex gap-1">
+                        <div className="absolute -top-6 right-0 flex gap-1">
                           <button
                             onClick={() => { setEditingMessageId(m.id); setEditingContent(m.content) }}
                             className="text-xs text-text-secondary hover:text-text-primary bg-surface-raised border border-surface-border rounded px-2 py-0.5"
