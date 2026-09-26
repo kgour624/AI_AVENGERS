@@ -25,6 +25,11 @@ import (
 // before any design work begins.
 const UnderstandingEvent = "understanding_captured"
 
+// maxUnderstandingAttempts bounds the restate loop: client adds missing info,
+// experts restate, client reviews again. Without a cap a client that keeps
+// asking for changes would loop forever.
+const maxUnderstandingAttempts = 3
+
 // UnderstandingArtifact is one expert's restatement of the requirement.
 //
 // Every field is prose the CLIENT can judge, not internal vocabulary: the point
@@ -159,4 +164,38 @@ func (r *WorkflowRunner) captureUnderstandings(
 		return nil, fmt.Errorf("understanding: no expert produced a restatement")
 	}
 	return out, nil
+}
+
+// askUnderstandingGate shows every expert's restatement to the client and waits
+// for the decision. Returns the decision, the client's notes (what was missing),
+// and any error. Mirrors the design gate so both behave identically.
+func (r *WorkflowRunner) askUnderstandingGate(
+	ctx context.Context,
+	workflowID uuid.UUID,
+	arts []UnderstandingArtifact,
+	attempt int,
+) (string, string, error) {
+	var from uuid.UUID
+	if len(arts) > 0 {
+		from = arts[0].ExpertID
+	}
+	approvalID, err := r.tools.AskClient(ctx, AskClientRequest{
+		WorkflowID:      workflowID,
+		FromExpertID:    from,
+		GateName:        "understanding",
+		Summary:         fmt.Sprintf("Before any design: does your team understand the requirement correctly? (review %d of %d)", attempt, maxUnderstandingAttempts),
+		ArtifactContent: arts,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("understanding gate: %w", err)
+	}
+	if err := r.waitForResume(ctx, workflowID); err != nil {
+		return "", "", fmt.Errorf("understanding gate wait: %w", err)
+	}
+	decision, notes := r.lastApprovalDecision(ctx, workflowID, approvalID)
+	r.logger.Info("runner: understanding gate answered",
+		zap.String("workflow_id", workflowID.String()),
+		zap.Int("attempt", attempt),
+		zap.String("decision", decision))
+	return decision, notes, nil
 }
