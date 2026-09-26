@@ -102,6 +102,11 @@ type WorkflowRunner struct {
 	// expert), and the only thing allowed to say a unit of work is finished.
 	// Optional; when unset the runner just runs the work (see Claim).
 	taskAttempts *TaskAttemptStore
+	// artifactVerification measures what a wave produced (G3). Optional, and
+	// deliberately separate from crossVerifier: that one can block, this one only
+	// reports, so "the reviewer approved it" and "the evidence backs it" stay two
+	// different statements.
+	artifactVerification *ArtifactVerificationService
 }
 
 // CodebaseWorkspace is what the runner needs from the approval layer (3E).
@@ -127,6 +132,12 @@ func (r *WorkflowRunner) SetCodebaseWorkspace(cw CodebaseWorkspace) {
 // recoverable, skipping work that never happened is not.
 func (r *WorkflowRunner) SetTaskAttemptStore(s *TaskAttemptStore) {
 	r.taskAttempts = s
+}
+
+// SetArtifactVerification wires the artifact verifier (G3). nil disables it and
+// nothing claims otherwise: the workflow simply carries no verdicts.
+func (r *WorkflowRunner) SetArtifactVerification(v *ArtifactVerificationService) {
+	r.artifactVerification = v
 }
 
 // defaultMaxWaveTasks bounds how many expert tasks in one wave run at once.
@@ -1144,6 +1155,14 @@ func (r *WorkflowRunner) executeWaves(
 					zap.Error(cvErr),
 				)
 			}
+		}
+
+		// Measure the artifacts this wave produced, after the review gate has had
+		// its say: an artifact that was revised should be judged in its revised
+		// form, and one that was blocked never reaches here (the branch above
+		// returns). Non-fatal by construction — the service logs and returns.
+		if r.artifactVerification != nil {
+			r.artifactVerification.VerifyWaveArtifacts(ctx, workflowID, experts, lastSeqBefore)
 		}
 	}
 
