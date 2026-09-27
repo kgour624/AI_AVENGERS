@@ -20,6 +20,13 @@ type Server struct {
 	logger   *zap.Logger
 	version  string
 	scope    Scope
+	// auditor may be nil: the stdio session on a developer's machine has
+	// nothing to audit against, and a nil auditor must never be special-cased
+	// at every call site.
+	auditor *Auditor
+	// tokens is set only for the HTTP transport. A nil store means "this server
+	// cannot authenticate anybody", which HTTP refuses instead of running open.
+	tokens TokenStore
 }
 
 // NewServer builds a server over a registry. The scope is fixed for the session:
@@ -31,6 +38,12 @@ func NewServer(registry *Registry, logger *zap.Logger, version string, scope Sco
 	}
 	return &Server{registry: registry, logger: logger, version: version, scope: scope}
 }
+
+// SetTokenStore enables token authentication for the HTTP transport.
+func (s *Server) SetTokenStore(tokens TokenStore) { s.tokens = tokens }
+
+// SetAuditor enables the audit trail for this server.
+func (s *Server) SetAuditor(auditor *Auditor) { s.auditor = auditor }
 
 // jsonRPCRequest is one incoming message. Notifications (no id) are legal in the
 // protocol and must not be answered.
@@ -104,90 +117,11 @@ func (s *Server) handleLine(ctx context.Context, w io.Writer, line []byte) {
 		return
 	}
 
-	notification := len(req.ID) == 0
-
-	switch req.Method {
-	case "initialize":
-		if notification {
-			return
-		}
-		s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"protocolVersion": protocolVersion,
-			"capabilities":    map[string]any{"tools": map[string]any{}},
-			"serverInfo":      map[string]any{"name": "ai-avengers-experts", "version": s.version},
-		}})
-	case "notifications/initialized", "initialized":
-		// Client acknowledgement. Nothing to do, nothing to reply.
-	case "ping":
-		if notification {
-			return
-		}
-		s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}})
-	case "tools/list":
-		if notification {
-			return
-		}
-		s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"tools": s.registry.List(s.scope),
-		}})
-	case "tools/call":
-		if notification {
-			return
-		}
-		s.handleToolCall(ctx, w, req)
-	default:
-		if notification {
-			return
-		}
-		s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: req.ID,
-			Error: &jsonRPCError{Code: -32601, Message: "method not found: " + req.Method}})
-	}
-}
-
-// handleToolCall runs one tool. A ToolError is a caller mistake (unknown domain,
-// forbidden tool) and is reported as a tool-level error; anything else is a
-// server fault, logged with its detail while the client only learns that the
-// call failed. Handled once, here, at the boundary.
-func (s *Server) handleToolCall(ctx context.Context, w io.Writer, req jsonRPCRequest) {
-	var params struct {
-		Name      string          `json:"name"`
-		Arguments json.RawMessage `json:"arguments"`
-	}
-	if err := json.Unmarshal(req.Params, &params); err != nil {
-		s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: req.ID,
-			Error: &jsonRPCError{Code: -32602, Message: "invalid params: " + err.Error()}})
+	resp, replyDue := s.dispatch(ctx, s.scope, req)
+	if !replyDue {
 		return
 	}
-
-	result, err := s.registry.Call(ctx, s.scope, params.Name, params.Arguments)
-	if err != nil {
-		var toolErr *ToolError
-		if errors.As(err, &toolErr) {
-			s.logger.Info("mcp tool rejected",
-				zap.String("tool", params.Name),
-				zap.String("code", toolErr.Code),
-			)
-			// isError keeps this a successful JSON-RPC response: MCP models a
-			// tool-level failure this way, and the client needs to see why.
-			s.writeToolError(w, req.ID, toolErr.Message)
-			return
-		}
-		s.logger.Error("mcp tool failed", zap.String("tool", params.Name), zap.Error(err))
-		s.writeToolError(w, req.ID, "The tool failed on the server.")
-		return
-	}
-
-	s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-		"content": []map[string]any{{"type": "text", "text": result.Text}},
-		"isError": false,
-	}})
-}
-
-func (s *Server) writeToolError(w io.Writer, id json.RawMessage, message string) {
-	s.writeJSON(w, jsonRPCResponse{JSONRPC: "2.0", ID: id, Result: map[string]any{
-		"content": []map[string]any{{"type": "text", "text": message}},
-		"isError": true,
-	}})
+	s.writeJSON(w, resp)
 }
 
 // writeJSON writes one reply. A write error means the client is gone; log it and

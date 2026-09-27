@@ -13,11 +13,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -100,6 +103,47 @@ func run() error {
 	)
 
 	server := mcp.NewServer(registry, logger, version, scope)
+
+	// HTTP mode: one URL per team, a token per developer. Started only when an
+	// address is configured, so the default deployment stays stdio-only and
+	// opens no port at all.
+	if addr := strings.TrimSpace(os.Getenv("MCP_HTTP_ADDR")); addr != "" {
+		tokenStore := mcp.NewPGTokenStore(pool)
+		auditor := mcp.NewAuditor(ctx, pool, logger)
+		server.SetTokenStore(tokenStore)
+		server.SetAuditor(auditor)
+		defer auditor.Close()
+
+		httpServer := &http.Server{
+			Addr:              addr,
+			Handler:           server,
+			ReadHeaderTimeout: 15 * time.Second,
+			// No write timeout: an expert answer streams for minutes, and a
+			// write deadline would cut a legitimate reply in half.
+		}
+
+		// Shutdown is bounded and owned by this function: cancel (a signal or
+		// the client going away) stops accepting, then the in-flight handler
+		// gets its grace period — no goroutine outlives run().
+		shutdownDone := make(chan struct{})
+		go func() {
+			defer close(shutdownDone)
+			<-ctx.Done()
+			stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			if err := httpServer.Shutdown(stopCtx); err != nil {
+				logger.Warn("mcp http shutdown", zap.Error(err))
+			}
+		}()
+
+		logger.Info("mcp http listening", zap.String("addr", addr))
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("http server: %w", err)
+		}
+		<-shutdownDone
+		return nil
+	}
+
 	return server.ServeStdio(ctx, os.Stdin, os.Stdout)
 }
 

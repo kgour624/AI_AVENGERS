@@ -60,6 +60,10 @@ func NewToolError(code, message string) *ToolError {
 type Scope struct {
 	// Label identifies the token in logs and audits (never the token itself).
 	Label string
+	// TokenID is the token row this scope came from. Carried so an audit entry
+	// can point at the token without re-resolving it. Empty for stdio sessions,
+	// which have no token.
+	TokenID string
 	// Domains restricts which experts may be reached. Empty = every domain,
 	// which is what the local stdio case (the owner's own machine) wants.
 	Domains []string

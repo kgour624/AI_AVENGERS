@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS mcp_audit;
+DROP TABLE IF EXISTS mcp_tokens;
