@@ -3,8 +3,11 @@ package chinawall
 import (
 	"context"
 	"fmt"
+	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -957,6 +960,28 @@ COURSE CONTENT:
 	return &generatedAnswer{Answer: resp.Content, Citations: citations}, nil
 }
 
+// sectionWorkers returns how many sections may be generated at once.
+//
+// WHY bounded: one request per section fired simultaneously would hit the
+// provider's per-key rate limit and trigger its breaker, which is slower than
+// the sequential loop this replaced. Four matches the provider concurrency that
+// already works for batch ingestion; SECTION_WORKERS tunes it per deployment.
+func sectionWorkers(sectionCount int) int {
+	workers := 4
+	if v := strings.TrimSpace(os.Getenv("SECTION_WORKERS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workers = n
+		}
+	}
+	if workers > sectionCount && sectionCount > 0 {
+		workers = sectionCount
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
+}
+
 // generateStructured generates a structured answer section-by-section.
 //
 // DESIGN DECISION (2026-09-16):
@@ -970,10 +995,22 @@ COURSE CONTENT:
 //	3. JSON format forced the model to escape code (\n, \") — LLMs
 //	   are unreliable at this, producing invalid JSON on complex code.
 //
-//	New approach: one LLM call PER SECTION, sequentially.
-//	WHY sequential not parallel:
-//	- User reads Pattern → Idea → Code → Walkthrough → TestCases in order.
-//	  Sequential streaming lets them read each section as it arrives.
+//	New approach: one LLM call PER SECTION.
+//	WHY parallel now (was sequential):
+//	- Sequential cost the SUM of every section: measured on a real answer,
+//	  context_assembly 11.7s + self_learning 92.7s + decision_engine 195.6s,
+//	  where decision_engine is this loop — six sections at ~30s each. That
+//	  crossed the collector timeout and the user got "all experts failed".
+//	  Removal was never the fix: the work stays, it just overlaps.
+//	- Order is still guaranteed. Each section streams into its OWN buffered
+//	  channel and a single collector forwards those channels to tokenCh in
+//	  section order, so the reader still gets Pattern → Idea → Code → ... and
+//	  tokens from two sections can never interleave.
+//	- Bounded workers (SECTION_WORKERS, default 4): the provider is not
+//	  hammered with one request per section at once.
+//	- Parent waits (wg.Wait + collectorDone): no orphan goroutines, per the
+//	  "no orphan goroutines" rule — the function returns only when every
+//	  section has finished AND everything it produced has been forwarded.
 //	- Each section is independently China-Wall enforced with citations.
 //	- No JSON format — plain text per section, no escaping issues.
 //	- Any model works: DeepSeek, Claude, Gemini — all return plain text.
@@ -998,21 +1035,88 @@ func (e *Enforcer) generateStructured(
 		defaultLanguage = "java"
 	}
 
+	type sectionOutcome struct {
+		content   string
+		citations []Citation
+		err       error
+	}
+	outcomes := make([]sectionOutcome, len(sections))
+
+	// One buffered channel per section. Tokens are never shared between
+	// sections, so parallel generation cannot interleave two sections' text —
+	// the collector below drains them in section order.
+	secChs := make([]chan string, len(sections))
+	for i := range sections {
+		secChs[i] = make(chan string, 2048)
+	}
+
+	workers := sectionWorkers(len(sections))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+
+	for i := range sections {
+		wg.Add(1)
+		sem <- struct{}{} // acquire before spawning: keeps concurrency bounded
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			var sink chan<- string
+			if tokenCh != nil {
+				sink = secChs[i]
+			}
+			content, cites, err := e.generateOneSection(
+				ctx, question, chunks, expertName, reasoningCharter,
+				replyContext, contextText, sections[i], defaultLanguage, profile, sink,
+			)
+			outcomes[i] = sectionOutcome{content: content, citations: cites, err: err}
+			close(secChs[i])
+		}(i)
+	}
+
+	// Collector: the only writer to tokenCh, so the reader sees sections in
+	// template order even though they were produced concurrently. It ends when
+	// the last section channel closes (or the request is cancelled), and the
+	// caller waits on collectorDone — no orphan goroutine survives this call.
+	collectorDone := make(chan struct{})
+	if tokenCh != nil {
+		go func() {
+			defer close(collectorDone)
+			for i := range sections {
+				for tok := range secChs[i] {
+					select {
+					case tokenCh <- tok:
+					case <-ctx.Done():
+						// Drain whatever is left so no producer is left blocked
+						// on a channel that nobody reads anymore.
+						for j := i; j < len(sections); j++ {
+							for range secChs[j] {
+							}
+						}
+						return
+					}
+				}
+			}
+		}()
+	} else {
+		close(collectorDone)
+	}
+
+	wg.Wait()
+	<-collectorDone
+
 	allCitations := []Citation{}
 	seen := make(map[string]bool)
 	resultSections := make([]TemplateSectionResult, 0, len(sections))
-
-	for _, section := range sections {
-		content, secCitations, err := e.generateOneSection(
-			ctx, question, chunks, expertName, reasoningCharter,
-			replyContext, contextText, section, defaultLanguage, profile, tokenCh,
-		)
-		if err != nil {
+	for i, section := range sections {
+		content := outcomes[i].content
+		secCitations := outcomes[i].citations
+		if outcomes[i].err != nil {
 			// One section failing should not kill the whole answer.
 			// Log and continue — user gets partial answer, not blank screen.
 			e.logger.Warn("section generation failed — using empty content",
 				zap.String("section", section.Key),
-				zap.Error(err),
+				zap.Error(outcomes[i].err),
 			)
 			content = ""
 			secCitations = []Citation{}
