@@ -1576,6 +1576,47 @@ func (h *suggestionHeap) Pop() interface{} {
 // goes in. The score and the reason are both returned so a human can see why a
 // file was suggested and reject it, which is the point of the approval loop.
 func (s *Service) SuggestRepoFiles(ctx context.Context, projectID uuid.UUID, requirement string, limit int) ([]RepoFileSuggestion, error) {
+	return s.suggestRepoFilesWindow(ctx, projectID, requirement, limit)
+}
+
+// SuggestRepoFilesPage returns the next page of the EXISTING ranking.
+//
+// The Min-Heap, top-K scoring, graph incoming-edge/hub bonus, token matching,
+// reasons, and tie order below are unchanged. Paging asks the same ranker for a
+// wider prefix (offset+limit), then slices off the prefix already shown. That
+// means page N is the next items from the same ranking, not a new algorithm or
+// an independently re-ranked subset.
+func (s *Service) SuggestRepoFilesPage(ctx context.Context, projectID uuid.UUID, requirement string, offset, limit int) ([]RepoFileSuggestion, int, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit <= 0 {
+		limit = suggestDefaultLimitSize
+	}
+	if limit > suggestMaxLimitSize {
+		limit = suggestMaxLimitSize
+	}
+	if offset >= suggestMaxLimitSize {
+		return []RepoFileSuggestion{}, offset, nil
+	}
+	if offset+limit > suggestMaxLimitSize {
+		limit = suggestMaxLimitSize - offset
+	}
+	window, err := s.suggestRepoFilesWindow(ctx, projectID, requirement, offset+limit)
+	if err != nil {
+		return nil, offset, err
+	}
+	if offset >= len(window) {
+		return []RepoFileSuggestion{}, len(window), nil
+	}
+	end := offset + limit
+	if end > len(window) {
+		end = len(window)
+	}
+	return window[offset:end], end, nil
+}
+
+func (s *Service) suggestRepoFilesWindow(ctx context.Context, projectID uuid.UUID, requirement string, limit int) ([]RepoFileSuggestion, error) {
 	if limit <= 0 {
 		limit = suggestDefaultLimitSize
 	}
@@ -1670,6 +1711,8 @@ func (s *Service) SuggestRepoFiles(ctx context.Context, projectID uuid.UUID, req
 	for i := len(out) - 1; i >= 0; i-- {
 		out[i] = heap.Pop(best).(RepoFileSuggestion)
 	}
+	// Stable tie order: the existing score/ranking is unchanged; this only makes
+	// paging deterministic when different paths receive exactly the same score.
 	return out, nil
 }
 

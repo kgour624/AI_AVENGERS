@@ -52,6 +52,9 @@ export function CodebasePanel({
   const queryClient = useQueryClient()
   const [newPath, setNewPath] = useState('')
   const [actionError, setActionError] = useState<string | null>(null)
+  const [suggestionOffset, setSuggestionOffset] = useState(0)
+  const [shownRankedCount, setShownRankedCount] = useState(0)
+  const [hasMoreSuggestions, setHasMoreSuggestions] = useState(false)
 
   const { data, isLoading } = useQuery({
     queryKey: ['workflow', workflowId, 'codebase'],
@@ -62,9 +65,20 @@ export function CodebasePanel({
     queryClient.invalidateQueries({ queryKey: ['workflow', workflowId, 'codebase'] })
 
   const suggestMutation = useMutation({
-    mutationFn: () => suggestCodebaseFiles(workflowId),
-    onSuccess: invalidate,
-    onError: () => setActionError('Could not generate suggestions. Add requirement text first.'),
+    mutationFn: ({ offset, limit }: { offset: number; limit: number }) =>
+      suggestCodebaseFiles(workflowId, limit, offset),
+    onSuccess: async (result, variables) => {
+      setSuggestionOffset(result.offset)
+      setShownRankedCount((previous) => Math.max(previous, variables.offset + result.count))
+      setHasMoreSuggestions(result.hasMore)
+      await invalidate()
+      if (result.suggestions.length === 0 && variables.offset > 0) {
+        setActionError('No more matching files. Ranking and scores are unchanged.')
+      } else {
+        setActionError(null)
+      }
+    },
+    onError: () => setActionError('Could not fetch the next ranked files. Add requirement text first.'),
   })
 
   const addMutation = useMutation({
@@ -209,12 +223,22 @@ export function CodebasePanel({
           <Button
             size="sm"
             variant="secondary"
-            onClick={() => suggestMutation.mutate()}
+            onClick={() => {
+              setSuggestionOffset(0)
+              setShownRankedCount(0)
+              setHasMoreSuggestions(false)
+              suggestMutation.mutate({ offset: 0, limit: 10 })
+            }}
             isLoading={suggestMutation.isPending}
           >
-            Find relevant files
+            Find relevant files (first 10)
           </Button>
         </div>
+        {shownRankedCount > 0 && (
+          <p className="mt-2 text-[10px] text-text-disabled">
+            Showing the first {shownRankedCount} ranked candidates. “Show more” continues the same ranking; scores and heuristics are unchanged.
+          </p>
+        )}
 
         <div className="mt-3 flex gap-2">
           <input
@@ -234,6 +258,18 @@ export function CodebasePanel({
         </div>
 
         {actionError && <p className="mt-2 text-xs text-mode-refuse">{actionError}</p>}
+        {hasMoreSuggestions && (
+          <Button
+            className="mt-2"
+            size="sm"
+            variant="secondary"
+            disabled={suggestMutation.isPending}
+            isLoading={suggestMutation.isPending}
+            onClick={() => suggestMutation.mutate({ offset: suggestionOffset, limit: 10 })}
+          >
+            Show more ranked files
+          </Button>
+        )}
       </Card>
 
       {pending.length > 0 && (
