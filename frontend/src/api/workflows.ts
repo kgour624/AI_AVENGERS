@@ -329,3 +329,59 @@ export async function downloadCodebasePatch(workflowId: string): Promise<Blob> {
  */
 export const deleteWorkflow = (workflowId: string) =>
   baseAPI.delete<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}`).then((res) => res.data.data!)
+
+// enableCodeDelivery turns code generation on for a workflow that was created
+// design-only, and re-enters the implementation phase with the approved design
+// as input. Added because deliver_code was creation-only: a finished design
+// workflow had no way to ask for code without redoing the design in a new
+// workflow.
+export const enableCodeDelivery = (id: string) =>
+  baseAPI.post(`/api/v1/workflows/${id}/deliver-code`).then((res) => res.data)
+
+export interface WorkflowFileEntry {
+  path: string
+  name?: string
+  expert_id?: string
+  operation?: string
+  has_content?: boolean
+}
+
+export interface Publication {
+  id: string
+  token: string
+  title: string
+  file_count: number
+  created_at: string
+}
+
+// Files produced by a workflow. Same source as the FILES tab, so a redesign or a
+// later code-generation run shows up here without any cache to invalidate.
+export const listWorkflowFiles = (id: string) =>
+  baseAPI.get<ApiResponse<WorkflowFileEntry[]>>(`/api/v1/workflows/${id}/files`).then((r) => r.data.data!)
+
+// Admin-side download: the file's current content, as a blob.
+export const downloadWorkflowFile = async (id: string, path: string): Promise<Blob> => {
+  const res = await baseAPI.get(`/api/v1/workflows/${id}/file-content`, {
+    params: { path },
+    responseType: 'blob',
+  })
+  return res.data as Blob
+}
+
+export const listPublications = (id: string) =>
+  baseAPI.get<ApiResponse<Publication[]>>(`/api/v1/workflows/${id}/publications`).then((r) => r.data.data!)
+
+// Submit: creates a NEW public token holding the chosen files.
+export const createPublication = (id: string, body: { title: string; paths: string[] }) =>
+  baseAPI
+    .post<ApiResponse<{ id: string; token: string; title: string; files_added: number }>>(
+      `/api/v1/workflows/${id}/publications`,
+      body
+    )
+    .then((r) => r.data.data!)
+
+// Push: adds files to an EXISTING token, so the landing page URL never changes.
+export const pushToPublication = (publicationId: string, paths: string[]) =>
+  baseAPI
+    .post<ApiResponse<{ files_added: number }>>(`/api/v1/admin/publications/${publicationId}/push`, { paths })
+    .then((r) => r.data.data!)
