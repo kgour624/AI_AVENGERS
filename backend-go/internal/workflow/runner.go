@@ -311,14 +311,24 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// so waves match the checkpoint. Fall back to Planner if missing.
 	var tasks []TaskSpec
 	planFromBlackboard := false
+	customPlanPresent := false
+	customPlanTasks, customPlanPresent, customPlanErr := r.loadCustomPlan(ctx, workflowID, experts)
+	if customPlanErr != nil {
+		log.Error("runner: configured workflow plan invalid; refusing to replace it with generated tasks", zap.Error(customPlanErr))
+		_ = r.engine.Fail(ctx, workflowID, "configured workflow plan is invalid: "+customPlanErr.Error())
+		return
+	}
+	if customPlanPresent {
+		tasks = customPlanTasks
+	}
 	if resumePhase != "" {
-		if reloaded, ok := r.loadPlanTasksFromBlackboard(ctx, workflowID, experts); ok {
+		if reloaded, ok := r.loadPlanTasksFromBlackboard(ctx, workflowID, experts); ok && !customPlanPresent {
 			tasks = reloaded
 			planFromBlackboard = true
 			log.Info("runner: reloaded plan from blackboard", zap.Int("tasks", len(tasks)))
 		}
 	}
-	if len(tasks) == 0 {
+	if len(tasks) == 0 && !customPlanPresent {
 		log.Info("runner: planning", zap.Int("experts", len(experts)))
 		planned, planErr := r.planner.Plan(ctx, workflowID, requirementText, experts)
 		if planErr != nil {
@@ -329,12 +339,21 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		tasks = planned
 	}
 
-	// Step 6: Build DAG (topological sort + cycle check).
-	waves, err := BuildDAG(tasks)
-	if err != nil {
-		log.Error("runner: DAG build failed", zap.Error(err))
-		_ = r.engine.Fail(ctx, workflowID, "DAG build failed: "+err.Error())
-		return
+	// Step 6: build waves from the exact client DAG, or the legacy planner DAG.
+	var waves []ExecutionWave
+	customPlanExecuted := customPlanPresent && len(tasks) > 0 && tasks[0].CustomPlanStepID != ""
+	if customPlanExecuted {
+		waves = make([]ExecutionWave, len(tasks))
+		for i, task := range tasks {
+			waves[i] = ExecutionWave{task}
+		}
+	} else {
+		waves, err = BuildDAG(tasks)
+		if err != nil {
+			log.Error("runner: DAG build failed", zap.Error(err))
+			_ = r.engine.Fail(ctx, workflowID, "DAG build failed: "+err.Error())
+			return
+		}
 	}
 	log.Info("runner: DAG built",
 		zap.Int("tasks", len(tasks)),
@@ -346,7 +365,19 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// Fresh start: post plan + intake gate.
 	// Resume: skip both — plan already on blackboard and intake already approved
 	// (otherwise status would be paused_for_approval, not running).
-	if resumePhase == "" {
+	if customPlanPresent && resumePhase == "" {
+		_, err = r.store.Post(ctx, blackboard.PostRequest{WorkflowID: workflowID, EventType: "task_plan_ready", PostedByClient: true, Content: planContent})
+		if err != nil {
+			_ = r.engine.Fail(ctx, workflowID, "post configured workflow plan failed: "+err.Error())
+			return
+		}
+		_, err = r.tools.AskClient(ctx, AskClientRequest{WorkflowID: workflowID, FromExpertID: uuid.Nil, GateName: "intake", Summary: fmt.Sprintf("Review your configured %d-step workflow plan and approve.", len(tasks)), ArtifactContent: planContent})
+		if err != nil {
+			_ = r.engine.Fail(ctx, workflowID, "configured plan approval failed: "+err.Error())
+			return
+		}
+		if err := r.waitForResume(ctx, workflowID); err != nil { return }
+	} else if resumePhase == "" {
 		// Step 7: Post task_plan_ready event.
 		// Projector will INSERT workflow_tasks rows from this event.
 		// Runner does NOT write to workflow_tasks directly.
@@ -452,8 +483,8 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	// misunderstanding could only surface after the design existed. Each expert now
 	// states its reading in plain words, the client adds what was missing, the
 	// experts restate, and only then does design start.
-	runUnderstanding := resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseUnderstanding)
-	if runUnderstanding {
+	runUnderstanding := !customPlanPresent && (resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseUnderstanding))
+	if runUnderstanding && !customPlanPresent {
 		if strings.TrimSpace(requirementText) == "" {
 			log.Error("runner: understanding phase needs the requirement text")
 			_ = r.engine.Fail(ctx, workflowID, "Understanding phase: requirement not available")
@@ -482,7 +513,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		log.Info("runner: understanding approved, starting design")
 	}
 
-	runDesign := resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseDetailedDesign)
+	runDesign := !customPlanPresent && (resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseDetailedDesign))
 	if runDesign {
 		for attempt := 1; attempt <= maxDesignAttempts; attempt++ {
 			if savedState == nil || savedState.DesignRevisionID != designRevisionID.String() {
@@ -596,7 +627,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 				)
 			}
 		}
-	} else {
+	} else if !customPlanPresent {
 		log.Info("runner: skipping design phases + gate (resume past design)",
 			zap.String("resume_phase", resumePhase),
 		)
@@ -618,8 +649,39 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 		resumeCompleted = nil
 	}
 
+	// --- Custom plan: execute the client's exact ordered steps ---
+	//
+	// This IS the workflow for a client-authored plan: the saved steps run in
+	// the order the client approved, each with the expert it names. The legacy
+	// phase machinery below is skipped (guarded by customPlanExecuted), because
+	// running both would execute work the client never asked for.
+	if customPlanExecuted {
+		for stepIndex, task := range tasks {
+			stepPhase, _ := customPlanPhase(task.CustomPlanKind)
+			stepState := &runnerState{Phase: stepPhase}
+			log.Info("runner: executing client-authored workflow step",
+				zap.Int("step", stepIndex+1),
+				zap.Int("total", len(tasks)),
+				zap.String("output", task.CustomPlanOutput),
+				zap.String("kind", task.CustomPlanKind),
+				zap.String("phase", stepPhase),
+			)
+			execMu.Lock()
+			stepErr := r.executeWaves(ctx, workflowID, []ExecutionWave{{task}}, experts, stepState, uuid.Nil, "")
+			execMu.Unlock()
+			if stepErr != nil {
+				reason := fmt.Sprintf("configured workflow step %q failed: %v", task.CustomPlanOutput, stepErr)
+				log.Error("runner: configured workflow step failed", zap.Error(stepErr))
+				_ = r.engine.Fail(ctx, workflowID, reason)
+				return
+			}
+		}
+		r.runTraceabilityChain(ctx, workflowID)
+		r.saveRunnerState(ctx, workflowID, &runnerState{Phase: PhaseHandoff})
+	}
+
 	// --- Phase: Implementation (Aider) ---
-	if resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseImplementation) {
+	if !customPlanExecuted && (resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseImplementation)) {
 		if err := r.mustTransition(ctx, workflowID, PhaseImplementation, log); err != nil {
 			return
 		}
@@ -659,7 +721,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	}
 
 	// --- Phase: QA (Aider - test generation) ---
-	if resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseQA) {
+	if !customPlanExecuted && (resumePhase == "" || phaseIndex(resumePhase) <= phaseIndex(PhaseQA)) {
 		if err := r.mustTransition(ctx, workflowID, PhaseQA, log); err != nil {
 			return
 		}
@@ -685,7 +747,7 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 			}
 		}
 		r.saveRunnerState(ctx, workflowID, &runnerState{Phase: PhaseHandoff})
-	} else {
+	} else if !customPlanExecuted {
 		log.Info("runner: skipping QA phase (already past checkpoint)")
 	}
 
@@ -694,7 +756,12 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	}
 
 	// Step 9: Final approval.
-	if err := r.mustTransition(ctx, workflowID, PhaseHandoff, log); err != nil {
+	if customPlanExecuted {
+		if err := r.engine.RestartPhase(ctx, workflowID, PhaseHandoff); err != nil {
+			_ = r.engine.Fail(ctx, workflowID, "custom plan could not enter handoff: "+err.Error())
+			return
+		}
+	} else if err := r.mustTransition(ctx, workflowID, PhaseHandoff, log); err != nil {
 		return
 	}
 	allArtifacts, _ := r.store.GetByType(ctx, workflowID,
@@ -952,7 +1019,11 @@ func (r *WorkflowRunner) executeWaves(
 				if claimRevisionID == uuid.Nil {
 					claimRevisionID = RevisionInitial
 				}
-				attempt, decision, claimErr := r.taskAttempts.Claim(ctx, workflowID, state.Phase, expert.ID, claimRevisionID)
+				claimPhase := state.Phase
+				if t.CustomPlanStepID != "" {
+					claimPhase = state.Phase + ":step:" + t.CustomPlanStepID
+				}
+				attempt, decision, claimErr := r.taskAttempts.Claim(ctx, workflowID, claimPhase, expert.ID, claimRevisionID)
 				if claimErr != nil {
 					r.logger.Error("runner: could not claim this unit of work",
 						zap.String("expert", expert.Name),
@@ -989,8 +1060,17 @@ func (r *WorkflowRunner) executeWaves(
 				}
 
 				switch decision {
-				case DecisionSkipDone:
-					_, checkpointClaimed := alreadyDone[expert.ID.String()]
+			case DecisionSkipDone:
+				if t.CustomPlanStepID != "" {
+					errMu.Lock()
+					if !containsID(state.CompletedExpertIDs, expert.ID.String()) {
+						state.CompletedExpertIDs = append(state.CompletedExpertIDs, expert.ID.String())
+					}
+					errMu.Unlock()
+					r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
+					return
+				}
+				_, checkpointClaimed := alreadyDone[expert.ID.String()]
 					r.logger.Info("runner: skipping an expert this phase already produced",
 						zap.String("expert", expert.Name),
 						zap.String("phase", state.Phase),
@@ -1049,6 +1129,21 @@ func (r *WorkflowRunner) executeWaves(
 					}
 				}
 
+				// A client-authored step is executed exactly as declared: the
+				// capability decides the executor, the step ID is the retry
+				// identity, and no legacy phase may reinterpret it.
+				if t.CustomPlanStepID != "" {
+					stepErr := r.runCustomPlanStep(ctx, workflowID, expert, t, experts, state, &errMu, recordSuccess, recordFailure, &firstErr)
+					if stepErr != nil {
+						recordFailure(stepErr.Error())
+						errMu.Lock()
+						if firstErr == nil { firstErr = stepErr }
+						state.FailedExpertIDs = append(state.FailedExpertIDs, expert.ID.String())
+						errMu.Unlock()
+					}
+					r.saveRunnerState(ctx, workflowID, snapshotRunnerState(state, &errMu))
+					return
+				}
 				// Route to appropriate executor based on phase.
 				if useAider {
 					// Implementation phase now means AUTHORING (§9 of
@@ -1525,6 +1620,16 @@ func phaseIndex(phase string) int {
 		}
 	}
 	return -1
+}
+
+func planTaskTitle(t TaskSpec) string {
+	if t.CustomPlanOutput != "" { return t.CustomPlanOutput }
+	return t.Title
+}
+
+func planTaskDescription(t TaskSpec) string {
+	if t.CustomPlanInstructions != "" { return t.CustomPlanInstructions }
+	return t.Description
 }
 
 // loadWorkflowExperts loads expert records with workflow-specific fields.

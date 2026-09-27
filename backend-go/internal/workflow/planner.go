@@ -18,6 +18,16 @@ type TaskSpec struct {
 	Title              string
 	Description        string
 	DependsOnExpertIDs []uuid.UUID
+	// CustomPlanKind and CustomPlanOutput are present only when the client
+	// authored this workflow's plan. They let the runner select the executor and
+	// keep the requested artifact name without hardcoding a domain.
+	CustomPlanKind   string   `json:"custom_plan_kind,omitempty"`
+	CustomPlanOutput string   `json:"custom_plan_output,omitempty"`
+	CustomPlanStepID string   `json:"custom_plan_step_id,omitempty"`
+	CustomPlanInstructions string `json:"custom_plan_instructions,omitempty"`
+	CustomPlanLanguage string `json:"custom_plan_language,omitempty"`
+	CustomPlanCapability string `json:"custom_plan_capability,omitempty"`
+	DependsOnStepIDs []string `json:"depends_on_step_ids,omitempty"`
 }
 
 // plannerMaxRetries: LLMs hallucinate ~30% on structured JSON output.

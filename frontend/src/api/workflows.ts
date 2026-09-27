@@ -98,6 +98,17 @@ export const createWorkflow = (req: {
    * every workflow did before this option existed.
    */
   deliverCode?: boolean
+  /** User-defined expert -> artifact -> dependency plan. Empty = legacy default. */
+  plan?: Array<{
+    id: string
+    expertId: string
+    output: string
+    instructions: string
+    kind?: string
+    language?: string
+    capability?: string
+    dependsOn?: string[]
+  }>
 }) =>
   baseAPI
     .post<ApiResponse<Workflow>>('/api/v1/workflows', req)

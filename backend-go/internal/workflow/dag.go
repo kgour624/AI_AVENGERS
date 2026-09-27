@@ -42,21 +42,28 @@ func BuildDAG(tasks []TaskSpec) ([]ExecutionWave, error) {
 		return nil, fmt.Errorf("dag: no tasks provided")
 	}
 
-	// Build expert_id → TaskSpec index map for O(1) lookup.
+	// Build task-identity → TaskSpec index map for O(1) lookup. Legacy planner
+	// tasks are keyed by expert ID (one task per expert); custom per-workflow
+	// plans are keyed by their step ID, so one expert may own multiple ordered
+	// outputs without collapsing into one task.
 	taskIndex := make(map[string]int, len(tasks))
 	for i, t := range tasks {
-		taskIndex[t.ExpertID.String()] = i
+		key := taskKey(t)
+		if _, exists := taskIndex[key]; exists {
+			return nil, fmt.Errorf("dag: duplicate task identity %q", key)
+		}
+		taskIndex[key] = i
 	}
 
 	// Validate: all depends_on_expert_ids must exist in task list.
 	// WHY here not in Planner: Planner validates against expert list.
 	// DAG validates against task list (a subset of experts may have tasks).
 	for _, t := range tasks {
-		for _, depID := range t.DependsOnExpertIDs {
-			if _, ok := taskIndex[depID.String()]; !ok {
+		for _, depKey := range taskDependencyKeys(t) {
+			if _, ok := taskIndex[depKey]; !ok {
 				return nil, fmt.Errorf(
-					"dag: task for expert %s depends on expert %s which has no task",
-					t.ExpertID, depID,
+					"dag: task %s depends on task %s which does not exist",
+					taskKey(t), depKey,
 				)
 			}
 		}
@@ -75,15 +82,15 @@ func BuildDAG(tasks []TaskSpec) ([]ExecutionWave, error) {
 	// number of dependencies task i itself declares.
 	inDegree := make([]int, len(tasks))
 	for i, t := range tasks {
-		inDegree[i] = len(t.DependsOnExpertIDs)
+		inDegree[i] = len(taskDependencyKeys(t))
 	}
 
 	// Build adjacency list: task i → tasks that depend on i.
 	// When task i completes, we decrement in-degree of its dependents.
 	adj := make([][]int, len(tasks))
 	for i, t := range tasks {
-		for _, depID := range t.DependsOnExpertIDs {
-			depIdx := taskIndex[depID.String()]
+		for _, depKey := range taskDependencyKeys(t) {
+			depIdx := taskIndex[depKey]
 			// depIdx → i: when depIdx completes, i's in-degree decreases.
 			adj[depIdx] = append(adj[depIdx], i)
 		}
@@ -139,4 +146,26 @@ func BuildDAG(tasks []TaskSpec) ([]ExecutionWave, error) {
 	}
 
 	return waves, nil
+}
+
+func taskKey(t TaskSpec) string {
+	if t.CustomPlanStepID != "" {
+		return "step:" + t.CustomPlanStepID
+	}
+	return "expert:" + t.ExpertID.String()
+}
+
+func taskDependencyKeys(t TaskSpec) []string {
+	if t.CustomPlanStepID != "" {
+		out := make([]string, 0, len(t.DependsOnStepIDs))
+		for _, id := range t.DependsOnStepIDs {
+			out = append(out, "step:"+id)
+		}
+		return out
+	}
+	out := make([]string, 0, len(t.DependsOnExpertIDs))
+	for _, id := range t.DependsOnExpertIDs {
+		out = append(out, "expert:"+id.String())
+	}
+	return out
 }

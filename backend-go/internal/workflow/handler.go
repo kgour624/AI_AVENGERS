@@ -106,6 +106,9 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 		// Absent/false = design only, which is what every workflow did before this
 		// option existed.
 		DeliverCode bool `json:"deliver_code"`
+		// Plan is the client-defined workflow: expert + output + instructions +
+		// dependencies. Empty preserves the existing default planner/phase flow.
+		Plan []WorkflowPlanStep `json:"plan"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_INPUT", err.Error())
@@ -117,6 +120,11 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 	roleStr, _ := role.(string)
 	if err := auth.MustHaveExpertAccess(c.Request.Context(), h.engine.DB(), clientID, roleStr, req.SelectedExpertIDs); err != nil {
 		response.Forbidden(c, err.Error())
+		return
+	}
+	orderedPlan, err := ValidateWorkflowPlan(req.Plan, req.SelectedExpertIDs)
+	if err != nil {
+		response.BadRequest(c, "INVALID_WORKFLOW_PLAN", err.Error())
 		return
 	}
 
@@ -152,6 +160,19 @@ func (h *Handler) CreateWorkflow(c *gin.Context) {
 				zap.String("workflow_id", w.ID.String()),
 				zap.Error(err),
 			)
+		}
+	}
+	if len(orderedPlan) > 0 {
+		if _, err := h.store.Post(c.Request.Context(), blackboard.PostRequest{
+			WorkflowID:     w.ID,
+			EventType:      WorkflowPlanEvent,
+			PostedByClient: true,
+			Content:        orderedPlan,
+		}); err != nil {
+			h.logger.Error("create workflow: could not persist configured plan", zap.Error(err))
+			_ = h.engine.Fail(c.Request.Context(), w.ID, "workflow plan could not be saved")
+			response.InternalError(c)
+			return
 		}
 	}
 
