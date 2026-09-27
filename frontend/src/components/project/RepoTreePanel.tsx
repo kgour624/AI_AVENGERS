@@ -117,7 +117,10 @@ function TreeRow({ node, depth, collapsed, onToggle, selectedPath, onSelect }: T
 
   // has_content false is shown, not hidden: the client should see that their
   // repository contains the file even when we chose not to store its bytes.
-  const canOpen = node.entry?.has_content ?? false
+  // Openable even when content was not stored during sync: the API fetches that
+  // single file from the provider on demand the first time it is opened, so the
+  // old "metadata only" gate only disabled the click and hid a working feature.
+  const canOpen = Boolean(node.entry ?? node.children)
   const isSelected = selectedPath === node.path
 
   return (
@@ -125,7 +128,7 @@ function TreeRow({ node, depth, collapsed, onToggle, selectedPath, onSelect }: T
       type="button"
       onClick={() => canOpen && onSelect(node.path)}
       disabled={!canOpen}
-      title={canOpen ? node.path : `${node.path} — content not stored (binary, unsupported, or too large)`}
+      title={node.entry?.has_content ? node.path : `${node.path} — opened on demand from the repository`}
       style={indent}
       className={cn(
         'flex w-full items-center justify-between gap-2 rounded px-2 py-1 text-left text-xs',

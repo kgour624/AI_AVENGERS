@@ -1,8 +1,8 @@
 package repo
 
 import (
-	"context"
 	"container/heap"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -368,11 +368,11 @@ func NewService(
 	logger *zap.Logger,
 ) *Service {
 	return &Service{
-		db:       db,
-		embedder: embedder,
-		chunker:  training.NewTextChunker(training.DefaultChunkerConfig()),
+		db:            db,
+		embedder:      embedder,
+		chunker:       training.NewTextChunker(training.DefaultChunkerConfig()),
 		encryptionKey: []byte(encryptionKey),
-		redis:    redisClient,
+		redis:         redisClient,
 		githubOAuth: OAuthConfig{
 			ClientID:     githubClientID,
 			ClientSecret: githubClientSecret,
@@ -1272,9 +1272,11 @@ func (s *Service) ListRepoTree(ctx context.Context, projectID uuid.UUID) ([]Repo
 func (s *Service) GetRepoFileContent(ctx context.Context, projectID uuid.UUID, path string) (*RepoFileContent, error) {
 	var commitSHA, language, content string
 	var size int
-		var hasContent bool
+	var hasContent bool
+	var connectionID uuid.UUID
 	err := s.db.QueryRow(ctx,
-		`SELECT rf.commit_sha, COALESCE(rf.language, ''), COALESCE(b.content, ''), COALESCE(b.size_bytes, 0), (rf.blob_sha IS NOT NULL)
+		`SELECT rf.commit_sha, COALESCE(rf.language, ''), COALESCE(b.content, ''), COALESCE(b.size_bytes, 0),
+		        (rf.blob_sha IS NOT NULL), rf.repo_connection_id
 		   FROM repo_files rf
 		   LEFT JOIN repo_blobs b ON b.sha = rf.blob_sha
 		  WHERE rf.repo_connection_id = (
@@ -1285,15 +1287,31 @@ func (s *Service) GetRepoFileContent(ctx context.Context, projectID uuid.UUID, p
 		  ORDER BY rf.updated_at DESC
 		  LIMIT 1`,
 		projectID, path,
-	).Scan(&commitSHA, &language, &content, &size, &hasContent)
+	).Scan(&commitSHA, &language, &content, &size, &hasContent, &connectionID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrRepoFileNotFound
 	}
 	if err != nil {
 		return nil, fmt.Errorf("load repo file: %w", err)
 	}
+
+	// On-demand content fetch.
+	//
+	// WHY: a sync stores content only for the files it indexes; every other file
+	// in the tree is metadata-only, which left the client able to SEE a file in
+	// the browser but not open it. Fetching the single requested file the first
+	// time it is opened fixes that without storing a whole repository.
 	if !hasContent {
-		return nil, ErrRepoFileContentUnavailable
+		fetched, fetchedSize, fetchErr := s.fetchAndStoreFileContent(ctx, connectionID, commitSHA, path)
+		if fetchErr != nil {
+			s.logger.Warn("on-demand repo file fetch failed",
+				zap.String("connection_id", connectionID.String()),
+				zap.String("path", path),
+				zap.Error(fetchErr),
+			)
+			return nil, ErrRepoFileContentUnavailable
+		}
+		content, size = fetched, fetchedSize
 	}
 	return &RepoFileContent{
 		Path:      path,
@@ -2618,9 +2636,9 @@ func (h *Handler) ConnectRepo(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Provider     string `json:"provider" binding:"required"`
-		RepoURL      string `json:"repo_url" binding:"required"`
-		AccessToken  string `json:"access_token" binding:"required"`
+		Provider      string `json:"provider" binding:"required"`
+		RepoURL       string `json:"repo_url" binding:"required"`
+		AccessToken   string `json:"access_token" binding:"required"`
 		DefaultBranch string `json:"default_branch"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -2862,4 +2880,46 @@ func (h *Handler) SuggestRepoFiles(c *gin.Context) {
 	}
 
 	response.OK(c, gin.H{"suggestions": suggestions, "count": len(suggestions)})
+}
+
+// fetchAndStoreFileContent pulls one file from the provider and caches it, so a
+// metadata-only tree entry becomes viewable the first time it is opened.
+//
+// The cache key is derived from commit+path rather than the provider's blob
+// hash, because a metadata-only row never stored one; that makes the write
+// idempotent and keeps the pinned revision in the identity.
+func (s *Service) fetchAndStoreFileContent(ctx context.Context, connectionID uuid.UUID, commitSHA, path string) (string, int, error) {
+	var provider, repoURL, branch string
+	if err := s.db.QueryRow(ctx,
+		`SELECT provider, repo_url, default_branch FROM repo_connections WHERE id=$1`, connectionID,
+	).Scan(&provider, &repoURL, &branch); err != nil {
+		return "", 0, fmt.Errorf("load connection for file fetch: %w", err)
+	}
+	token, err := s.accessTokenForConnection(ctx, connectionID)
+	if err != nil {
+		return "", 0, err
+	}
+	content, err := s.fetchFileContent(ctx, provider, repoURL, branch, path, token)
+	if err != nil {
+		return "", 0, err
+	}
+	cacheSHA := "ondemand:" + commitSHA + ":" + path
+	if commitSHA == "" {
+		cacheSHA = "ondemand::" + path
+	}
+	if _, err := s.db.Exec(ctx,
+		`INSERT INTO repo_blobs (sha, size_bytes, content) VALUES ($1, $2, $3)
+		 ON CONFLICT (sha) DO UPDATE SET content = EXCLUDED.content, size_bytes = EXCLUDED.size_bytes`,
+		cacheSHA, len(content), content,
+	); err != nil {
+		return "", 0, fmt.Errorf("cache fetched file content: %w", err)
+	}
+	if _, err := s.db.Exec(ctx,
+		`UPDATE repo_files SET blob_sha = $1, size_bytes = $2, updated_at = NOW()
+		  WHERE repo_connection_id = $3 AND path = $4`,
+		cacheSHA, len(content), connectionID, path,
+	); err != nil {
+		return "", 0, fmt.Errorf("link fetched file content: %w", err)
+	}
+	return content, len(content), nil
 }
