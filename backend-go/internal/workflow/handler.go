@@ -282,18 +282,18 @@ func (h *Handler) GetKanban(c *gin.Context) {
 	defer rows.Close()
 
 	type taskRow struct {
-		ID               uuid.UUID  `json:"id"`
-		WorkflowID       uuid.UUID  `json:"workflow_id"`
-		AssignedExpertID uuid.UUID  `json:"assigned_expert_id"`
-		ExpertName       string     `json:"expert_name"`
-		Domain           string     `json:"domain"`
-		Title            string     `json:"title"`
-		Description      string     `json:"description"`
-		Status           string     `json:"status"`
-		CostUSD          float64    `json:"cost_usd"`
-		StartedAt        *string    `json:"started_at"`
-		CompletedAt      *string    `json:"completed_at"`
-		UpdatedAt        string     `json:"updated_at"`
+		ID               uuid.UUID `json:"id"`
+		WorkflowID       uuid.UUID `json:"workflow_id"`
+		AssignedExpertID uuid.UUID `json:"assigned_expert_id"`
+		ExpertName       string    `json:"expert_name"`
+		Domain           string    `json:"domain"`
+		Title            string    `json:"title"`
+		Description      string    `json:"description"`
+		Status           string    `json:"status"`
+		CostUSD          float64   `json:"cost_usd"`
+		StartedAt        *string   `json:"started_at"`
+		CompletedAt      *string   `json:"completed_at"`
+		UpdatedAt        string    `json:"updated_at"`
 	}
 
 	var tasks []taskRow
@@ -370,6 +370,7 @@ func (h *Handler) RunWorkflow(runner *WorkflowRunner) gin.HandlerFunc {
 		})
 	}
 }
+
 // Body: {decision, notes?}
 // decision: approve | approve_with_notes | request_changes | reject_and_restart_phase | cancel_workflow
 func (h *Handler) RespondToApproval(c *gin.Context) {
@@ -662,4 +663,38 @@ func (h *Handler) RetryTask(c *gin.Context) {
 		zap.String("task_id", taskID.String()),
 	)
 	response.OK(c, gin.H{"status": "task reset to todo"})
+}
+
+// DeleteWorkflow DELETE /workflows/:id
+//
+// Every table that references a workflow cascades (checked against the live
+// schema), so removing the row also removes its tasks, artifacts, chats and
+// approvals. A RUNNING workflow is refused instead: its runner is still writing,
+// and deleting underneath it would leave orphaned work and confusing errors.
+func (h *Handler) DeleteWorkflow(c *gin.Context) {
+	workflowID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
+		return
+	}
+	clientID := c.MustGet("user_id").(uuid.UUID)
+
+	var status string
+	if err := h.engine.DB().QueryRow(c.Request.Context(),
+		`SELECT status FROM workflows WHERE id=$1 AND client_id=$2`, workflowID, clientID,
+	).Scan(&status); err != nil {
+		response.NotFound(c, "workflow")
+		return
+	}
+	if status == "running" || status == "paused_for_approval" {
+		response.Conflict(c, "stop the workflow before deleting it")
+		return
+	}
+	if _, err := h.engine.DB().Exec(c.Request.Context(),
+		`DELETE FROM workflows WHERE id=$1 AND client_id=$2`, workflowID, clientID); err != nil {
+		h.logger.Error("delete workflow failed", zap.String("workflow_id", workflowID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"status": "deleted"})
 }

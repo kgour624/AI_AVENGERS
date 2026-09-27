@@ -1197,3 +1197,9 @@ export const classifyExpertDepthLayers = (expertId: string) =>
       `/api/v1/admin/experts/${expertId}/depth-layers`,
     )
     .then((res) => res.data.data!.job)
+
+// Soft-deletes an expert (deleted_at) so history stays auditable but the expert
+// disappears from every picker. Disable uses the existing update call
+// (isActive: false).
+export const deleteExpert = (expertId: string) =>
+  baseAPI.delete<ApiResponse<{ status: string }>>(`/api/v1/admin/experts/${expertId}`).then((res) => res.data.data!)

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
-import { useQuery } from '@tanstack/react-query'
-import { listWorkflows } from '@/api/workflows'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { listWorkflows, deleteWorkflow } from '@/api/workflows'
 import { queryKeys } from '@/api/queryKeys'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
@@ -9,6 +9,7 @@ import { Button } from '@/components/ui/Button'
 import { Skeleton } from '@/components/ui/Skeleton'
 import { CreateWorkflowModal } from './CreateWorkflowModal'
 import { cn } from '@/utils/cn'
+import { handleAPIError } from '@/utils/errors'
 
 const STATUS_VARIANT: Record<string, 'brand' | 'neutral' | 'warning' | 'danger'> = {
   draft:                   'neutral',
@@ -22,6 +23,7 @@ const STATUS_VARIANT: Record<string, 'brand' | 'neutral' | 'warning' | 'danger'>
 
 function WorkflowsPage() {
   const [isCreateOpen, setIsCreateOpen] = useState(false)
+  const queryClient = useQueryClient()
 
   const { data: workflows = [], isLoading } = useQuery({
     queryKey: queryKeys.workflows.all,
@@ -90,6 +92,31 @@ function WorkflowsPage() {
                 >
                   View Kanban
                 </Link>
+                <button
+                  type="button"
+                  title={
+                    wf.status === 'running' || wf.status === 'paused_for_approval'
+                      ? 'Stop the workflow before deleting it'
+                      : 'Delete this workflow and everything it produced'
+                  }
+                  onClick={async () => {
+                    const active = wf.status === 'running' || wf.status === 'paused_for_approval'
+                    if (active) {
+                      window.alert('This workflow is still running. Stop it first, then delete.')
+                      return
+                    }
+                    if (!window.confirm(`Delete "${wf.title}"? Its tasks, files and chats will be removed.`)) return
+                    try {
+                      await deleteWorkflow(wf.id)
+                      await queryClient.invalidateQueries({ queryKey: queryKeys.workflows.all })
+                    } catch (deleteErr) {
+                      window.alert(handleAPIError(deleteErr))
+                    }
+                  }}
+                  className="rounded-md border border-glass-border px-2.5 py-1 text-xs text-text-secondary transition-all hover:border-mode-refuse/40 hover:text-mode-refuse"
+                >
+                  Delete
+                </button>
               </div>
             </div>
           </Card>

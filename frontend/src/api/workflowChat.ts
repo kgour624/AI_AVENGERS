@@ -188,3 +188,7 @@ export const proposeChange = (chatId: string, changeGoal: string) =>
       { changeGoal }
     )
     .then((res) => res.data.data!)
+
+/** Deletes one workflow conversation (its messages and participants cascade). */
+export const deleteWorkflowChat = (chatId: string) =>
+  baseAPI.delete<ApiResponse<{ status: string }>>(`/api/v1/workflow-chats/${chatId}`).then((res) => res.data.data!)

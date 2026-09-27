@@ -1281,3 +1281,20 @@ func (s *WorkflowChatService) buildUserPrompt(deliverable, sections, history, qu
 
 	return sb.String()
 }
+
+// DeleteChat removes a conversation owned by this client.
+//
+// WHY ownership is checked in the WHERE clause: deleting by id alone would let
+// any client delete another client's thread. A zero-row result is reported so
+// the caller sees "not found" instead of a silent success.
+func (s *WorkflowChatService) DeleteChat(ctx context.Context, chatID, clientID uuid.UUID) error {
+	tag, err := s.db.Exec(ctx,
+		`DELETE FROM workflow_chats WHERE id = $1 AND client_id = $2`, chatID, clientID)
+	if err != nil {
+		return fmt.Errorf("delete workflow chat: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("workflow chat not found")
+	}
+	return nil
+}

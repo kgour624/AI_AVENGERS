@@ -6,6 +6,7 @@ import {
   getWorkflowChat,
   listWorkflowChatMessages,
   sendWorkflowChatMessage,
+  deleteWorkflowChat,
   getWorkflowFiles,
   addChatParticipant,
   removeChatParticipant,
@@ -458,7 +459,7 @@ function ChatThread({
 export function WorkflowChatPanel({ workflowId, availableExperts }: Props) {
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
 
-  const { data: chats = [], isLoading } = useQuery({
+  const { data: chats = [], isLoading, refetch: refetchChats } = useQuery({
     queryKey: queryKeys.workflows.chats(workflowId),
     queryFn: () => listWorkflowChats(workflowId),
   })
@@ -487,21 +488,39 @@ export function WorkflowChatPanel({ workflowId, availableExperts }: Props) {
                 </p>
               )}
               {chats.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => setActiveChatId(c.id)}
-                  className={cn(
-                    'block w-full px-3 py-2 text-left text-xs',
-                    activeChatId === c.id
-                      ? 'bg-surface-overlay text-text-primary'
-                      : 'text-text-secondary hover:bg-surface-overlay/60'
-                  )}
-                >
-                  <span className="block truncate font-medium">{c.title}</span>
-                  <span className="block text-[10px] text-text-disabled">
-                    {c.messageCount} message{c.messageCount === 1 ? '' : 's'}
-                  </span>
-                </button>
+                <div key={c.id} className="group flex items-center">
+                  <button
+                    onClick={() => setActiveChatId(c.id)}
+                    className={cn(
+                      'block flex-1 px-3 py-2 text-left text-xs',
+                      activeChatId === c.id
+                        ? 'bg-surface-overlay text-text-primary'
+                        : 'text-text-secondary hover:bg-surface-overlay/60'
+                    )}
+                  >
+                    <span className="block truncate font-medium">{c.title}</span>
+                    <span className="block text-[10px] text-text-disabled">
+                      {c.messageCount} message{c.messageCount === 1 ? '' : 's'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    title="Delete this conversation"
+                    aria-label="Delete this conversation"
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      if (!window.confirm(`Delete "${c.title}"? This cannot be undone.`)) return
+                      await deleteWorkflowChat(c.id)
+                      if (activeChatId === c.id) setActiveChatId('')
+                      // Refresh the list so the deleted conversation disappears
+                      // immediately instead of lingering until the next reload.
+                      await refetchChats()
+                    }}
+                    className="mr-1 rounded px-2 py-1 text-xs text-text-disabled opacity-0 transition group-hover:opacity-100 hover:text-mode-refuse"
+                  >
+                    Delete
+                  </button>
+                </div>
               ))}
             </div>
           </div>
