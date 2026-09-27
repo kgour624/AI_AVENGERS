@@ -1,5 +1,6 @@
 import { useAuthStore } from '@/stores/authStore'
 import { useStreamStore } from '@/stores/streamStore'
+import { refreshSession } from '@/api/base'
 import { camelizeKeys } from '@/utils/casing'
 import type { ExpertResponse, SynthesisResult } from '@/types/expert'
 
@@ -177,6 +178,27 @@ export function useSSEStream() {
       // preflight rejection) - distinct from an HTTP error status.
       setError(chatId, `Network error: ${String(networkError)}`)
       return
+    }
+
+    // The stream uses raw fetch, so the axios 401-refresh interceptor never runs
+    // for it. When the session token expires mid-answer the stream was simply
+    // cut with "HTTP 401" and the client lost the response. Refresh once and
+    // retry the same request, which is what kept failing in production.
+    if (response.status === 401) {
+      try {
+        await refreshSession()
+        const refreshed = useAuthStore.getState().accessToken
+        if (refreshed) headers['Authorization'] = `Bearer ${refreshed}`
+        const retry = await fetch(
+          `${import.meta.env.VITE_API_URL}/api/v1/chats/${chatId}/messages`,
+          { method: 'POST', headers, body, credentials: 'include' },
+        )
+        if (retry.ok) {
+          response = retry
+        }
+      } catch {
+        // fall through to the normal error path below
+      }
     }
 
     if (!response.ok) {

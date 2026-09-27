@@ -34,6 +34,10 @@ var ValidSectionTypes = map[SectionType]bool{
 type TemplateSection struct {
 	Key      string      `json:"key"`
 	Label    string      `json:"label"`
+	// MaxWords is the admin's per-section length cap (0 = no limit). It is
+	// enforced in the structured prompt so an answer's shape is controlled by
+	// the category instead of by the model's mood.
+	MaxWords int `json:"max_words,omitempty"`
 	Type     SectionType `json:"type"`
 	Required bool        `json:"required"`
 	// Description (2026-09-08 RCA fix): optional admin-authored guidance

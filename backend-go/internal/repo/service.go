@@ -18,6 +18,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -2752,6 +2753,33 @@ func (h *Handler) SyncRepo(c *gin.Context) {
 	response.OK(c, map[string]string{"status": "sync started"})
 }
 
+// ListBranches GET /projects/:id/repo/branches
+//
+// The push/check screens use it to offer a branch picker, so the client never has
+// to remember a branch name (GitHub shows main/design-v1; those are the names
+// this returns).
+func (h *Handler) ListBranches(c *gin.Context) {
+	projectID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid project ID")
+		return
+	}
+	if !h.assertProjectAccess(c, projectID) {
+		return
+	}
+	branches, defaultBranch, err := h.svc.ListBranches(c.Request.Context(), projectID)
+	switch {
+	case errors.Is(err, ErrNoRepoConnection):
+		response.NotFound(c, "repo connection")
+		return
+	case err != nil:
+		h.logger.Warn("list repo branches failed", zap.Error(err))
+		response.OK(c, gin.H{"branches": []string{}, "default_branch": "", "error": err.Error()})
+		return
+	}
+	response.OK(c, gin.H{"branches": branches, "default_branch": defaultBranch})
+}
+
 // GetSyncStatus GET /projects/:id/repo/status
 func (h *Handler) GetSyncStatus(c *gin.Context) {
 	projectID, err := uuid.Parse(c.Param("id"))
@@ -2984,4 +3012,68 @@ func (s *Service) fetchAndStoreFileContent(ctx context.Context, connectionID uui
 		return "", 0, fmt.Errorf("link fetched file content: %w", err)
 	}
 	return content, len(content), nil
+}
+
+// ListBranches returns the connected repository's branch names and its default
+// branch, so a client can pick a branch instead of remembering its name.
+//
+// WHY the provider API rather than the synced tree: the sync only knows the one
+// branch it indexed. The push/check screens need every branch that exists, which
+// is exactly what GitHub's /branches and GitLab's /repository/branches expose.
+func (s *Service) ListBranches(ctx context.Context, projectID uuid.UUID) ([]string, string, error) {
+	var provider, repoURL, defaultBranch string
+	if err := s.db.QueryRow(ctx,
+		`SELECT provider, repo_url, COALESCE(default_branch,'')
+		   FROM repo_connections WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1`,
+		projectID,
+	).Scan(&provider, &repoURL, &defaultBranch); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, "", ErrNoRepoConnection
+		}
+		return nil, "", fmt.Errorf("load repo connection: %w", err)
+	}
+	token, err := s.accessTokenForConnection(ctx, projectID)
+	if err != nil {
+		return nil, "", err
+	}
+
+	var apiURL string
+	switch provider {
+	case ProviderGitHub:
+		apiURL = fmt.Sprintf("https://api.github.com/repos/%s/branches?per_page=100", extractOwnerRepo(repoURL))
+	case ProviderGitLab:
+		apiURL = fmt.Sprintf("https://gitlab.com/api/v4/projects/%s/repository/branches?per_page=100",
+			url.QueryEscape(extractGitLabPath(repoURL)))
+	default:
+		return nil, "", fmt.Errorf("unsupported provider: %s", provider)
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return nil, "", fmt.Errorf("list branches: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("list branches: provider returned %d", resp.StatusCode)
+	}
+
+	var payload []struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, "", fmt.Errorf("decode branches: %w", err)
+	}
+	names := make([]string, 0, len(payload))
+	for _, b := range payload {
+		if strings.TrimSpace(b.Name) != "" {
+			names = append(names, b.Name)
+		}
+	}
+	sort.Strings(names)
+	if defaultBranch == "" && len(names) > 0 {
+		defaultBranch = names[0]
+	}
+	return names, defaultBranch, nil
 }

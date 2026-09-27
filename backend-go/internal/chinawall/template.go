@@ -76,6 +76,9 @@ func buildStructuredPrompt(
 	sb.WriteString("\n\nCRITICAL RULES:\n")
 	sb.WriteString("1. Respond with STRICT JSON ONLY — no markdown, no prose outside the JSON object.\n")
 	sb.WriteString(fmt.Sprintf("2. The JSON object must have EXACTLY these keys: %s\n", sectionKeysList(sections)))
+	if limits := wordLimitsRule(sections); limits != "" {
+		sb.WriteString(limits)
+	}
 	if profile.CitationMode == CitationModeLoose {
 		// LOOSE: mirrors generateFlatText's loose-mode system prompt.
 		// WHY: forcing a strict per-claim citation rule on a domain whose
@@ -308,4 +311,23 @@ func renderTestCaseBuckets(val json.RawMessage) (string, error) {
 		}
 	}
 	return sb.String(), nil
+}
+
+// wordLimitsRule renders the admin's per-section word caps as one prompt rule.
+//
+// WHY a prompt rule and not a post-hoc truncation: cutting a section after the
+// fact can remove the conclusion of a code block or a citation, which is worse
+// than asking for the right length up front. Only sections with a positive cap
+// are listed, so an unconfigured category produces exactly the old prompt.
+func wordLimitsRule(sections []category.TemplateSection) string {
+	var parts []string
+	for _, s := range sections {
+		if s.MaxWords > 0 {
+			parts = append(parts, fmt.Sprintf("%s: at most %d words", s.Label, s.MaxWords))
+		}
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "Section length limits (match the SHAPE the client asked for): " + strings.Join(parts, "; ") + ". "
 }
