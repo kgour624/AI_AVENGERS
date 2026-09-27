@@ -22,6 +22,7 @@ type Handler struct {
 	store     *blackboard.Store
 	redis     *redis.Client
 	projector *Projector
+	runner    *WorkflowRunner
 	logger    *zap.Logger
 }
 
@@ -697,4 +698,56 @@ func (h *Handler) DeleteWorkflow(c *gin.Context) {
 		return
 	}
 	response.OK(c, gin.H{"status": "deleted"})
+}
+
+// SetWorkflowRunner lets the server hand the handler the runner it needs to
+// re-enter a phase on an existing workflow (code delivery).
+func (h *Handler) SetWorkflowRunner(runner *WorkflowRunner) { h.runner = runner }
+
+// EnableCodeDelivery POST /workflows/:id/deliver-code
+//
+// WHY: deliver_code could only be chosen at creation, so a design-only workflow
+// that had already finished had no way to ask for code — the client had to
+// create a second workflow and re-run the whole design. This turns code delivery
+// on for THIS workflow and re-enters the implementation phase, keeping the
+// approved design as the input.
+func (h *Handler) EnableCodeDelivery(c *gin.Context) {
+	workflowID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
+		return
+	}
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	ctx := context.Background()
+
+	tag, err := h.engine.DB().Exec(ctx,
+		`UPDATE workflows
+		    SET deliver_code = TRUE,
+		        status = 'running',
+		        current_phase = 'implementation',
+		        phase_completed_at = NULL,
+		        failure_reason = NULL,
+		        -- The crash-recovery checkpoint still points at the finished phase;
+		        -- clearing it is what makes the runner execute implementation
+		        -- instead of resuming straight past it.
+		        runner_state = NULL,
+		        updated_at = NOW()
+		  WHERE id = $1 AND client_id = $2 AND status IN ('completed','failed')`,
+		workflowID, clientID)
+	if err != nil {
+		h.logger.Error("enable code delivery failed", zap.String("workflow_id", workflowID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		response.Conflict(c, "code generation can only be enabled on a finished workflow of yours")
+		return
+	}
+	if h.projector != nil {
+		go h.projector.Run(ctx, workflowID)
+	}
+	if h.runner != nil {
+		go h.runner.Run(ctx, workflowID)
+	}
+	response.OK(c, gin.H{"status": "code_delivery_enabled"})
 }

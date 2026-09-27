@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { listWorkflows, deleteWorkflow } from '@/api/workflows'
 import { queryKeys } from '@/api/queryKeys'
+import { useAuthStore } from '@/stores/authStore'
+import { PublicShareModal, WorkflowFilesModal } from '@/components/workflow/WorkflowShareModals'
 import { Card } from '@/components/ui/Card'
 import { Badge } from '@/components/ui/Badge'
 import { Button } from '@/components/ui/Button'
@@ -22,6 +24,10 @@ const STATUS_VARIANT: Record<string, 'brand' | 'neutral' | 'warning' | 'danger'>
 }
 
 function WorkflowsPage() {
+  const isAdmin = useAuthStore((st) => st.isAdmin())
+  const [filesFor, setFilesFor] = useState<string | null>(null)
+  const [shareFor, setShareFor] = useState<string | null>(null)
+
   const [isCreateOpen, setIsCreateOpen] = useState(false)
   const queryClient = useQueryClient()
 
@@ -92,6 +98,24 @@ function WorkflowsPage() {
                 >
                   View Kanban
                 </Link>
+                {isAdmin && (
+                  <>
+                    <button
+                      type="button"
+                      className="rounded-md border border-glass-border px-2.5 py-1 text-xs text-text-secondary transition-all hover:border-brand/40 hover:text-brand"
+                      onClick={() => setFilesFor(wf.id)}
+                    >
+                      Files
+                    </button>
+                    <button
+                      type="button"
+                      className="rounded-md border border-glass-border px-2.5 py-1 text-xs text-text-secondary transition-all hover:border-brand/40 hover:text-brand"
+                      onClick={() => setShareFor(wf.id)}
+                    >
+                      Public
+                    </button>
+                  </>
+                )}
                 <button
                   type="button"
                   title={
@@ -122,6 +146,8 @@ function WorkflowsPage() {
           </Card>
         ))}
       </div>
+      {filesFor && <WorkflowFilesModal workflowId={filesFor} open onClose={() => setFilesFor(null)} />}
+      {shareFor && <PublicShareModal workflowId={shareFor} open onClose={() => setShareFor(null)} />}
 
       <CreateWorkflowModal isOpen={isCreateOpen} onClose={() => setIsCreateOpen(false)} />
     </div>

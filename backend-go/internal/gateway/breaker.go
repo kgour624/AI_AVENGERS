@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -198,6 +200,15 @@ func (b *Breaker) RecordFailure(provider string, cause error) {
 	if b == nil || !b.cfg.Enabled {
 		return
 	}
+	// A cancelled request is not a provider outage: the caller gave up (client
+	// disconnected, our own deadline fired), so the provider was never proven
+	// unhealthy. Counting it opened the breaker during a slow answer — three
+	// cancellations in a row blacklisted the provider for a minute and every
+	// remaining section was then generated as empty content.
+	if cause != nil && errors.Is(cause, context.Canceled) {
+		return
+	}
+
 	b.mu.Lock()
 	defer b.mu.Unlock()
 

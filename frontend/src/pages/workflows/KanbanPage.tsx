@@ -1,7 +1,7 @@
 import { useParams, useNavigate } from 'react-router-dom'
 import { useMemo, useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getBlackboard, getWorkflow, respondToApproval, cancelWorkflow, retryTask } from '@/api/workflows'
+import { enableCodeDelivery, getBlackboard, getWorkflow, respondToApproval, cancelWorkflow, retryTask } from '@/api/workflows'
 import { useKanbanStream } from '@/hooks/useKanbanStream'
 import { useFileStream } from '@/hooks/useFileStream'
 import type { BlackboardEvent, KanbanTask } from '@/api/workflows'
@@ -611,6 +611,22 @@ type WorkspaceTab = 'board' | 'deliverables' | 'activity' | 'files' | 'codebase'
 
 function KanbanPage() {
   const { id } = useParams<{ id: string }>()
+  const queryClient = useQueryClient()
+  const [enablingCode, setEnablingCode] = useState(false)
+
+  // Design-only workflows used to be a dead end: deliver_code could only be
+  // chosen at creation. This switches code generation on for THIS workflow and
+  // re-enters implementation with the approved design as the input.
+  const handleEnableCode = async () => {
+    if (!id) return
+    setEnablingCode(true)
+    try {
+      await enableCodeDelivery(id)
+      queryClient.invalidateQueries({ queryKey: ['workflow', id] })
+    } finally {
+      setEnablingCode(false)
+    }
+  }
 
   // Workflow metadata: title, status, cost — poll every 10s (lightweight)
   const { data: workflow } = useQuery({
@@ -757,6 +773,16 @@ function KanbanPage() {
               <span className="text-xs text-text-disabled">
                 ${workflow.costSpentUsd.toFixed(4)} / ${workflow.costBudgetUsd.toFixed(2)}
               </span>
+              {!workflow.deliverCode && workflow.status === 'completed' && (
+                <button
+                  type="button"
+                  onClick={handleEnableCode}
+                  disabled={enablingCode}
+                  className="rounded-md border border-border-subtle bg-white/5 px-3 py-1 text-xs font-medium text-text-primary transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {enablingCode ? 'Starting...' : 'Generate code from this design'}
+                </button>
+              )}
             </>
           )}
         </div>

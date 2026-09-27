@@ -164,6 +164,16 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   // Feature #6: Persistent expert selection with lock toggle
   const [isLocked, setIsLocked] = useState(() => loadLockState(chatId))
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => {
+
+  // Collaborative means "merge several experts' answers". With fewer than two
+  // experts selected there is nothing to merge, and the control used to stay on
+  // Collaborative anyway — the mode is pulled back to Independent as soon as the
+  // selection drops below two.
+  useEffect(() => {
+    if (selectedIds.size < 2 && answerMode === 'collaborative') {
+      setAnswerMode('independent')
+    }
+  }, [selectedIds.size, answerMode])
     // Load persisted selection if locked, otherwise start empty
     return isLocked ? loadPersistedSelection(chatId) : new Set()
   })
@@ -473,7 +483,12 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
           className="rounded-md border border-surface-border bg-surface-overlay px-2 py-1 text-xs text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
         >
           <option value="independent">Independent</option>
-          <option value="collaborative">Collaborative</option>
+          {/* One expert has nothing to merge: the option is disabled and the
+              mode is forced back to Independent below, so the composer can never
+              claim "Collaborative" while a single expert is selected. */}
+          <option value="collaborative" disabled={selectedIds.size < 2}>
+            {selectedIds.size < 2 ? 'Collaborative (needs 2+ experts)' : 'Collaborative'}
+          </option>
         </select>
 
         {/* T-GEN: answer basis — trained-only by default, matching the strict

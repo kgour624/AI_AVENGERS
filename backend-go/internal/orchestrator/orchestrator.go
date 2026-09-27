@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -338,9 +340,25 @@ func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*O
 		close(resultCh)
 	}()
 
-	// Collect results with timeout
-	// WHY 120s timeout: LLM calls + self-learning steps can take 30-60s for complex problems.
-	timeoutCtx, cancel := context.WithTimeout(ctx, 300*time.Second)
+	// Collect results with timeout.
+	//
+	// WHY not 120s: the first ceiling was below what a single expert legitimately
+	// needs. Measured on a real answer: context_assembly 11.7s + self_learning
+	// 92.7s + decision_engine 195.6s = ~300s for ONE expert, so the collector
+	// timed out with 0 responses, cancelled the in-flight LLM calls ("context
+	// canceled"), and the user saw "all experts failed or timed out" with a
+	// half-streamed answer. Upstream raised the ceiling to 300s; that is still
+	// on the edge of a real request, so the default here is 900s and it is
+	// tunable per deployment. Cancellation is unchanged: this context is derived
+	// from the request, so a client disconnect still cancels immediately.
+	collectTimeout := 900 * time.Second
+	if v := strings.TrimSpace(os.Getenv("ORCHESTRATOR_COLLECT_TIMEOUT_SECONDS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			collectTimeout = time.Duration(n) * time.Second
+		}
+	}
+	timeoutCtx, cancel := context.WithTimeout(ctx, collectTimeout)
+
 	defer cancel()
 
 	var expertResponses []ExpertResponse

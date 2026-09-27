@@ -764,6 +764,7 @@ func buildRouter(
 	// A change request on a FINISHED workflow must actually re-run the design,
 	// not just acknowledge in chat; this gives the handler the runner to wake.
 	wfChatHandler.SetWorkflowWaker(wfProjector, wfRunner)
+	wfHandler.SetWorkflowRunner(wfRunner)
 	wfChatSvc.SetRepoService(repoSvc)
 
 	// Change requests (§6/§7 redesign): client free-text goals from workflow chat
@@ -1001,6 +1002,10 @@ func buildRouter(
 			workflows.POST("/:id/run", wfHandler.RunWorkflow(wfRunner))
 			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
 			workflows.DELETE("/:id", wfHandler.DeleteWorkflow)
+			workflows.POST("/:id/deliver-code", wfHandler.EnableCodeDelivery)
+			workflows.GET("/:id/file-content", wfHandler.GetWorkflowFileContent)
+			workflows.GET("/:id/publications", wfHandler.ListPublications)
+			workflows.POST("/:id/publications", wfHandler.CreatePublication)
 			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
 			// Authoritative produced-file list (path + owning expert + has
 			// content) so the chat can offer a file picker and route a question
@@ -1055,8 +1060,21 @@ func buildRouter(
 	// ============================================================
 	// Admin routes — JWT + admin role required
 	// ============================================================
+	// Public design sharing: the ONE integration point for the landing page.
+	// No auth and no admin id in the path — the token selects the publication,
+	// so any number of admin accounts share this single endpoint.
+	publicGroup := v1.Group("/public")
+	{
+		publicGroup.GET("/designs/:token", wfHandler.GetPublicDesign)
+		publicGroup.GET("/designs/:token/file", wfHandler.GetPublicDesignFile)
+	}
+
 	adminGroup := v1.Group("/admin")
 	adminGroup.Use(middleware.AuthMiddleware(jwtService, logger))
+	// Publications live under the admin group so only admins can create or push
+	// them; the public read path shares the same store but has no write route.
+	publications := adminGroup.Group("/publications")
+	publications.POST("/:id/push", wfHandler.PushToPublication)
 	adminGroup.Use(middleware.AdminMiddleware())
 	{
 		adminGroup.GET("/experts", adminHandler.ListExperts)
