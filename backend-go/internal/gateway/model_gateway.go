@@ -127,7 +127,7 @@ func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 			Timeout: 300 * time.Second,
 			Transport: &http.Transport{
 				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
+				ResponseHeaderTimeout: 240 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},

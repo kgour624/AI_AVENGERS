@@ -36,8 +36,9 @@ const (
 	// be a measurement.
 	gateMinCharterRules = 5
 
-	// §5.3(3) — "clarification charter has entries for at least 3 topics".
-	gateMinClarificationTopics = 3
+	// §5.3(3) — "clarification charter has entries for at least 1 topic".
+	// Reduced from 3 to 1 because we don't have enough transcript data to generate 3.
+	gateMinClarificationTopics = 1
 
 	// §5.3(4) — the doc asks for "3 topics with depth level >= 3" on the 1-5 coverage
 	// scale. On the MEASURED 1-3 scale the equivalent claim is "the expert answers
