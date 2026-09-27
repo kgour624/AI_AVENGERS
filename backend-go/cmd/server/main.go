@@ -733,6 +733,9 @@ func buildRouter(
 		wfToolRegistry, workspaceRoot, logger,
 	)
 	wfChatHandler := workflow.NewChatHandler(wfChatSvc, logger)
+	// A change request on a FINISHED workflow must actually re-run the design,
+	// not just acknowledge in chat; this gives the handler the runner to wake.
+	wfChatHandler.SetWorkflowWaker(wfProjector, wfRunner)
 
 	// Change requests (§6/§7 redesign): client free-text goals from workflow chat
 	// become change_requests rows + blackboard events; the runner watches and
