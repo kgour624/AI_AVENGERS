@@ -124,10 +124,10 @@ func NewModelGateway(cfg config.LLMConfig, logger *zap.Logger) *ModelGateway {
 		// the entire round-trip including body read — kept for streaming
 		// compatibility (streaming body reads can legitimately take >60s).
 		httpClient: &http.Client{
-			Timeout: 120 * time.Second,
+			Timeout: 300 * time.Second,
 			Transport: &http.Transport{
 				TLSHandshakeTimeout:   10 * time.Second,
-				ResponseHeaderTimeout: 30 * time.Second,
+				ResponseHeaderTimeout: 240 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,
 			},
 		},

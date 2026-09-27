@@ -148,7 +148,7 @@ function AmendmentCard({ workflowId, amendment }: { workflowId: string; amendmen
                 isLoading={respond.isPending}
                 onClick={() => respond.mutate({ decision: 'approve' })}
               >
-                \u2713 Approve
+                ✓ Approve
               </Button>
               <Button size="sm" variant="secondary" onClick={() => setEditing(true)}>
                 Edit & approve

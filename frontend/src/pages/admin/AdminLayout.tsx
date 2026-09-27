@@ -78,7 +78,7 @@ export function AdminLayout() {
       <div className="flex flex-1 overflow-hidden">
       <aside className="w-56 flex-shrink-0 border-r border-glass-border bg-surface-raised/70 p-4 backdrop-blur-xl">
         <p className="mb-4 font-semibold tracking-wide [text-shadow:0_0_12px_var(--glow-purple)]">
-          {'\u26A1'} AI Avengers Admin
+          {'⚡'} AI Avengers Admin
         </p>
         <nav className="flex flex-col gap-1">
           {NAV_ITEMS.map((item) => (
@@ -102,7 +102,7 @@ export function AdminLayout() {
           to="/"
           className="mt-4 block border-t border-glass-border pt-3 text-sm text-text-secondary hover:text-text-primary"
         >
-          {'\u2190'} Back to App
+          {'←'} Back to App
         </Link>
       </aside>
       <main className="min-w-0 flex-1 overflow-y-auto">

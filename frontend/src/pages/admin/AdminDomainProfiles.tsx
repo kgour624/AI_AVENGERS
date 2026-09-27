@@ -153,10 +153,10 @@ function AdminDomainProfiles() {
               <div>
                 <p className="font-medium text-text-primary">{p.domain}</p>
                 <p className="mt-1 text-xs text-text-disabled">
-                  {p.coverageMode} {'\u00b7'} {p.citationMode} {'\u00b7'} {p.stripMode}
+                  {p.coverageMode} {'·'} {p.citationMode} {'·'} {p.stripMode}
                   {p.gate1Skip && (
                     <>
-                      {' \u00b7 '}
+                      {' · '}
                       <Badge variant="brand">gate1 skip</Badge>
                     </>
                   )}

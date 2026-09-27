@@ -49,10 +49,10 @@ function AdminStats() {
                     ProjectMemoryPanel) - this file had never been
                     audited for it until now. Wrapped in {'...'}. */}
                 <p className="text-sm">
-                  {'\u2b50'} {r.avgScore.toFixed(1)} ({r.totalRatings})
+                  {'⭐'} {r.avgScore.toFixed(1)} ({r.totalRatings})
                 </p>
                 <p className="text-xs text-text-disabled">
-                  {r.goodRatings} good{' \u00b7 '}
+                  {r.goodRatings} good{' · '}
                   {r.badRatings} bad
                 </p>
               </div>
@@ -71,9 +71,9 @@ function AdminStats() {
           {violations.map((v) => (
             <p key={v.id} className="text-sm text-text-secondary">
               <span className="text-text-disabled">{formatRelativeTime(v.createdAt)}</span>
-              {' \u00b7 '}
+              {' · '}
               {v.eventType}
-              {' \u2014 '}
+              {' — '}
               {v.reasoning}
             </p>
           ))}

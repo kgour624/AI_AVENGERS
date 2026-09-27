@@ -132,7 +132,7 @@ function ParticipantsRow({
             className="ml-1.5 text-text-disabled hover:text-mode-refuse"
             aria-label={`Remove ${p.expertName}`}
           >
-            \u00d7
+            {"×"}
           </button>
         </Badge>
       ))}

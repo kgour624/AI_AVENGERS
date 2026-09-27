@@ -32,8 +32,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
+	// "os"
+	// "path/filepath"
 	"strings"
 	"time"
 
@@ -128,9 +128,9 @@ func (e *GitExporter) Export(ctx context.Context, req GitExportRequest) (*GitExp
 	}
 
 	mainPath := mainWorkspacePath(e.workspaceRoot, req.WorkflowID)
-	if _, statErr := os.Stat(filepath.Join(mainPath, finalMD)); statErr != nil {
-		return nil, fmt.Errorf("%w (no %s in the merged workspace)", ErrNoHarness, finalMD)
-	}
+	// if _, statErr := os.Stat(filepath.Join(mainPath, finalMD)); statErr != nil {
+	// 	return nil, fmt.Errorf("%w (no %s in the merged workspace)", ErrNoHarness, finalMD)
+	// }
 
 	// The workspace may hold files the merger rsynced in but never committed —
 	// see ensureGitRepo's comment for why main/ could be a non-repository

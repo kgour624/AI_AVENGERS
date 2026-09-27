@@ -320,7 +320,7 @@ func (s *CodebaseService) requirementText(ctx context.Context, workflowID uuid.U
 	err := s.db.QueryRow(ctx,
 		`SELECT content FROM blackboard_events
 		  WHERE workflow_id=$1 AND event_type='requirement_captured'
-		  ORDER BY created_at DESC LIMIT 1`,
+		  ORDER BY posted_at DESC LIMIT 1`,
 		workflowID,
 	).Scan(&raw)
 	if err != nil {

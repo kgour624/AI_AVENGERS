@@ -82,7 +82,9 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   )
 
   function addPlanStep() {
-    const id = crypto.randomUUID()
+    const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).substring(2)
     const previous = planSteps.at(-1)
     setPlanSteps((steps) => [
       ...steps,
@@ -283,7 +285,7 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
                     'flex h-3.5 w-3.5 flex-shrink-0 items-center justify-center rounded border text-[9px]',
                     selected ? 'border-brand bg-brand text-white' : 'border-surface-border'
                   )}>
-                    {selected && '\u2713'}
+                    {selected && '✓'}
                   </span>
                   <span className="font-medium">{expert.name}</span>
                   <span className="ml-auto text-text-disabled">{expert.domain}</span>

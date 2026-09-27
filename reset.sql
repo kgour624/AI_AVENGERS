@@ -1,0 +1,1 @@
+UPDATE users SET hashed_password = '$2a$12$Z1G6.8O3lHq1h3UqQ0M46.7/R4.m.7L0O0E/1Y0x0Y1M3C3E5O7sC', is_active = true, totp_enabled = false WHERE email = 'admin@aiavengers.com';

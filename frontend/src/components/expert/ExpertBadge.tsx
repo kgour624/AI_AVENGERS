@@ -51,7 +51,7 @@ export function ExpertBadge({ expert, isSelected, onClick }: ExpertBadgeProps) {
     >
       <span className={cn('h-2 w-2 rounded-full', dotColor)} aria-hidden="true" />
       {expert.expertName}
-      {isSelected && <span aria-hidden="true">\u2713</span>}
+      {isSelected && <span aria-hidden="true">✓</span>}
     </button>
   )
 }

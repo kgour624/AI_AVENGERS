@@ -82,10 +82,15 @@ export function RepoConnectModal({ isOpen, onClose, projectId }: RepoConnectModa
   // rather than staying in this modal - there is no XHR response to
   // await once the redirect happens, by design of the OAuth flow.
   const handleOAuthConnect = async () => {
+    if (!repoUrl.trim()) {
+      setOauthError('Please enter a Repository URL before connecting with OAuth.')
+      return
+    }
     setIsOauthLoading(true)
     setOauthError('')
     try {
-      const { url } = await getOAuthURL(projectId, provider)
+      const branchToUse = defaultBranch.trim() || 'main'
+      const { url } = await getOAuthURL(projectId, provider, repoUrl.trim(), branchToUse)
       window.location.href = url
     } catch (err) {
       setOauthError(err instanceof Error ? err.message : 'Could not start OAuth flow')

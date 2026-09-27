@@ -52,10 +52,10 @@ export const connectRepo = (projectId: string, req: ConnectRepoRequest) =>
 // JSON to a top-level browser navigation (repo/service.go's
 // OAuthCallback, fixed in the same batch as this function). This is
 // what makes a real "1-click" flow possible for the first time.
-export const getOAuthURL = (projectId: string, provider: 'github' | 'gitlab') =>
+export const getOAuthURL = (projectId: string, provider: 'github' | 'gitlab', repoUrl: string, defaultBranch: string) =>
   baseAPI
     .get<ApiResponse<{ url: string; state: string }>>(`/api/v1/repo/oauth/${provider}`, {
-      params: { project_id: projectId },
+      params: { project_id: projectId, repo_url: repoUrl, default_branch: defaultBranch },
     })
     .then((res) => res.data.data!)
 

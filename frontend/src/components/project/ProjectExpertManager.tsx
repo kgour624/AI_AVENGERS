@@ -72,7 +72,7 @@ export function ProjectExpertManager({ projectId, experts }: { projectId: string
               aria-label={`Remove ${e.expertName}`}
               className="absolute -right-1 -top-1 hidden h-4 w-4 rounded-full bg-mode-refuse text-[10px] text-white group-hover:flex group-hover:items-center group-hover:justify-center"
             >
-              {'\u00d7'}
+              {'×'}
             </button>
           </div>
         ))}
