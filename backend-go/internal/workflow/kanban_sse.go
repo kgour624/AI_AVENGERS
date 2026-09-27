@@ -76,6 +76,35 @@ func (h *Handler) StreamKanban(c *gin.Context) {
 	// SSE comment format: lines starting with ':' are ignored by EventSource.
 	c.Writer.Write([]byte(": connected\n\n"))
 	c.Writer.Flush()
+	// Replay the current pending approval, if any.
+	//
+	// WHY: the approval id reached the client only through the live
+	// question_to_client event. When the runner asks for approval while the
+	// browser is reconnecting — exactly what a resume or a change request does —
+	// that event was missed, the gate rendered with an empty id, and the client
+	// saw "Approval ID not yet received from server" with dead buttons.
+	{
+		var pendingApprovalID uuid.UUID
+		var pendingGate, pendingSummary string
+		err := h.engine.DB().QueryRow(c.Request.Context(),
+			`SELECT id, gate_name, COALESCE(summary, '')
+			   FROM approval_requests
+			  WHERE workflow_id = $1 AND status = 'pending'
+			  ORDER BY requested_at DESC
+			  LIMIT 1`,
+			workflowID,
+		).Scan(&pendingApprovalID, &pendingGate, &pendingSummary)
+		if err == nil {
+			sendKanbanSSE(c.Writer, SSEKanbanApproval, map[string]interface{}{
+				"event_type": "question_to_client",
+				"content": map[string]string{
+					"approvalId": pendingApprovalID.String(),
+					"gateName":   pendingGate,
+					"summary":    pendingSummary,
+				},
+			})
+		}
+	}
 
 	c.Stream(func(w io.Writer) bool {
 		select {
@@ -89,7 +118,7 @@ func (h *Handler) StreamKanban(c *gin.Context) {
 			// Check if workflow is done.
 			if event.EventType == "workflow_completed" || event.EventType == "workflow_failed" {
 				sendKanbanSSE(w, SSEKanbanDone, map[string]interface{}{
-					"event_type": event.EventType,
+					"event_type":  event.EventType,
 					"workflow_id": workflowID.String(),
 				})
 				return false
@@ -138,11 +167,11 @@ func (h *Handler) handleKanbanEvent(w io.Writer, event blackboard.Event) {
 	}
 
 	payload := map[string]interface{}{
-		"sequence_number":    event.SequenceNumber,
-		"event_type":         event.EventType,
+		"sequence_number":     event.SequenceNumber,
+		"event_type":          event.EventType,
 		"posted_by_expert_id": event.PostedByExpertID,
-		"posted_at":          event.PostedAt,
-		"content":            json.RawMessage(event.Content),
+		"posted_at":           event.PostedAt,
+		"content":             json.RawMessage(event.Content),
 	}
 
 	switch {
