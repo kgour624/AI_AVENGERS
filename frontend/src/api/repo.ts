@@ -194,3 +194,14 @@ export const suggestRepoFiles = (projectId: string, q: string, limit = 10) =>
       { params: { q, limit } }
     )
     .then((res) => res.data.data!)
+
+/**
+ * Branches of the connected repository, so the push/check screens can offer a
+ * picker instead of asking the client to remember a branch name.
+ */
+export const getRepoBranches = (projectId: string) =>
+  baseAPI
+    .get<ApiResponse<{ branches: string[]; defaultBranch: string }>>(
+      `/api/v1/projects/${projectId}/repo/branches`
+    )
+    .then((res) => res.data.data ?? { branches: [], defaultBranch: '' })

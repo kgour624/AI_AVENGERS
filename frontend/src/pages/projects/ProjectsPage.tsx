@@ -97,7 +97,7 @@ export default function ProjectsPage() {
           className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3"
         >
           {projects.map((p, i) => (
-            <motion.div key={p.id} variants={i < ARC_MOTION.maxStaggerItems ? fadeUp : undefined}>
+            <motion.div key={p.id} className="h-full" variants={i < ARC_MOTION.maxStaggerItems ? fadeUp : undefined}>
               <ProjectCard
                 project={p}
                 onDeleted={() => revalidator.revalidate()}

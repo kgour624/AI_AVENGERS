@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { exportHarnessToGit, ingestCodeFeedback, type GitExportResult } from '@/api/delivery'
 import { useRepoSyncStatus } from '@/hooks/useRepoSyncStatus'
+import { getRepoBranches } from '@/api/repo'
 import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
@@ -28,7 +30,7 @@ import { handleAPIError } from '@/utils/errors'
 
 type Provider = 'github' | 'gitlab'
 
-function ExportForm({ workflowId, connectedRepoUrl }: { workflowId: string; connectedRepoUrl?: string }) {
+function ExportForm({ workflowId, connectedRepoUrl, branches, defaultBranch }: { workflowId: string; connectedRepoUrl?: string; branches?: string[]; defaultBranch?: string }) {
   const [provider, setProvider] = useState<Provider>('github')
   const [repoUrl, setRepoUrl] = useState('')
   const [branch, setBranch] = useState('main')
@@ -40,9 +42,22 @@ function ExportForm({ workflowId, connectedRepoUrl }: { workflowId: string; conn
   // overwrite something the admin typed deliberately.
   useEffect(() => {
     if (!connectedRepoUrl) return
-    setRepoUrl((current) => (current.trim() === '' ? connectedRepoUrl : current))
+    // Show the short owner/repo form the way the provider shows it
+    // (mehrasneha161-ai/Codepush), instead of a full clone URL.
+    const shortForm = connectedRepoUrl
+      .replace(/^https?:\/\//, '')
+      .replace(/^www\./, '')
+      .replace(/^(github|gitlab)\.com\//, '')
+      .replace(/\.git$/, '')
+    setRepoUrl((current) => (current.trim() === '' ? shortForm : current))
     setCreateRepo(false)
   }, [connectedRepoUrl])
+
+  // Branches come from the connection, so the client picks main/design-v1
+  // instead of recalling the name.
+  useEffect(() => {
+    if (defaultBranch && branch.trim() === '') setBranch(defaultBranch)
+  }, [defaultBranch, branch])
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -88,12 +103,26 @@ function ExportForm({ workflowId, connectedRepoUrl }: { workflowId: string; conn
           onChange={(e) => setRepoUrl(e.target.value)}
           className="flex-1"
         />
-        <Input
-          placeholder="branch"
-          value={branch}
-          onChange={(e) => setBranch(e.target.value)}
-          className="w-28"
-        />
+        {branches && branches.length > 0 ? (
+          <select
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            className="rounded-md border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary"
+          >
+            {branches.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <Input
+            placeholder="branch"
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            className="w-28"
+          />
+        )}
       </div>
 
       <label className="mt-2 flex items-center gap-1.5 text-[11px] text-text-secondary">
@@ -221,6 +250,12 @@ export function DeliveryPanel({
 }) {
   const { data: repoStatus } = useRepoSyncStatus(projectId ?? '', !!projectId)
   const needsRepo = !!projectId && !!repoStatus && !repoStatus.connected
+  const { data: repoBranches } = useQuery({
+    queryKey: ['repo-branches', projectId],
+    queryFn: () => getRepoBranches(projectId ?? ''),
+    enabled: !!projectId && !!repoStatus?.connected,
+    retry: false,
+  })
 
   return (
     <div className="mt-6">
@@ -244,7 +279,12 @@ export function DeliveryPanel({
       )}
       <div className="grid grid-cols-2 gap-4">
         <Card className="p-4">
-          <ExportForm workflowId={workflowId} connectedRepoUrl={repoStatus?.connected ? repoStatus.repoUrl : undefined} />
+          <ExportForm
+            workflowId={workflowId}
+            connectedRepoUrl={repoStatus?.connected ? repoStatus.repoUrl : undefined}
+            branches={repoBranches?.branches}
+            defaultBranch={repoBranches?.defaultBranch}
+          />
         </Card>
         <Card className="p-4">
           <CodeFeedbackForm workflowId={workflowId} />
