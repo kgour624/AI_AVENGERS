@@ -54,10 +54,30 @@ func run() error {
 	defer pool.Close()
 
 	catalog := mcp.NewPGCatalog(pool)
-	registry := mcp.NewRegistry(
+
+	tools := []mcp.Tool{
 		mcp.NewListExpertsTool(catalog),
 		mcp.NewGetStandardsTool(catalog),
-	)
+	}
+
+	// ask_expert and review_change need the running API server, because the
+	// answer pipeline lives there and this binary must not grow a second copy of
+	// it. Unset config disables exactly those two tools and says so — a server
+	// that silently pretends to have them would just fail on first use.
+	apiBase := strings.TrimSpace(os.Getenv("MCP_API_BASE_URL"))
+	apiToken := strings.TrimSpace(os.Getenv("MCP_API_TOKEN"))
+	apiChat := strings.TrimSpace(os.Getenv("MCP_CHAT_ID"))
+	if apiBase != "" && apiToken != "" && apiChat != "" {
+		answerer := mcp.NewHTTPAnswerer(apiBase, apiToken, apiChat)
+		tools = append(tools,
+			mcp.NewAskExpertTool(catalog, answerer),
+			mcp.NewReviewChangeTool(catalog, answerer),
+		)
+	} else {
+		logger.Warn("ask_expert and review_change are disabled; set MCP_API_BASE_URL, MCP_API_TOKEN and MCP_CHAT_ID to enable them")
+	}
+
+	registry := mcp.NewRegistry(tools...)
 
 	version := strings.TrimSpace(os.Getenv("MCP_SERVER_VERSION"))
 	if version == "" {
