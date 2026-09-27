@@ -34,7 +34,7 @@ export function Card({ className, children, glow = 'none', glass = false, ...pro
   return (
     <div
       className={cn(
-        'rounded-lg border p-4',
+        'rounded-lg border p-4 lift',
         // Base: glass morphism or solid
         glass
           ? 'border-glass-border bg-surface-raised/60 backdrop-blur-xl shadow-card'

@@ -15,7 +15,8 @@ const variantClasses: Record<ButtonVariant, string> = {
   primary: [
     'bg-brand text-white',
     'border border-brand/60',
-    'shadow-[0_0_12px_oklch(68%_0.28_295_/_0.35)]',
+    'brand-gradient text-white',
+    'shadow-[0_0_15px_rgba(139,92,246,0.4)]',
     'hover:bg-brand-hover',
     'hover:shadow-[0_0_20px_oklch(68%_0.28_295_/_0.55),_0_0_40px_oklch(68%_0.28_295_/_0.2)]',
     'hover:border-brand/80',
