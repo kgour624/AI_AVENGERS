@@ -82,6 +82,7 @@ const router = createBrowserRouter([
               { path: 'llm-settings', lazy: () => import('@/pages/admin/AdminLLMSettings') },
               { path: 'usage', lazy: () => import('@/pages/admin/AdminUsage') },
               { path: 'reliability', lazy: () => import('@/pages/admin/AdminReliability') },
+              { path: 'mcp-access', lazy: () => import('@/pages/admin/AdminMcpAccess') },
             ],
           },
         ],
