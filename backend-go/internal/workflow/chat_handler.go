@@ -8,6 +8,7 @@ package workflow
 // the chat service being constructed.
 
 import (
+	"context"
 	"errors"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +22,18 @@ import (
 type ChatHandler struct {
 	svc    *WorkflowChatService
 	logger *zap.Logger
+	// Wake mechanism for a change request on a workflow that is NOT running.
+	// Optional (set via SetWorkflowWaker); nil keeps the old behaviour for tests
+	// and for deployments that do not wire it.
+	projector *Projector
+	runner    *WorkflowRunner
+}
+
+// SetWorkflowWaker wires the projector and runner used to resume a workflow when
+// a change request arrives after it finished.
+func (h *ChatHandler) SetWorkflowWaker(projector *Projector, runner *WorkflowRunner) {
+	h.projector = projector
+	h.runner = runner
 }
 
 // NewChatHandler creates the handler.
@@ -339,6 +352,36 @@ func (h *ChatHandler) ProposeChange(crSvc *ChangeRequestService) gin.HandlerFunc
 		if err != nil {
 			h.respondErr(c, err, "propose change")
 			return
+		}
+
+		// A change request on a FINISHED workflow used to be recorded and then
+		// abandoned: the acknowledgement said "experts will re-run", but nothing
+		// was running to pick it up, so the client waited forever. Put the
+		// workflow back into the design phase and start the runner so the request
+		// is actually executed and comes back for approval.
+		if h.runner != nil {
+			ctx := context.Background()
+			tag, wakeErr := h.runner.engine.DB().Exec(ctx,
+				`UPDATE workflows
+				    SET status = 'running',
+				        current_phase = 'detailed_design',
+				        phase_completed_at = NULL,
+				        failure_reason = NULL,
+				        updated_at = NOW()
+				  WHERE id = $1 AND status IN ('completed','failed')`,
+				cr.WorkflowID)
+			if wakeErr != nil {
+				h.logger.Error("change request: could not wake workflow",
+					zap.String("workflow_id", cr.WorkflowID.String()), zap.Error(wakeErr))
+			} else if tag.RowsAffected() > 0 {
+				if h.projector != nil {
+					go h.projector.Run(ctx, cr.WorkflowID)
+				}
+				go h.runner.Run(ctx, cr.WorkflowID)
+				h.logger.Info("change request: workflow resumed for redesign",
+					zap.String("workflow_id", cr.WorkflowID.String()),
+					zap.String("change_request_id", cr.ID.String()))
+			}
 		}
 		response.Created(c, cr)
 	}

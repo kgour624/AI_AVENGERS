@@ -11,7 +11,18 @@ import type { SynthesisResult } from '@/types/expert'
  * decide" - the system never silently picks a winner between
  * contradicting experts).
  */
-export function SynthesisPanel({ synthesis }: { synthesis: SynthesisResult }) {
+export function SynthesisPanel({
+  synthesis,
+  onDecide,
+}: {
+  synthesis: SynthesisResult
+  /**
+   * Called when the client picks one side of a contradiction. The choice is sent
+   * back into the conversation, so the experts answer again WITH that decision
+   * instead of the client having to prove the conflict was even noticed.
+   */
+  onDecide?: (instruction: string) => void
+}) {
   return (
     <div className="rounded-lg border border-brand/30 bg-brand/5 p-4">
       <p className="mb-2 text-sm font-medium text-brand">\u26a1 SYNTHESIS</p>
@@ -27,6 +38,24 @@ export function SynthesisPanel({ synthesis }: { synthesis: SynthesisResult }) {
           <p>
             \u26a0\ufe0f Contradiction on {c.topic}: {c.expertA} says "{c.positionA}", {c.expertB} says "
             {c.positionB}" \u2014 <span className="font-medium">YOU DECIDE</span>
+          {onDecide && (
+            <div className="mt-1 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => onDecide(`Decision on ${c.topic}: go with ${c.expertA}. Continue the answer with this decision.`)}
+                className="rounded border border-brand/40 px-2 py-0.5 text-xs text-brand hover:bg-brand/10"
+              >
+                Go with {c.expertA}
+              </button>
+              <button
+                type="button"
+                onClick={() => onDecide(`Decision on ${c.topic}: go with ${c.expertB}. Continue the answer with this decision.`)}
+                className="rounded border border-brand/40 px-2 py-0.5 text-xs text-brand hover:bg-brand/10"
+              >
+                Go with {c.expertB}
+              </button>
+            </div>
+          )}
           </p>
         </div>
       ))}

@@ -106,6 +106,17 @@ export default function ChatPage() {
   const [pendingUserText, setPendingUserText] = useState<string | null>(null)
   // Last request, kept so a failed answer offers a one-click Retry.
   const [lastSend, setLastSend] = useState<SendMessageOptions | null>(null)
+  // Mirrors the composer's choice (same localStorage key) so the answer can be
+  // led by the combined synthesis when collaborative is selected.
+  const answerMode = (() => {
+    try {
+      return localStorage.getItem(`chat_${chat.id}_answer_mode`) === 'collaborative'
+        ? 'collaborative'
+        : 'independent'
+    } catch {
+      return 'independent'
+    }
+  })()
   // Assistant-message count when the current request was sent, so the completion
   // effect can tell "history refreshed with the new answer" from "history is old".
   const assistantCountAtSendRef = useRef(0)
@@ -480,6 +491,10 @@ export default function ChatPage() {
                 </div>
               )}
 
+              {answerMode === 'collaborative' && stream?.synthesis && (
+                <SynthesisPanel synthesis={stream.synthesis} onDecide={(instruction) => void handleSend(instruction, lastSend?.expertIds ?? [])} />
+              )}
+
               {stream.expertResponses.map((partial, i) =>
                 partial.expertId ? (
                   <ExpertResponse key={partial.expertId} response={partial as ExpertResponseType} isStreaming />
@@ -490,7 +505,10 @@ export default function ChatPage() {
             </>
           )}
 
-          {stream?.synthesis && <SynthesisPanel synthesis={stream.synthesis} />}
+          {/* Independent keeps the original order (experts, then synthesis). */}
+          {answerMode === 'independent' && stream?.synthesis && (
+            <SynthesisPanel synthesis={stream.synthesis} onDecide={(instruction) => void handleSend(instruction, lastSend?.expertIds ?? [])} />
+          )}
 
           {stream?.status === 'error' && (
             <div className="flex items-center justify-between gap-3 rounded-md border border-mode-refuse/30 bg-mode-refuse/5 p-3">
