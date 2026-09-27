@@ -120,6 +120,28 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
    * user who raises it once does not have to re-pick it every message. 0 = the
    * strict China Wall (default), matching the workflow's 0-30% rule.
    */
+  /**
+   * Answer mode, persisted per chat like the answer basis.
+   *   independent (default) — each expert answers on its own, as today.
+   *   collaborative         — the experts' answers are merged into one combined
+   *                           response (the synthesis) and shown first.
+   * The synthesis is produced either way; this only decides what leads.
+   */
+  const [answerMode, setAnswerMode] = useState<'independent' | 'collaborative'>(() => {
+    try {
+      return localStorage.getItem(`chat_${chatId}_answer_mode`) === 'collaborative' ? 'collaborative' : 'independent'
+    } catch {
+      return 'independent'
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem(`chat_${chatId}_answer_mode`, answerMode)
+    } catch {
+      /* storage disabled — the in-memory value still applies */
+    }
+  }, [chatId, answerMode])
+
   const [allowancePct, setAllowancePct] = useState(() => {
     try {
       const saved = localStorage.getItem(`chat_${chatId}_generic_allowance`)
@@ -441,6 +463,18 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
             e.target.value = ''
           }}
         />
+
+        {/* Collaborative vs independent answers. Default stays independent so
+            nothing changes for anyone who does not pick this. */}
+        <select
+          value={answerMode}
+          onChange={(e) => setAnswerMode(e.target.value as 'independent' | 'collaborative')}
+          title="How multiple experts answer: separately, or merged into one combined reply"
+          className="rounded-md border border-surface-border bg-surface-overlay px-2 py-1 text-xs text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+        >
+          <option value="independent">Independent</option>
+          <option value="collaborative">Collaborative</option>
+        </select>
 
         {/* T-GEN: answer basis — trained-only by default, matching the strict
             China Wall and the workflow's 0-30% rule. */}
