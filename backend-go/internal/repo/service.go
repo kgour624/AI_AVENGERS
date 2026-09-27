@@ -661,12 +661,12 @@ func (s *Service) GetSyncStatus(ctx context.Context, projectID uuid.UUID) (map[s
 
 	err := s.db.QueryRow(ctx,
 		`SELECT sync_status, repo_url, COALESCE(repo_name,''),
-		        total_chunks, last_sync_at, COALESCE(error_message, '')
+		        total_chunks, last_sync_at
 		 FROM repo_connections
 		 WHERE project_id=$1
 		 ORDER BY created_at DESC LIMIT 1`,
 		projectID,
-	).Scan(&status, &repoURL, &repoName, &totalChunks, &lastSync, &errorMsg)
+	).Scan(&status, &repoURL, &repoName, &totalChunks, &lastSync)
 	if err != nil {
 		return map[string]interface{}{"connected": false}, nil
 	}
@@ -2473,6 +2473,11 @@ func (h *Handler) assertProjectAccess(c *gin.Context, projectID uuid.UUID) bool 
 func (h *Handler) GetOAuthURL(c *gin.Context) {
 	provider := c.Param("provider")
 	projectID := c.Query("project_id")
+	repoURL := c.Query("repo_url")
+	defaultBranch := c.Query("default_branch")
+	if defaultBranch == "" {
+		defaultBranch = "main"
+	}
 	if projectID == "" {
 		response.BadRequest(c, "MISSING_PROJECT_ID", "project_id query param required")
 		return
@@ -2490,6 +2495,13 @@ func (h *Handler) GetOAuthURL(c *gin.Context) {
 	}
 
 	state := uuid.New().String() // CSRF protection
+	// Store repoURL and defaultBranch in state using format provider:projectID:repoURL:defaultBranch
+	oauthState := fmt.Sprintf("%s:%s:%s:%s", provider, parsedProjectID.String(), repoURL, defaultBranch)
+	if err := h.svc.redis.Set(c.Request.Context(), oauthStateKey(state), oauthState, oauthStateTTL).Err(); err != nil {
+		response.InternalError(c)
+		return
+	}
+
 	oauthURL, err := h.svc.GetOAuthURL(c.Request.Context(), provider, state, projectID)
 	if err != nil {
 		// A missing OAuth app is a deployment fact needing an operator fix,
@@ -2540,12 +2552,21 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	// Delete state — one-time use
 	_ = h.svc.redis.Del(c.Request.Context(), oauthStateKey(state))
 
-	// Parse state value: "provider:projectID"
-	parts := strings.SplitN(stateValue, ":", 2)
-	if len(parts) != 2 || parts[0] != provider {
+	// Parse state value: "provider:projectID:repoURL:defaultBranch" (repoURL and defaultBranch are optional)
+	parts := strings.SplitN(stateValue, ":", 4)
+	if len(parts) < 2 || parts[0] != provider {
 		c.Redirect(http.StatusFound, frontendBase+"/?repoError=state_mismatch")
 		return
 	}
+	repoURL := ""
+	defaultBranch := "main"
+	if len(parts) >= 3 {
+		repoURL = parts[2]
+	}
+	if len(parts) >= 4 {
+		defaultBranch = parts[3]
+	}
+
 	projectID, err := uuid.Parse(parts[1])
 	if err != nil {
 		c.Redirect(http.StatusFound, frontendBase+"/?repoError=invalid_project")
@@ -2582,12 +2603,10 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		return
 	}
 
-	// Connect repo with the obtained token
-	// repo_url and default_branch will be fetched during sync
-	// For now store a placeholder URL — sync will update it
+	// Connect repo with the obtained token and the repo URL/branch passed via state
 	connID, err := h.svc.ConnectRepoOAuth(
 		c.Request.Context(), projectID, clientID,
-		provider, "", tok.AccessToken, tok.RefreshToken, "main", tok.ExpiresAt,
+		provider, repoURL, tok.AccessToken, tok.RefreshToken, defaultBranch, tok.ExpiresAt,
 	)
 	if err != nil {
 		h.logger.Error("ConnectRepo failed after OAuth", zap.Error(err))
