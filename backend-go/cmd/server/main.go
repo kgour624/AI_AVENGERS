@@ -1034,6 +1034,7 @@ func buildRouter(
 		adminGroup.POST("/experts", adminHandler.CreateExpert)
 		adminGroup.PATCH("/experts/:id", adminHandler.UpdateExpert)
 		adminGroup.DELETE("/experts/:id", adminHandler.DeleteExpert)
+		adminGroup.POST("/experts/:id/ingest-batch", adminHandler.IngestTranscriptBatch)
 		adminGroup.POST("/experts/:id/ingest", adminHandler.IngestTranscript)
 		adminGroup.POST("/experts/:id/regenerate-charter", adminHandler.RegenerateCharter)
 		// C2: expert versioning + capability drift.

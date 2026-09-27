@@ -5,6 +5,7 @@ import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
 import { Skeleton } from '@/components/ui/Skeleton'
+import { Modal } from '@/components/ui/Modal'
 import { TranscriptUploadModal } from '@/components/admin/TranscriptUploadModal'
 import { CreateExpertModal } from '@/components/admin/CreateExpertModal'
 import { EditCharterModal } from '@/components/admin/EditCharterModal'
@@ -115,6 +116,11 @@ function AdminExperts() {
   })
   const queryClient = useQueryClient()
   const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set())
+  // Delete confirmation: typing the expert's name is deliberate friction so a
+  // misclick cannot remove an expert (and its history) in one tap.
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null)
+  const [deleteConfirmText, setDeleteConfirmText] = useState('')
+  const [deleteBusy, setDeleteBusy] = useState(false)
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null)
   const [isCreateOpen, setIsCreateOpen] = useState(false)
   const [charterTargetId, setCharterTargetId] = useState<string | null>(null)
@@ -252,14 +258,9 @@ function AdminExperts() {
                 variant="ghost"
                 size="sm"
                 className="text-mode-refuse hover:bg-mode-refuse/10"
-                onClick={async () => {
-                  if (!window.confirm(`Delete "${expert.name}"? It will be removed from every picker; its history stays.`)) return
-                  try {
-                    await deleteExpert(expert.id)
-                    await queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
-                  } catch (deleteErr) {
-                    window.alert(handleAPIError(deleteErr))
-                  }
+                onClick={() => {
+                  setDeleteConfirmText('')
+                  setDeleteTarget({ id: expert.id, name: expert.name })
                 }}
               >
                 Delete
@@ -339,6 +340,58 @@ function AdminExperts() {
         expertId={pipelineExpertId}
         expertName={pipelineExpertName}
       />
+
+      {/* Delete confirmation: the admin must type the expert's exact name, so a
+          stray click cannot delete an expert plus its training history. */}
+      <Modal
+        isOpen={deleteTarget !== null}
+        onClose={() => {
+          if (!deleteBusy) setDeleteTarget(null)
+        }}
+      >
+        <h3 className="mb-2 text-sm font-medium text-text-primary">
+          Delete {deleteTarget?.name}?
+        </h3>
+        <p className="mb-3 text-xs text-text-secondary">
+          The expert disappears from every workflow and chat picker. Its past chunks,
+          jobs and artifacts stay in the database for audit. This cannot be undone from
+          the UI.
+        </p>
+        <p className="mb-1 text-[11px] text-text-disabled">
+          Type <span className="font-semibold text-text-primary">{deleteTarget?.name}</span> to confirm
+        </p>
+        <input
+          value={deleteConfirmText}
+          onChange={(e) => setDeleteConfirmText(e.target.value)}
+          placeholder={deleteTarget?.name}
+          className="w-full rounded-md border border-glass-border bg-surface-overlay px-3 py-1.5 text-xs text-text-primary placeholder:text-text-disabled focus:outline-none focus:ring-2 focus:ring-brand/40"
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <Button variant="secondary" onClick={() => setDeleteTarget(null)} disabled={deleteBusy}>
+            Cancel
+          </Button>
+          <Button
+            variant="danger"
+            disabled={deleteBusy || deleteConfirmText.trim() !== (deleteTarget?.name ?? '')}
+            isLoading={deleteBusy}
+            onClick={async () => {
+              if (!deleteTarget) return
+              setDeleteBusy(true)
+              try {
+                await deleteExpert(deleteTarget.id)
+                await queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
+                setDeleteTarget(null)
+              } catch (deleteErr) {
+                window.alert(handleAPIError(deleteErr))
+              } finally {
+                setDeleteBusy(false)
+              }
+            }}
+          >
+            Delete expert
+          </Button>
+        </div>
+      </Modal>
 
       {/* A12: Edit Config modal — pre-fills from expert object */}
       {configTargetId && (() => {

@@ -253,15 +253,36 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
       response.templateSections && response.templateSections.length > 0
         ? response.templateSections.map((s) => s.label + ':\n' + s.content).join('\n\n')
         : response.content
-    navigator.clipboard
-      .writeText(text)
-      .then(() => {
-        setCopied(true)
-        setTimeout(() => setCopied(false), 1500)
-      })
-      .catch((err) => {
-        console.warn('copy to clipboard failed', err)
-      })
+    // WHY the fallback: navigator.clipboard only exists in a secure context
+    // (https or localhost). On a plain-http deployment the button silently did
+    // nothing, which is the bug this fixes. The textarea + execCommand path
+    // works there, so the button copies in both environments.
+    const markCopied = () => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    }
+    const legacyCopy = () => {
+      try {
+        const area = document.createElement('textarea')
+        area.value = text
+        area.setAttribute('readonly', '')
+        area.style.position = 'fixed'
+        area.style.opacity = '0'
+        document.body.appendChild(area)
+        area.select()
+        const ok = document.execCommand('copy')
+        document.body.removeChild(area)
+        if (ok) markCopied()
+        else console.warn('copy failed: clipboard is not available in this context')
+      } catch (err) {
+        console.warn('copy failed', err)
+      }
+    }
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(markCopied).catch(legacyCopy)
+    } else {
+      legacyCopy()
+    }
   }
 
   function handleReplyClick() {
