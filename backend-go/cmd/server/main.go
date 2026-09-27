@@ -215,6 +215,34 @@ func main() {
 						zap.Int64("count", res.RowsAffected()),
 					)
 				}
+
+				// Stale-running recovery.
+				//
+				// WHY: an ingestion job runs in a goroutine inside this process. If
+				// the API restarts (deploy, crash, OOM) that goroutine dies, but the
+				// DB row stays 'running' — the admin screen then polls forever at
+				// whatever percent it reached (seen live: 86% with every step already
+				// done in the timeline). A running job that has not written any
+				// progress for 15 minutes has no worker behind it, so it is failed
+				// with a readable reason and the client stops waiting.
+				stale, staleErr := postgres.Exec(context.Background(),
+					`UPDATE ingestion_jobs
+					    SET status        = 'failed',
+					        error_message = 'Auto-failed: no progress for 15 minutes (the worker stopped, likely an API restart). Re-upload or retry the job.',
+					        completed_at  = NOW(),
+					        updated_at    = NOW()
+					  WHERE status = 'running'
+					    AND updated_at < NOW() - INTERVAL '15 minutes'`,
+				)
+				if staleErr != nil {
+					logger.Warn("stale job checker: DB error", zap.Error(staleErr))
+					continue
+				}
+				if stale.RowsAffected() > 0 {
+					logger.Warn("stale job checker: running jobs with no live worker were failed",
+						zap.Int64("count", stale.RowsAffected()),
+					)
+				}
 			case <-ctx.Done():
 				return
 			}
