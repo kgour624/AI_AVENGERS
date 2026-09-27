@@ -1,0 +1,34 @@
+{
+  "_comment": [
+    "Example Claude Code hooks that put a domain expert in the loop while an agent codes.",
+    "Merge the 'hooks' block into .claude/settings.json (project) or ~/.claude/settings.json (you).",
+    "WHY PostToolUse with --warn-only: a hook fires after EVERY file write, and blocking every write",
+    "  would make the agent unusable. It reports the expert's issues as the work happens.",
+    "WHY Stop without --warn-only: that is the checkpoint with teeth — the turn cannot end on a change",
+    "  the expert rejected, so the agent has to address the issues before reporting done.",
+    "Set MCP_URL, MCP_TOKEN and MCP_DOMAIN in the environment the agent runs in."
+  ],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python tools/mcp-review-gate/review_gate.py --warn-only --context \"file just edited by the agent\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python tools/mcp-review-gate/review_gate.py"
+          }
+        ]
+      }
+    ]
+  }
+}
