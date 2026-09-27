@@ -153,11 +153,27 @@ function ExportForm({ workflowId, connectedRepoUrl, branches, defaultBranch }: {
   )
 }
 
-function CodeFeedbackForm({ workflowId }: { workflowId: string }) {
+function CodeFeedbackForm({ workflowId, connectedRepoUrl, branches, defaultBranch }: { workflowId: string; connectedRepoUrl?: string; branches?: string[]; defaultBranch?: string }) {
   const [provider, setProvider] = useState<Provider>('github')
   const [repoUrl, setRepoUrl] = useState('')
   const [branch, setBranch] = useState('')
   const [started, setStarted] = useState(false)
+
+  // Same convenience as the push form: the connected repo and its branches are
+  // offered instead of retyped.
+  useEffect(() => {
+    if (!connectedRepoUrl) return
+    const shortForm = connectedRepoUrl
+      .replace(/^https?:\/\//, '')
+      .replace(/^www\./, '')
+      .replace(/^(github|gitlab)\.com\//, '')
+      .replace(/\.git$/, '')
+    setRepoUrl((current) => (current.trim() === '' ? shortForm : current))
+  }, [connectedRepoUrl])
+
+  useEffect(() => {
+    if (defaultBranch) setBranch((current) => (current.trim() === '' ? defaultBranch : current))
+  }, [defaultBranch])
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -203,12 +219,26 @@ function CodeFeedbackForm({ workflowId }: { workflowId: string }) {
           onChange={(e) => setRepoUrl(e.target.value)}
           className="flex-1"
         />
-        <Input
-          placeholder="branch (default)"
-          value={branch}
-          onChange={(e) => setBranch(e.target.value)}
-          className="w-32"
-        />
+        {branches && branches.length > 0 ? (
+          <select
+            value={branch || defaultBranch || ''}
+            onChange={(e) => setBranch(e.target.value)}
+            className="rounded-md border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary"
+          >
+            {branches.map((b) => (
+              <option key={b} value={b}>
+                {b}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <Input
+            placeholder="branch (default)"
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            className="w-32"
+          />
+        )}
       </div>
 
       {mutation.isError && (
@@ -287,7 +317,12 @@ export function DeliveryPanel({
           />
         </Card>
         <Card className="p-4">
-          <CodeFeedbackForm workflowId={workflowId} />
+          <CodeFeedbackForm
+            workflowId={workflowId}
+            connectedRepoUrl={repoStatus?.connected ? repoStatus.repoUrl : undefined}
+            branches={repoBranches?.branches}
+            defaultBranch={repoBranches?.defaultBranch}
+          />
         </Card>
       </div>
     </div>
