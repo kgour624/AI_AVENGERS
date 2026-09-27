@@ -60,7 +60,7 @@ function categoryToDraft(cat: ExpertCategory | null) {
     description: cat?.description ?? '',
     defaultLanguage: cat?.defaultLanguage ?? 'java',
     askStructurePermission: cat?.askStructurePermission ?? false,
-    sections: ((schema?.sections ?? []) as SectionDraft[]).map((s) => ({ ...s, maxWords: s.maxWords ?? 0 })),
+    sections: ((schema?.sections ?? []) as SectionDraft[]).map((s) => ({ ...s })),
     // T-CAT: multiple named formats. Off = the original single template.
     useMultiple: templates.length > 0,
     templates: templates as TemplateDraft[],
