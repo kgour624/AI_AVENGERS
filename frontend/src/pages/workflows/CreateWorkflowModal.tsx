@@ -9,6 +9,17 @@ import { createWorkflow, startWorkflow, runWorkflow } from '@/api/workflows'
 import { useRepoSyncStatus } from '@/hooks/useRepoSyncStatus'
 import { queryKeys } from '@/api/queryKeys'
 import { cn } from '@/utils/cn'
+import { useMemo } from 'react'
+
+interface PlanDraft {
+  id: string
+  expertId: string
+  output: string
+  instructions: string
+  kind: string
+  language: string
+  dependsOn: string[]
+}
 
 interface Props {
   isOpen: boolean
@@ -32,6 +43,8 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   // this must be a deliberate choice rather than a default.
   const [deliverCode, setDeliverCode] = useState(false)
   const [selectedExpertIds, setSelectedExpertIds] = useState<string[]>([])
+  const [customPlan, setCustomPlan] = useState(false)
+  const [planSteps, setPlanSteps] = useState<PlanDraft[]>([])
   const [budget, setBudget] = useState('10')
   const [error, setError] = useState<string | null>(null)
 
@@ -63,11 +76,47 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   const repoReady = !!repoStatus?.connected && repoStatus.status === 'complete'
   const repoBlocked = isExisting && !!projectId && !repoReady
 
+  const selectedExperts = useMemo(
+    () => experts.filter((e) => selectedExpertIds.includes(e.id)),
+    [experts, selectedExpertIds]
+  )
+
+  function addPlanStep() {
+    const id = crypto.randomUUID()
+    const previous = planSteps.at(-1)
+    setPlanSteps((steps) => [
+      ...steps,
+      { id, expertId: '', output: '', instructions: '', kind: 'other', language: '', dependsOn: previous ? [previous.id] : [] },
+    ])
+  }
+
+  function updatePlanStep(id: string, patch: Partial<PlanDraft>) {
+    setPlanSteps((steps) => steps.map((s) => (s.id === id ? { ...s, ...patch } : s)))
+  }
+
+  function removePlanStep(id: string) {
+    setPlanSteps((steps) => steps.filter((s) => s.id !== id).map((s) => ({
+      ...s,
+      dependsOn: s.dependsOn.filter((dep) => dep !== id),
+    })))
+  }
+
   const createMut = useMutation({
     mutationFn: async () => {
       if (!title.trim()) throw new Error('Title is required')
       if (!projectId) throw new Error('Select a project')
       if (selectedExpertIds.length === 0) throw new Error('Select at least one expert')
+      if (customPlan && planSteps.length === 0) throw new Error('Add at least one workflow step')
+      if (customPlan) {
+        for (const [i, step] of planSteps.entries()) {
+          if (!step.expertId || !step.output.trim() || !step.instructions.trim()) {
+            throw new Error(`Step ${i + 1}: choose an expert and fill in its output and instructions`)
+          }
+          if (!selectedExpertIds.includes(step.expertId)) {
+            throw new Error(`Step ${i + 1}: its expert must also be selected above`)
+          }
+        }
+      }
       const wf = await createWorkflow({
         projectId,
         title: title.trim(),
@@ -76,6 +125,12 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
         requirementText: requirement.trim() || undefined,
         mode,
         deliverCode,
+        plan: customPlan ? planSteps.map((s) => ({
+          ...s,
+          output: s.output.trim(),
+          instructions: s.instructions.trim(),
+          capability: s.kind,
+        })) : undefined,
       })
       // Launching straight into a run is right for scratch and wrong for an
       // existing codebase: the approved readable set is what the runner seeds the
@@ -107,6 +162,8 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
     setProjectId('')
     setMode('scratch')
     setSelectedExpertIds([])
+    setCustomPlan(false)
+    setPlanSteps([])
     setBudget('10')
     setError(null)
     onClose()
@@ -234,6 +291,76 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
               )
             })}
           </div>
+        </div>
+
+        <div className="rounded-md border border-glass-border p-3">
+          <label className="flex cursor-pointer items-center gap-2 text-xs font-medium text-text-secondary">
+            <input type="checkbox" checked={customPlan} onChange={(e) => setCustomPlan(e.target.checked)} />
+            Configure this workflow's exact steps (expert → output → order)
+          </label>
+          {!customPlan && (
+            <p className="mt-1 text-[10px] text-text-disabled">
+              Off keeps the existing default workflow. Turn on to choose exactly what each expert produces.
+            </p>
+          )}
+          {customPlan && (
+            <div className="mt-3 space-y-3">
+              <p className="text-[10px] text-text-disabled">
+                This exact saved plan runs. Add any expert/output you need, choose its capability and language, then choose its dependencies. Independent steps may run together; dependent steps wait for their parents. No fixed domain or output list.
+              </p>
+              {planSteps.map((step, i) => (
+                <div key={step.id} className="space-y-2 rounded border border-surface-border p-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-text-primary">Step {i + 1}</span>
+                    <button type="button" onClick={() => removePlanStep(step.id)} className="text-xs text-mode-refuse">Remove</button>
+                  </div>
+                  <select
+                    value={step.expertId}
+                    onChange={(e) => updatePlanStep(step.id, { expertId: e.target.value })}
+                    className="w-full rounded border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary"
+                  >
+                    <option value="">Who owns this step?</option>
+                    {selectedExperts.map((expert) => <option key={expert.id} value={expert.id}>{expert.name} — {expert.domain}</option>)}
+                  </select>
+                  <input
+                    value={step.output}
+                    onChange={(e) => updatePlanStep(step.id, { output: e.target.value })}
+                    placeholder="Name this output (free text): e.g. API contract, Python service, test plan"
+                    className="w-full rounded border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary"
+                  />
+                  <textarea
+                    value={step.instructions}
+                    onChange={(e) => updatePlanStep(step.id, { instructions: e.target.value })}
+                    placeholder="What exactly should this expert do?"
+                    rows={2}
+                    className="w-full resize-y rounded border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary"
+                  />
+                  <div className="grid grid-cols-2 gap-2">
+                    <select value={step.kind} onChange={(e) => updatePlanStep(step.id, { kind: e.target.value })} className="rounded border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary">
+                      <option value="design">Design / document</option>
+                      <option value="implementation">Implementation / code</option>
+                      <option value="testing">Testing / QA</option>
+                      <option value="other">Other (expert authored)</option>
+                    </select>
+                    {(step.kind === 'implementation' || step.kind === 'testing') && (
+                      <input value={step.language} onChange={(e) => updatePlanStep(step.id, { language: e.target.value })} placeholder="Language / stack e.g. Go, .NET" className="rounded border border-glass-border bg-surface-overlay px-2 py-1.5 text-xs text-text-primary" />
+                    )}
+                  </div>
+                  <label className="block text-[10px] text-text-secondary">Depends on earlier steps</label>
+                  <div className="flex flex-wrap gap-2">
+                    {planSteps.slice(0, i).map((prior) => (
+                      <label key={prior.id} className="flex items-center gap-1 text-[10px] text-text-disabled">
+                        <input type="checkbox" checked={step.dependsOn.includes(prior.id)} onChange={(e) => updatePlanStep(step.id, { dependsOn: e.target.checked ? [...step.dependsOn, prior.id] : step.dependsOn.filter((x) => x !== prior.id) })} />
+                        {prior.output || `Step ${planSteps.indexOf(prior) + 1}`}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              ))}
+              <Button type="button" variant="secondary" size="sm" onClick={addPlanStep} disabled={selectedExpertIds.length === 0}>+ Add step</Button>
+              {selectedExpertIds.length === 0 && <p className="text-[10px] text-mode-refuse">Select experts above before configuring steps.</p>}
+            </div>
+          )}
         </div>
 
         <div>
