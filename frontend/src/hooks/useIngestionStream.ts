@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { getIngestionJobEvents } from '@/api/admin'
 import type { IngestionJob, IngestionJobEvent } from '@/api/admin'
 import { useAuthStore } from '@/stores/authStore'
 import { camelizeKeys, snakeifyKeys } from '@/utils/casing'
@@ -219,6 +220,15 @@ export function describeJobEvent(ev: IngestionJobEvent): { type: string; message
  * implementation, and it is exactly why refreshing erased the log).
  */
 export function useIngestionStream(expertId: string | null): IngestionStreamState {
+  // Durable history.
+  //
+  // WHY this exists: the panel counted only LIVE SSE events and labelled the
+  // number "from database", while the job-history endpoint was never called —
+  // so a finished job backed by 101 rows in ingestion_job_events showed
+  // "0 events" with an empty timeline. History is now loaded once per job and
+  // merged underneath whatever the live stream already delivered.
+  const historyLoadedFor = useRef<string | null>(null)
+
   const [state, setState] = useState<IngestionStreamState>({
     job: null,
     lastEvent: null,
@@ -230,6 +240,37 @@ export function useIngestionStream(expertId: string | null): IngestionStreamStat
     verification: null,
     progress: null,
   })
+
+  useEffect(() => {
+    const jobID = state.job?.id
+    if (!expertId || !jobID) return
+    if (historyLoadedFor.current === jobID) return
+    historyLoadedFor.current = jobID
+    let cancelled = false
+    getIngestionJobEvents(expertId, jobID, 0)
+      .then((data) => {
+        if (cancelled || !data?.events?.length) return
+        setState((prev) => {
+          const known = new Set(data.events.map((e) => e.sequenceNumber))
+          const liveOnly = prev.events.filter((e) => !known.has(e.sequenceNumber))
+          const merged = [...data.events, ...liveOnly].sort(
+            (a, b) => a.sequenceNumber - b.sequenceNumber
+          )
+          return {
+            ...prev,
+            events: merged,
+            eventLog: merged.map((e) => ({ seq: e.sequenceNumber, ts: e.createdAt, ...describeJobEvent(e) })),
+          }
+        })
+      })
+      .catch(() => {
+        // Best-effort: an unavailable history read must not break the live view.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [expertId, state.job?.id])
+
 
   const esRef = useRef<EventSource | null>(null)
   const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
