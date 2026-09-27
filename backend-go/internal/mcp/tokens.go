@@ -107,3 +107,92 @@ func normaliseList(values []string) []string {
 	}
 	return out
 }
+
+// TokenRecord is one token as an admin sees it. The hash is never included: an
+// admin needs to recognise and revoke a token, not to read the credential.
+type TokenRecord struct {
+	ID           string   `json:"id"`
+	Label        string   `json:"label"`
+	Domains      []string `json:"domains"`
+	Tools        []string `json:"tools"`
+	Revoked      bool     `json:"revoked"`
+	LastUsedAt   *string  `json:"last_used_at,omitempty"`
+	RequestCount int64    `json:"request_count"`
+	CreatedAt    string   `json:"created_at"`
+}
+
+// Create mints a token for a user and returns the PLAINTEXT once.
+//
+// WHY the plaintext is returned here and stored nowhere: the caller shows it to
+// the person who asked for it and then forgets it. Only the hash is persisted,
+// so a lost token is replaced, never recovered — and a database leak yields no
+// working credential.
+func (s *PGTokenStore) Create(ctx context.Context, userID, label string, domains, tools []string) (string, TokenRecord, error) {
+	raw, err := NewToken()
+	if err != nil {
+		return "", TokenRecord{}, err
+	}
+	var rec TokenRecord
+	var lastUsed *string
+	err = s.db.QueryRow(ctx,
+		`INSERT INTO mcp_tokens (user_id, token_hash, label, domains, tools)
+		 VALUES ($1,$2,$3,$4,$5)
+		 RETURNING id, label, domains, tools, revoked_at IS NOT NULL, last_used_at::text, request_count, created_at::text`,
+		userID, HashToken(raw), label, normaliseOrEmpty(domains), normaliseOrEmpty(tools),
+	).Scan(&rec.ID, &rec.Label, &rec.Domains, &rec.Tools, &rec.Revoked, &lastUsed, &rec.RequestCount, &rec.CreatedAt)
+	if err != nil {
+		return "", TokenRecord{}, fmt.Errorf("mcp: create token: %w", err)
+	}
+	rec.LastUsedAt = lastUsed
+	return raw, rec, nil
+}
+
+// List returns every token, newest first, for the admin screen.
+func (s *PGTokenStore) List(ctx context.Context) ([]TokenRecord, error) {
+	rows, err := s.db.Query(ctx,
+		`SELECT id, label, domains, tools, revoked_at IS NOT NULL, last_used_at::text, request_count, created_at::text
+		   FROM mcp_tokens
+		  ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("mcp: list tokens: %w", err)
+	}
+	defer rows.Close()
+
+	out := []TokenRecord{}
+	for rows.Next() {
+		var rec TokenRecord
+		var lastUsed *string
+		if err := rows.Scan(&rec.ID, &rec.Label, &rec.Domains, &rec.Tools, &rec.Revoked, &lastUsed, &rec.RequestCount, &rec.CreatedAt); err != nil {
+			return nil, fmt.Errorf("mcp: scan token: %w", err)
+		}
+		rec.LastUsedAt = lastUsed
+		out = append(out, rec)
+	}
+	return out, rows.Err()
+}
+
+// Revoke marks a token unusable. The row is kept so the audit trail keeps
+// pointing at a readable record instead of a dangling id.
+func (s *PGTokenStore) Revoke(ctx context.Context, id string) error {
+	tag, err := s.db.Exec(ctx,
+		`UPDATE mcp_tokens SET revoked_at = NOW() WHERE id = $1 AND revoked_at IS NULL`, id)
+	if err != nil {
+		return fmt.Errorf("mcp: revoke token: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return NewToolError("NOT_FOUND", "no active token with that id")
+	}
+	return nil
+}
+
+// normaliseOrEmpty keeps a pg array column happy: Postgres wants '{}' rather
+// than NULL for an empty list.
+func normaliseOrEmpty(values []string) []string {
+	out := []string{}
+	for _, v := range values {
+		if t := strings.TrimSpace(v); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}

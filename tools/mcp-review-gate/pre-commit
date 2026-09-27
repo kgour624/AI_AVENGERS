@@ -1,0 +1,24 @@
+#!/bin/sh
+# Git pre-commit hook: the staged change must survive the domain expert's review.
+#
+# WHY here and not only in the agent: commits happen with or without an agent, so
+# the gate belongs at the point every change passes through. Install it with:
+#
+#     cp tools/mcp-review-gate/pre-commit .git/hooks/pre-commit
+#     chmod +x .git/hooks/pre-commit
+#
+# Exit 1 blocks the commit; the review is printed so the author can fix the
+# issues. If the review cannot be obtained the script follows the gate's
+# fail-open default, which is deliberate: an unreachable service must not stop
+# work. Use REVIEW_FAIL_CLOSED=1 where a release path must never skip review.
+set -u
+
+REVIEW_FAIL_CLOSED="${REVIEW_FAIL_CLOSED:-0}"
+ARGS=""
+if [ "$REVIEW_FAIL_CLOSED" = "1" ]; then
+  ARGS="--fail-closed"
+fi
+
+# Runs from the repository root so `git diff --cached` sees the real change.
+# shellcheck disable=SC2086
+exec python3 "$(git rev-parse --show-toplevel)/tools/mcp-review-gate/review_gate.py" $ARGS
