@@ -492,7 +492,7 @@ export default function ChatPage() {
               )}
 
               {answerMode === 'collaborative' && stream?.synthesis && (
-                <SynthesisPanel synthesis={stream.synthesis} />
+                <SynthesisPanel synthesis={stream.synthesis} onDecide={(instruction) => void handleSend(instruction, lastSend?.expertIds ?? [])} />
               )}
 
               {stream.expertResponses.map((partial, i) =>
@@ -507,7 +507,7 @@ export default function ChatPage() {
 
           {/* Independent keeps the original order (experts, then synthesis). */}
           {answerMode === 'independent' && stream?.synthesis && (
-            <SynthesisPanel synthesis={stream.synthesis} />
+            <SynthesisPanel synthesis={stream.synthesis} onDecide={(instruction) => void handleSend(instruction, lastSend?.expertIds ?? [])} />
           )}
 
           {stream?.status === 'error' && (
