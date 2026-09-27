@@ -12,11 +12,11 @@ func TestPickModelLimitPrecedence(t *testing.T) {
 	}
 
 	tests := []struct {
-		name        string
-		provider    string
-		tier        string
-		wantOK      bool
-		wantOutput  int
+		name       string
+		provider   string
+		tier       string
+		wantOK     bool
+		wantOutput int
 	}{
 		{name: "exact tier row wins over the wildcard", provider: "anthropic", tier: LimitTierStrong, wantOK: true, wantOutput: 200},
 		{name: "wildcard covers a tier without its own row", provider: "anthropic", tier: LimitTierCheap, wantOK: true, wantOutput: 100},
@@ -58,7 +58,7 @@ func TestEffectiveOutputBudget(t *testing.T) {
 		{name: "small request is kept", requested: 200, ceiling: 8192, want: 200},
 		{name: "request above the ceiling is narrowed", requested: 32000, ceiling: 8192, want: 8192},
 		{name: "at the ceiling", requested: 8192, ceiling: 8192, want: 8192},
-		{name: "no ceiling and no request keeps the historical 2000", requested: 0, ceiling: 0, want: 2000},
+		{name: "no ceiling and no request uses the 5000 fallback", requested: 0, ceiling: 0, want: 5000},
 		{name: "no ceiling with an explicit request", requested: 900, ceiling: 0, want: 900},
 	}
 
@@ -73,9 +73,9 @@ func TestEffectiveOutputBudget(t *testing.T) {
 
 func TestLimitTierMapping(t *testing.T) {
 	cases := map[ModelType]string{
-		ModelStrong: LimitTierStrong,
-		ModelFast:   LimitTierFast,
-		ModelCheap:  LimitTierCheap,
+		ModelStrong:   LimitTierStrong,
+		ModelFast:     LimitTierFast,
+		ModelCheap:    LimitTierCheap,
 		ModelType(""): LimitTierDefault,
 	}
 	for in, want := range cases {

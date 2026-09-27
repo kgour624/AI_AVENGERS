@@ -110,10 +110,13 @@ func pickModelLimit(rows []ModelLimit, provider, tier string) (ModelLimit, bool)
 // model spends the budget on thinking.
 func effectiveOutputBudget(requested, ceiling int) int {
 	if ceiling <= 0 {
-		// No ceiling known: keep the historical 2000-token default rather than
-		// sending 0, which providers read as "use your default".
+		// No ceiling known. The old 2000-token fallback was the value answers kept
+		// dying at: a long design answer hit it mid-way (finish_reason=length) and
+		// the client saw a truncated stream. 5000 gives a normal answer room to
+		// finish, while a configured ceiling (llm_model_limits, or a provider's own
+		// MaxTokens) still wins over this fallback.
 		if requested <= 0 {
-			return 2000
+			return 5000
 		}
 		return requested
 	}
