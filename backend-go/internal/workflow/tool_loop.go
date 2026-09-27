@@ -43,6 +43,7 @@ import (
 
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/repo"
 )
 
 // toolLoopMaxStepsDefault is used when system_settings has no
@@ -100,6 +101,10 @@ type toolLoopContext struct {
 	expert        workflowExpert
 	chatID        uuid.UUID
 	workspaceRoot string
+	// repoSvc (nil-safe): the connected repository's index. When wired, the chat
+	// can read the client's real source files instead of answering from theory —
+	// the same access the workflow's own agents already have.
+	repoSvc *repo.Service
 }
 
 // ToolRegistry holds every tool this codebase knows how to run.
@@ -133,6 +138,18 @@ func NewToolRegistry(workspaceRoot string, logger *zap.Logger) *ToolRegistry {
 			"lists design sections, so code files must be discovered here or you will guess a path that does not exist.",
 		InputSchema: `{}`,
 		Handler:     toolListFiles,
+	})
+	r.register(Tool{
+		Name:        "list_repo_files",
+		Description: "List files in the client's connected repository (their real codebase). Use this when the question is about the project they synced from GitHub/GitLab.",
+		InputSchema: `{}`,
+		Handler:     toolListRepoFiles,
+	})
+	r.register(Tool{
+		Name:        "read_repo_file",
+		Description: "Read one file from the client's connected repository by its exact path (from list_repo_files). Content is fetched from the provider if the sync only stored metadata.",
+		InputSchema: `{"path": "string, required"}`,
+		Handler:     toolReadRepoFile,
 	})
 	r.register(Tool{
 		Name:        "read_design",
@@ -1385,4 +1402,62 @@ func toolAskClient(ctx context.Context, l *toolLoopContext, input json.RawMessag
 		return nil, fmt.Errorf("ask_client: %w", err)
 	}
 	return map[string]any{"asked": true, "event_id": ev.ID}, nil
+}
+
+// repoProjectID resolves the project behind this workflow, which is what every
+// repository lookup is keyed by.
+func (l *toolLoopContext) repoProjectID(ctx context.Context) (uuid.UUID, error) {
+	var projectID uuid.UUID
+	if err := l.db.QueryRow(ctx, `SELECT project_id FROM workflows WHERE id=$1`, l.workflowID).Scan(&projectID); err != nil {
+		return uuid.Nil, fmt.Errorf("resolve workflow project: %w", err)
+	}
+	return projectID, nil
+}
+
+// toolListRepoFiles lists the client's repository tree.
+func toolListRepoFiles(ctx context.Context, l *toolLoopContext, _ json.RawMessage) (any, error) {
+	if l.repoSvc == nil {
+		return map[string]any{"files": []string{}, "note": "no repository connected"}, nil
+	}
+	projectID, err := l.repoProjectID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	entries, _, err := l.repoSvc.ListRepoTree(ctx, projectID)
+	if err != nil {
+		return map[string]any{"files": []string{}, "note": err.Error()}, nil
+	}
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		paths = append(paths, e.Path)
+	}
+	sortStrings(paths)
+	return map[string]any{"files": paths, "count": len(paths)}, nil
+}
+
+// toolReadRepoFile returns one repository file's content, fetching it on demand
+// when the sync stored metadata only.
+func toolReadRepoFile(ctx context.Context, l *toolLoopContext, input json.RawMessage) (any, error) {
+	if l.repoSvc == nil {
+		return map[string]any{"content": "", "note": "no repository connected"}, nil
+	}
+	var in struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(input, &in); err != nil || strings.TrimSpace(in.Path) == "" {
+		return nil, fmt.Errorf("read_repo_file: path is required")
+	}
+	projectID, err := l.repoProjectID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	file, err := l.repoSvc.GetRepoFileContent(ctx, projectID, strings.TrimSpace(in.Path))
+	if err != nil {
+		return map[string]any{"path": in.Path, "content": "", "error": err.Error()}, nil
+	}
+	content := file.Content
+	if len(content) > 60000 {
+		content = content[:60000] + " [truncated]"
+	}
+	return map[string]any{"path": file.Path, "language": file.Language, "content": content}, nil
 }

@@ -50,6 +50,7 @@ import (
 
 	"ai_avengers/backend/internal/blackboard"
 	"ai_avengers/backend/internal/gateway"
+	"ai_avengers/backend/internal/repo"
 )
 
 // Errors a caller is expected to branch on.
@@ -131,6 +132,8 @@ type ChatParticipant struct {
 const maxFocusFileChars = 20000
 
 type WorkflowChatService struct {
+	// repoSvc (nil-safe): lets the chat read the client's connected repository.
+	repoSvc *repo.Service
 	db            *pgxpool.Pool
 	store         *blackboard.Store
 	gates         *GateSystem
@@ -617,6 +620,7 @@ func (s *WorkflowChatService) Send(
 	// the step in flight, not the ones already done.
 	loopCtx := &toolLoopContext{
 		db:            s.db,
+		repoSvc:       s.repoSvc,
 		store:         s.store, // the real Store — see NewWorkflowChatService's comment
 		sections:      s.sections,
 		gates:         s.gates,
@@ -1287,6 +1291,10 @@ func (s *WorkflowChatService) buildUserPrompt(deliverable, sections, history, qu
 // WHY ownership is checked in the WHERE clause: deleting by id alone would let
 // any client delete another client's thread. A zero-row result is reported so
 // the caller sees "not found" instead of a silent success.
+// SetRepoService wires the repository index so workflow chat can read the
+// client's real source files. Nil keeps the previous behaviour.
+func (s *WorkflowChatService) SetRepoService(repoSvc *repo.Service) { s.repoSvc = repoSvc }
+
 func (s *WorkflowChatService) DeleteChat(ctx context.Context, chatID, clientID uuid.UUID) error {
 	tag, err := s.db.Exec(ctx,
 		`DELETE FROM workflow_chats WHERE id = $1 AND client_id = $2`, chatID, clientID)
