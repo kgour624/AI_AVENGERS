@@ -105,17 +105,23 @@ export default function ProjectPage() {
       </div>
 
       <div className="mt-6">
-        <ChatList projectId={project.id} />
+        <div className="max-h-72 overflow-y-auto rounded-md border border-surface-border p-1">
+          <ChatList projectId={project.id} />
+        </div>
       </div>
 
       <div className="mt-6">
         <p className="mb-1 text-sm font-medium text-text-secondary">Cross-Expert Decisions</p>
-        <ProjectMemoryPanel projectId={project.id} />
+        <div className="max-h-80 overflow-y-auto rounded-md border border-surface-border p-1">
+          <ProjectMemoryPanel projectId={project.id} />
+        </div>
       </div>
 
       <div className="mt-6">
         <p className="mb-1 text-sm font-medium text-text-secondary">Recent Activity</p>
-        <ProjectTimeline events={timeline} />
+        <div className="max-h-80 overflow-y-auto rounded-md border border-surface-border p-1">
+          <ProjectTimeline events={timeline} />
+        </div>
       </div>
 
       <div className="mt-6">

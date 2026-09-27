@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { useMutation } from '@tanstack/react-query'
 import { exportHarnessToGit, ingestCodeFeedback, type GitExportResult } from '@/api/delivery'
@@ -28,12 +28,21 @@ import { handleAPIError } from '@/utils/errors'
 
 type Provider = 'github' | 'gitlab'
 
-function ExportForm({ workflowId }: { workflowId: string }) {
+function ExportForm({ workflowId, connectedRepoUrl }: { workflowId: string; connectedRepoUrl?: string }) {
   const [provider, setProvider] = useState<Provider>('github')
   const [repoUrl, setRepoUrl] = useState('')
   const [branch, setBranch] = useState('main')
   const [createRepo, setCreateRepo] = useState(false)
   const [result, setResult] = useState<GitExportResult | null>(null)
+
+  // Prefill the connected repository: remembering owner/repo by hand is the
+  // step this removes. Only fills while the field is untouched, so it can never
+  // overwrite something the admin typed deliberately.
+  useEffect(() => {
+    if (!connectedRepoUrl) return
+    setRepoUrl((current) => (current.trim() === '' ? connectedRepoUrl : current))
+    setCreateRepo(false)
+  }, [connectedRepoUrl])
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -235,7 +244,7 @@ export function DeliveryPanel({
       )}
       <div className="grid grid-cols-2 gap-4">
         <Card className="p-4">
-          <ExportForm workflowId={workflowId} />
+          <ExportForm workflowId={workflowId} connectedRepoUrl={repoStatus?.connected ? repoStatus.repoUrl : undefined} />
         </Card>
         <Card className="p-4">
           <CodeFeedbackForm workflowId={workflowId} />

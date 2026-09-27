@@ -154,6 +154,33 @@ export const updateExpert = (expertId: string, req: UpdateExpertRequest) =>
 // hashes rather than replacing the first — the corpus doubles and retrieval gets
 // noisier while the job still reports success. Replacing is the only way to move
 // an expert onto new chunking, so the choice is explicit here.
+export interface BatchIngestResult {
+  filename: string
+  jobId?: string
+  status: 'accepted' | 'rejected'
+  reason?: string
+}
+
+/**
+ * Uploads many transcripts in one request. The server runs them through a bounded
+ * worker pool, so 50 files do not open 50 parallel embeds.
+ *
+ * Append-only: replace_existing is deliberately not sent here, because several
+ * jobs cannot safely share a "clear the corpus first" step. Use the single-file
+ * upload when you need to replace the corpus.
+ */
+export const ingestTranscriptsBatch = (expertId: string, files: File[]) => {
+  const formData = new FormData()
+  for (const file of files) formData.append('transcripts', file)
+  return baseAPI
+    .post<ApiResponse<{ results: BatchIngestResult[]; accepted: number; workers: number }>>(
+      `/api/v1/admin/experts/${expertId}/ingest-batch`,
+      formData,
+      { headers: { 'Content-Type': 'multipart/form-data' } }
+    )
+    .then((res) => res.data.data!)
+}
+
 export const ingestTranscript = (expertId: string, file: File, replaceExisting = false) => {
   const formData = new FormData()
   // WHY "transcript", not "file": confirmed against

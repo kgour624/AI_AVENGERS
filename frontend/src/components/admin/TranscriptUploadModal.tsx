@@ -1,7 +1,7 @@
 import { useState, useCallback } from 'react'
 import { useDropzone } from 'react-dropzone'
 import { useMutation } from '@tanstack/react-query'
-import { ingestTranscript } from '@/api/admin'
+import { ingestTranscript, ingestTranscriptsBatch, type BatchIngestResult } from '@/api/admin'
 import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
@@ -76,6 +76,10 @@ export function TranscriptUploadModal({
   onIngestStarted,
 }: TranscriptUploadModalProps) {
   const [file, setFile] = useState<File | null>(null)
+  // Batch mode: many documents in one go, processed by the server's bounded pool.
+  const [batchFiles, setBatchFiles] = useState<File[]>([])
+  const [batchMode, setBatchMode] = useState(false)
+  const [batchResults, setBatchResults] = useState<BatchIngestResult[] | null>(null)
   // Append is the default and the safe choice: it adds this document to whatever
   // the expert already knows. Replacing throws the existing corpus away first,
   // and it is the ONLY way to apply a changed chunker without doubling the
@@ -83,13 +87,20 @@ export function TranscriptUploadModal({
   const [replaceExisting, setReplaceExisting] = useState(false)
 
   const onDrop = useCallback((accepted: File[]) => {
-    const f = accepted[0]
-    if (f) setFile(f)
-  }, [])
+    if (accepted.length === 0) return
+    if (batchMode || accepted.length > 1) {
+      setBatchMode(true)
+      setBatchFiles((previous) => [...previous, ...accepted].slice(0, 50))
+      setBatchResults(null)
+      return
+    }
+    const first = accepted[0]
+    if (first) setFile(first)
+  }, [batchMode])
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
-    multiple: false,
+    multiple: true,
     // WHY the map spans several MIME types: react-dropzone matches on MIME, and
     // the office/document MIME types vary by OS and browser (a .docx can arrive
     // as application/vnd.openxmlformats-officedocument.wordprocessingml.document
@@ -119,6 +130,23 @@ export function TranscriptUploadModal({
       // Catch-all for the office/document formats browsers report as generic
       // binary (common on Windows). The server still does the real validation.
       'application/octet-stream': ACCEPTED_DOCUMENT_EXTENSIONS,
+    },
+  })
+
+  const batchMutation = useMutation({
+    mutationFn: () => {
+      if (batchFiles.length === 0) throw new Error('No files selected')
+      const tooBig = batchFiles.find((f) => f.size > 50 * 1024 * 1024)
+      if (tooBig) throw new Error(`${tooBig.name} is larger than 50MB`)
+      return ingestTranscriptsBatch(expertId, batchFiles)
+    },
+    onSuccess: (data) => {
+      setBatchResults(data.results)
+      const accepted = data.results.filter((r) => r.status === 'accepted')
+      // Start the progress view with the first accepted job; every file still has
+      // its own job row and its own status in the results table.
+      if (accepted[0]?.jobId) onIngestStarted(accepted[0].jobId)
+      setBatchFiles([])
     },
   })
 
@@ -171,6 +199,58 @@ export function TranscriptUploadModal({
         </p>
       )}
 
+      <label className="mt-3 flex items-center gap-2 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={batchMode}
+          onChange={(e) => {
+            setBatchMode(e.target.checked)
+            setBatchFiles([])
+            setBatchResults(null)
+          }}
+        />
+        <span className="text-[11px] text-text-secondary">
+          Batch upload (up to 50 documents at once, processed a few at a time)
+        </span>
+      </label>
+
+      {batchMode && (
+        <div className="mt-2">
+          <p className="text-[11px] text-text-disabled">
+            {batchFiles.length} of 50 selected
+            {batchFiles.length > 0 ? ' — documents are added to the corpus (append)' : ''}
+          </p>
+          {batchFiles.length > 0 && (
+            <ul className="mt-1 max-h-32 overflow-y-auto text-[11px] text-text-secondary">
+              {batchFiles.map((f, i) => (
+                <li key={`${f.name}-${i}`} className="flex items-center justify-between gap-2">
+                  <span className="truncate">{f.name}</span>
+                  <button
+                    type="button"
+                    className="text-text-disabled hover:text-mode-refuse"
+                    onClick={() => setBatchFiles((prev) => prev.filter((_, j) => j !== i))}
+                  >
+                    remove
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {batchResults && (
+            <ul className="mt-2 max-h-40 overflow-y-auto text-[11px]">
+              {batchResults.map((r, i) => (
+                <li key={`${r.filename}-${i}`} className="flex items-center justify-between gap-2">
+                  <span className="truncate">{r.filename}</span>
+                  <span className={r.status === 'accepted' ? 'text-mode-advise' : 'text-mode-refuse'}>
+                    {r.status === 'accepted' ? 'queued' : r.reason || 'rejected'}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       <label className="mt-3 flex items-start gap-2 cursor-pointer">
         <input
           type="checkbox"
@@ -192,14 +272,27 @@ export function TranscriptUploadModal({
       {mutation.isError && (
         <p className="mt-2 text-sm text-mode-refuse">{describeUploadError(mutation.error)}</p>
       )}
+      {batchMutation.isError && (
+        <p className="mt-2 text-sm text-mode-refuse">{describeUploadError(batchMutation.error)}</p>
+      )}
 
       <div className="mt-4 flex justify-end gap-2">
         <Button variant="secondary" onClick={onClose} disabled={mutation.isPending}>
           Cancel
         </Button>
-        <Button onClick={() => mutation.mutate()} disabled={!file} isLoading={mutation.isPending}>
-          {replaceExisting ? 'Replace & Train' : 'Start Ingestion'}
-        </Button>
+        {batchMode ? (
+          <Button
+            onClick={() => batchMutation.mutate()}
+            disabled={batchFiles.length === 0}
+            isLoading={batchMutation.isPending}
+          >
+            Ingest {batchFiles.length} file{batchFiles.length === 1 ? '' : 's'}
+          </Button>
+        ) : (
+          <Button onClick={() => mutation.mutate()} disabled={!file} isLoading={mutation.isPending}>
+            {replaceExisting ? 'Replace & Train' : 'Start Ingestion'}
+          </Button>
+        )}
       </div>
     </Modal>
   )
