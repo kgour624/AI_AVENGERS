@@ -39,6 +39,8 @@ interface SectionDraft {
   label: string
   type: CategorySectionType
   required: boolean
+  /** Word cap for this section (0/undefined = no limit); sent as max_words. */
+  maxWords?: number
 }
 
 interface TemplateDraft {
@@ -58,7 +60,7 @@ function categoryToDraft(cat: ExpertCategory | null) {
     description: cat?.description ?? '',
     defaultLanguage: cat?.defaultLanguage ?? 'java',
     askStructurePermission: cat?.askStructurePermission ?? false,
-    sections: ((schema?.sections ?? []) as SectionDraft[]).map((s) => ({ ...s })),
+    sections: ((schema?.sections ?? []) as SectionDraft[]).map((s) => ({ ...s, maxWords: s.maxWords ?? 0 })),
     // T-CAT: multiple named formats. Off = the original single template.
     useMultiple: templates.length > 0,
     templates: templates as TemplateDraft[],
@@ -118,6 +120,14 @@ function SectionRow({
             </option>
           ))}
         </select>
+        <input
+          type="number"
+          min={0}
+          value={section.maxWords ?? 0}
+          onChange={(e) => onPatch(index, { maxWords: Number(e.target.value) })}
+          title="Maximum words for this section (0 = no limit)"
+          className="w-16 rounded-md border border-surface-border bg-surface-overlay px-1 py-1 text-xs text-text-primary focus:outline-none focus:ring-2 focus:ring-brand"
+        />
         <label className="flex items-center gap-1 text-xs text-text-secondary">
           <input
             type="checkbox"
