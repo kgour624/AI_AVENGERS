@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -172,6 +175,29 @@ func (cv *CrossVerifier) VerifyWaveArtifacts(
 	return nil
 }
 
+// reviewWorkers returns how many reviewers may run at once.
+//
+// WHY bounded: reviewers are LLM calls on the same provider key, so firing one
+// per reviewer on a large roster would hit the rate limit and trip the breaker —
+// slower than the sequential loop this replaces. Four matches the concurrency
+// already used for batch ingestion and answer sections; CROSS_VERIFY_WORKERS
+// tunes it per deployment.
+func reviewWorkers(reviewerCount int) int {
+	workers := 4
+	if v := strings.TrimSpace(os.Getenv("CROSS_VERIFY_WORKERS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			workers = n
+		}
+	}
+	if workers > reviewerCount && reviewerCount > 0 {
+		workers = reviewerCount
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	return workers
+}
+
 // reviewArtifact runs the review loop for one artifact.
 //
 // MENTAL MODEL:
@@ -230,8 +256,39 @@ func (cv *CrossVerifier) reviewArtifact(
 		var failedReviewers []string
 		var changeRequests []string
 
-		for _, reviewer := range reviewers {
-			status, comment, reviewErr := cv.reviewWithSecondCritic(ctx, workflowID, artifact, reviewer, allExperts)
+		// Reviewers run concurrently, results are aggregated in order.
+		//
+		// WHY this is safe: a reviewer only READS the artifact through
+		// reviewWithSecondCritic and returns a verdict — reviewers never see each
+		// other's output, so there is nothing for two of them to race on. What
+		// must stay ordered is the DECISION, and that is preserved: the loop
+		// below still walks reviewers in their original order, so
+		// reviewedCount, failedReviewers, changeRequests, allApproved and
+		// anyBlocked come out exactly as the sequential loop produced them.
+		// Only the wall-clock changes: N reviewers used to cost N × review time.
+		type reviewOutcome struct {
+			status  string
+			comment string
+			err     error
+		}
+		outcomes := make([]reviewOutcome, len(reviewers))
+		workers := reviewWorkers(len(reviewers))
+		var reviewWG sync.WaitGroup
+		sem := make(chan struct{}, workers)
+		for i := range reviewers {
+			reviewWG.Add(1)
+			sem <- struct{}{} // acquisition before the goroutine bounds concurrency
+			go func(i int) {
+				defer reviewWG.Done()
+				defer func() { <-sem }()
+				status, comment, err := cv.reviewWithSecondCritic(ctx, workflowID, artifact, reviewers[i], allExperts)
+				outcomes[i] = reviewOutcome{status: status, comment: comment, err: err}
+			}(i)
+		}
+		reviewWG.Wait() // parent waits — no orphan goroutine survives this round
+
+		for i, reviewer := range reviewers {
+			status, comment, reviewErr := outcomes[i].status, outcomes[i].comment, outcomes[i].err
 			if reviewErr != nil {
 				cv.logger.Warn("cross-verify: reviewer failed (skipping)",
 					zap.String("reviewer", reviewer.Name),
@@ -267,8 +324,8 @@ func (cv *CrossVerifier) reviewArtifact(
 		if anyBlocked {
 			// Hard stop — post to blackboard and return error
 			_, _ = cv.store.Post(ctx, blackboard.PostRequest{
-				WorkflowID: workflowID,
-				EventType:  "artifact_blocked",
+				WorkflowID:     workflowID,
+				EventType:      "artifact_blocked",
 				PostedByClient: true,
 				Content: map[string]interface{}{
 					"artifact_id":   artifact.ID.String(),
@@ -396,8 +453,8 @@ func (cv *CrossVerifier) reviewArtifact(
 		zap.String("artifact_type", artifact.EventType),
 	)
 	_, _ = cv.store.Post(ctx, blackboard.PostRequest{
-		WorkflowID: workflowID,
-		EventType:  "review_escalated_to_client",
+		WorkflowID:     workflowID,
+		EventType:      "review_escalated_to_client",
 		PostedByClient: true,
 		Content: map[string]interface{}{
 			"artifact_id":   artifact.ID.String(),
