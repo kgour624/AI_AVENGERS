@@ -82,7 +82,9 @@ export function CreateWorkflowModal({ isOpen, onClose }: Props) {
   )
 
   function addPlanStep() {
-    const id = crypto.randomUUID()
+    const id = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID()
+      : Date.now().toString(36) + Math.random().toString(36).substring(2)
     const previous = planSteps.at(-1)
     setPlanSteps((steps) => [
       ...steps,
