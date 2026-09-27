@@ -228,11 +228,11 @@ func main() {
 				stale, staleErr := postgres.Exec(context.Background(),
 					`UPDATE ingestion_jobs
 					    SET status        = 'failed',
-					        error_message = 'Auto-failed: no progress for 15 minutes (the worker stopped, likely an API restart). Re-upload or retry the job.',
+					        error_message = 'Auto-failed: no progress for 120 minutes (the worker stopped, likely an API restart). Re-upload or retry the job.',
 					        completed_at  = NOW(),
 					        updated_at    = NOW()
 					  WHERE status = 'running'
-					    AND updated_at < NOW() - INTERVAL '15 minutes'`,
+					    AND updated_at < NOW() - INTERVAL '120 minutes'`,
 				)
 				if staleErr != nil {
 					logger.Warn("stale job checker: DB error", zap.Error(staleErr))
