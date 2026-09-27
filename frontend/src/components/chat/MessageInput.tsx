@@ -164,19 +164,24 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   // Feature #6: Persistent expert selection with lock toggle
   const [isLocked, setIsLocked] = useState(() => loadLockState(chatId))
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => {
-
-    // Collaborative means "merge several experts' answers". With fewer than two
-    // experts selected there is nothing to merge, and the control used to stay on
-    // Collaborative anyway — the mode is pulled back to Independent as soon as the
-    // selection drops below two.
-    useEffect(() => {
-      if (selectedIds.size < 2 && answerMode === 'collaborative') {
-        setAnswerMode('independent')
-      }
-    }, [selectedIds.size, answerMode])
     // Load persisted selection if locked, otherwise start empty
     return isLocked ? loadPersistedSelection(chatId) : new Set()
   })
+
+  // Collaborative means "merge several experts' answers". With fewer than two
+  // experts selected there is nothing to merge, and the control used to stay on
+  // Collaborative anyway — the mode is pulled back to Independent as soon as the
+  // selection drops below two.
+  //
+  // WHY it sits here and not inside the useState above: a hook may only run at
+  // the top level of the component. Nesting it in the initializer also ran it in
+  // the same tick the state was declared, which threw "Cannot access
+  // 'selectedIds' before initialization" and blanked the whole chat page.
+  useEffect(() => {
+    if (selectedIds.size < 2 && answerMode === 'collaborative') {
+      setAnswerMode('independent')
+    }
+  }, [selectedIds.size, answerMode])
 
   // CT-D4: reply state, isolated per-chat via replyStore (CT-L10 —
   // does not touch streamStore or the message list at all).
