@@ -7,23 +7,25 @@ export default {
     extend: {
       colors: {
         // Surfaces — 2051 depth hierarchy
-        'surface-void':         'oklch(6%  0.015 285)',
-        'surface-base':         'oklch(9%  0.018 285)',
-        'surface-raised':       'oklch(13% 0.020 285)',
-        'surface-overlay':      'oklch(17% 0.022 285)',
-        'surface-float':        'oklch(21% 0.024 285)',
-        'surface-border':       'oklch(28% 0.025 285)',
-        'surface-panel-hover':  'oklch(18% 0.022 285)',
+        'surface-void':         'oklch(11% 0.02 265)'   /* #0B0F19 deep obsidian */,
+        'surface-base':         'oklch(13% 0.022 265)',
+        'surface-raised':       'oklch(18% 0.025 265)'   /* #151C2C card */,
+        'surface-overlay':      'oklch(22% 0.028 265)',
+        'surface-float':        'oklch(26% 0.030 265)',
+        'surface-border':       'oklch(34% 0.02 265)'    /* #2A3441 hairline */,
+        'surface-panel-hover':  'oklch(24% 0.028 265)',
 
         // Text
-        'text-primary':   'oklch(96% 0.008 285)',
-        'text-secondary': 'oklch(62% 0.012 285)',
-        'text-disabled':  'oklch(38% 0.008 285)',
+        'text-primary':   'oklch(99% 0 0)'      /* pure white headings */,
+        'text-secondary': 'oklch(78% 0.012 265)' /* #9CA3AF-ish body, readable */,
+        'text-disabled':  'oklch(62% 0.010 265)',
 
         // Brand — Electric Violet
-        'brand':       'oklch(68% 0.28 295)',
-        'brand-hover': 'oklch(73% 0.28 295)',
-        'brand-dim':   'oklch(68% 0.28 295 / 0.15)',
+        'brand':       'oklch(64% 0.22 292)'   /* #8B5CF6 electric purple */,
+        'brand-hover': 'oklch(70% 0.23 292)',
+        'brand-dim':   'oklch(64% 0.22 292 / 0.18)',
+        'accent':      'oklch(72% 0.13 220)'   /* #06B6D4 neon cyan */,
+        'accent-dim':  'oklch(72% 0.13 220 / 0.18)',
 
         // Response modes (functional — hues locked)
         'mode-advise':        'oklch(68% 0.18 145)',
