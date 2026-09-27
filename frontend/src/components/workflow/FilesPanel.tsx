@@ -22,6 +22,13 @@ export interface FilesPanelProps {
   isConnected: boolean
   isDone: boolean
   lastWave: FileStreamState['lastWave']
+  /**
+   * Called when the client selects a file here, so the chat below can scope the
+   * next question to that exact file (and to the expert who produced it). The
+   * Files tab is where people look at their output; making them re-pick the same
+   * file in the chat was the missing link.
+   */
+  onFocusFile?: (filePath: string) => void
 }
 
 // TreeNode is a directory (isDir) or a leaf file. `path` is the full path so
@@ -136,7 +143,7 @@ function TreeRow({ node, depth, collapsed, onToggle, selectedPath, onSelect }: T
   )
 }
 
-export function FilesPanel({ files, isConnected, isDone, lastWave }: FilesPanelProps) {
+export function FilesPanel({ files, isConnected, isDone, lastWave, onFocusFile }: FilesPanelProps) {
   const [selectedPath, setSelectedPath] = useState<string | null>(null)
   // Collapsed folder paths. Default: everything expanded.
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -153,6 +160,12 @@ export function FilesPanel({ files, isConnected, isDone, lastWave }: FilesPanelP
   }
 
   const selected = selectedPath ? files.find((f) => f.filePath === selectedPath) : undefined
+
+  // Selecting here also focuses the chat on the same file.
+  const selectFile = (path: string) => {
+    setSelectedPath(path)
+    onFocusFile?.(path)
+  }
 
   const statusLabel = isDone ? 'Complete' : isConnected ? 'Live' : 'Connecting...'
   const statusDot = isDone
@@ -205,7 +218,7 @@ export function FilesPanel({ files, isConnected, isDone, lastWave }: FilesPanelP
                 collapsed={collapsed}
                 onToggle={onToggle}
                 selectedPath={selectedPath}
-                onSelect={setSelectedPath}
+                onSelect={selectFile}
               />
             ))}
           </Card>

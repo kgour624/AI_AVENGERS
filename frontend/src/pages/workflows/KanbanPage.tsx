@@ -661,6 +661,9 @@ function KanbanPage() {
   // Feature #28: workspace tab strip + its counts.
   // events is hoisted so the counts, the empty-state guard and the panels all
   // read the same list (no three copies of `blackboard?.events ?? []`).
+  // File selected in the FILES tab; the deliverable chat scopes the next
+  // question to it (and locks the expert to its author).
+  const [focusedFile, setFocusedFile] = useState('')
   const [activeTab, setActiveTab] = useState<WorkspaceTab>('board')
   const events = blackboard?.events ?? []
 
@@ -852,6 +855,7 @@ function KanbanPage() {
             isConnected={fileStream.isConnected}
             isDone={fileStream.isDone}
             lastWave={fileStream.lastWave}
+            onFocusFile={setFocusedFile}
           />
         )}
 
@@ -864,7 +868,7 @@ function KanbanPage() {
           own tool loop. Available once the workflow has produced at least
           one task/expert to talk to. */}
       {id && availableExperts.length > 0 && (
-        <WorkflowChatPanel workflowId={id} availableExperts={availableExperts} />
+        <WorkflowChatPanel workflowId={id} availableExperts={availableExperts} focusFile={focusedFile} onClearFocusFile={() => setFocusedFile('')} />
       )}
 
       {/* Amendments (§7.5) — proposals from the chat's mutating tools and from
