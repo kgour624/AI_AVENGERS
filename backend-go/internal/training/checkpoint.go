@@ -225,7 +225,8 @@ func (t *ProgressTracker) UpdateDB(ctx context.Context, done int, stage, detail 
 			current_stage                = $3,
 			stage_detail                 = $4,
 			cost_usd                     = $5,
-			estimated_seconds_remaining  = $6
+			estimated_seconds_remaining  = $6,
+			updated_at                   = NOW()
 		 WHERE id = $7`,
 		done, t.totalChunks, stage, detail, t.TotalCost(), etaSec, t.jobID,
 	)

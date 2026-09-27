@@ -235,7 +235,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   function toggleLock() {
     const newLockState = !isLocked
     setIsLocked(newLockState)
-    
+
     if (newLockState) {
       // When locking, save current selection
       saveSelection(chatId, selectedIds)
@@ -286,12 +286,12 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     )
     setMessage('')
     setAttachedFiles([])
-    
+
     // Feature #6: Only clear selection if NOT locked
     if (!isLocked) {
       setSelectedIds(new Set())
     }
-    
+
     // CT-D4: clear the reply target on successful send — same moment
     // ChatPage.tsx clears pendingUserText, so "replying to" state never
     // outlives the turn it was drafted for.
@@ -328,7 +328,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     <div className="border-t border-surface-border bg-surface-raised p-3">
       <div className="flex items-center justify-between">
         <ExpertPicker experts={experts} selectedIds={selectedIds} onChange={handleSelectionChange} />
-        
+
         <div className="flex items-center gap-3">
           {/* Feature #19: Keyboard Shortcut Help
               WHY corner placement: non-intrusive, discoverable
@@ -448,8 +448,8 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
             selectedIds.size === 0
               ? 'Select at least one expert to ask a question...'
               : isLocked
-              ? 'Ask a follow-up question... (selection locked, ⌘+Enter to send)'
-              : 'Ask a follow-up question... (⌘+Enter to send)'
+                ? 'Ask a follow-up question... (selection locked, ⌘+Enter to send)'
+                : 'Ask a follow-up question... (⌘+Enter to send)'
           }
           rows={1}
           className="flex-1 resize-none bg-transparent text-sm text-text-primary placeholder:text-text-disabled focus:outline-none"
@@ -532,7 +532,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
           ))}
         </div>
       )}
-      
+
       {isLocked && selectedIds.size > 0 && (
         <p className="mt-1 text-xs text-text-disabled">
           🔒 Selection locked: {selectedIds.size} expert{selectedIds.size !== 1 ? 's' : ''} will be used for all messages
