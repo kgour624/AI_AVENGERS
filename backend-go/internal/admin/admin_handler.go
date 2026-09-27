@@ -4301,3 +4301,30 @@ func (h *AdminHandler) SetGateThreshold(c *gin.Context) {
 // Deliberately separate from validStripModes (domain-profile values, uppercase).
 // "full_strip" = strict (uncited sentences stripped); "code_exempt" = VIP pass.
 var validExpertStripModes = map[string]bool{"full_strip": true, "code_exempt": true}
+
+// DeleteExpert DELETE /admin/experts/:id
+//
+// Soft delete: experts are referenced by historical workflows, attempts and
+// artifacts, so removing the row would break that history. deleted_at is what
+// every expert query already filters on, so the expert disappears from every
+// list while the past stays auditable.
+func (h *AdminHandler) DeleteExpert(c *gin.Context) {
+	id, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	tag, err := h.db.Exec(c.Request.Context(),
+		`UPDATE experts SET deleted_at = NOW(), is_active = FALSE, updated_at = NOW()
+		  WHERE id = $1 AND deleted_at IS NULL`, id)
+	if err != nil {
+		h.logger.Error("delete expert failed", zap.String("expert_id", id.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		response.NotFound(c, "expert")
+		return
+	}
+	response.OK(c, gin.H{"status": "deleted"})
+}

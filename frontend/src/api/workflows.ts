@@ -321,3 +321,11 @@ export async function downloadCodebasePatch(workflowId: string): Promise<Blob> {
   }
   return res.blob()
 }
+
+/**
+ * Deletes a workflow and everything it owns (tasks, artifacts, chats).
+ * The API refuses while the workflow is running, so the caller sees a clear
+ * reason instead of orphaned work.
+ */
+export const deleteWorkflow = (workflowId: string) =>
+  baseAPI.delete<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}`).then((res) => res.data.data!)

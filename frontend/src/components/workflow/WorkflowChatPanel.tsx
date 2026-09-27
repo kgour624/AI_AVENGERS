@@ -6,6 +6,7 @@ import {
   getWorkflowChat,
   listWorkflowChatMessages,
   sendWorkflowChatMessage,
+  deleteWorkflowChat,
   getWorkflowFiles,
   addChatParticipant,
   removeChatParticipant,
@@ -42,6 +43,9 @@ export interface WorkflowChatExpertOption {
 
 interface Props {
   workflowId: string
+  /** File selected in the FILES tab; the next question is scoped to it. */
+  focusFile?: string
+  onClearFocusFile?: () => void
   // Experts actually in this workflow (from the Kanban task list, so the
   // participant picker only ever offers experts this workflow really has —
   // not the global expert catalogue).
@@ -299,15 +303,20 @@ function ChatThread({
   chatId,
   workflowId,
   availableExperts,
+  focusFile = '',
 }: {
   chatId: string
   workflowId: string
   availableExperts: WorkflowChatExpertOption[]
+  /** Chosen in the FILES tab; scopes the next question to that file. */
+  focusFile?: string
 }) {
   const queryClient = useQueryClient()
   const [draft, setDraft] = useState('')
   const [toExpertId, setToExpertId] = useState('')
-  const [focusFile, setFocusFile] = useState('')
+  // Mirror the file picked in the FILES tab into this composer's selector.
+  useEffect(() => { if (focusFile) setLocalFocus(focusFile) }, [focusFile])
+  const [localFocus, setLocalFocus] = useState('')
   const [error, setError] = useState<string | null>(null)
 
   // Files the workflow ACTUALLY produced (from the artifact events), each with
@@ -318,18 +327,18 @@ function ChatThread({
     queryFn: () => getWorkflowFiles(workflowId),
     enabled: Boolean(workflowId),
   })
-  const selectedFile = files.find((f) => f.path === focusFile)
+  const selectedFile = files.find((f) => f.path === localFocus)
   // With a file selected, only its author can answer: the list is filtered so
   // another expert cannot be picked by mistake.
   const expertOptions =
-    focusFile && selectedFile?.expertId
+    localFocus && selectedFile?.expertId
       ? availableExperts.filter((e) => e.id === selectedFile.expertId)
       : availableExperts
 
   useEffect(() => {
-    if (focusFile && selectedFile?.expertId) setToExpertId(selectedFile.expertId)
-    if (!focusFile) setToExpertId('')
-  }, [focusFile, selectedFile?.expertId])
+    if (localFocus && selectedFile?.expertId) setToExpertId(selectedFile.expertId)
+    if (!localFocus) setToExpertId('')
+  }, [localFocus, selectedFile?.expertId])
 
   const { data: messages = [], isLoading } = useQuery({
     queryKey: queryKeys.workflowChats.messages(chatId),
@@ -340,7 +349,7 @@ function ChatThread({
   // so there is no streaming state to manage here — just a pending mutation.
   const sendMut = useMutation({
     mutationFn: () =>
-      sendWorkflowChatMessage(chatId, draft.trim(), toExpertId || undefined, focusFile || undefined),
+      sendWorkflowChatMessage(chatId, draft.trim(), toExpertId || undefined, localFocus || undefined),
     onSuccess: () => {
       setDraft('')
       setError(null)
@@ -380,8 +389,8 @@ function ChatThread({
       <div className="flex items-end gap-2 border-t border-surface-border p-2">
         {files.length > 0 && (
           <select
-            value={focusFile}
-            onChange={(e) => setFocusFile(e.target.value)}
+            value={localFocus}
+            onChange={(e) => setLocalFocus(e.target.value)}
             className="max-w-[190px] rounded border border-surface-overlay bg-surface-base px-1.5 py-1.5 text-xs text-text-secondary"
             title="Ask about one generated file (its author answers, using the file's real content)"
           >
@@ -417,7 +426,7 @@ function ChatThread({
           <select
             value={toExpertId}
             onChange={(e) => setToExpertId(e.target.value)}
-            disabled={Boolean(focusFile && selectedFile?.expertId)}
+            disabled={Boolean(localFocus && selectedFile?.expertId)}
             className="rounded border border-surface-overlay bg-surface-base px-1.5 py-1.5 text-xs text-text-secondary disabled:opacity-60"
             title="Which expert answers (default: the deliverable's author)"
           >
@@ -455,10 +464,10 @@ function ChatThread({
   )
 }
 
-export function WorkflowChatPanel({ workflowId, availableExperts }: Props) {
+export function WorkflowChatPanel({ workflowId, availableExperts, focusFile = '' }: Props) {
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
 
-  const { data: chats = [], isLoading } = useQuery({
+  const { data: chats = [], isLoading, refetch: refetchChats } = useQuery({
     queryKey: queryKeys.workflows.chats(workflowId),
     queryFn: () => listWorkflowChats(workflowId),
   })
@@ -487,21 +496,39 @@ export function WorkflowChatPanel({ workflowId, availableExperts }: Props) {
                 </p>
               )}
               {chats.map((c) => (
-                <button
-                  key={c.id}
-                  onClick={() => setActiveChatId(c.id)}
-                  className={cn(
-                    'block w-full px-3 py-2 text-left text-xs',
-                    activeChatId === c.id
-                      ? 'bg-surface-overlay text-text-primary'
-                      : 'text-text-secondary hover:bg-surface-overlay/60'
-                  )}
-                >
-                  <span className="block truncate font-medium">{c.title}</span>
-                  <span className="block text-[10px] text-text-disabled">
-                    {c.messageCount} message{c.messageCount === 1 ? '' : 's'}
-                  </span>
-                </button>
+                <div key={c.id} className="group flex items-center">
+                  <button
+                    onClick={() => setActiveChatId(c.id)}
+                    className={cn(
+                      'block flex-1 px-3 py-2 text-left text-xs',
+                      activeChatId === c.id
+                        ? 'bg-surface-overlay text-text-primary'
+                        : 'text-text-secondary hover:bg-surface-overlay/60'
+                    )}
+                  >
+                    <span className="block truncate font-medium">{c.title}</span>
+                    <span className="block text-[10px] text-text-disabled">
+                      {c.messageCount} message{c.messageCount === 1 ? '' : 's'}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    title="Delete this conversation"
+                    aria-label="Delete this conversation"
+                    onClick={async (e) => {
+                      e.stopPropagation()
+                      if (!window.confirm(`Delete "${c.title}"? This cannot be undone.`)) return
+                      await deleteWorkflowChat(c.id)
+                      if (activeChatId === c.id) setActiveChatId('')
+                      // Refresh the list so the deleted conversation disappears
+                      // immediately instead of lingering until the next reload.
+                      await refetchChats()
+                    }}
+                    className="mr-1 rounded px-2 py-1 text-xs text-text-disabled opacity-0 transition group-hover:opacity-100 hover:text-mode-refuse"
+                  >
+                    Delete
+                  </button>
+                </div>
               ))}
             </div>
           </div>
@@ -513,6 +540,7 @@ export function WorkflowChatPanel({ workflowId, availableExperts }: Props) {
                 chatId={activeChat.id}
                 workflowId={workflowId}
                 availableExperts={availableExperts}
+                focusFile={focusFile}
               />
             ) : (
               <div className="flex h-full items-center justify-center">

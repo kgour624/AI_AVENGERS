@@ -967,6 +967,7 @@ func buildRouter(
 			workflows.GET("/:id/kanban", wfHandler.GetKanban)
 			workflows.POST("/:id/run", wfHandler.RunWorkflow(wfRunner))
 			workflows.GET("/:id/kanban/stream", wfHandler.StreamKanban)
+			workflows.DELETE("/:id", wfHandler.DeleteWorkflow)
 			workflows.GET("/:id/files/stream", wfHandler.StreamFiles)
 			// Authoritative produced-file list (path + owning expert + has
 			// content) so the chat can offer a file picker and route a question
@@ -1028,6 +1029,7 @@ func buildRouter(
 		adminGroup.GET("/experts", adminHandler.ListExperts)
 		adminGroup.POST("/experts", adminHandler.CreateExpert)
 		adminGroup.PATCH("/experts/:id", adminHandler.UpdateExpert)
+		adminGroup.DELETE("/experts/:id", adminHandler.DeleteExpert)
 		adminGroup.POST("/experts/:id/ingest", adminHandler.IngestTranscript)
 		adminGroup.POST("/experts/:id/regenerate-charter", adminHandler.RegenerateCharter)
 		// C2: expert versioning + capability drift.

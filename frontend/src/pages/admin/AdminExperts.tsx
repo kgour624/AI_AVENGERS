@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getAdminExperts, regenerateCharter } from '@/api/admin'
+import { getAdminExperts, regenerateCharter, updateExpert, deleteExpert } from '@/api/admin'
 import { Card } from '@/components/ui/Card'
 import { Button } from '@/components/ui/Button'
 import { Badge } from '@/components/ui/Badge'
@@ -13,6 +13,7 @@ import { IngestionPipelineModal } from '@/components/admin/IngestionPipelineModa
 import { ExpertCapabilitiesTable } from '@/components/admin/ExpertCapabilitiesTable'
 import { useIngestionStatus } from '@/hooks/useIngestionStatus'
 import { trainingStatusLabel } from '@/types/expert'
+import { handleAPIError } from '@/utils/errors'
 
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 11 ("Admin Expert
@@ -113,6 +114,7 @@ function AdminExperts() {
     queryFn: getAdminExperts,
   })
   const queryClient = useQueryClient()
+  const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set())
   const [uploadTargetId, setUploadTargetId] = useState<string | null>(null)
   const [isCreateOpen, setIsCreateOpen] = useState(false)
   const [charterTargetId, setCharterTargetId] = useState<string | null>(null)
@@ -220,6 +222,47 @@ function AdminExperts() {
               {/* A12: new config edit button */}
               <Button variant="ghost" size="sm" onClick={() => setConfigTargetId(expert.id)}>
                 Edit Config
+              </Button>
+              {/* Disable keeps the expert and its history but removes it from every
+                  workflow/chat picker; Enable brings it back. Delete is a soft
+                  delete (deleted_at) so past artifacts stay auditable. */}
+              <Button
+                variant="ghost"
+                size="sm"
+                disabled={togglingIds.has(expert.id)}
+                onClick={async () => {
+                  setTogglingIds((prev) => new Set(prev).add(expert.id))
+                  try {
+                    await updateExpert(expert.id, { isActive: !expert.isActive })
+                    await queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
+                  } catch (toggleErr) {
+                    window.alert(handleAPIError(toggleErr))
+                  } finally {
+                    setTogglingIds((prev) => {
+                      const next = new Set(prev)
+                      next.delete(expert.id)
+                      return next
+                    })
+                  }
+                }}
+              >
+                {expert.isActive ? 'Disable' : 'Enable'}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                className="text-mode-refuse hover:bg-mode-refuse/10"
+                onClick={async () => {
+                  if (!window.confirm(`Delete "${expert.name}"? It will be removed from every picker; its history stays.`)) return
+                  try {
+                    await deleteExpert(expert.id)
+                    await queryClient.invalidateQueries({ queryKey: ['admin', 'experts'] })
+                  } catch (deleteErr) {
+                    window.alert(handleAPIError(deleteErr))
+                  }
+                }}
+              >
+                Delete
               </Button>
               {/* Regenerate Charter: shown when charter is blank or training failed.
                   One-click fix for experts whose LLM credits ran out during ingestion.

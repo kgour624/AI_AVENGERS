@@ -416,3 +416,23 @@ func (h *ChatHandler) RegisterRoutesWithCR(protected *gin.RouterGroup, crSvc *Ch
 		ch.POST("/propose-change", h.ProposeChange(crSvc))
 	}
 }
+
+// DeleteChat DELETE /api/v1/workflow-chats/:chatId
+//
+// Removes a conversation the client no longer needs. Messages and participants
+// reference the chat with ON DELETE CASCADE, so deleting the chat row removes
+// its thread without touching the workflow's real artifacts.
+func (h *ChatHandler) DeleteChat(c *gin.Context) {
+	chatID, err := uuid.Parse(c.Param("chatId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid chat ID")
+		return
+	}
+	clientID := c.MustGet("user_id").(uuid.UUID)
+	if err := h.svc.DeleteChat(c.Request.Context(), chatID, clientID); err != nil {
+		h.logger.Error("delete workflow chat failed", zap.String("chat_id", chatID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, gin.H{"status": "deleted"})
+}
