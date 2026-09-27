@@ -3021,18 +3021,22 @@ func (s *Service) fetchAndStoreFileContent(ctx context.Context, connectionID uui
 // branch it indexed. The push/check screens need every branch that exists, which
 // is exactly what GitHub's /branches and GitLab's /repository/branches expose.
 func (s *Service) ListBranches(ctx context.Context, projectID uuid.UUID) ([]string, string, error) {
+	var connectionID uuid.UUID
 	var provider, repoURL, defaultBranch string
 	if err := s.db.QueryRow(ctx,
-		`SELECT provider, repo_url, COALESCE(default_branch,'')
+		`SELECT id, provider, repo_url, COALESCE(default_branch,'')
 		   FROM repo_connections WHERE project_id=$1 ORDER BY created_at DESC LIMIT 1`,
 		projectID,
-	).Scan(&provider, &repoURL, &defaultBranch); err != nil {
+	).Scan(&connectionID, &provider, &repoURL, &defaultBranch); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, "", ErrNoRepoConnection
 		}
 		return nil, "", fmt.Errorf("load repo connection: %w", err)
 	}
-	token, err := s.accessTokenForConnection(ctx, projectID)
+	// The token is stored per CONNECTION, not per project. Passing the project id
+	// here returned no row, so the branch call failed for every project and the UI
+	// silently fell back to its text input instead of a dropdown.
+	token, err := s.accessTokenForConnection(ctx, connectionID)
 	if err != nil {
 		return nil, "", err
 	}

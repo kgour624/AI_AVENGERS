@@ -367,6 +367,12 @@ func (h *ChatHandler) ProposeChange(crSvc *ChangeRequestService) gin.HandlerFunc
 				        current_phase = 'detailed_design',
 				        phase_completed_at = NULL,
 				        failure_reason = NULL,
+				        -- Clear the crash-recovery checkpoint too. Without this the
+				        -- runner resumes from its last saved phase (handoff for a
+				        -- finished workflow), skips design entirely, and finishes with
+				        -- "no design or code artifacts were produced" — which is exactly
+				        -- why a proposed change request produced no visible progress.
+				        runner_state = NULL,
 				        updated_at = NOW()
 				  WHERE id = $1 AND status IN ('completed','failed')`,
 				cr.WorkflowID)

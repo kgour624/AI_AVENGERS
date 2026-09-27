@@ -319,14 +319,26 @@ export function IngestionPipelineModal({
             <h2 className="text-base font-semibold text-text-primary">Ingestion Pipeline</h2>
             <p className="mt-0.5 text-xs text-text-secondary">{expertName}</p>
           </div>
-          {/* Live indicator */}
+          {/* Status indicator.
+              It used to report only SSE connectivity, so a job that had already
+              finished (complete / with warnings / failed) still showed a pulsing
+              "Live" next to a 100% bar and its final warning box — a contradictory
+              screen. The job's own terminal state now wins. */}
           <div className="flex items-center gap-1.5">
             <span className={cn(
               'h-2 w-2 rounded-full',
-              stream.isConnected ? 'bg-mode-advise animate-pulse' : 'bg-glow-amber animate-pulse'
+              isFailed ? 'bg-mode-refuse'
+                : isWarning ? 'bg-glow-amber'
+                : isComplete ? 'bg-mode-advise'
+                : isPaused ? 'bg-glow-amber animate-pulse'
+                : stream.isConnected ? 'bg-mode-advise animate-pulse' : 'bg-glow-amber animate-pulse'
             )} />
             <span className="text-[10px] font-medium uppercase tracking-wider text-text-disabled">
-              {stream.isConnected ? 'Live' : 'Reconnecting...'}
+              {isFailed ? 'Failed'
+                : isWarning ? 'Finished with warnings'
+                : isComplete ? 'Finished'
+                : isPaused ? 'Paused'
+                : stream.isConnected ? 'Live' : 'Reconnecting...'}
             </span>
           </div>
         </div>
@@ -803,7 +815,11 @@ export function IngestionPipelineModal({
             className="h-44 overflow-y-auto rounded-lg border border-surface-border bg-surface-void p-2 font-mono text-[10px]"
           >
             {stream.eventLog.length === 0 ? (
-              <p className="text-text-disabled">Waiting for the first event…</p>
+              <p className="text-text-disabled">
+                {isDone || isFailed
+                  ? 'No timeline events were recorded for this run.'
+                  : 'Waiting for the first event…'}
+              </p>
             ) : (
               stream.eventLog.map((entry) => (
                 <div key={entry.seq} className="flex gap-2 py-0.5">

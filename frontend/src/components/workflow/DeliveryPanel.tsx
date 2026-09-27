@@ -30,7 +30,7 @@ import { handleAPIError } from '@/utils/errors'
 
 type Provider = 'github' | 'gitlab'
 
-function ExportForm({ workflowId, connectedRepoUrl, branches, defaultBranch }: { workflowId: string; connectedRepoUrl?: string; branches?: string[]; defaultBranch?: string }) {
+function ExportForm({ workflowId, connectedRepoName, connectedRepoUrl, branches, defaultBranch }: { workflowId: string; connectedRepoName?: string; connectedRepoUrl?: string; branches?: string[]; defaultBranch?: string }) {
   const [provider, setProvider] = useState<Provider>('github')
   const [repoUrl, setRepoUrl] = useState('')
   const [branch, setBranch] = useState('main')
@@ -44,11 +44,12 @@ function ExportForm({ workflowId, connectedRepoUrl, branches, defaultBranch }: {
     if (!connectedRepoUrl) return
     // Show the short owner/repo form the way the provider shows it
     // (mehrasneha161-ai/Codepush), instead of a full clone URL.
-    const shortForm = connectedRepoUrl
-      .replace(/^https?:\/\//, '')
-      .replace(/^www\./, '')
-      .replace(/^(github|gitlab)\.com\//, '')
-      .replace(/\.git$/, '')
+    // Prefer the provider's own "owner/repo" string. The regex fallback stays
+    // only for callers that have a URL and no name, and it must not cut the
+    // middle of a name (the old version produced "haamraaaa45-group1").
+    const shortForm = connectedRepoName && connectedRepoName.includes('/')
+      ? connectedRepoName
+      : connectedRepoUrl
     setRepoUrl((current) => (current.trim() === '' ? shortForm : current))
     setCreateRepo(false)
   }, [connectedRepoUrl])
@@ -311,6 +312,7 @@ export function DeliveryPanel({
         <Card className="p-4">
           <ExportForm
             workflowId={workflowId}
+            connectedRepoName={repoStatus?.connected ? repoStatus.repoName : undefined}
             connectedRepoUrl={repoStatus?.connected ? repoStatus.repoUrl : undefined}
             branches={repoBranches?.branches}
             defaultBranch={repoBranches?.defaultBranch}
