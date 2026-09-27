@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -26,7 +27,7 @@ func (s *Server) dispatch(ctx context.Context, scope Scope, req jsonRPCRequest) 
 			return jsonRPCResponse{}, false
 		}
 		return jsonRPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{
-			"protocolVersion": protocolVersion,
+			"protocolVersion": negotiateVersion(req.Params),
 			"capabilities":    map[string]any{"tools": map[string]any{}},
 			"serverInfo":      map[string]any{"name": "ai-avengers-experts", "version": s.version},
 		}}, true
@@ -152,4 +153,29 @@ func domainFromArgs(args json.RawMessage) string {
 		return ""
 	}
 	return probe.Domain
+}
+
+// negotiateVersion answers initialize with the client's protocol revision when
+// this server supports it, and with its own otherwise.
+//
+// WHY echo instead of always replying with ours: a client that asked for a newer
+// revision and is told an older one may refuse the session outright. The wire
+// shape this server uses (initialize, tools/list, tools/call) is identical
+// across these revisions, so agreeing with the client is both honest and what
+// keeps a current Claude Code from rejecting the handshake.
+func negotiateVersion(params json.RawMessage) string {
+	supported := map[string]bool{
+		"2024-11-05": true,
+		"2025-03-26": true,
+		"2025-06-18": true,
+	}
+	var in struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if len(params) > 0 && json.Unmarshal(params, &in) == nil {
+		if supported[strings.TrimSpace(in.ProtocolVersion)] {
+			return strings.TrimSpace(in.ProtocolVersion)
+		}
+	}
+	return protocolVersion
 }

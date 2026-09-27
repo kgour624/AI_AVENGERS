@@ -24,6 +24,9 @@ type Server struct {
 	// nothing to audit against, and a nil auditor must never be special-cased
 	// at every call site.
 	auditor *Auditor
+	// sessions is the HTTP transport's initialize bookkeeping. Unused by stdio,
+	// which is one process per client and needs no session at all.
+	sessions *sessionStore
 	// tokens is set only for the HTTP transport. A nil store means "this server
 	// cannot authenticate anybody", which HTTP refuses instead of running open.
 	tokens TokenStore
@@ -36,7 +39,7 @@ func NewServer(registry *Registry, logger *zap.Logger, version string, scope Sco
 	if logger == nil {
 		logger = zap.NewNop()
 	}
-	return &Server{registry: registry, logger: logger, version: version, scope: scope}
+	return &Server{registry: registry, logger: logger, version: version, scope: scope, sessions: newSessionStore()}
 }
 
 // SetTokenStore enables token authentication for the HTTP transport.
