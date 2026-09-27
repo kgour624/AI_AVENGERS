@@ -186,6 +186,12 @@ export function IngestionPipelineModal({
   const isPaused = job?.status === 'paused'
   const isRunning = !!job && !isDone && !isFailed && !isPaused
 
+  // A job that is running again must not keep showing an earlier failure: that
+  // was the contradictory screen ("Failed" banner + "job is running" notice).
+  useEffect(() => {
+    if (job?.status === 'running') setResumeError(null)
+  }, [job?.status])
+
   // ------------------------------------------------------------------
   // Corpus check + repair (Phase D/E)
   // ------------------------------------------------------------------
@@ -272,6 +278,9 @@ export function IngestionPipelineModal({
     setResumeError(null)
     try {
       await resumeIngestionJob(expertId, job.id)
+      // The job is running again, so any previous failure text is stale — clear it
+      // rather than leaving "Failed" on screen next to a live running job.
+      setResumeError(null)
       // SSE stream will auto-reconnect and show live progress
     } catch (err: unknown) {
       const msg = (err as { response?: { data?: { error?: { message?: string } } } })
