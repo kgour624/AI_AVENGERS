@@ -60,6 +60,7 @@ const (
 // repository API, and a test can supply a stub without a database.
 type RepoCodeSource interface {
 	SuggestRepoFiles(ctx context.Context, projectID uuid.UUID, requirement string, limit int) ([]repo.RepoFileSuggestion, error)
+	SuggestRepoFilesPage(ctx context.Context, projectID uuid.UUID, requirement string, offset, limit int) ([]repo.RepoFileSuggestion, int, error)
 	RepoFileExists(ctx context.Context, projectID uuid.UUID, path string) (bool, error)
 	// CopyFilesToWorkspace materialises approved files into a workspace. It is
 	// here (rather than in the runner) because the blob store is the repository
@@ -342,19 +343,29 @@ func (s *CodebaseService) requirementText(ctx context.Context, workflowID uuid.U
 // unique index is (workflow_id, path), so an existing row — of ANY status — is
 // left exactly as it is.
 func (s *CodebaseService) SuggestForWorkflow(ctx context.Context, workflowID uuid.UUID, limit int) ([]CodebaseFile, error) {
+	added, _, _, err := s.SuggestForWorkflowPage(ctx, workflowID, 0, limit)
+	return added, err
+}
+
+// SuggestForWorkflowPage requests a later slice from the same repo ranker and
+// records only new candidates. Existing pending/approved/rejected decisions
+// still win because the same (workflow_id,path) ON CONFLICT DO NOTHING rule is
+// retained. offset is the number of ranked suggestions the client has already
+// asked to show (not the number approved).
+func (s *CodebaseService) SuggestForWorkflowPage(ctx context.Context, workflowID uuid.UUID, offset, limit int) ([]CodebaseFile, int, bool, error) {
 	projectID, err := s.workflowProject(ctx, workflowID)
 	if err != nil {
-		return nil, err
+		return nil, offset, false, err
 	}
 
 	requirement := s.requirementText(ctx, workflowID)
 	if requirement == "" {
-		return nil, ErrNoRequirement
+		return nil, offset, false, ErrNoRequirement
 	}
 
-	suggestions, err := s.repo.SuggestRepoFiles(ctx, projectID, requirement, limit)
+	suggestions, nextOffset, err := s.repo.SuggestRepoFilesPage(ctx, projectID, requirement, offset, limit)
 	if err != nil {
-		return nil, fmt.Errorf("suggest repo files: %w", err)
+		return nil, offset, false, fmt.Errorf("suggest repo files: %w", err)
 	}
 
 	added := []CodebaseFile{}
@@ -377,7 +388,7 @@ func (s *CodebaseService) SuggestForWorkflow(ctx context.Context, workflowID uui
 			continue // already known to this workflow (any status): keep the human's decision
 		}
 		if err != nil {
-			return nil, fmt.Errorf("store codebase suggestion: %w", err)
+			return nil, offset, false, fmt.Errorf("store codebase suggestion: %w", err)
 		}
 		added = append(added, file)
 
@@ -391,7 +402,11 @@ func (s *CodebaseService) SuggestForWorkflow(ctx context.Context, workflowID uui
 		zap.Int("candidates", len(suggestions)),
 		zap.Int("new_rows", len(added)),
 	)
-	return added, nil
+	// If the ranker returned a full page, there may be another page. The API
+	// caps the overall ranked window at suggestMaxLimitSize, so "Show more"
+	// eventually stops even on huge repositories.
+	hasMore := nextOffset < 50 && len(suggestions) > 0
+	return added, nextOffset, hasMore, nil
 }
 
 // ErrNoRequirement is returned when a workflow has no requirement text yet, so
@@ -654,11 +669,12 @@ func (h *CodebaseHandler) Suggest(c *gin.Context) {
 		return
 	}
 	var body struct {
-		Limit int `json:"limit"`
+		Limit  int `json:"limit"`
+		Offset int `json:"offset"`
 	}
 	_ = c.ShouldBindJSON(&body) // an empty body is valid: default limit applies
 
-	added, err := h.svc.SuggestForWorkflow(c.Request.Context(), workflowID, body.Limit)
+	added, nextOffset, hasMore, err := h.svc.SuggestForWorkflowPage(c.Request.Context(), workflowID, body.Offset, body.Limit)
 	switch {
 	case errors.Is(err, ErrNoRequirement):
 		response.Conflict(c, "this workflow has no requirement text yet, so there is nothing to rank files against")
@@ -674,7 +690,7 @@ func (h *CodebaseHandler) Suggest(c *gin.Context) {
 		response.InternalError(c)
 		return
 	}
-	response.OK(c, gin.H{"suggestions": added, "count": len(added)})
+	response.OK(c, gin.H{"suggestions": added, "count": len(added), "offset": nextOffset, "limit": body.Limit, "has_more": hasMore})
 }
 
 // AddFile POST /workflows/:id/codebase/files

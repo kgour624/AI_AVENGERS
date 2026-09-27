@@ -208,11 +208,11 @@ export const getCodebaseFiles = (workflowId: string) =>
  * whatever their status, so a file the client already rejected cannot be
  * silently re-proposed by a later run.
  */
-export const suggestCodebaseFiles = (workflowId: string, limit?: number) =>
+export const suggestCodebaseFiles = (workflowId: string, limit?: number, offset = 0) =>
   baseAPI
-    .post<ApiResponse<{ suggestions: CodebaseFile[]; count: number }>>(
+    .post<ApiResponse<{ suggestions: CodebaseFile[]; count: number; offset: number; limit: number; hasMore: boolean }>>(
       `/api/v1/workflows/${workflowId}/codebase/suggest`,
-      { limit }
+      { limit, offset }
     )
     .then((res) => res.data.data!)
 
