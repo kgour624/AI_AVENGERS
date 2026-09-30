@@ -38,6 +38,10 @@ import (
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/jobevents"
 	"ai_avengers/backend/internal/knowledge"
+	"ai_avengers/backend/internal/mcp"
+	"ai_avengers/backend/internal/mcp-v2"
+	mcpv2businessstorage "ai_avengers/backend/internal/mcp-v2/business/storage"
+	mcpv2storage "ai_avengers/backend/internal/mcp-v2/storage"
 	"ai_avengers/backend/internal/memory"
 	"ai_avengers/backend/internal/message"
 	"ai_avengers/backend/internal/middleware"
@@ -561,6 +565,24 @@ func buildRouter(
 	} else {
 		logger.Info("repo sync scheduler disabled (REPO_SYNC_INTERVAL_HOURS=0); the Sync Now button still works")
 	}
+	 {
+     mcpStore := mcpv2storage.NewPostgresAdapter(postgres.Pool)
+	 mcpTx := mcpv2businessstorage.NewTxManager(postgres.Pool)
+     realGw := mcpv2.NewRealGatewayAdapter(modelGateway)
+     realDecision := mcpv2.NewDecisionAdapter(decisionEngine)
+     realVec := mcpv2.NewRealVectorAdapter(embedder)
+     mcpSvc := mcpv2.NewService(mcpv2.Deps{
+         DB: mcpStore, TxStarter: mcpTx,
+         Gateway: realGw, Decision: realDecision, Vector: realVec,
+         Redis: mcpv2.NewRedisAdapter(redisClient.Client),
+         Logger: logger,
+     })
+     mcpHandler := mcpv2.NewHandler(mcpSvc, logger)
+     mcpHandler.RegisterRoutes(router)
+ }
+	mcpTokenStore := mcp.NewPGTokenStore(postgres.Pool)
+	mcpAdminHandler := mcp.NewAdminHandler(mcpTokenStore, logger)
+
 	adminHandler := adminpkg.NewAdminHandler(postgres.Pool, modelGateway, mlClient, embedder, categoryRegistry, domainRegistry, versionSvc, evalStore, tenantSvc, usageSvc, freshnessSvc, byoSvc, eventsStore, docExtractor, logger)
 
 	// I2: capability measurement. The retriever is the SAME assembler the chat and
@@ -1170,6 +1192,13 @@ func buildRouter(
 		// WHY proxy: API key must never leave the server.
 		adminGroup.GET("/codecraftapi/models", adminHandler.GetCodeCraftModels)
 		adminGroup.GET("/embedding-settings", adminHandler.GetEmbeddingSettings)
+		// MCP Token Management
+		adminGroup.GET("/mcp-tokens", mcpAdminHandler.ListMCPTokens)
+		adminGroup.POST("/mcp-tokens", mcpAdminHandler.CreateMCPToken)
+		adminGroup.POST("/mcp-tokens/:id/revoke", mcpAdminHandler.RevokeMCPToken)
+		
+
+
 		adminGroup.POST("/embedding-settings", adminHandler.UpdateEmbeddingSettings)
 		// Expert categories (migration 010, CT-A3) — admin-owned template layer.
 		adminGroup.GET("/expert-categories", adminHandler.ListExpertCategories)

@@ -83,6 +83,7 @@ const router = createBrowserRouter([
               { path: 'usage', lazy: () => import('@/pages/admin/AdminUsage') },
               { path: 'reliability', lazy: () => import('@/pages/admin/AdminReliability') },
               { path: 'mcp-access', lazy: () => import('@/pages/admin/AdminMcpAccess') },
+              { path: 'mcp', lazy: () => import('@/pages/admin/AdminMcpControlCenter') },
             ],
           },
         ],

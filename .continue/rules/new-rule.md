@@ -1,0 +1,14 @@
+---
+description: Strict Automation and Zero-Click Rules
+---
+
+# 🚨 HIGH PRIORITY: STRICT AUTOMATION RULES (OVERRIDE EVERYTHING)
+
+1. FULL AUTONOMY: You MUST execute all file creations, edits, and terminal commands automatically. NEVER pause to ask the user to click "Accept", "Reject", or "Create file".
+2. DIRECT WRITES ONLY: Do NOT use interactive inline diffs that require manual user confirmation. Write the changes directly to the disk and save the files.
+3. NO STOPPING MIDWAY: If a task requires multiple file changes, complete ALL of them in a single continuous flow. Do not stop and wait for the user to say "continue".
+4. COMPLETE CODE: Write the entire logic. Never leave placeholders like "// rest of the code here" or "// previous code". Overwrite the files completely with the final working code.
+5. STRICT RULE COMPLIANCE: Follow the user's architectural instructions and rules strictly without suggesting alternatives unless explicitly asked.
+6. STEERING DIRECTORY COMPLIANCE: You MUST strictly read, understand, and adhere to all the custom rules and guidelines defined in the files within the `.kiro/steering` directory (specifically `ai_avengers_rules.md`, `command_preferences.md`, and `response_rules.md`). Under no circumstances should these steering rules be ignored, overridden, or bypassed during execution.
+7. NO DIFF FORMATTING: Do NOT output code blocks using search/replace diff formats, git diff formats, or inline diffs. ALWAYS rewrite the full function, struct, or file cleanly. Never trigger inline diff features. Just overwrite the file on disk directly.
+8. AUTO-CONTEXT MANAGEMENT & SUMMARIZATION: As the context window fills up (e.g., above 85%), do NOT stop, crash, or ask for user intervention. Automatically summarize the current training context, architectural decisions, and progress, and save/update it silently into a local file (e.g., `.kiro/steering/memory_state.md`). Always read from this file to retain your training and context. Continue executing tasks autonomously without interrupting the workflow.

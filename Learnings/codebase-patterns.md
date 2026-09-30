@@ -35,4 +35,11 @@
 ## Test conventions
 - Go tests use standard `*_test.go` files and `testing`; unit tests commonly test package behavior without external service infrastructure, while backend compile verification uses the Docker build when local Go is unavailable. (seen in: `backend-go/internal/`, `backend-go/Dockerfile`)
 - Frontend build command is `npm run build` (`tsc -b && vite build`); lint script exists but requires an ESLint configuration. (seen in: `frontend/package.json`)
-- Python source can be syntax-checked with `python -m py_compile`; sidecar dependencies are pinned in requirements. (seen in: `ml-sidecar/requirements.txt`)
+"- Python source can be syntax-checked with `python -m py_compile`; sidecar dependencies are pinned in requirements. (seen in: `ml-sidecar/requirements.txt`)
+
+## I5 Layer-aware Retrieval — Pending Design (2026-09-28)
+- I4 done: `reciprocalRankFusion` (rrfK=60), keyword OR (max 8 terms), fusion fixes invisible defects because reranker re-scores (seen in: `backend-go/internal/context/retrieval_rank.go:1-14`).
+- `RetrievalPreference` is **reorder-only, never filter** — `DefaultPreferenceBoost=1.25`, `retrievalPoolFactor=3`, `applyPreferenceBoost()` pure and safe to leave on (seen in: `backend-go/internal/context/retrieval_preference.go:8-27`).
+- `Depth layers` are Option A (nothing invented): Layer 1 WHAT/WHY, 2 HOW/TRADE-OFFS, 3 FAILURE/EDGE; `Report()` + `layerFindings()` honestly tells buyer where depth is missing — this is the risk-free truth used while I5 is pending (seen in: `backend-go/internal/training/depth_layers.go:1-35`).
+- I5 pending intentionally: Layer-aware retrieval (\"kya tootega\" → Layer-3 first) is the **3rd retrieval change** after RRF + graph; not added until those two are measured in this environment, otherwise attribution is lost. Coverage report answers depth questions without risk in the meantime (source: purane developer ka note + `docs/I5_LAYER_AWARE_RETRIEVAL_DESIGN.md`).
+- Future I5 design (direct-implementation ready): `InferLayerPreference(question)` pure trigger match → `GetCourseChunksWithLayerAware()` wrapper (3x pool when active) → `CapabilityRetriever` 4th method for isolated A/B; flagged OFF by default, 3 files + 2 tests + 0 migrations. Full copy-paste blocks in `docs/I5_LAYER_AWARE_RETRIEVAL_DESIGN.md` §3A-3C."

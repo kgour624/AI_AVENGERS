@@ -19,13 +19,10 @@ services:
       context: ./backend-go
       dockerfile: Dockerfile
     command: [ "./migrate", "up" ]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      - DATABASE_URL=postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@postgres:5432/ai_avengers?sslmode=disable
-    depends_on:
-      postgres:
-        condition: service_healthy
-    # WHY restart: no — migrations are one-shot.
-    # Running them again on crash is wrong (could indicate a real problem).
+      - DATABASE_URL=${DATABASE_URL:-postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@host.docker.internal:5432/ai_avengers?sslmode=disable}
     restart: no
     networks:
       - avengers-network
@@ -38,13 +35,15 @@ services:
       context: ./backend-go
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "8081:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8080
       - SERVER_ENV=development
-      - DATABASE_URL=postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@postgres:5432/ai_avengers?sslmode=disable
-      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=${DATABASE_URL:-postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@host.docker.internal:5432/ai_avengers?sslmode=disable}
+      - REDIS_URL=${REDIS_URL:-redis://host.docker.internal:6379}
       - ML_SIDECAR_URL=http://ml-sidecar:8001
       - JWT_SECRET=${JWT_SECRET}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -70,16 +69,9 @@ services:
       - CAVOTI_API_KEY=${CAVOTI_API_KEY:-}
       - CAVOTI_BASE_URL=${CAVOTI_BASE_URL:-https://cavoti.com/v1}
     depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
       ml-sidecar:
         condition: service_started
       migrate:
-        # WHY service_completed_successfully:
-        # migrate exits with code 0 after applying migrations.
-        # api must not start until migrations are done.
         condition: service_completed_successfully
     volumes:
       - workspaces:/workspaces
@@ -97,7 +89,7 @@ services:
       context: .
       dockerfile: aider-service/Dockerfile
     ports:
-      - "8082:8082"
+      - "8083:8082"
     environment:
       # litellm's OpenAI transport appends /chat/completions to this base URL.
       - MODEL_GATEWAY_URL=http://api:8080/api/v1/llm/proxy
@@ -129,7 +121,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile.dev
     ports:
-      - "3001:3000"
+      - "3002:3000"
       #volumes:
       # Mount source for HMR — changes reflect instantly
       #- ./frontend:/app
@@ -137,14 +129,12 @@ services:
       # WHY: Host OS node_modules may differ from container (e.g. linux vs mac)
       #- /app/node_modules
     environment:
-      - VITE_API_URL=http://192.168.1.7:8080
+      - VITE_API_URL=http://192.168.1.7:8081
       # 2026-09-09 fix (round 12): tells vite.config.ts's server.hmr.clientPort
-      # what port the BROWSER actually uses (host-side 3001), not the
-      # container-internal port (3000) Vite would otherwise assume for its
       # injected HMR WebSocket client - this is what "[vite] failed to
       # connect to websocket" was caused by. Must match the host-side port
       # in this same file's "ports: - 3001:3000" mapping below.
-      - VITE_HMR_CLIENT_PORT=3001
+      - VITE_HMR_CLIENT_PORT=3002
     depends_on:
       - api
     restart: unless-stopped
@@ -161,7 +151,7 @@ services:
       context: ./ml-sidecar
       dockerfile: Dockerfile
     ports:
-      - "8001:8001"
+      - "8002:8001" # HOST 8002 -> CONTAINER 8001 (fix: 8001 already allocated on host, internal ML_SIDECAR_URL still http://ml-sidecar:8001)
     volumes:
       - ml-models:/root/.cache/huggingface # Cache downloaded models
     environment:
@@ -176,7 +166,7 @@ services:
   postgres:
     image: pgvector/pgvector:pg15
     ports:
-      - "5432:5432"
+      - "5433:5432"
     environment:
       - POSTGRES_USER=avengers
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-avengers_pass}
@@ -199,7 +189,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "6379:6379"
+      - "6380:6379"
     volumes:
       - redis-data:/data
     command: redis-server --appendonly yes
