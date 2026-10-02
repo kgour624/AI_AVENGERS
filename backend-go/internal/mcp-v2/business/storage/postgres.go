@@ -5,7 +5,10 @@ package storage
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"regexp"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"ai_avengers/backend/internal/mcp-v2/business"
@@ -28,8 +31,161 @@ func (d dbExpert) parse() (business.Expert, error) {
 	return business.Expert{ID: d.id, Name: d.name, Slug: d.slug, Charter: d.charter}, nil
 }
 
+// dbTool is Storage Model for mcp_v2_tools — maps to business.ToolDefinition via parse().
+// Storage model uses raw JSONB bytes; parse() unmarshals into business.InputSchema + Action.
+type dbTool struct {
+	id             string
+	name           string
+	displayName    string
+	description    string
+	isActive       bool
+	inputSchemaRaw []byte // raw JSONB -> parse() unmarshals to InputSchema
+	actionRaw      []byte // raw JSONB -> parse() unmarshals to ActionDef
+}
+
+func (d dbTool) parse() (business.ToolDefinition, error) {
+	if d.name == "" {
+		return business.ToolDefinition{}, fmt.Errorf("invalid tool name")
+	}
+	var schema map[string]any
+	if len(d.inputSchemaRaw) > 0 {
+		if err := json.Unmarshal(d.inputSchemaRaw, &schema); err != nil {
+			schema = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+	}
+	if schema == nil {
+		schema = map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	var action business.ActionDef
+	if len(d.actionRaw) > 0 && string(d.actionRaw) != "{}" && string(d.actionRaw) != "null" {
+		_ = json.Unmarshal(d.actionRaw, &action)
+	}
+	return business.ToolDefinition{
+		ID:          d.id,
+		Name:        d.name,
+		DisplayName: d.displayName,
+		Description: d.description,
+		IsActive:    d.isActive,
+		InputSchema: schema,
+		Action:      action,
+	}, nil
+}
+
+// ListTools implements business.Storer — fetches active tools from mcp_v2_tools.
+// Follows clean architecture: SQL -> dbTool (Storage Model) -> parse() -> business.ToolDefinition (Core Model).
+func (p *PostgresAdapter) ListTools(ctx context.Context) ([]business.ToolDefinition, error) {
+	rows, err := p.pool.Query(ctx, `SELECT id::text, name, display_name, COALESCE(description,''), is_active, COALESCE(input_schema, '{}'::jsonb), COALESCE(action, '{}'::jsonb) FROM mcp_v2_tools WHERE is_active = true ORDER BY display_name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("list tools: %w", err)
+	}
+	defer rows.Close()
+
+	var out []business.ToolDefinition
+	for rows.Next() {
+		var d dbTool
+		if err := rows.Scan(&d.id, &d.name, &d.displayName, &d.description, &d.isActive, &d.inputSchemaRaw, &d.actionRaw); err != nil {
+			return nil, fmt.Errorf("scan tool: %w", err)
+		}
+		t, err := d.parse()
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate tools: %w", err)
+	}
+	return out, nil
+}
+
+func (p *PostgresAdapter) CreateTool(ctx context.Context, t business.ToolDefinition) error {
+	schemaBytes, err := json.Marshal(t.InputSchema)
+	if err != nil {
+		return fmt.Errorf("marshal input_schema: %w", err)
+	}
+	if len(schemaBytes) == 0 || string(schemaBytes) == "null" {
+		schemaBytes = []byte(`{}`)
+	}
+	actionBytes, err := json.Marshal(t.Action)
+	if err != nil {
+		return fmt.Errorf("marshal action: %w", err)
+	}
+	if len(actionBytes) == 0 || string(actionBytes) == "null" {
+		actionBytes = []byte(`{}`)
+	}
+	_, err = p.pool.Exec(ctx, `INSERT INTO mcp_v2_tools (name, display_name, description, input_schema, action, is_active) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, true)`, t.Name, t.DisplayName, t.Description, string(schemaBytes), string(actionBytes))
+	if err != nil {
+		return fmt.Errorf("create tool: %w", err)
+	}
+	return nil
+}
+
+func (p *PostgresAdapter) GetTool(ctx context.Context, name string) (business.ToolDefinition, error) {
+	var d dbTool
+	err := p.pool.QueryRow(ctx, `SELECT id::text, name, display_name, COALESCE(description,''), is_active, COALESCE(input_schema, '{}'::jsonb), COALESCE(action, '{}'::jsonb) FROM mcp_v2_tools WHERE name=$1 LIMIT 1`, name).Scan(&d.id, &d.name, &d.displayName, &d.description, &d.isActive, &d.inputSchemaRaw, &d.actionRaw)
+	if err != nil {
+		return business.ToolDefinition{}, fmt.Errorf("get tool: %w", err)
+	}
+	return d.parse()
+}
+
+var selectOnlyRe = regexp.MustCompile(`(?i)^\s*SELECT\b`)
+var forbidRe = regexp.MustCompile(`(?i)\b(INSERT|UPDATE|DELETE|DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|EXECUTE|CALL)\b`)
+
+func validateSQLRead(query string) error {
+	q := strings.TrimSpace(query)
+	if q == "" {
+		return fmt.Errorf("query required")
+	}
+	if !selectOnlyRe.MatchString(q) {
+		return fmt.Errorf("only SELECT allowed")
+	}
+	if forbidRe.MatchString(q) {
+		return fmt.Errorf("forbidden keyword in query")
+	}
+	if strings.Contains(q, "--") || strings.Contains(q, ";") {
+		// allow single statement SELECT with ; at end only
+		trimmed := strings.TrimSuffix(q, ";")
+		if strings.Contains(trimmed, ";") {
+			return fmt.Errorf("multiple statements not allowed")
+		}
+		if strings.Contains(trimmed, "--") {
+			return fmt.Errorf("comment not allowed")
+		}
+	}
+	return nil
+}
+
+func (p *PostgresAdapter) ExecSQLRead(ctx context.Context, query string, args []any) ([]map[string]any, error) {
+	if err := validateSQLRead(query); err != nil {
+		return nil, err
+	}
+	rows, err := p.pool.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("exec sql: %w", err)
+	}
+	defer rows.Close()
+	fields := rows.FieldDescriptions()
+	var out []map[string]any
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			return nil, err
+		}
+		m := make(map[string]any, len(fields))
+		for i, fd := range fields {
+			m[string(fd.Name)] = vals[i]
+		}
+		out = append(out, m)
+		if len(out) > 1000 {
+			break
+		}
+	}
+	return out, rows.Err()
+}
+
 func (p *PostgresAdapter) ListExperts(ctx context.Context) ([]business.Expert, error) {
-	rows, err := p.pool.Query(ctx, `SELECT id::text, name, slug, charter FROM experts WHERE is_active = true ORDER BY name`)
+	rows, err := p.pool.Query(ctx, `SELECT id::text, name, slug, COALESCE(reasoning_charter, '') FROM experts WHERE is_active = true ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("list experts: %w", err)
 	}
@@ -51,11 +207,16 @@ func (p *PostgresAdapter) ListExperts(ctx context.Context) ([]business.Expert, e
 
 func (p *PostgresAdapter) GetExpert(ctx context.Context, expertID string) (business.Expert, error) {
 	var d dbExpert
-	err := p.pool.QueryRow(ctx, `SELECT id::text, name, slug, charter FROM experts WHERE id=$1`, expertID).Scan(&d.id, &d.name, &d.slug, &d.charter)
-	if err != nil {
-		return business.Expert{}, fmt.Errorf("get expert: %w", err)
+	err := p.pool.QueryRow(ctx, `SELECT id::text, name, slug, COALESCE(reasoning_charter, '') FROM experts WHERE id=$1`, expertID).Scan(&d.id, &d.name, &d.slug, &d.charter)
+	if err == nil {
+		return d.parse()
 	}
-	return d.parse()
+	// Alias fallback: slug or name (case-insensitive) so Claude sending slug still works — ID remains single source of truth
+	err2 := p.pool.QueryRow(ctx, `SELECT id::text, name, slug, COALESCE(reasoning_charter, '') FROM experts WHERE LOWER(slug)=LOWER($1) OR LOWER(name)=LOWER($1) LIMIT 1`, expertID).Scan(&d.id, &d.name, &d.slug, &d.charter)
+	if err2 == nil {
+		return d.parse()
+	}
+	return business.Expert{}, fmt.Errorf("get expert: %w", err)
 }
 
 // pgvector cosine — real embedding search (production end-to-end)
@@ -68,7 +229,10 @@ func (p *PostgresAdapter) SearchChunks(ctx context.Context, expertID string, emb
 		limit = 50
 	}
 	if len(embedding) == 0 {
-		rows, err := p.pool.Query(ctx, `SELECT id::text, expert_id::text, content, 0.0::real as score FROM course_chunks WHERE expert_id=$1 LIMIT $2`, expertID, limit)
+		rows, err := p.pool.Query(ctx, `SELECT id::text, expert_id::text, chunk_text, 0.0::real as score FROM course_chunks WHERE expert_id=$1 LIMIT $2`, expertID, limit)
+		if err != nil && strings.Contains(err.Error(), "column") {
+			rows, err = p.pool.Query(ctx, `SELECT id::text, expert_id::text, content, 0.0::real as score FROM course_chunks WHERE expert_id=$1 LIMIT $2`, expertID, limit)
+		}
 		if err != nil {
 			return nil, "", 0, fmt.Errorf("search chunks fallback: %w", err)
 		}
@@ -84,7 +248,10 @@ func (p *PostgresAdapter) SearchChunks(ctx context.Context, expertID string, emb
 		return chunks, "", len(chunks), rows.Err()
 	}
 	vecStr := pgVectorString(embedding)
-	rows, err := p.pool.Query(ctx, `SELECT id::text, expert_id::text, content, 1 - (embedding <=> $2::vector) as score FROM course_chunks WHERE expert_id=$1 ORDER BY embedding <=> $2::vector LIMIT $3`, expertID, vecStr, limit)
+	rows, err := p.pool.Query(ctx, `SELECT id::text, expert_id::text, chunk_text, 1 - (embedding <=> $2::vector) as score FROM course_chunks WHERE expert_id=$1 ORDER BY embedding <=> $2::vector LIMIT $3`, expertID, vecStr, limit)
+	if err != nil && strings.Contains(err.Error(), "column") {
+		rows, err = p.pool.Query(ctx, `SELECT id::text, expert_id::text, content, 1 - (embedding <=> $2::vector) as score FROM course_chunks WHERE expert_id=$1 ORDER BY embedding <=> $2::vector LIMIT $3`, expertID, vecStr, limit)
+	}
 	if err != nil {
 		return nil, "", 0, fmt.Errorf("search chunks vector: %w", err)
 	}

@@ -48,10 +48,14 @@ func (p *PostgresAdapter) ListExperts(ctx context.Context) ([]mcpv2.Expert, erro
 func (p *PostgresAdapter) GetExpert(ctx context.Context, expertID string) (mcpv2.Expert, error) {
 	var d dbExpert
 	err := p.pool.QueryRow(ctx, `SELECT id::text, name, slug, charter FROM experts WHERE id=$1`, expertID).Scan(&d.id, &d.name, &d.slug, &d.charter)
-	if err != nil {
-		return mcpv2.Expert{}, fmt.Errorf("get expert: %w", err)
+	if err == nil {
+		return d.parse()
 	}
-	return d.parse()
+	// slug/name alias fallback — ID is source of truth but Claude often sends slug
+	if err2 := p.pool.QueryRow(ctx, `SELECT id::text, name, slug, charter FROM experts WHERE LOWER(slug)=LOWER($1) OR LOWER(name)=LOWER($1) LIMIT 1`, expertID).Scan(&d.id, &d.name, &d.slug, &d.charter); err2 == nil {
+		return d.parse()
+	}
+	return mcpv2.Expert{}, fmt.Errorf("get expert: %w", err)
 }
 
 func (p *PostgresAdapter) SearchChunks(ctx context.Context, expertID string, embedding []float32, limit int, cursor string) ([]mcpv2.Chunk, string, int, error) {

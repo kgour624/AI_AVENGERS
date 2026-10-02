@@ -28,6 +28,7 @@ type Expert struct {
 type Catalog interface {
 	ListExperts(ctx context.Context) ([]Expert, error)
 	ExpertFor(ctx context.Context, domain, slugOrName string) (Expert, bool, error)
+	ExpertByID(ctx context.Context, id string) (Expert, bool, error)
 }
 
 // PGCatalog reads experts straight from Postgres. Read-only by construction:
@@ -103,6 +104,28 @@ func (c *PGCatalog) ExpertFor(ctx context.Context, domain, slugOrName string) (E
 			if NormDomainKey(e.Domain) == wantDomain {
 				return e, true, nil
 			}
+		}
+	}
+	return Expert{}, false, nil
+}
+
+// ExpertByID finds one expert by its stable UUID.
+//
+// WHY this exists: list_experts now prints id:`<uuid>` so a Claude roundtrip
+// can copy-paste the ID without hallucinating it. Domain+slug is kept as an
+// alias, but ID is the single source of truth.
+func (c *PGCatalog) ExpertByID(ctx context.Context, id string) (Expert, bool, error) {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return Expert{}, false, nil
+	}
+	all, err := c.ListExperts(ctx)
+	if err != nil {
+		return Expert{}, false, err
+	}
+	for _, e := range all {
+		if e.ID == id {
+			return e, true, nil
 		}
 	}
 	return Expert{}, false, nil

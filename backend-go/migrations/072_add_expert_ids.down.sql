@@ -1,0 +1,1 @@
+ALTER TABLE mcp_tokens DROP COLUMN IF EXISTS expert_ids;

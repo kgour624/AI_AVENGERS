@@ -27,19 +27,20 @@ import (
 )
 
 func main() {
-	userID := flag.String("user", "", "user UUID the token acts as (required)")
+		userID := flag.String("user", "", "user UUID the token acts as (required)")
 	label := flag.String("label", "", "human label shown in the audit log (required)")
-	domains := flag.String("domains", "", "comma-separated allowed domains (empty = all)")
+	domains := flag.String("domains", "", "comma-separated allowed domains (empty = all) — legacy, prefer -expert-ids")
+	expertIDs := flag.String("expert-ids", "", "comma-separated allowed expert IDs (empty = all)")
 	tools := flag.String("tools", "", "comma-separated allowed tools (empty = all)")
 	flag.Parse()
 
-	if err := run(*userID, *label, *domains, *tools); err != nil {
+	if err := run(*userID, *label, *domains, *expertIDs, *tools); err != nil {
 		fmt.Fprintln(os.Stderr, "mcp-token:", err)
 		os.Exit(1)
 	}
 }
 
-func run(userID, label, domains, tools string) error {
+func run(userID, label, domains, expertIDs, tools string) error {
 	userID = strings.TrimSpace(userID)
 	label = strings.TrimSpace(label)
 	if userID == "" || label == "" {
@@ -65,10 +66,10 @@ func run(userID, label, domains, tools string) error {
 		return err
 	}
 
-	_, err = pool.Exec(ctx,
-		`INSERT INTO mcp_tokens (user_id, token_hash, label, domains, tools)
-		 VALUES ($1,$2,$3,$4,$5)`,
-		userID, mcp.HashToken(token), label, splitList(domains), splitList(tools))
+		_, err = pool.Exec(ctx,
+		`INSERT INTO mcp_tokens (user_id, token_hash, label, domains, expert_ids, tools)
+		 VALUES ($1,$2,$3,$4,$5,$6)`,
+		userID, mcp.HashToken(token), label, splitList(domains), splitList(expertIDs), splitList(tools))
 	if err != nil {
 		return fmt.Errorf("store token: %w", err)
 	}

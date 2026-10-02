@@ -66,19 +66,19 @@ func (s *PGTokenStore) Resolve(ctx context.Context, rawToken string) (Scope, Tok
 		return Scope{}, TokenInfo{}, NewToolError("FORBIDDEN", "missing bearer token")
 	}
 
-	var id, label string
-	var domains, tools []string
+		var id, label string
+	var domains, expertIDs, tools []string
 	err := s.db.QueryRow(ctx,
-		`SELECT id, label, domains, tools FROM mcp_tokens
+		`SELECT id, label, domains, expert_ids, tools FROM mcp_tokens
 		  WHERE token_hash = $1 AND revoked_at IS NULL`, HashToken(rawToken),
-	).Scan(&id, &label, &domains, &tools)
+	).Scan(&id, &label, &domains, &expertIDs, &tools)
 	if err != nil {
 		// Deliberately one message for "unknown" and "revoked": telling a caller
 		// which of the two it hit would confirm that a token once existed.
 		return Scope{}, TokenInfo{}, NewToolError("FORBIDDEN", "invalid or revoked token")
 	}
 
-	return Scope{Label: label, Domains: normaliseList(domains), Tools: normaliseList(tools)}, TokenInfo{ID: id, Label: label}, nil
+	return Scope{Label: label, Domains: normaliseList(domains), ExpertIDs: normaliseList(expertIDs), Tools: normaliseList(tools), TokenID: id}, TokenInfo{ID: id, Label: label}, nil
 }
 
 // Touch records use. Best effort: a failed bookkeeping update must never fail
@@ -114,6 +114,7 @@ type TokenRecord struct {
 	ID           string   `json:"id"`
 	Label        string   `json:"label"`
 	Domains      []string `json:"domains"`
+	ExpertIDs    []string `json:"expert_ids"`
 	Tools        []string `json:"tools"`
 	Revoked      bool     `json:"revoked"`
 	LastUsedAt   *string  `json:"last_used_at,omitempty"`
@@ -127,7 +128,7 @@ type TokenRecord struct {
 // the person who asked for it and then forgets it. Only the hash is persisted,
 // so a lost token is replaced, never recovered — and a database leak yields no
 // working credential.
-func (s *PGTokenStore) Create(ctx context.Context, userID, label string, domains, tools []string) (string, TokenRecord, error) {
+func (s *PGTokenStore) Create(ctx context.Context, userID, label string, domains, expertIDs, tools []string) (string, TokenRecord, error) {
 	raw, err := NewToken()
 	if err != nil {
 		return "", TokenRecord{}, err
@@ -135,11 +136,11 @@ func (s *PGTokenStore) Create(ctx context.Context, userID, label string, domains
 	var rec TokenRecord
 	var lastUsed *string
 	err = s.db.QueryRow(ctx,
-		`INSERT INTO mcp_tokens (user_id, token_hash, label, domains, tools)
-		 VALUES ($1,$2,$3,$4,$5)
-		 RETURNING id, label, domains, tools, revoked_at IS NOT NULL, last_used_at::text, request_count, created_at::text`,
-		userID, HashToken(raw), label, normaliseOrEmpty(domains), normaliseOrEmpty(tools),
-	).Scan(&rec.ID, &rec.Label, &rec.Domains, &rec.Tools, &rec.Revoked, &lastUsed, &rec.RequestCount, &rec.CreatedAt)
+		`INSERT INTO mcp_tokens (user_id, token_hash, label, domains, expert_ids, tools)
+		 VALUES ($1,$2,$3,$4,$5,$6)
+		 RETURNING id, label, domains, expert_ids, tools, revoked_at IS NOT NULL, last_used_at::text, request_count, created_at::text`,
+		userID, HashToken(raw), label, normaliseOrEmpty(domains), normaliseOrEmpty(expertIDs), normaliseOrEmpty(tools),
+	).Scan(&rec.ID, &rec.Label, &rec.Domains, &rec.ExpertIDs, &rec.Tools, &rec.Revoked, &lastUsed, &rec.RequestCount, &rec.CreatedAt)
 	if err != nil {
 		return "", TokenRecord{}, fmt.Errorf("mcp: create token: %w", err)
 	}
@@ -150,7 +151,7 @@ func (s *PGTokenStore) Create(ctx context.Context, userID, label string, domains
 // List returns every token, newest first, for the admin screen.
 func (s *PGTokenStore) List(ctx context.Context) ([]TokenRecord, error) {
 	rows, err := s.db.Query(ctx,
-		`SELECT id, label, domains, tools, revoked_at IS NOT NULL, last_used_at::text, request_count, created_at::text
+		`SELECT id, label, domains, expert_ids, tools, revoked_at IS NOT NULL, last_used_at::text, request_count, created_at::text
 		   FROM mcp_tokens
 		  ORDER BY created_at DESC`)
 	if err != nil {
@@ -161,8 +162,8 @@ func (s *PGTokenStore) List(ctx context.Context) ([]TokenRecord, error) {
 	out := []TokenRecord{}
 	for rows.Next() {
 		var rec TokenRecord
-		var lastUsed *string
-		if err := rows.Scan(&rec.ID, &rec.Label, &rec.Domains, &rec.Tools, &rec.Revoked, &lastUsed, &rec.RequestCount, &rec.CreatedAt); err != nil {
+			var lastUsed *string
+			if err := rows.Scan(&rec.ID, &rec.Label, &rec.Domains, &rec.ExpertIDs, &rec.Tools, &rec.Revoked, &lastUsed, &rec.RequestCount, &rec.CreatedAt); err != nil {
 			return nil, fmt.Errorf("mcp: scan token: %w", err)
 		}
 		rec.LastUsedAt = lastUsed

@@ -66,7 +66,11 @@ type Scope struct {
 	TokenID string
 	// Domains restricts which experts may be reached. Empty = every domain,
 	// which is what the local stdio case (the owner's own machine) wants.
+	// Kept for backwards compatibility; new tokens use ExpertIDs.
 	Domains []string
+	// ExpertIDs restricts which experts may be reached. Empty = every expert.
+	// When set, it is the granular replacement for Domains.
+	ExpertIDs []string
 	// Tools restricts which tools may be called. Empty = every tool.
 	Tools []string
 }
@@ -100,6 +104,22 @@ func (s Scope) AllowsDomain(domain string) bool {
 	return false
 }
 
+// AllowsExpert reports whether this scope may reach the given expert ID.
+// Empty ExpertIDs = every expert (stdio / unrestricted token). When ExpertIDs
+// is set it is authoritative for expert-gated calls.
+func (s Scope) AllowsExpert(expertID string) bool {
+	if len(s.ExpertIDs) == 0 {
+		return true
+	}
+	want := strings.TrimSpace(expertID)
+	for _, id := range s.ExpertIDs {
+		if strings.TrimSpace(id) == want {
+			return true
+		}
+	}
+	return false
+}
+
 // NormDomainKey lowercases and strips separators so a domain compares equal
 // regardless of how a human or a token wrote it.
 func NormDomainKey(domain string) string {
@@ -120,3 +140,39 @@ func decodeArgs(args json.RawMessage, dst any) error {
 	}
 	return nil
 }
+
+// availableExpertsHint builds the self-correcting hint Claude needs when it
+// sends a wrong domain/expert_id. It lists what this token CAN see with real
+// IDs so the next call can copy-paste without asking the user.
+func availableExpertsHint(ctx context.Context, catalog Catalog, scope Scope) string {
+	experts, err := catalog.ListExperts(ctx)
+	if err != nil || len(experts) == 0 {
+		return "Call list_experts to see available experts."
+	}
+	visible := []Expert{}
+	for _, e := range experts {
+		if !scope.AllowsDomain(e.Domain) {
+			continue
+		}
+		if !scope.AllowsExpert(e.ID) {
+			continue
+		}
+		visible = append(visible, e)
+		if len(visible) >= 5 {
+			break
+		}
+	}
+	if len(visible) == 0 {
+		return "No experts are available to this token — check token scope."
+	}
+	parts := make([]string, 0, len(visible))
+	for _, e := range visible {
+		parts = append(parts, fmt.Sprintf("%s: %s (%s)", e.ID, e.Slug, e.Name))
+	}
+	more := ""
+	if len(experts) > len(visible) {
+		more = " — call list_experts for full list"
+	}
+	return "Available: " + strings.Join(parts, " | ") + more
+}
+

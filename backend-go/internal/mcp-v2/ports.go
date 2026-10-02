@@ -15,15 +15,20 @@ type ExpertLimits = business.ExpertLimits
 type Message = business.Message
 type GatewayUsage = business.GatewayUsage
 type GateResult = business.GateResult
+type ToolDefinition = business.ToolDefinition
 
 // Small interfaces at boundaries (RULE 8-B:32) — Discover, don't design. Input uses interface, return concrete.
 // Business defines Storer; App reuses it via business.Storer ( §7 — storage under business domain).
 type DBPort = business.Storer
 
 // RedisPort for atomic counters + Pub/Sub wakeup only (RULE 8-F:46).
+// Phase 3: added cache ops for mcp_v2:tools (5m TTL) to avoid DB on every tools/list.
 type RedisPort interface {
 	IncrTokens(ctx context.Context, key string, delta int64) (int64, error)
 	Publish(ctx context.Context, channel string, payload []byte) error
+	Get(ctx context.Context, key string) (string, error)
+	Set(ctx context.Context, key string, value string, ttlSeconds int) error
+	Del(ctx context.Context, key string) error
 }
 
 // GatewayPort wraps internal/gateway ModelGateway.Call (cheap|strong|fast).

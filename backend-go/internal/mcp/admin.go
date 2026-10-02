@@ -48,10 +48,11 @@ func (h *AdminHandler) ListMCPTokens(c *gin.Context) {
 // only its hash, so this is the one moment it can be copied.
 func (h *AdminHandler) CreateMCPToken(c *gin.Context) {
 	var req struct {
-		Label   string   `json:"label"`
-		Domains []string `json:"domains"`
-		Tools   []string `json:"tools"`
-	}
+			Label     string   `json:"label"`
+			Domains   []string `json:"domains"`
+			ExpertIDs []string `json:"expert_ids"`
+			Tools     []string `json:"tools"`
+		}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response.BadRequest(c, "INVALID_REQUEST", "label is required")
 		return
@@ -71,7 +72,7 @@ func (h *AdminHandler) CreateMCPToken(c *gin.Context) {
 		return
 	}
 
-	raw, record, err := h.tokens.Create(c.Request.Context(), ownerID.String(), req.Label, req.Domains, req.Tools)
+	raw, record, err := h.tokens.Create(c.Request.Context(), ownerID.String(), req.Label, req.Domains, req.ExpertIDs, req.Tools)
 	if err != nil {
 		h.logger.Error("create mcp token failed", zap.Error(err))
 		response.InternalError(c)

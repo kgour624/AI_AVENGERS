@@ -13,6 +13,7 @@ const (
 	CodeLimitExceeded  Code = "LIMIT_EXCEEDED"
 	CodeUnauthorized   Code = "UNAUTHORIZED"
 	CodeForbidden      Code = "FORBIDDEN"
+	CodeCancelled      Code = "CANCELLED"
 	CodeInternal       Code = "INTERNAL"
 )
 
@@ -35,6 +36,7 @@ func (e *AppError) Unwrap() error { return e.Err }
 func NewInvalidInput(msg string, err error) *AppError { return &AppError{Code: CodeInvalidInput, Msg: msg, Err: err} }
 func NewNotFound(msg string) *AppError               { return &AppError{Code: CodeNotFound, Msg: msg} }
 func NewLimitExceeded(msg string) *AppError           { return &AppError{Code: CodeLimitExceeded, Msg: msg} }
+func NewCancelled(msg string, err error) *AppError    { return &AppError{Code: CodeCancelled, Msg: msg, Err: err} }
 func NewInternal(msg string, err error) *AppError     { return &AppError{Code: CodeInternal, Msg: msg, Err: err} }
 
 // MapCodeToHTTP maps App Code -> HTTP (API layer responsibility, but helper here for handler).

@@ -27,7 +27,11 @@ func (d *DecisionAdapter) Check(ctx context.Context, expertID, question string, 
 	var cwChunks []chinawall.CourseChunk
 	for _, c := range chunks {
 		id, _ := uuid.Parse(c.ID)
-		cwChunks = append(cwChunks, chinawall.CourseChunk{ID: id, Text: c.Text})
+		cwChunks = append(cwChunks, chinawall.CourseChunk{
+			ID:          id,
+			Text:        c.Text,
+			RerankScore: c.Score, // Pass the score so Gate 2 doesn't hard-refuse
+		})
 	}
 	// Build minimal Expert — domain lookup not needed for gate2 coverage check; gate2 checks chunks non-empty.
 	expertUUID, _ := uuid.Parse(expertID)

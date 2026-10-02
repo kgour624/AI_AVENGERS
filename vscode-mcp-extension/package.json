@@ -1,0 +1,29 @@
+{
+  "name": "codeedgepro-nexus",
+  "displayName": "CodeEdgePro Nexus",
+  "description": "CodeEdgePro Nexus: AI Avengers Protocol for Next-Gen Software Architecture and Engineering.",
+  "version": "1.0.0",
+  "publisher": "codeedgepro",
+  "icon": "logo.png",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": { "activitybar": [{ "id": "aiAvengers", "title": "CodeEdgePro Nexus", "icon": "$(robot)" }] },
+    "views": { "aiAvengers": [{ "type": "webview", "id": "aiAvengers.chatView", "name": "Expert Chat" }] },
+    "commands": [
+      { "command": "aiAvengers.setToken", "title": "CodeEdgePro: Set MCP Token" },
+      { "command": "aiAvengers.connect", "title": "CodeEdgePro: Connect" },
+      { "command": "aiAvengers.disconnect", "title": "CodeEdgePro: Disconnect" },
+      { "command": "aiAvengers.clearChat", "title": "CodeEdgePro: Clear Chat" },
+      { "command": "aiAvengers.attachFile", "title": "CodeEdgePro: Attach Current File" }
+    ],
+    "keybindings": [
+      { "command": "aiAvengers.attachFile", "key": "ctrl+shift+a", "when": "editorTextFocus" }
+    ],
+    "configuration": { "title": "CodeEdgePro", "properties": { "aiAvengers.mcpUrl": { "type": "string", "default": "http://localhost:8080/mcp/v2", "description": "Remote MCP API URL (CodeEdgePro Backend)" } } }
+  },
+  "scripts": { "compile": "tsc -p ./", "watch": "tsc -watch -p ./", "package": "vsce package" },
+  "devDependencies": { "@types/vscode": "^1.85.0", "@types/node": "^20.0.0", "typescript": "^5.4.0" }
+}
