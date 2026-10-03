@@ -27,13 +27,13 @@ export function SynthesisPanel({
     <div className="rounded-lg border border-brand/30 bg-brand/5 p-4">
       <p className="mb-2 text-sm font-medium text-brand">\u26a1 SYNTHESIS</p>
 
-      {synthesis.agreements.map((agreement, i) => (
+      {synthesis.agreements?.map((agreement, i) => (
         <p key={i} className="text-sm text-mode-advise">
           \u2705 Agreement: {agreement}
         </p>
       ))}
 
-      {synthesis.contradictions.map((c, i) => (
+      {synthesis.contradictions?.map((c, i) => (
         <div key={i} className="mt-2 text-sm text-mode-warn">
           <p>
             \u26a0\ufe0f Contradiction on {c.topic}: {c.expertA} says "{c.positionA}", {c.expertB} says "

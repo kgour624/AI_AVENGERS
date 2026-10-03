@@ -15,6 +15,7 @@ import { ArtifactProof, parseArtifactVerification, type ArtifactVerification } f
 import { AmendmentsPanel } from '@/components/workflow/AmendmentsPanel'
 import { DeliveryPanel } from '@/components/workflow/DeliveryPanel'
 import { DownloadDesignPackageButton } from '@/components/workflow/DownloadDesignPackageButton'
+import { DownloadUnifiedDesignButton } from '@/components/workflow/DownloadUnifiedDesignButton'
 import { ActivityLog } from '@/components/workflow/ActivityLog'
 import { FilesPanel } from '@/components/workflow/FilesPanel'
 import { CodebasePanel } from '@/components/workflow/CodebasePanel'
@@ -137,10 +138,7 @@ function ApprovalGate({
     ?.sort((a, b) => new Date(b.postedAt).getTime() - new Date(a.postedAt).getTime())[0]
 
   const respond = async (decision: 'approve' | 'request_changes') => {
-    if (!approvalId) {
-      setError('Approval ID not yet received from server. Please wait a moment and try again.')
-      return
-    }
+
     setLoading(decision)
     setError(null)
     try {
@@ -153,6 +151,16 @@ function ApprovalGate({
       )
       setSent(true)
     } catch (e) {
+      // 409 = "approval already responded or not pending" — the backend already
+      // processed this approval (e.g. a retry or a stale approval ID from an
+      // earlier gate that failed mid-flight and re-triggered). Treat as success
+      // so the UI disables the buttons and shows "Resuming workflow..." instead
+      // of a confusing error. This mirrors the documented backend behaviour in
+      // workflow/handler.go ("approval already responded or not pending").
+      if (e instanceof Error && e.message.includes('409')) {
+        setSent(true)
+        return
+      }
       setError(e instanceof Error ? e.message : 'Request failed')
     } finally {
       setLoading(null)
@@ -639,7 +647,7 @@ function KanbanPage() {
   // Live Kanban state via SSE — replaces 5s polling
   // WHY SSE: instant updates when expert posts artifact or changes status.
   // 5s polling = user sees stale board for up to 5s after each update.
-  const stream = useKanbanStream(id ?? null)
+  const stream = useKanbanStream(id ?? null, workflow?.status)
   const tasks = stream.tasks
   const isLoading = !stream.isConnected && tasks.length === 0 && !stream.isDone
 
@@ -835,12 +843,17 @@ function KanbanPage() {
             )}
 
             {/* Approval gate — interactive Approve/Request Changes controls */}
-            {workflow?.status === 'paused_for_approval' && (
+            {workflow?.status === 'paused_for_approval' && !stream.approvalGate && (
+              <div className="p-4 border rounded bg-yellow-50 animate-pulse">
+                Loading approval details... (SSE reconnecting)
+              </div>
+            )}
+            {workflow?.status === 'paused_for_approval' && stream.approvalGate && (
               <ApprovalGate
                 workflowId={id!}
-                approvalId={stream.approvalGate?.approvalId ?? ''}
-                gateName={stream.approvalGate?.gateName ?? 'approval'}
-                summary={stream.approvalGate?.summary ?? 'Review and approve to continue.'}
+                approvalId={stream.approvalGate.approvalId}
+                gateName={stream.approvalGate.gateName}
+                summary={stream.approvalGate.summary}
                 currentGenericPct={workflow?.genericAllowancePct ?? 0}
               />
             )}
@@ -919,19 +932,40 @@ function KanbanPage() {
         </div>
       )}
 
-      {/* Completion notice + Download Design Package.
-          Gated on a stream that did not fail AND a status that is not failed:
-          the stream closes for a failure too, and showing the green bar over a
-          failed run is how "it says complete but nothing was produced" started. */}
+      {/* Unified design doc: available as soon as handoff writes it (see
+          design_doc.go). Not gated on workflow completion — it belongs to the
+          handoff gate, not the final state. Completion notice below includes
+          it too when both are present; suppress the standalone row once that
+          notice is shown so it does not render twice. */}
+      {id && workflow?.status !== 'failed' && fileStream.latestDesignDoc &&
+        !(!stream.isFailed && (stream.isDone || workflow?.status === 'completed')) && (
+        <div className="mt-2 flex justify-end">
+          <DownloadUnifiedDesignButton workflowId={id} designDoc={fileStream.latestDesignDoc} />
+        </div>
+      )}
+
+      {/* Completion notice + legacy client-side Download Design Package.
+          Gated on not-failed so a failed workflow never shows the green bar
+          (the stream also closes on failure, which used to make every failure
+          look "complete"). When the unified doc is also present the same
+          DownloadUnifiedDesignButton is rendered inside this card so there is
+          still only one anchor-download path. */}
       {!stream.isFailed && workflow?.status !== 'failed' && (stream.isDone || workflow?.status === 'completed') && (
         <div className="mt-4 rounded-lg border border-mode-advise/30 bg-mode-advise/10 p-4">
-          <div className="flex items-center justify-between gap-4">
-            <p className="text-sm font-medium text-mode-advise">{'✅'} Workflow Complete</p>
-            <DownloadDesignPackageButton
-              workflowTitle={workflow?.title ?? 'workflow'}
-              events={events}
-              expertNames={expertNames}
-            />
+          <div className="flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-4">
+              <p className="text-sm font-medium text-mode-advise">{'✅'} Workflow Complete</p>
+              <DownloadDesignPackageButton
+                workflowTitle={workflow?.title ?? 'workflow'}
+                events={events}
+                expertNames={expertNames}
+              />
+            </div>
+            {id && fileStream.latestDesignDoc && (
+              <div className="flex justify-end border-t border-mode-advise/20 pt-3">
+                <DownloadUnifiedDesignButton workflowId={id} designDoc={fileStream.latestDesignDoc} />
+              </div>
+            )}
           </div>
         </div>
       )}

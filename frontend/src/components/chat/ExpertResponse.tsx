@@ -11,6 +11,7 @@ import { useReplyStore } from '@/stores/replyStore'
 import { splitContentByCitations } from '@/utils/parseCitations'
 import { cn } from '@/utils/cn'
 import { ARC_MOTION } from '@/design-system/motion'
+import { buildResponseMarkdown, buildMarkdownFilename, downloadMarkdown } from '@/utils/exportMarkdown'
 
 // ============================================================
 // ReasoningPanel — gate-by-gate decision breakdown
@@ -248,6 +249,12 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
   const isLongResponse = wordCount > 500
   const shouldTruncate = isLongResponse && !isExpanded
 
+  const handleDownloadMarkdown = () => {
+    const markdown = buildResponseMarkdown(response)
+    const filename = buildMarkdownFilename(response.expertName ?? 'response')
+    downloadMarkdown(markdown, filename)
+  }
+
   function handleCopyResponse() {
     const text =
       response.templateSections && response.templateSections.length > 0
@@ -338,6 +345,14 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
         <div className="flex items-center gap-2">
           <ModeBadge mode={response.mode} />
           <span className="text-xs text-text-secondary">{Math.round(response.confidence * 100)}%</span>
+          <button
+            type="button"
+            onClick={handleDownloadMarkdown}
+            aria-label={`Download ${response.expertName} response as Markdown`}
+            className="text-xs text-text-secondary hover:text-text-primary"
+          >
+            Download .md
+          </button>
           <button
             type="button"
             onClick={handleCopyResponse}

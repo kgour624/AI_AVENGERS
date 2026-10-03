@@ -1,4 +1,4 @@
-package chat
+﻿package chat
 
 import (
 	"context"
@@ -68,7 +68,14 @@ type Message struct {
 	Coverage string `json:"coverage,omitempty"`
 	// RefusalReason (C9): Gate-5 / partial refusal reason. "" → NULL.
 	RefusalReason string `json:"refusal_reason,omitempty"`
-	CreatedAt            time.Time  `json:"created_at"`
+	// CollabSections (migration 075, Collaborative Relay): ordered
+	// [{expert_id, expert_name, section_title, content}] when this message
+	// is the single merged answer for a "collaborative" answer_mode turn
+	// with 2+ experts. nil for every independent-mode message (the
+	// default) and every message saved before this feature — additive,
+	// zero-regression, same convention as TemplateSections above.
+	CollabSections interface{} `json:"collab_sections,omitempty"`
+	CreatedAt      time.Time   `json:"created_at"`
 }
 
 // ErrNotFound is returned when a chat is not found.
@@ -295,13 +302,13 @@ func (s *Service) SaveMessage(ctx context.Context, msg Message) (uuid.UUID, erro
 			(chat_id, role, content, turn_number, expert_id, decision_mode,
 			 confidence, warning_text, clarifying_questions, citations,
 			 reply_to_message_id, template_sections,
-			 quality_score, coverage, refusal_reason)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+			 quality_score, coverage, refusal_reason, collab_sections)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 		 RETURNING id`,
 		msg.ChatID, msg.Role, msg.Content, msg.TurnNumber,
 		msg.ExpertID, decisionMode, msg.Confidence,
 		warningText, msg.ClarifyingQuestions, msg.Citations, msg.ReplyToMessageID,
-		msg.TemplateSections, qualityScore, coverage, refusalReason,
+		msg.TemplateSections, qualityScore, coverage, refusalReason, msg.CollabSections,
 	).Scan(&id)
 	if err != nil {
 		return uuid.Nil, fmt.Errorf("save message failed: %w", err)
@@ -329,6 +336,7 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		        COALESCE(clarifying_questions,'[]'::jsonb),
 		        COALESCE(citations,'[]'::jsonb),
 		        reply_to_message_id,
+			collab_sections,
 		        template_sections,
 		        created_at
 		 FROM messages
@@ -348,13 +356,14 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 		// Bug 3.4 fix: citations JSONB is now selected and scanned back
 		// into m.Citations (as []map[string]interface{}, matching the
 		// pattern already used for clarifying_questions below).
-		var clarifyingJSON, citationsJSON, templateSectionsJSON []byte
+		var clarifyingJSON, citationsJSON, templateSectionsJSON, collabSectionsJSON []byte
 		if err := rows.Scan(
 			&m.ID, &m.ChatID, &m.Role, &m.Content, &m.TurnNumber,
 			&m.ExpertID, &m.DecisionMode, &m.Confidence,
 			&m.TokensUsed, &m.CostUSD,
 			&m.WarningText, &clarifyingJSON, &citationsJSON,
 			&m.ReplyToMessageID,
+			&collabSectionsJSON,
 			&templateSectionsJSON,
 			&m.CreatedAt,
 		); err != nil {
@@ -385,6 +394,16 @@ func (s *Service) ListMessages(ctx context.Context, chatID, clientID uuid.UUID, 
 			var sections []map[string]interface{}
 			_ = json.Unmarshal(templateSectionsJSON, &sections)
 			m.TemplateSections = sections
+		}
+		// Migration 075 (Collaborative Relay): unmarshal collab_sections
+		// JSONB -> generic slice, same pattern as template_sections above.
+		// NULL column (independent-mode message, or any row saved before
+		// this feature) leaves collabSectionsJSON empty and
+		// m.CollabSections stays nil.
+		if len(collabSectionsJSON) > 0 {
+			var sections []map[string]interface{}
+			_ = json.Unmarshal(collabSectionsJSON, &sections)
+			m.CollabSections = sections
 		}
 		messages = append(messages, m)
 	}

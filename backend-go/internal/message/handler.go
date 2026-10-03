@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -17,6 +18,7 @@ import (
 	"ai_avengers/backend/internal/auth"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/collab"
 	"ai_avengers/backend/internal/docextract"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
@@ -93,6 +95,183 @@ func (h *Handler) extractAttachments(c *gin.Context) string {
 	return sb.String()
 }
 
+func parseUUIDOrNil(s string) uuid.UUID {
+	if s == "" {
+		return uuid.Nil
+	}
+	id, err := uuid.Parse(s)
+	if err != nil {
+		return uuid.Nil
+	}
+	return id
+}
+
+// GetActiveRelay returns the latest non-terminal relay run for a chat plus its
+// transparency transcript and, if a section is awaiting review, that section's
+// gate payload. Used by the frontend on reconnect to hydrate the live view.
+func (h *Handler) GetActiveRelay(c *gin.Context) {
+	chatID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid chat ID")
+		return
+	}
+	store := collab.NewRelayStore(h.db)
+	run, err := store.GetActiveRun(c.Request.Context(), chatID)
+	if err != nil {
+		// no active run -> 204-style empty; frontend treats as "nothing to hydrate"
+		c.JSON(http.StatusNotFound, gin.H{"relay": nil})
+		return
+	}
+	events, _ := store.EventsAfter(c.Request.Context(), run.ID, 0)
+
+	payload := gin.H{
+		"run_id":     run.ID,
+		"chat_id":    run.ChatID,
+		"status":     run.Status,
+		"events":     events,
+		"plan":       run.Plan,
+		"current_index": run.CurrentIndex,
+	}
+
+	if run.Status == collab.RunAwaitingReview {
+		sec, err := store.GetSectionByIndex(c.Request.Context(), run.ID, run.CurrentIndex)
+		if err == nil {
+			payload["pending_review"] = gin.H{
+				"section_id":           sec.ID,
+				"section_index":        sec.SectionIndex,
+				"section_title":        sec.SectionTitle,
+				"expert_name":          sec.ExpertName,
+				"content":              sec.RawContent,
+				"conflict":             sec.ConflictDetected,
+				"conflict_explanation": sec.ConflictExplanation,
+			}
+		}
+	}
+
+	if run.Status == collab.RunRelayFailed {
+		payload["failure"] = gin.H{
+			"failed_at_index": run.FailedAtIndex,
+			"reason":          run.FailureReason,
+			"retry_until":     run.RetryDeadline,
+		}
+	}
+
+	c.JSON(http.StatusOK, payload)
+}
+
+// ApproveRelaySection is the human-in-the-loop action (ans7 edit + approve,
+// ans3 resolve). After writing, if the relay goroutine is no longer alive, it
+// re-launches the relay from the persisted cursor so the pipeline continues.
+func (h *Handler) ApproveRelaySection(c *gin.Context) {
+	runID, err := uuid.Parse(c.Param("runId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid run ID")
+		return
+	}
+	sectionID, err := uuid.Parse(c.Param("sectionId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid section ID")
+		return
+	}
+	var body struct {
+		EditedContent    string `json:"edited_content"`
+		ResolutionSource string `json:"resolution_source"` // 'expert_a' | 'expert_b' | 'human_merged'
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	store := collab.NewRelayStore(h.db)
+	sec, _ := store.GetSection(c.Request.Context(), sectionID)
+	if sec.ID == uuid.Nil {
+		response.NotFound(c, "section")
+		return
+	}
+
+	finalContent := body.EditedContent
+	edited := body.EditedContent != ""
+	if !edited {
+		finalContent = sec.RawContent
+	}
+
+	approved, err := store.ApproveSection(c.Request.Context(), runID, sectionID, finalContent, edited, body.ResolutionSource)
+	if err != nil {
+		response.InternalError(c)
+		return
+	}
+	_ = store.UpdateRunStatus(c.Request.Context(), runID, collab.RunRunning)
+
+	// If the relay goroutine died (client disconnected mid-gate), resume it.
+	h.resumeRelayIfInactive(c.Request.Context(), runID)
+
+	c.JSON(http.StatusOK, gin.H{
+		"approved":         true,
+		"section_index":    approved.SectionIndex,
+		"final_content":    approved.FinalContent,
+		"edited":           approved.Edited,
+		"resolution_source": approved.ResolutionSource,
+	})
+}
+
+// RetryRelay re-launches a failed relay from its failed section, only valid
+// before retry_deadline (ans4).
+func (h *Handler) RetryRelay(c *gin.Context) {
+	runID, err := uuid.Parse(c.Param("runId"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid run ID")
+		return
+	}
+	store := collab.NewRelayStore(h.db)
+	run, err := store.GetRun(c.Request.Context(), runID)
+	if err != nil {
+		response.NotFound(c, "relay")
+		return
+	}
+	if run.RetryDeadline != nil && time.Now().After(*run.RetryDeadline) {
+		response.BadRequest(c, "RETRY_EXPIRED", "retry window elapsed")
+		return
+	}
+	h.resumeRelayIfInactive(c.Request.Context(), runID)
+	c.JSON(http.StatusOK, gin.H{"retrying": true, "run_id": runID})
+}
+
+func (h *Handler) resumeRelayIfInactive(ctx context.Context, runID uuid.UUID) {
+	// Idempotent claim: only proceed if the run is NOT currently progressing
+	// (status 'running' means a live goroutine owns it). A 0-row update means
+	// the live relay is still alive — skip. This survives process restarts.
+	tag, err := h.db.Exec(ctx,
+		`UPDATE collab_relay_runs SET status='retrying', updated_at=now()
+		  WHERE id=$1 AND status IN ('awaiting_human_review','relay_failed')`, runID)
+	if err != nil || tag.RowsAffected() == 0 {
+		return
+	}
+	go func() { _ = h.runResume(context.Background(), runID) }()
+}
+
+func (h *Handler) runResume(ctx context.Context, runID uuid.UUID) error {
+	store := collab.NewRelayStore(h.db)
+	run, err := store.GetRun(ctx, runID)
+	if err != nil {
+		return err
+	}
+	// Rebuild a minimal request from the stored run.
+	req := orchestrator.OrchestratorRequest{
+		ChatID:      run.ChatID,
+		ClientID:    uuid.Nil,
+		TurnNumber:  0,
+		ExpertIDs:   sectionExpertIDs(run.Plan),
+		ResumeRunID: runID,
+	}
+	_, err = h.orchestrator.ProcessCollaborative(ctx, req, nil, nil)
+	return err
+}
+
+func sectionExpertIDs(plan []collab.Section) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(plan))
+	for _, s := range plan {
+		ids = append(ids, s.ExpertID)
+	}
+	return ids
+}
+
 // SendMessageRequest is the input for sending a message.
 type SendMessageRequest struct {
 	Message   string   `json:"message" binding:"required"`
@@ -115,6 +294,17 @@ type SendMessageRequest struct {
 	// use when the trained chunks do not cover the question. 0/absent = strict
 	// China Wall (refuse), which is what every pre-existing client sends.
 	GenericAllowancePct float64 `json:"generic_allowance_pct,omitempty"`
+	// AnswerMode (Collaborative Relay): "" / "independent" (default, every
+	// pre-existing client) runs each selected expert in parallel exactly as
+	// before. "collaborative" requires 2+ expert_ids and instead runs them
+	// SEQUENTIALLY as one section-organized answer (internal/collab) — see
+	// orchestrator.ProcessCollaborative. Any other value is treated as
+	// "independent" (unknown values fail safe to the existing behavior,
+	// never to an error).
+	AnswerMode string `json:"answer_mode,omitempty"`
+	// ResumeRunID (Collaborative Relay retry/resume): when set, continue the
+	// given relay run from its persisted cursor instead of starting fresh.
+	ResumeRunID string `json:"resume_run_id,omitempty"`
 }
 
 // SSEEvent types for streaming
@@ -123,8 +313,16 @@ const (
 	SSEChunk     = "chunk"
 	SSEComplete  = "complete"
 	SSESynthesis = "synthesis"
-	SSEDone      = "done"
-	SSEError     = "error"
+	// SSESection (Collaborative Relay): one finished section, sent as each
+	// expert's turn completes in relay order. Independent mode (the
+	// existing SSEComplete above) never sends this event.
+	SSESection = "collab_section"
+	// SSERelayStep (Collaborative Relay, Phase 2): one transparency-log event.
+	// Carries step, expert_id, message, metadata. Rendered live, strictly in
+	// arrival order; persisted server-side to collab_relay_events for replay.
+	SSERelayStep = "relay_step"
+	SSEDone    = "done"
+	SSEError   = "error"
 )
 
 // Handler handles message sending with SSE streaming.
@@ -246,6 +444,7 @@ func (h *Handler) Send(c *gin.Context) {
 				req.GenericAllowancePct = pct
 			}
 		}
+		req.AnswerMode = c.PostForm("answer_mode")
 		fileContent = h.extractAttachments(c)
 	} else {
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -429,7 +628,15 @@ func (h *Handler) Send(c *gin.Context) {
 			}()
 		}
 
-		// Run orchestrator
+		// Run orchestrator.
+		// AnswerMode (Collaborative Relay): "collaborative" with 2+
+		// experts runs them SEQUENTIALLY as one section-organized answer
+		// (orchestrator.ProcessCollaborative) instead of the parallel
+		// independent-mode path below. Any other value (including an
+		// unknown string, or "collaborative" with only 1 expert
+		// selected) falls back to independent mode unchanged.
+		collabMode := req.AnswerMode == "collaborative" && len(expertIDs) >= 2
+
 		orchestratorReq := orchestrator.OrchestratorRequest{
 			ProjectID:           ch.ProjectID,
 			ClientID:            clientID,
@@ -447,7 +654,41 @@ func (h *Handler) Send(c *gin.Context) {
 			orchestratorReq.TokenCh = tokenCh
 		}
 
-		orchestratorResp, err := h.orchestrator.Process(c.Request.Context(), orchestratorReq)
+		var orchestratorResp *orchestrator.OrchestratorResponse
+		var err error
+		if collabMode {
+			orchestratorReq.ResumeRunID = parseUUIDOrNil(req.ResumeRunID)
+			orchestratorResp, err = h.orchestrator.ProcessCollaborative(
+				c.Request.Context(), orchestratorReq,
+				func(ev collab.StepEvent) {
+					sendSSE(w, SSERelayStep, map[string]interface{}{
+						"step":        string(ev.Step),
+						"expert_id":   ev.ExpertID,
+						"expert_name": ev.ExpertName,
+						"message":     ev.Message,
+						"metadata":    ev.Metadata,
+					})
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				},
+				func(section collab.Section, index, total int) {
+					sendSSE(w, SSESection, map[string]interface{}{
+						"expert_id":     section.ExpertID,
+						"expert_name":   section.ExpertName,
+						"section_title": section.SectionTitle,
+						"content":       section.Content,
+						"index":         index,
+						"total":         total,
+					})
+					if flusher, ok := w.(http.Flusher); ok {
+						flusher.Flush()
+					}
+				},
+			)
+		} else {
+			orchestratorResp, err = h.orchestrator.Process(c.Request.Context(), orchestratorReq)
+		}
 
 		// Stop the forwarder (do NOT close tokenCh — a live producer may still send).
 		if stopForwarding != nil {
@@ -467,50 +708,63 @@ func (h *Handler) Send(c *gin.Context) {
 			return false
 		}
 
-		// Stream each expert response
-		// savedMessageIDs: collect message_id per expert for SSEDone.
-		// WHY sync save (not async goroutine):
-		//   Frontend needs message_id to render the Reply button.
-		//   If save is async, SSEDone arrives before DB write completes,
-		//   message_id is unavailable, Reply button never renders.
-		//   Save is fast (single INSERT, <5ms) — sync cost is negligible
-		//   compared to the 2-10s LLM generation that just completed.
+		// savedMessageIDs: collect message_id per expert for SSEDone
+		// (collab mode uses a single "collab" key instead — see below).
 		savedMessageIDs := make(map[string]string) // expert_id -> message_id
-		for _, expertResp := range orchestratorResp.ExpertResponses {
-			// Ensure citations is never null in SSE payload.
-			// WHY: frontend calls citations.map() — null crashes JS.
-			// REFUSE/ASK modes have no citations — send [] not null.
-			citations := expertResp.Citations
-			if citations == nil {
-				citations = []chinawall.Citation{}
+		if collabMode && len(orchestratorResp.CollabSections) > 0 {
+			// Collaborative Relay: ONE merged message instead of one per
+			// expert. Content is the assembled Markdown; collab_sections
+			// (migration 075) preserves the structured per-expert data so a
+			// reload renders the same sectioned view the live stream showed.
+			savedID := h.saveCollabMessage(context.Background(), chatID, orchestratorResp.CollabSections, turnNumber)
+			if savedID != uuid.Nil {
+				savedMessageIDs["collab"] = savedID.String()
 			}
-			// Send complete expert response
-			sendSSE(w, SSEComplete, map[string]interface{}{
-				"expert_id":    expertResp.ExpertID,
-				"expert_name":  expertResp.ExpertName,
-				"domain":       expertResp.Domain,
-				"mode":         expertResp.Mode,
-				"content":      expertResp.Content,
-				"citations":    citations,
-				"confidence":   expertResp.Confidence,
-				"gate_stopped": expertResp.GateStopped,
-				"warning":      expertResp.Warning,
-				"questions":    expertResp.Questions,
-				// CT-B4: nil/omitted for every flat-text expert response (CT-L2).
-				// Frontend (CT-D5, not yet built) renders this when present,
-				// falls back to "content" above otherwise.
-				"template_sections": expertResp.TemplateSections,
-				// B8: claim→evidence reports; nil/omitted when verify off.
-				// Verification labels are never written into content (removed by product decision).
-				"claims": expertResp.Claims,
-			})
+		} else {
+			// Stream each expert response
+			// savedMessageIDs: collect message_id per expert for SSEDone.
+			// WHY sync save (not async goroutine):
+			//   Frontend needs message_id to render the Reply button.
+			//   If save is async, SSEDone arrives before DB write completes,
+			//   message_id is unavailable, Reply button never renders.
+			//   Save is fast (single INSERT, <5ms) — sync cost is negligible
+			//   compared to the 2-10s LLM generation that just completed.
+			for _, expertResp := range orchestratorResp.ExpertResponses {
+				// Ensure citations is never null in SSE payload.
+				// WHY: frontend calls citations.map() — null crashes JS.
+				// REFUSE/ASK modes have no citations — send [] not null.
+				citations := expertResp.Citations
+				if citations == nil {
+					citations = []chinawall.Citation{}
+				}
+				// Send complete expert response
+				sendSSE(w, SSEComplete, map[string]interface{}{
+					"expert_id":    expertResp.ExpertID,
+					"expert_name":  expertResp.ExpertName,
+					"domain":       expertResp.Domain,
+					"mode":         expertResp.Mode,
+					"content":      expertResp.Content,
+					"citations":    citations,
+					"confidence":   expertResp.Confidence,
+					"gate_stopped": expertResp.GateStopped,
+					"warning":      expertResp.Warning,
+					"questions":    expertResp.Questions,
+					// CT-B4: nil/omitted for every flat-text expert response (CT-L2).
+					// Frontend (CT-D5, not yet built) renders this when present,
+					// falls back to "content" above otherwise.
+					"template_sections": expertResp.TemplateSections,
+					// B8: claim→evidence reports; nil/omitted when verify off.
+					// Verification labels are never written into content (removed by product decision).
+					"claims": expertResp.Claims,
+				})
 
-			// Save assistant message SYNCHRONOUSLY.
-			// WHY sync: message_id needed in SSEDone for Reply button.
-			// Save is <5ms — negligible after 2-10s LLM generation.
-			savedID := h.saveAssistantMessage(context.Background(), chatID, expertResp, turnNumber)
-			if savedID.String() != uuid.Nil.String() {
-				savedMessageIDs[expertResp.ExpertID.String()] = savedID.String()
+				// Save assistant message SYNCHRONOUSLY.
+				// WHY sync: message_id needed in SSEDone for Reply button.
+				// Save is <5ms — negligible after 2-10s LLM generation.
+				savedID := h.saveAssistantMessage(context.Background(), chatID, expertResp, turnNumber)
+				if savedID.String() != uuid.Nil.String() {
+					savedMessageIDs[expertResp.ExpertID.String()] = savedID.String()
+				}
 			}
 		}
 
@@ -524,11 +778,17 @@ func (h *Handler) Send(c *gin.Context) {
 		// the user message (always saved before streaming). Fake uuid.New()
 		// used to FK-fail silently and leave chat_index empty forever.
 		indexMsgID := userMsgID
-		for _, expertResp := range orchestratorResp.ExpertResponses {
-			if idStr, ok := savedMessageIDs[expertResp.ExpertID.String()]; ok {
-				if parsed, perr := uuid.Parse(idStr); perr == nil && parsed != uuid.Nil {
-					indexMsgID = parsed
-					break
+		if idStr, ok := savedMessageIDs["collab"]; ok {
+			if parsed, perr := uuid.Parse(idStr); perr == nil && parsed != uuid.Nil {
+				indexMsgID = parsed
+			}
+		} else {
+			for _, expertResp := range orchestratorResp.ExpertResponses {
+				if idStr, ok := savedMessageIDs[expertResp.ExpertID.String()]; ok {
+					if parsed, perr := uuid.Parse(idStr); perr == nil && parsed != uuid.Nil {
+						indexMsgID = parsed
+						break
+					}
 				}
 			}
 		}
@@ -663,6 +923,36 @@ func (h *Handler) saveAssistantMessage(
 			}
 		}()
 	}
+	return savedID
+}
+
+// saveCollabMessage saves a Collaborative Relay turn's merged sections as
+// ONE assistant message (no single expert_id — the message represents all
+// of them). Content is the assembled Markdown (collab.AssembleMarkdown);
+// collab_sections (migration 075) stores the structured per-expert data so
+// ListMessages/reload renders the identical sectioned view the live SSE
+// stream showed, same convention as saveAssistantMessage's TemplateSections.
+// Returns uuid.Nil on save failure, same fail-soft contract as
+// saveAssistantMessage, so the caller can still send SSEDone.
+func (h *Handler) saveCollabMessage(
+	ctx context.Context,
+	chatID uuid.UUID,
+	sections []collab.Section,
+	turnNumber int,
+) uuid.UUID {
+	savedID, err := h.chatSvc.SaveMessage(ctx, chat.Message{
+		ChatID:         chatID,
+		Role:           "assistant",
+		Content:        collab.AssembleMarkdown(sections),
+		TurnNumber:     turnNumber,
+		CollabSections: sections,
+	})
+	if err != nil {
+		h.logger.Warn("save collab message failed", zap.Error(err))
+		_ = h.chatSvc.IncrementMessageCount(ctx, chatID)
+		return uuid.Nil
+	}
+	_ = h.chatSvc.IncrementMessageCount(ctx, chatID)
 	return savedID
 }
 

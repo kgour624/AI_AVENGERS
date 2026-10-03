@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -346,4 +347,62 @@ func (h *Handler) GetWorkflowFileContent(c *gin.Context) {
 	c.Header("Content-Type", "text/plain; charset=utf-8")
 	c.Header("Content-Disposition", `attachment; filename="`+filepath.Base(path)+`"`)
 	c.String(200, pc.Body)
+}
+
+// GetCombinedDesignDoc GET /workflows/:id/design-doc
+//
+// Serves the current unified design document (final_design.md, or the latest
+// redesign_N.md after a redesign) straight off disk — the "Download Unified
+// Design" button's one endpoint.
+//
+// WHY read the file from disk rather than from the blackboard event's own
+// content: writeCombinedDesignDoc (design_doc.go) does not put the markdown
+// body into the event it posts — only file_path/file_name/version, the same
+// choice export_git.go and the ZIP download already made for everything else
+// under the workspace main/ directory. The event is the pointer; the
+// workspace file is still the one source of truth for content, exactly like
+// GetWorkflowFileContent above treats blackboard content as truth for
+// per-expert artifacts (a deliberate difference in *where* truth lives for a
+// system-generated document versus an expert-authored one, not an
+// inconsistency).
+func (h *Handler) GetCombinedDesignDoc(c *gin.Context) {
+	workflowID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
+		return
+	}
+	ctx := c.Request.Context()
+
+	events, err := h.store.GetSince(ctx, workflowID, 0, 500)
+	if err != nil {
+		h.logger.Error("get combined design doc: list events failed",
+			zap.String("workflow_id", workflowID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	filePath, fileName, _, found := lookupCombinedDesignDoc(events)
+	if !found {
+		response.NotFound(c, "no combined design document has been generated for this workflow yet")
+		return
+	}
+
+	content, readErr := os.ReadFile(filePath)
+	if readErr != nil {
+		// The event exists but the file is gone (workspace cleanup, moved
+		// volume, etc). This is a real server-side problem, not a 404 for a
+		// document that was simply never generated — logged distinctly so
+		// the two cases are not confused when triaging.
+		h.logger.Error("get combined design doc: file missing on disk",
+			zap.String("workflow_id", workflowID.String()),
+			zap.String("file_path", filePath), zap.Error(readErr))
+		response.InternalError(c)
+		return
+	}
+
+	if fileName == "" {
+		fileName = filepath.Base(filePath)
+	}
+	c.Header("Content-Type", "text/markdown; charset=utf-8")
+	c.Header("Content-Disposition", `attachment; filename="`+fileName+`"`)
+	c.String(200, string(content))
 }

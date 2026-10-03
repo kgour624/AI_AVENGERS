@@ -31,10 +31,11 @@ function colorForId(id: string): string {
 export interface ExpertBadgeProps {
   expert: Pick<ProjectExpert, 'expertId' | 'expertName'>
   isSelected?: boolean
+  orderIndex?: number
   onClick?: () => void
 }
 
-export function ExpertBadge({ expert, isSelected, onClick }: ExpertBadgeProps) {
+export function ExpertBadge({ expert, isSelected, orderIndex, onClick }: ExpertBadgeProps) {
   const dotColor = colorForId(expert.expertId)
 
   return (
@@ -50,6 +51,11 @@ export function ExpertBadge({ expert, isSelected, onClick }: ExpertBadgeProps) {
       )}
     >
       <span className={cn('h-2 w-2 rounded-full', dotColor)} aria-hidden="true" />
+      {orderIndex !== undefined && isSelected && (
+        <span className="rounded bg-brand/20 px-1 py-0.5 text-[10px] font-semibold text-brand">
+          #{orderIndex}
+        </span>
+      )}
       {expert.expertName}
       {isSelected && <span aria-hidden="true">✓</span>}
     </button>

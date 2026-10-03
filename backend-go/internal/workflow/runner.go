@@ -794,6 +794,35 @@ func (r *WorkflowRunner) Run(ctx context.Context, workflowID uuid.UUID) {
 	for _, ev := range allArtifacts {
 		artifactIDs = append(artifactIDs, ev.ID)
 	}
+
+	// Combined design document (non-fatal): assembled from the allArtifacts
+	// fetch above, so this never re-queries the blackboard. A write failure
+	// must not block handoff — same precedent as publishCodeArtifacts in
+	// aider_runner.go ("Non-fatal: log error but don't fail the task").
+	mainPath := mainWorkspacePath(r.aiderRunner.workspaceDir, workflowID)
+	if docResult, docErr := writeCombinedDesignDoc(mainPath, workflowID,
+		state.DesignRevisionID, state.RedesignGoal, allArtifacts); docErr != nil {
+		log.Error("runner: combined design doc write failed", zap.Error(docErr))
+	} else {
+		// PostedByClient: true because this is a system/runner-generated event,
+		// not authored by any specific expert — same pattern as export_git.go
+		// and tools.go. blackboard_events_poster_check (migration 006) requires
+		// exactly one of posted_by_expert_id / posted_by_client to be set.
+		// With PostedByClient: false AND PostedByExpertID: nil the CHECK fires.
+		if _, postErr := r.store.Post(ctx, blackboard.PostRequest{
+			WorkflowID:     workflowID,
+			PostedByClient: true,
+			EventType:      combinedDesignDocEvent,
+			Content: map[string]interface{}{
+				"file_path": docResult.FilePath,
+				"file_name": docResult.FileName,
+				"version":   docResult.Version,
+			},
+		}); postErr != nil {
+			log.Error("runner: combined design doc event post failed", zap.Error(postErr))
+		}
+	}
+
 	_, err = r.tools.AskClient(ctx, AskClientRequest{
 		WorkflowID:    workflowID,
 		FromExpertID:  uuid.Nil,

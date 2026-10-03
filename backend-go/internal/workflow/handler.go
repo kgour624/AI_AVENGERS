@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/gin-gonic/gin"
@@ -566,6 +568,33 @@ func (h *Handler) RespondToApproval(c *gin.Context) {
 	})
 }
 
+// GET /api/v1/workflows/:id/approvals/pending
+func (h *Handler) GetPendingApproval(c *gin.Context) {
+	workflowID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid workflow ID")
+		return
+	}
+	var id uuid.UUID
+	var gateName, summary string
+	err = h.engine.DB().QueryRow(c.Request.Context(),
+		`SELECT id, gate_name, COALESCE(summary,'')
+		 FROM approval_requests
+		 WHERE workflow_id=$1 AND status='pending'
+		 ORDER BY requested_at DESC LIMIT 1`, workflowID,
+	).Scan(&id, &gateName, &summary)
+	if err != nil {
+		// pending nahi hai -> 404, frontend isko ignore karega
+		response.NotFound(c, "approval")
+		return
+	}
+	c.JSON(200, gin.H{
+		"approval_id": id.String(),
+		"gate_name":   gateName,
+		"summary":     summary,
+	})
+}
+
 // splitComma splits a comma-separated string into a slice.
 func splitComma(s string) []string {
 	var result []string
@@ -696,6 +725,20 @@ func (h *Handler) DeleteWorkflow(c *gin.Context) {
 		h.logger.Error("delete workflow failed", zap.String("workflow_id", workflowID.String()), zap.Error(err))
 		response.InternalError(c)
 		return
+	}
+	// Bug 1 fix: orphaned workspaces on manual delete.
+	// WHY: the DB row is gone so the 7-day auto-cleanup in main.go can no longer
+	// find this workflow by querying `workflows` — the files under
+	// {AIDER_WORKSPACE_ROOT}/{workflowID}/ would leak forever. Remove them
+	// synchronously here. Non-fatal: the DB delete already succeeded, so log
+	// and continue even if the dir is already gone or RemoveAll fails.
+	workspaceRoot := os.Getenv("AIDER_WORKSPACE_ROOT")
+	if workspaceRoot == "" {
+		workspaceRoot = "/tmp/ai_avengers_workspaces"
+	}
+	if err := os.RemoveAll(filepath.Join(workspaceRoot, workflowID.String())); err != nil {
+		h.logger.Warn("delete workflow: workspace cleanup failed",
+			zap.String("workflow_id", workflowID.String()), zap.Error(err))
 	}
 	response.OK(c, gin.H{"status": "deleted"})
 }

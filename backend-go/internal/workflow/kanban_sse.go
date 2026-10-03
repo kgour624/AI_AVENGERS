@@ -180,6 +180,20 @@ func (h *Handler) handleKanbanEvent(w io.Writer, event blackboard.Event) {
 	case artifactTypes[event.EventType]:
 		sendKanbanSSE(w, SSEKanbanArtifact, payload)
 	case event.EventType == "question_to_client":
+		// Normalize snake_case -> camelCase for frontend.
+		// WHY: replay sends {approvalId, gateName} but blackboard_events.content
+		// is stored as {approval_id, gate_name} from tools.AskClient. 
+		// Frontend camelizeKeys handles deep keys, par RawMessage double-encode
+		// ke wajah se kabhi kabhi miss ho jata hai. Yaha ek baar normalize kar do.
+		var rawContent map[string]any
+		if err := json.Unmarshal(json.RawMessage(event.Content), &rawContent); err == nil {
+			normalized := map[string]string{
+				"approvalId": getStr(rawContent, "approval_id", "approvalId", "id"),
+				"gateName":   getStr(rawContent, "gate_name", "gateName"),
+				"summary":    getStr(rawContent, "summary"),
+			}
+			payload["content"] = normalized
+		}
 		sendKanbanSSE(w, SSEKanbanApproval, payload)
 	default:
 		sendKanbanSSE(w, SSEKanbanTask, payload)
@@ -201,4 +215,15 @@ func sendKanbanSSE(w io.Writer, eventType string, data interface{}) {
 		payload = fmt.Sprintf(`{"type":"%s"}`, eventType)
 	}
 	fmt.Fprintf(w, "data: %s\n\n", payload)
+}
+
+func getStr(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
 }

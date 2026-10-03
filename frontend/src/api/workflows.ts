@@ -162,6 +162,11 @@ export const respondToApproval = (
     )
     .then((res) => res.data.data!)
 
+export interface PendingApproval { approvalId: string; gateName: string; summary: string }
+export const getPendingApproval = (workflowId: string) =>
+  baseAPI.get<ApiResponse<PendingApproval>>(`/api/v1/workflows/${workflowId}/approvals/pending`)
+    .then(r => camelizeKeys<PendingApproval>(r.data.data))
+
 export const cancelWorkflow = (workflowId: string) =>
   baseAPI
     .post<ApiResponse<{ status: string }>>(`/api/v1/workflows/${workflowId}/cancel`)
@@ -385,3 +390,18 @@ export const pushToPublication = (publicationId: string, paths: string[]) =>
   baseAPI
     .post<ApiResponse<{ files_added: number }>>(`/api/v1/admin/publications/${publicationId}/push`, { paths })
     .then((r) => r.data.data!)
+
+// Unified design document (handoff phase): final_design.md, or the latest
+// redesign_N.md after a redesign. Separate from downloadWorkflowFile above
+// because it is backed by its own endpoint (GET /:id/design-doc) — see
+// GetCombinedDesignDoc in publish.go. The backend reads the file straight off
+// disk; the SSE event is just a pointer (file_path/file_name/version), so a
+// fetch here always returns the current on-disk content. 404 means the doc
+// hasn't been generated yet (pre-handoff); 500 means the pointer exists but the
+// file is missing — a triage distinction worth keeping out of this helper.
+export const downloadCombinedDesignDoc = async (id: string): Promise<Blob> => {
+  const res = await baseAPI.get(`/api/v1/workflows/${id}/design-doc`, {
+    responseType: 'blob',
+  })
+  return res.data as Blob
+}

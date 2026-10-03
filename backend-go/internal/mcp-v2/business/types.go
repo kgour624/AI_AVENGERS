@@ -61,13 +61,15 @@ type GateResult struct{ GateStopped int; Allowed bool }
 // InputSchema is the JSON Schema for MCP tools/list (JSONB in DB -> map[string]any in Go).
 // Action is the Dynamic Engine interpreter config (Phase 1: SQL_READ). JSONB -> ActionDef.
 type ToolDefinition struct {
-	ID          string         `json:"id"`
-	Name        string         `json:"name"`
-	DisplayName string         `json:"display_name"`
-	Description string         `json:"description"`
-	IsActive    bool           `json:"is_active"`
-	InputSchema map[string]any `json:"input_schema"`
-	Action      ActionDef      `json:"action"`
+	ID           string         `json:"id"`
+	Name         string         `json:"name"`
+	DisplayName  string         `json:"display_name"`
+	Description  string         `json:"description"`
+	IsActive     bool           `json:"is_active"`
+	InputSchema  map[string]any `json:"input_schema"`
+	Action       ActionDef      `json:"action"`
+	Annotations  map[string]any `json:"annotations,omitempty"`
+	OutputSchema map[string]any `json:"output_schema,omitempty"`
 }
 
 // ActionType defines interpreter strategy — Interpreter Pattern (not code-gen).

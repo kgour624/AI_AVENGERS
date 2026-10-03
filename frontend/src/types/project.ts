@@ -5,7 +5,7 @@
  * AI_AVENGERS_SYSTEM_ARCHITECTURE.md section 5.
  */
 
-import type { Citation, ResponseMode, TemplateSectionResult } from './expert'
+import type { Citation, CollabSection, ResponseMode, TemplateSectionResult } from './expert'
 
 export type ProjectStatus = 'active' | 'completed' | 'archived'
 export type RepoProvider = 'github' | 'gitlab'
@@ -92,6 +92,18 @@ export interface Message {
    * stream having shown it correctly moments earlier.
    */
   templateSections?: TemplateSectionResult[]
+  /**
+   * Collaborative Relay (migration 075): ordered per-expert sections
+   * when this message is the single merged answer for a
+   * "collaborative" answer_mode turn (2+ experts relayed
+   * sequentially). undefined for every independent-mode message
+   * (the default) and every message saved before this feature -
+   * same optionality convention as templateSections above. When
+   * present, `content` above is still the assembled Markdown
+   * (collab.AssembleMarkdown) so a consumer that ignores this field
+   * entirely still renders something reasonable.
+   */
+  collabSections?: CollabSection[]
   createdAt: string
 }
 

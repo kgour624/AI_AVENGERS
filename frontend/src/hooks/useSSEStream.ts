@@ -2,7 +2,7 @@ import { useAuthStore } from '@/stores/authStore'
 import { useStreamStore } from '@/stores/streamStore'
 import { refreshSession } from '@/api/base'
 import { camelizeKeys } from '@/utils/casing'
-import type { ExpertResponse, SynthesisResult } from '@/types/expert'
+import type { ExpertResponse, SynthesisResult, CollabSection } from '@/types/expert'
 
 /**
  * SSE streaming via fetch() + ReadableStream (NOT EventSource).
@@ -60,6 +60,16 @@ export interface SendMessageOptions {
   templateName?: string
   /** CT-L6: explicit opt-in only, ignored if replyToMessageId is unset. */
   includeFullThread?: boolean
+  /**
+   * Collaborative Relay: '' / 'independent' (default, every pre-existing
+   * caller) runs each selected expert in parallel exactly as before.
+   * 'collaborative' requires 2+ expertIds and instead runs them
+   * SEQUENTIALLY as one merged answer (message/handler.go's AnswerMode).
+   * Unset/unknown values fail safe to independent mode on the backend,
+   * never to an error.
+   */
+  answerMode?: 'independent' | 'collaborative'
+  resumeRunId?: string
 }
 
 type SSEEvent =
@@ -67,6 +77,10 @@ type SSEEvent =
   | { type: 'chunk'; data: { content: string; expertId: string } }
   | { type: 'complete'; data: ExpertResponse }
   | { type: 'synthesis'; data: SynthesisResult }
+  // Collaborative Relay: one finished section, sent as each expert's turn
+  // mode never sends this event.
+  | { type: 'collab_section'; data: CollabSection }
+  | { type: 'relay_step'; data: import('@/types/expert').RelayStepEvent }
   | { type: 'done'; data: { turnNumber: number; durationMs: number } }
   | { type: 'error'; data: { message: string } }
 
@@ -102,11 +116,22 @@ function applyEvent(chatId: string, event: SSEEvent) {
     case 'synthesis':
       appendChunk(chatId, { synthesis: event.data })
       break
+    case 'collab_section': {
+      // Collaborative Relay: append in the order sections arrive, which IS
+      // relay order - never re-sort this.
+      const current = useStreamStore.getState().activeStreams.get(chatId)
+      const sections = current ? [...current.collabSections, event.data] : [event.data]
+      appendChunk(chatId, { status: 'streaming', collabSections: sections })
+      break
+    }
     case 'done':
       completeStream(chatId)
       break
     case 'error':
       setError(chatId, event.data.message)
+      break
+    case 'relay_step':
+      useStreamStore.getState().appendRelayStep(chatId, event.data)
       break
   }
 }
@@ -124,6 +149,8 @@ export function useSSEStream() {
       includeFullThread,
       templateName,
       genericAllowancePct,
+      answerMode,
+      resumeRunId,
     } = options
     const hasFiles = Boolean(files && files.length > 0)
 
@@ -145,6 +172,8 @@ export function useSSEStream() {
       if (replyToMessageId) formData.append('reply_to_message_id', replyToMessageId)
       if (includeFullThread) formData.append('include_full_thread', 'true')
       if (templateName) formData.append('template_name', templateName)
+      if (answerMode) formData.append('answer_mode', answerMode)
+      if (resumeRunId) formData.append('resume_run_id', resumeRunId)
       body = formData
       // WHY no Content-Type set for FormData: the browser sets the
       // multipart boundary itself. Setting it manually (as plain
@@ -158,6 +187,8 @@ export function useSSEStream() {
         ...(includeFullThread ? { include_full_thread: true } : {}),
         ...(templateName ? { template_name: templateName } : {}),
         ...(genericAllowancePct ? { generic_allowance_pct: genericAllowancePct } : {}),
+        ...(answerMode ? { answer_mode: answerMode } : {}),
+        ...(resumeRunId ? { resume_run_id: resumeRunId } : {}),
       })
       headers['Content-Type'] = 'application/json'
     }

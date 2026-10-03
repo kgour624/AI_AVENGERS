@@ -21,31 +21,111 @@ import { ExpertBadge } from './ExpertBadge'
 export interface ExpertPickerProps {
   experts: ProjectExpert[]
   selectedIds: Set<string>
-  onChange: (selectedIds: Set<string>) => void
+  orderedIds?: string[]
+  onChange: (selectedIds: Set<string>, newOrderedIds?: string[]) => void
+  onReorder?: (newOrderedIds: string[]) => void
 }
 
-export function ExpertPicker({ experts, selectedIds, onChange }: ExpertPickerProps) {
+export function ExpertPicker({
+  experts,
+  selectedIds,
+  orderedIds,
+  onChange,
+  onReorder,
+}: ExpertPickerProps) {
+  // Compute effective ordered array of selected expert IDs
+  const activeOrder = orderedIds && orderedIds.length > 0
+    ? orderedIds.filter((id) => selectedIds.has(id))
+    : Array.from(selectedIds)
+
   function toggle(expertId: string) {
-    const next = new Set(selectedIds)
-    if (next.has(expertId)) {
-      next.delete(expertId)
+    const nextSet = new Set(selectedIds)
+    let nextOrder = [...activeOrder]
+
+    if (nextSet.has(expertId)) {
+      nextSet.delete(expertId)
+      nextOrder = nextOrder.filter((id) => id !== expertId)
     } else {
-      next.add(expertId)
+      nextSet.add(expertId)
+      nextOrder.push(expertId)
     }
-    onChange(next)
+
+    onChange(nextSet, nextOrder)
+    if (onReorder) onReorder(nextOrder)
   }
 
+  function moveExpert(index: number, direction: 'left' | 'right') {
+    const targetIndex = direction === 'left' ? index - 1 : index + 1
+    if (targetIndex < 0 || targetIndex >= activeOrder.length) return
+    const nextOrder = [...activeOrder]
+    const temp = nextOrder[index]!
+    nextOrder[index] = nextOrder[targetIndex]!
+    nextOrder[targetIndex] = temp
+    if (onReorder) onReorder(nextOrder)
+  }
+
+  const expertMap = new Map(experts.map((e) => [e.expertId, e]))
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      <span className="text-xs text-text-secondary">Experts:</span>
-      {experts.map((expert) => (
-        <ExpertBadge
-          key={expert.expertId}
-          expert={expert}
-          isSelected={selectedIds.has(expert.expertId)}
-          onClick={() => toggle(expert.expertId)}
-        />
-      ))}
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-text-secondary">Experts:</span>
+        {experts.map((expert) => {
+          const isSelected = selectedIds.has(expert.expertId)
+          const orderIdx = activeOrder.indexOf(expert.expertId)
+          return (
+            <ExpertBadge
+              key={expert.expertId}
+              expert={expert}
+              isSelected={isSelected}
+              orderIndex={isSelected && orderIdx !== -1 ? orderIdx + 1 : undefined}
+              onClick={() => toggle(expert.expertId)}
+            />
+          )
+        })}
+      </div>
+
+      {/* Interactive Reordering Strip when 2+ experts selected */}
+      {activeOrder.length > 1 && (
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-brand/30 bg-brand/5 p-2 text-xs">
+          <span className="font-semibold text-brand">Execution Order (Sequence):</span>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {activeOrder.map((id, idx) => {
+              const exp = expertMap.get(id)
+              if (!exp) return null
+              return (
+                <div
+                  key={id}
+                  className="flex items-center gap-1 rounded border border-surface-border bg-surface-overlay px-2 py-1 text-text-primary"
+                >
+                  <span className="font-bold text-brand">#{idx + 1}</span>
+                  <span>{exp.expertName}</span>
+                  <div className="ml-1 flex items-center gap-0.5">
+                    <button
+                      type="button"
+                      disabled={idx === 0}
+                      onClick={() => moveExpert(idx, 'left')}
+                      className="rounded px-1 text-[10px] font-bold text-text-secondary hover:bg-brand/20 hover:text-brand disabled:opacity-30"
+                      title="Move earlier in execution sequence"
+                    >
+                      ◀
+                    </button>
+                    <button
+                      type="button"
+                      disabled={idx === activeOrder.length - 1}
+                      onClick={() => moveExpert(idx, 'right')}
+                      className="rounded px-1 text-[10px] font-bold text-text-secondary hover:bg-brand/20 hover:text-brand disabled:opacity-30"
+                      title="Move later in execution sequence"
+                    >
+                      ▶
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

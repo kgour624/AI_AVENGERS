@@ -15,10 +15,11 @@ import (
 // SSE event type constants for the file/code stream.
 // Naming mirrors kanban_sse.go's SSEKanban* constants exactly.
 const (
-	SSEFileArtifact = "file_artifact" // expert produced/modified a code file (code_artifact_produced)
-	SSEFileWave     = "file_wave"     // a wave's code was merged into main/ (wave_completed)
-	SSEFileDone     = "file_done"     // workflow completed or failed
-	SSEFileError    = "file_error"    // stream error
+	SSEFileArtifact  = "file_artifact"   // expert produced/modified a code file (code_artifact_produced)
+	SSEFileWave      = "file_wave"       // a wave's code was merged into main/ (wave_completed)
+	SSEFileDesignDoc = "file_design_doc" // combined design document written (combined_design_doc_produced)
+	SSEFileDone      = "file_done"       // workflow completed or failed
+	SSEFileError     = "file_error"      // stream error
 )
 
 // StreamFiles handles GET /api/v1/workflows/:id/files/stream
@@ -36,6 +37,9 @@ const (
 //                                 file, posted by
 //                                 AuthoringRunner.publishDesignArtifact)
 //     wave_completed          -> SSE file_wave (main/ was just updated)
+//     combined_design_doc_produced -> SSE file_design_doc (unified design
+//                                 markdown written at handoff — see
+//                                 design_doc.go's writeCombinedDesignDoc)
 //   Everything else is ignored — a file browser doesn't care about task
 //   status or approval gates, that's StreamKanban's job.
 //
@@ -46,6 +50,7 @@ const (
 //   3. For each new blackboard event:
 //      - code_artifact_produced -> SSE file_artifact
 //      - wave_completed          -> SSE file_wave
+//      - combined_design_doc_produced -> SSE file_design_doc
 //      - workflow_completed/failed -> SSE file_done + close
 //      - everything else -> ignored
 //   4. Client disconnects -> ctx.Done() -> subscriber stops
@@ -142,6 +147,13 @@ func (h *Handler) handleFileEvent(w io.Writer, event blackboard.Event) {
 		sendKanbanSSE(w, SSEFileArtifact, payload)
 	case "wave_completed":
 		sendKanbanSSE(w, SSEFileWave, payload)
+	case combinedDesignDocEvent:
+		// Own SSE type, not folded into file_artifact: this payload's content
+		// is {file_path, file_name, version}, not the filePath/language/content
+		// shape FileEntry expects, so reusing file_artifact would either break
+		// FilesPanel's tree render or need a shape-sniffing branch there. A
+		// distinct event name keeps both consumers simple.
+		sendKanbanSSE(w, SSEFileDesignDoc, payload)
 	default:
 		// Not a file-relevant event — ignored.
 	}

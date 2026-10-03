@@ -16,6 +16,7 @@ import (
 
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/collab"
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/gateway"
@@ -58,6 +59,10 @@ type OrchestratorRequest struct {
 	// message/handler.go creates this channel and forwards tokens to SSE.
 	// nil = blocking (used by tests, smoke test, non-streaming callers).
 	TokenCh chan<- string
+	// ResumeRunID (Collaborative Relay, ans2/ans4): when set, continue an
+	// existing relay run from its persisted state (current_index) instead of
+	// starting a fresh relay. Used by retry-after-failure and reconnect-resume.
+	ResumeRunID uuid.UUID
 }
 
 // OrchestratorResponse is the full output including all expert responses.
@@ -71,6 +76,13 @@ type OrchestratorResponse struct {
 	// Populated by processWithExpert via PhaseTimer (Observer pattern).
 	// Nil when no experts ran (error path).
 	PhaseTimings []observability.PhaseResult
+	// CollabSections (Collaborative Relay): populated ONLY by
+	// ProcessCollaborative, nil for every Process (independent-mode) call —
+	// the existing behavior for every pre-existing caller is completely
+	// unaffected. When non-nil, message/handler.go saves ONE merged
+	// assistant message (collab_sections JSONB, migration 075) instead of
+	// one message per expert.
+	CollabSections []collab.Section
 }
 
 // ExpertResponse is one expert's response.
@@ -329,7 +341,11 @@ func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*O
 		wg.Add(1)
 		go func(expert expertRecord) {
 			defer wg.Done()
-			result := o.processWithExpert(ctx, req, expert)
+			// "" peerContext: the independent path has no notion of other
+			// experts' answers — every expert still answers from only its
+			// own trained corpus + reply thread, exactly as before this
+			// parameter was added.
+			result := o.processWithExpert(ctx, req, expert, "")
 			resultCh <- result
 		}(exp)
 	}
@@ -404,9 +420,293 @@ collected:
 	}, nil
 }
 
+// ProcessCollaborative runs the gated, fully-observable sequential relay.
+// (See the OLD body's doc comments for the WHY-sequential rationale — unchanged.)
+//
+// New behavior vs Phase 1:
+//   - plan is ALWAYS FallbackPlan (PlanSections is unwired; see plan.go).
+//   - every step is persisted to collab_relay_events AND emitted via onStep.
+//   - hard stop on any expert failure (ans2): no later expert runs.
+//   - a cheap consistency check (ans3) runs after each section.
+//   - a human review gate (ans7) blocks before the next expert, allowing edit;
+//     the edited content becomes the peer context for the next expert.
+func (o *Orchestrator) ProcessCollaborative(
+	ctx context.Context,
+	req OrchestratorRequest,
+	onStep collab.StepFunc,
+	onProgress collab.ProgressFunc,
+) (*OrchestratorResponse, error) {
+	start := time.Now()
+	store := collab.NewRelayStore(o.db)
+
+	// --- resume support -----------------------------------------------------
+	// If a prior run exists (reconnect or retry), continue from its state
+	// instead of starting fresh.
+	var resumeRun *collab.RelayRun
+	if req.ResumeRunID != uuid.Nil {
+		r, err := store.GetRun(ctx, req.ResumeRunID)
+		if err == nil {
+			resumeRun = &r
+			if err := store.BeginRetry(ctx, r.ID); err != nil {
+				o.logger.Warn("collab: begin retry failed", zap.Error(err))
+			}
+		}
+	}
+
+	if len(req.ExpertIDs) == 0 {
+		return nil, fmt.Errorf("no experts selected")
+	}
+	experts, err := o.loadExperts(ctx, req.ExpertIDs)
+	if err != nil {
+		return nil, fmt.Errorf("load experts failed: %w", err)
+	}
+	if len(experts) == 0 {
+		return nil, fmt.Errorf("no active experts found")
+	}
+
+	byID := make(map[uuid.UUID]expertRecord, len(experts))
+	infos := make([]collab.ExpertInfo, 0, len(experts))
+	for _, e := range experts {
+		byID[e.ID] = e
+		categoryName := ""
+		if o.categoryRegistry != nil && e.CategoryID != nil {
+			if cat := o.categoryRegistry.Get(*e.CategoryID); cat != nil {
+				categoryName = cat.Name
+			}
+		}
+		infos = append(infos, collab.ExpertInfo{
+			ID: e.ID, Name: e.Name, Domain: e.Domain, CategoryName: categoryName,
+		})
+	}
+
+	// ans1: always the fallback plan (UI selection order). PlanSections unwired.
+	plan := collab.FallbackPlan(infos)
+
+	// Create or reuse the persisted run.
+	var runID uuid.UUID
+	if resumeRun != nil {
+		runID = resumeRun.ID
+	} else {
+		runID, err = store.CreateRun(ctx, collab.RelayRun{
+			ChatID:        req.ChatID,
+			UserMessageID: req.UserMessageID,
+			Plan:          plan,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create relay run: %w", err)
+		}
+	}
+
+	emit := func(step collab.StepName, expertID *uuid.UUID, name, msg string, meta map[string]any) {
+		if onStep != nil {
+			onStep(collab.StepEvent{Step: step, ExpertID: expertID, ExpertName: name, Message: msg, Metadata: meta})
+		}
+		_, _ = store.AppendEvent(ctx, runID, string(step), expertID, msg, meta)
+	}
+
+	emit(collab.StepPlan, nil, "", fmt.Sprintf("Plan locked: %d expert(s) in selection order.", len(plan)), nil)
+
+	responsesByExpert := make(map[uuid.UUID]ExpertResponse, len(experts))
+
+	runExpert := func(runCtx context.Context, expertID uuid.UUID, peerContext string) (string, error) {
+		expert, ok := byID[expertID]
+		if !ok {
+			return "", fmt.Errorf("expert %s not found among loaded experts", expertID)
+		}
+		resp := o.processWithExpert(runCtx, req, expert, peerContext)
+		responsesByExpert[expertID] = resp
+		if resp.Error != "" {
+			return "", fmt.Errorf("%s", resp.Error)
+		}
+		if len(resp.TemplateSections) > 0 {
+			return flattenTemplateSections(resp.TemplateSections), nil
+		}
+		return resp.Content, nil
+	}
+
+	// Determine the start index (resume skips already-approved sections).
+	startIndex := 0
+	if resumeRun != nil {
+		startIndex = resumeRun.CurrentIndex
+	}
+
+	var peerContext strings.Builder
+	// Rebuild peer context from already-approved prior sections on resume.
+	for i := 0; i < startIndex && i < len(plan); i++ {
+		sec, err := store.GetSectionByIndex(ctx, runID, i)
+		if err != nil || sec.Status != collab.SectionApproved {
+			continue
+		}
+		collab.AppendPeerContext(&peerContext, collab.Section{
+			ExpertID: sec.ExpertID, ExpertName: sec.ExpertName,
+			SectionTitle: sec.SectionTitle, Content: sec.FinalContent,
+		})
+	}
+
+	sections := make([]collab.Section, 0, len(plan))
+
+	for i := startIndex; i < len(plan); i++ {
+		sec := plan[i]
+		eid := sec.ExpertID
+
+		// --- Stage 2: expert turn (ans6 sub-steps) ---
+		if err := store.MarkSectionStatus(ctx, runID, i, collab.SectionGenerating); err == nil {
+			_ = store.UpdateRunStatus(ctx, runID, collab.RunRunning)
+		}
+		emit(collab.StepExpertStarted, &eid, sec.ExpertName,
+			fmt.Sprintf("%s started working on section %d/%d.", sec.ExpertName, i+1, len(plan)), nil)
+		emit(collab.StepRetrievingContext, &eid, sec.ExpertName,
+			sec.ExpertName+" is retrieving context (pgvector search).", nil)
+		emit(collab.StepChinaWallCheck, &eid, sec.ExpertName,
+			sec.ExpertName+" is checking coverage against the China Wall.", nil)
+		emit(collab.StepGeneratingAnswer, &eid, sec.ExpertName,
+			sec.ExpertName+" is generating the answer.", nil)
+
+		content, runErr := runExpert(ctx, eid, collab.FormatPeerContext(peerContext.String()))
+
+		if runErr != nil {
+			// ans2: HARD STOP. No later expert runs.
+			_ = store.SetSectionFailure(ctx, runID, i, runErr.Error())
+			deadline := time.Now().Add(collab.RetryWindow)
+			_ = store.MarkRunFailed(ctx, runID, i, runErr.Error(), deadline)
+			emit(collab.StepExpertFailed, &eid, sec.ExpertName,
+				fmt.Sprintf("%s failed: %s", sec.ExpertName, runErr.Error()),
+				map[string]any{"retryable": true, "retryUntil": deadline})
+			emit(collab.StepRelayFailed, &eid, sec.ExpertName,
+				"Relay stopped because an expert could not answer. No later expert ran.",
+				map[string]any{"runId": runID, "failedAtIndex": i, "retryUntil": deadline})
+			return &OrchestratorResponse{
+				ExpertResponses: toExpertResponses(responsesByExpert, sections),
+				TurnNumber:      req.TurnNumber,
+				DurationMs:      time.Since(start).Milliseconds(),
+				CollabSections:  sections,
+			}, fmt.Errorf("relay failed at section %d (%s): %w", i, sec.ExpertName, runErr)
+		}
+
+		emit(collab.StepExpertCompleted, &eid, sec.ExpertName,
+			fmt.Sprintf("%s finished.", sec.ExpertName), nil)
+
+		sec.Content = content
+		_ = store.SetSectionRawContent(ctx, runID, i, content)
+
+		// --- Stage 3: consistency check (ans3, only if there are prior sections) ---
+		conflict, explanation := false, ""
+		if i > 0 {
+			emit(collab.StepCheckingConsistency, &eid, sec.ExpertName,
+				"Checking consistency with earlier sections...", nil)
+			conflict, explanation, err = collab.CheckConsistency(ctx, o.gw, o.logger,
+				sec.SectionTitle, content, eid, sections)
+			if err != nil {
+				emit(collab.StepConsistencyChecked, &eid, sec.ExpertName,
+					"Consistency check unavailable (continuing without it).", nil)
+				conflict = false
+			} else {
+				emit(collab.StepConsistencyChecked, &eid, sec.ExpertName,
+					fmt.Sprintf("Consistency checked (conflict=%v).", conflict),
+					map[string]any{"conflict": conflict})
+			}
+			if conflict {
+				_ = store.SetSectionConflict(ctx, runID, i, true, explanation)
+			}
+		}
+
+		// --- Stage 4: human gate (ans7 always; ans3 resolve UI when conflict) ---
+		sectionRow, _ := store.GetSectionByIndex(ctx, runID, i)
+		emit(collab.StepAwaitingReview, &eid, sec.ExpertName,
+			fmt.Sprintf("Waiting for human review of %s's section.", sec.ExpertName),
+			map[string]any{
+				"runId": runID, "sectionId": sectionRow.ID, "sectionIndex": i,
+				"sectionTitle": sec.SectionTitle, "expertName": sec.ExpertName,
+				"content": content, "conflict": conflict, "conflictExplanation": explanation,
+			})
+		_ = store.MarkSectionStatus(ctx, runID, i, collab.SectionAwaitingReview)
+		_ = store.UpdateRunStatus(ctx, runID, collab.RunAwaitingReview)
+
+		approved, waitErr := store.WaitForSectionApproval(ctx, sectionRow.ID)
+		if waitErr != nil {
+			// ctx cancelled (client disconnected) or deadline passed.
+			return &OrchestratorResponse{
+				ExpertResponses: toExpertResponses(responsesByExpert, sections),
+				TurnNumber:      req.TurnNumber,
+				DurationMs:      time.Since(start).Milliseconds(),
+				CollabSections:  sections,
+			}, waitErr
+		}
+
+		// Human-approved (possibly edited) content becomes the peer context.
+		sec.Content = approved.FinalContent
+		emit(collab.StepHumanApproved, &eid, sec.ExpertName,
+			fmt.Sprintf("Human approved %s's section (edited=%v).", sec.ExpertName, approved.Edited),
+			map[string]any{"edited": approved.Edited, "resolutionSource": approved.ResolutionSource})
+		collab.AppendPeerContext(&peerContext, sec)
+
+		// Copy debug metadata from the richer ExpertResponse (same as before).
+		if resp, ok := responsesByExpert[eid]; ok {
+			sec.Coverage = resp.Coverage
+			sec.Confidence = resp.Confidence
+			sec.Mode = string(resp.Mode)
+			sec.GenericAllowancePct = req.GenericAllowancePct
+		}
+
+		sections = append(sections, sec)
+
+		if onProgress != nil {
+			onProgress(sec, i, len(plan))
+		}
+
+		// Advance the run cursor so resume knows where to continue.
+		_, _ = o.db.Exec(ctx,
+			`UPDATE collab_relay_runs SET current_index=$2, updated_at=now() WHERE id=$1`,
+			runID, i+1)
+	}
+
+	_ = store.UpdateRunStatus(ctx, runID, collab.RunCompleted)
+	emit(collab.StepRelayCompleted, nil, "", "All sections approved. Relay complete.", nil)
+
+	return &OrchestratorResponse{
+		ExpertResponses: toExpertResponses(responsesByExpert, sections),
+		TurnNumber:      req.TurnNumber,
+		DurationMs:      time.Since(start).Milliseconds(),
+		CollabSections:  sections,
+	}, nil
+}
+
+// toExpertResponses maps stashed ExpertResponses in section order.
+func toExpertResponses(responsesByExpert map[uuid.UUID]ExpertResponse, sections []collab.Section) []ExpertResponse {
+	out := make([]ExpertResponse, 0, len(sections))
+	for _, s := range sections {
+		if resp, ok := responsesByExpert[s.ExpertID]; ok {
+			out = append(out, resp)
+		}
+	}
+	return out
+}
+
+func flattenTemplateSections(sections []chinawall.TemplateSectionResult) string {
+	var sb strings.Builder
+	for i, s := range sections {
+		if i > 0 {
+			sb.WriteString("\n\n")
+		}
+		sb.WriteString("### ")
+		sb.WriteString(s.Label)
+		sb.WriteString("\n\n")
+		sb.WriteString(strings.TrimSpace(s.Content))
+	}
+	return sb.String()
+}
+
 // processWithExpert runs one expert through the full pipeline.
 // Uses PhaseTimer (Observer pattern) to record per-phase latency.
-func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRequest, expert expertRecord) ExpertResponse {
+//
+// peerContext (Collaborative Relay): "" for the independent path (Process,
+// above) — the expert answers from its own corpus + reply thread only,
+// unchanged from before this parameter existed. ProcessCollaborative below
+// passes the prior relay sections' content here so a later expert can
+// build on earlier ones; it is merged into replyContext at the same point
+// formatReplyContext's output already is, reusing the existing injection
+// slot instead of adding a second one to the decision engine/China Wall.
+func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRequest, expert expertRecord, peerContext string) ExpertResponse {
 	timer := observability.NewPhaseTimer()
 
 	// C5: attribute every downstream LLM call in this expert's pipeline
@@ -517,7 +817,19 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	// injects it into the LLM system prompt only when non-empty.
 	// WHY format here not in enforcer: avoids importing appcontext
 	// from chinawall (would create a circular dependency).
+	//
+	// peerContext (Collaborative Relay, "" on the independent path): the
+	// prior sections' content, already formatted by collab.RunRelay's
+	// mergeReplyContext. Appending it here means collaborative mode needs
+	// zero new plumbing in decision/chinawall — it reuses the same
+	// reply-thread injection slot a reply-to-a-prior-turn already uses.
 	replyContext := formatReplyContext(assembledCtx.ReplyThread)
+	if peerContext != "" {
+		if replyContext != "" {
+			replyContext += "\n\n"
+		}
+		replyContext += peerContext
+	}
 
 	// Phase: self-learning
 	// WHY self-learning is CRITICAL for DSA/problem-solving domains:

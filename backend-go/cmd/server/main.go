@@ -25,6 +25,7 @@ import (
 	"ai_avengers/backend/internal/category"
 	"ai_avengers/backend/internal/chat"
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/collab"
 	"ai_avengers/backend/internal/config"
 	appcontext "ai_avengers/backend/internal/context"
 	"ai_avengers/backend/internal/db"
@@ -252,9 +253,25 @@ func main() {
 		}
 	}()
 
+	go func() {
+		t := time.NewTicker(5 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			store := collab.NewRelayStore(postgres.Pool)
+			n, err := store.SweepExpiredFailures(context.Background())
+			if err == nil && n > 0 {
+				logger.Info("swept expired relay failures", zap.Int64("count", n))
+			}
+		}
+	}()
+
 	// Workspace cleanup job: delete workspaces older than 7 days.
 	// WHY here: server-lifecycle concern, runs for lifetime of process.
-	// Runs every 24 hours, deletes workspaces from completed/failed/cancelled workflows.
+	// Runs every 24 hours, deletes workspaces from failed/cancelled workflows only.
+	// Completed workflows are retained indefinitely - their workspace holds the
+	// unified design doc (final_design.md / redesign_N.md) produced at the handoff
+	// gate (design_doc.go:writeCombinedDesignDoc) and served by
+	// GET /workflows/:id/design-doc; deleting it would break downloads months later.
 	// WHY 7 days: balance between debugging needs and disk space.
 	// WHY 24-hour interval: daily cleanup is sufficient, low overhead.
 	//
@@ -272,10 +289,10 @@ func main() {
 		// Run immediately on startup (don't wait 24 hours)
 		cleanupWorkspaces := func() {
 			ctx := context.Background()
-			// Find completed/failed/cancelled workflows
+			// Find failed/cancelled workflows (completed retained: unified design doc lives on disk)
 			rows, err := postgres.Query(ctx,
 				`SELECT id FROM workflows
-				 WHERE status IN ('completed', 'failed', 'cancelled')
+				 WHERE status IN ('failed', 'cancelled')
 				   AND updated_at < NOW() - INTERVAL '7 days'`,
 			)
 			if err != nil {
@@ -991,6 +1008,12 @@ func buildRouter(
 			chats.GET("/:id/messages", chatHandler.ListMessages)
 		}
 
+		// Collaborative Relay — human-in-the-loop + live transparency (expert chat).
+		// Deliberately separate from the workflow approval routes; no shared schema.
+		protected.GET("/chats/:id/relay/active", messageHandler.GetActiveRelay)
+		protected.POST("/collab/relay/:runId/sections/:sectionId/approve", messageHandler.ApproveRelaySection)
+		protected.POST("/collab/relay/:runId/retry", messageHandler.RetryRelay)
+
 		// Message routes
 		messages := protected.Group("/messages")
 		{
@@ -1034,6 +1057,7 @@ func buildRouter(
 			// to the expert who actually wrote the file.
 			workflows.GET("/:id/files", wfHandler.ListFiles)
 			workflows.POST("/:id/approvals/:aid/respond", wfHandler.RespondToApproval)
+			workflows.GET("/:id/approvals/pending", wfHandler.GetPendingApproval)
 			workflows.POST("/:id/cancel", wfHandler.CancelWorkflow)
 			workflows.POST("/:id/tasks/:taskId/retry", wfHandler.RetryTask)
 

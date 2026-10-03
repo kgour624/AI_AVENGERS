@@ -1,0 +1,2 @@
+ALTER TABLE mcp_v2_tools ADD COLUMN IF NOT EXISTS annotations JSONB;
+ALTER TABLE mcp_v2_tools ADD COLUMN IF NOT EXISTS output_schema JSONB;

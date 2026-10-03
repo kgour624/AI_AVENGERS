@@ -7,11 +7,21 @@ export interface FileEntry extends FileArtifact {
   expertId: string
 }
 
+export interface DesignDocPointer {
+  fileName: string
+  filePath: string
+  version: number
+}
+
 export interface FileStreamState {
   files: FileEntry[]
   isConnected: boolean
   isDone: boolean
   lastWave: { waveIndex: number; phase: string; expertIds: string[]; mergedFiles: string[] } | null
+  // latestDesignDoc is the most recent combined_design_doc_produced event
+  // surfaced on the file stream as file_design_doc (see files_sse.go). Null
+  // until handoff writes final_design.md; redesign_N replaces it.
+  latestDesignDoc: DesignDocPointer | null
   eventLog: Array<{ ts: string; type: string; message: string }>
 }
 
@@ -46,6 +56,7 @@ export function useFileStream(workflowId: string | null): FileStreamState {
     isConnected: false,
     isDone: false,
     lastWave: null,
+    latestDesignDoc: null,
     eventLog: [],
   })
 
@@ -147,6 +158,39 @@ export function useFileStream(workflowId: string | null): FileStreamState {
                   },
                 }))
                 addLog('wave', `Wave ${content.waveIndex ?? 0} merged (${content.expertIds?.length ?? 0} experts)`)
+              }
+              break
+            }
+
+            case 'file_design_doc': {
+              // combined_design_doc_produced surfaced as file_design_doc
+              // (files_sse.go:handleFileEvent). Payload content is
+              // {file_path, file_name, version}; keep the latest as a pointer
+              // so the download button knows what filename to offer. Most recent
+              // wins — matches lookupCombinedDesignDoc's semantics in design_doc.go.
+              const content = data?.content as {
+                filePath?: string
+                fileName?: string
+                version?: number
+                // raw keys before camelize: file_path/file_name — handle both
+              } & Record<string, unknown> | undefined
+              const raw = content as unknown as Record<string, unknown> | undefined
+              const filePath = (content?.filePath as string | undefined)
+                ?? (raw?.['filePath'] as string | undefined)
+                ?? (raw?.['file_path'] as string | undefined)
+                ?? ''
+              const fileName = (content?.fileName as string | undefined)
+                ?? (raw?.['fileName'] as string | undefined)
+                ?? (raw?.['file_name'] as string | undefined)
+                ?? (filePath ? filePath.split('/').pop() ?? '' : '')
+              if (filePath) {
+                const version = typeof content?.version === 'number' ? content.version
+                  : typeof raw?.['version'] === 'number' ? (raw['version'] as number) : 0
+                setState((prev) => ({
+                  ...prev,
+                  latestDesignDoc: { fileName, filePath, version },
+                }))
+                addLog('design_doc', `Design doc ready: ${fileName} (v${version})`)
               }
               break
             }

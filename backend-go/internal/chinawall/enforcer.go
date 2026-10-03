@@ -709,7 +709,7 @@ NO = chunks do not cover this question`)
 		Model:       gateway.ModelCheap,
 		UserPrompt:  sb.String(),
 		MaxTokens:   150, // More tokens for CoT reasoning
-		Temperature: 0.1,
+		Temperature: 0,
 		UseCache:    true,
 	})
 	if err != nil {

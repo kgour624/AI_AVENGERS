@@ -234,6 +234,32 @@ export interface Contradiction {
   positionB: string
 }
 
+/**
+ * Collaborative Relay (migration 075): one finished section of a
+ * sequential multi-expert answer. Mirrors the backend's
+ * collab.Section exactly (expert_id, expert_name, section_title,
+ * content) - camelCased here the same way every other SSE
+ * payload/persisted field is, since useSSEStream.ts's camelizeKeys
+ * runs on every event before it reaches application code and
+ * chat/service.go's ListMessages JSON-unmarshals the same shape for
+ * a reloaded message's `collab_sections` column.
+ *
+ * Ordering is significant (relay order = array order) - consumers
+ * must not re-sort this list.
+ */
+export interface CollabSection {
+  expertId: string
+  expertName: string
+  sectionTitle: string
+  content: string
+  /** Debug metadata (Phase-2 observability) — absent on messages saved
+   *  before this feature, so every consumer must treat these as optional. */
+  coverage?: string
+  confidence?: number
+  mode?: string
+  genericAllowancePct?: number
+}
+
 export interface SynthesisResult {
   agreements: string[]
   contradictions: Contradiction[]
@@ -311,4 +337,45 @@ export function getModeBadgeConfig(mode: ResponseMode): ModeBadgeConfig {
       return _exhaustive
     }
   }
+}
+
+export type RelayStepName =
+  | 'plan'
+  | 'expert_started'
+  | 'retrieving_context'
+  | 'china_wall_check'
+  | 'generating_answer'
+  | 'expert_completed'
+  | 'expert_failed'
+  | 'checking_consistency'
+  | 'consistency_checked'
+  | 'awaiting_human_review'
+  | 'human_approved'
+  | 'relay_failed'
+  | 'relay_completed'
+
+export interface RelayStepEvent {
+  step: RelayStepName
+  expertId?: string
+  expertName?: string
+  message: string
+  metadata?: Record<string, unknown>
+}
+
+export interface PendingRelayReview {
+  runId: string
+  sectionId: string
+  sectionIndex: number
+  sectionTitle: string
+  expertName: string
+  content: string
+  conflict: boolean
+  conflictExplanation?: string
+}
+
+export interface RelayFailure {
+  runId: string
+  failedAtIndex: number
+  reason: string
+  retryUntil: string
 }

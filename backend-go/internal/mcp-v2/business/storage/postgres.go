@@ -34,13 +34,15 @@ func (d dbExpert) parse() (business.Expert, error) {
 // dbTool is Storage Model for mcp_v2_tools — maps to business.ToolDefinition via parse().
 // Storage model uses raw JSONB bytes; parse() unmarshals into business.InputSchema + Action.
 type dbTool struct {
-	id             string
-	name           string
-	displayName    string
-	description    string
-	isActive       bool
-	inputSchemaRaw []byte // raw JSONB -> parse() unmarshals to InputSchema
-	actionRaw      []byte // raw JSONB -> parse() unmarshals to ActionDef
+	id              string
+	name            string
+	displayName     string
+	description     string
+	isActive        bool
+	inputSchemaRaw  []byte // raw JSONB -> parse() unmarshals to InputSchema
+	actionRaw       []byte // raw JSONB -> parse() unmarshals to ActionDef
+	annotationsRaw  []byte
+	outputSchemaRaw []byte
 }
 
 func (d dbTool) parse() (business.ToolDefinition, error) {
@@ -60,21 +62,31 @@ func (d dbTool) parse() (business.ToolDefinition, error) {
 	if len(d.actionRaw) > 0 && string(d.actionRaw) != "{}" && string(d.actionRaw) != "null" {
 		_ = json.Unmarshal(d.actionRaw, &action)
 	}
+	var annotations map[string]any
+	if len(d.annotationsRaw) > 0 && string(d.annotationsRaw) != "null" {
+		_ = json.Unmarshal(d.annotationsRaw, &annotations)
+	}
+	var outputSchema map[string]any
+	if len(d.outputSchemaRaw) > 0 && string(d.outputSchemaRaw) != "null" {
+		_ = json.Unmarshal(d.outputSchemaRaw, &outputSchema)
+	}
 	return business.ToolDefinition{
-		ID:          d.id,
-		Name:        d.name,
-		DisplayName: d.displayName,
-		Description: d.description,
-		IsActive:    d.isActive,
-		InputSchema: schema,
-		Action:      action,
+		ID:           d.id,
+		Name:         d.name,
+		DisplayName:  d.displayName,
+		Description:  d.description,
+		IsActive:     d.isActive,
+		InputSchema:  schema,
+		Action:       action,
+		Annotations:  annotations,
+		OutputSchema: outputSchema,
 	}, nil
 }
 
 // ListTools implements business.Storer — fetches active tools from mcp_v2_tools.
 // Follows clean architecture: SQL -> dbTool (Storage Model) -> parse() -> business.ToolDefinition (Core Model).
 func (p *PostgresAdapter) ListTools(ctx context.Context) ([]business.ToolDefinition, error) {
-	rows, err := p.pool.Query(ctx, `SELECT id::text, name, display_name, COALESCE(description,''), is_active, COALESCE(input_schema, '{}'::jsonb), COALESCE(action, '{}'::jsonb) FROM mcp_v2_tools WHERE is_active = true ORDER BY display_name ASC`)
+	rows, err := p.pool.Query(ctx, `SELECT id::text, name, display_name, COALESCE(description,''), is_active, COALESCE(input_schema, '{}'::jsonb), COALESCE(action, '{}'::jsonb), COALESCE(annotations, 'null'::jsonb), COALESCE(output_schema, 'null'::jsonb) FROM mcp_v2_tools WHERE is_active = true ORDER BY display_name ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list tools: %w", err)
 	}
@@ -83,7 +95,7 @@ func (p *PostgresAdapter) ListTools(ctx context.Context) ([]business.ToolDefinit
 	var out []business.ToolDefinition
 	for rows.Next() {
 		var d dbTool
-		if err := rows.Scan(&d.id, &d.name, &d.displayName, &d.description, &d.isActive, &d.inputSchemaRaw, &d.actionRaw); err != nil {
+		if err := rows.Scan(&d.id, &d.name, &d.displayName, &d.description, &d.isActive, &d.inputSchemaRaw, &d.actionRaw, &d.annotationsRaw, &d.outputSchemaRaw); err != nil {
 			return nil, fmt.Errorf("scan tool: %w", err)
 		}
 		t, err := d.parse()
@@ -122,7 +134,7 @@ func (p *PostgresAdapter) CreateTool(ctx context.Context, t business.ToolDefinit
 
 func (p *PostgresAdapter) GetTool(ctx context.Context, name string) (business.ToolDefinition, error) {
 	var d dbTool
-	err := p.pool.QueryRow(ctx, `SELECT id::text, name, display_name, COALESCE(description,''), is_active, COALESCE(input_schema, '{}'::jsonb), COALESCE(action, '{}'::jsonb) FROM mcp_v2_tools WHERE name=$1 LIMIT 1`, name).Scan(&d.id, &d.name, &d.displayName, &d.description, &d.isActive, &d.inputSchemaRaw, &d.actionRaw)
+	err := p.pool.QueryRow(ctx, `SELECT id::text, name, display_name, COALESCE(description,''), is_active, COALESCE(input_schema, '{}'::jsonb), COALESCE(action, '{}'::jsonb), COALESCE(annotations, 'null'::jsonb), COALESCE(output_schema, 'null'::jsonb) FROM mcp_v2_tools WHERE name=$1 LIMIT 1`, name).Scan(&d.id, &d.name, &d.displayName, &d.description, &d.isActive, &d.inputSchemaRaw, &d.actionRaw, &d.annotationsRaw, &d.outputSchemaRaw)
 	if err != nil {
 		return business.ToolDefinition{}, fmt.Errorf("get tool: %w", err)
 	}

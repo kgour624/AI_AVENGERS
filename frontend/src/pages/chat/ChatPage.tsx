@@ -7,7 +7,7 @@ import { getChat, getMessages, updateChatTitle } from '@/api/chats'
 import { getProjectExperts } from '@/api/projects'
 import { deleteMessage, updateMessage } from '@/api/messages'
 import type { ChatLoaderData } from '@/types/project'
-import type { ExpertResponse as ExpertResponseType } from '@/types/expert'
+import type { ExpertResponse as ExpertResponseType, CollabSection as CollabSectionType } from '@/types/expert'
 import { useSSEStream } from '@/hooks/useSSEStream'
 import type { SendMessageOptions } from '@/hooks/useSSEStream'
 import { useStreamStore } from '@/stores/streamStore'
@@ -18,6 +18,10 @@ import { SynthesisPanel } from '@/components/chat/SynthesisPanel'
 import { StreamingIndicator } from '@/components/chat/StreamingIndicator'
 import { CodeBlock } from '@/components/chat/CodeBlock'
 import { persistedMessageToExpertResponse } from '@/utils/adaptMessage'
+import { buildResponseMarkdown, buildMarkdownFilename, downloadMarkdown } from '@/utils/exportMarkdown'
+import { RelayTransparencyPanel } from '@/components/chat/RelayTransparencyPanel'
+import { SectionReviewGate } from '@/components/chat/SectionReviewGate'
+import { RelayFailedBanner } from '@/components/chat/RelayFailedBanner'
 
 /**
  * HighlightedText component - highlights search query matches in text.
@@ -40,6 +44,52 @@ function HighlightedText({ text, query }: { text: string; query: string }) {
         )
       )}
     </>
+  )
+}
+
+/**
+ * Collaborative Relay: renders the ordered per-expert sections of a
+ * sequentially-relayed answer, each clearly attributed to the expert
+ * who wrote it. Shared between the live SSE view (stream.collabSections,
+ * growing one section at a time) and a reloaded/persisted message
+ * (m.collabSections, all sections present at once) - both pass the same
+ * CollabSection[] shape, so one renderer keeps them visually identical.
+ */
+function CollabSectionList({ sections }: { sections: CollabSectionType[] }) {
+  return (
+    <div className="space-y-3">
+      {sections.map((section, i) => (
+        <div
+          key={`${section.expertId}-${i}`}
+          className="rounded-lg border-l-4 border-l-brand border-y border-r border-glass-border bg-surface-raised/80 p-4 backdrop-blur-xl"
+        >
+          <div className="mb-1 flex items-center justify-between">
+            <p className="text-xs font-medium text-brand">
+              {section.expertName}
+              {section.sectionTitle ? ` — ${section.sectionTitle}` : ''}
+            </p>
+            <button
+              type="button"
+              onClick={() => {
+                const markdown = buildResponseMarkdown({
+                  roleName: section.expertName,
+                  content: section.content
+                } as ExpertResponseType)
+                const filename = buildMarkdownFilename(section.expertName)
+                downloadMarkdown(markdown, filename)
+              }}
+              aria-label={`Download ${section.expertName} section as Markdown`}
+              className="text-xs text-text-secondary hover:text-text-primary"
+            >
+              Download .md
+            </button>
+          </div>
+          <div className="prose prose-invert prose-sm max-w-none text-text-primary">
+            <ReactMarkdown components={{ code: CodeBlock }}>{section.content}</ReactMarkdown>
+          </div>
+        </div>
+      ))}
+    </div>
   )
 }
 
@@ -107,8 +157,12 @@ export default function ChatPage() {
   // Last request, kept so a failed answer offers a one-click Retry.
   const [lastSend, setLastSend] = useState<SendMessageOptions | null>(null)
   // Mirrors the composer's choice (same localStorage key) so the answer can be
-  // led by the combined synthesis when collaborative is selected.
+  // led by the combined synthesis when collaborative is selected. Once a
+  // request has actually gone out, lastSend?.answerMode is the ground truth
+  // for THIS turn - the user may have flipped the composer's dropdown after
+  // sending, and localStorage would then describe the next turn, not this one.
   const answerMode = (() => {
+    if (lastSend?.answerMode) return lastSend.answerMode
     try {
       return localStorage.getItem(`chat_${chat.id}_answer_mode`) === 'collaborative'
         ? 'collaborative'
@@ -258,7 +312,8 @@ export default function ChatPage() {
     replyToMessageId?: string,
     includeFullThread?: boolean,
     templateName?: string,
-    genericAllowancePct?: number
+    genericAllowancePct?: number,
+    answerMode?: 'independent' | 'collaborative'
   ) {
     // Remember exactly what was sent so a failed answer can be retried with one
     // click instead of the user retyping the whole question (or re-attaching the
@@ -272,6 +327,7 @@ export default function ChatPage() {
       includeFullThread,
       templateName,
       genericAllowancePct,
+      answerMode,
     }
     setLastSend(payload)
     assistantCountAtSendRef.current = messages.filter((m) => m.role === 'assistant').length
@@ -444,6 +500,16 @@ export default function ChatPage() {
                   </div>
                 ) : (
                   (() => {
+                    // Collaborative Relay: a merged message has no single
+                    // expertId (it represents 2+ experts), so
+                    // persistedMessageToExpertResponse always returns null
+                    // for it below - check collabSections FIRST so a reload
+                    // renders the same attributed, sectioned view the live
+                    // stream showed, instead of falling into the generic
+                    // plain-text fallback.
+                    if (m.collabSections && m.collabSections.length > 0) {
+                      return <CollabSectionList sections={m.collabSections} />
+                    }
                     const asExpertResponse = persistedMessageToExpertResponse(m, experts)
                     if (!asExpertResponse) {
                       // Shouldn't happen for a well-formed assistant row, but
@@ -495,12 +561,40 @@ export default function ChatPage() {
                 <SynthesisPanel synthesis={stream.synthesis} onDecide={(instruction) => void handleSend(instruction, lastSend?.expertIds ?? [])} />
               )}
 
-              {stream.expertResponses.map((partial, i) =>
-                partial.expertId ? (
-                  <ExpertResponse key={partial.expertId} response={partial as ExpertResponseType} isStreaming />
-                ) : (
-                  <p key={i} className="text-xs text-text-disabled">Malformed response - missing expertId</p>
+              {answerMode === 'collaborative' && stream.relaySteps && stream.relaySteps.length > 0 && (
+                <RelayTransparencyPanel steps={stream.relaySteps} />
+              )}
+
+              {/* Collaborative Relay: sections arrive one at a time via
+                  collab_section SSE events, in relay order - render them as
+                  they land instead of waiting for the whole turn to finish. */}
+              {stream.collabSections.length > 0 ? (
+                <CollabSectionList sections={stream.collabSections} />
+              ) : (
+                answerMode === 'independent' && stream.expertResponses.map((partial, i) =>
+                  partial.expertId ? (
+                    <ExpertResponse key={partial.expertId} response={partial as ExpertResponseType} isStreaming />
+                  ) : (
+                    <p key={i} className="text-xs text-text-disabled">Malformed response - missing expertId</p>
+                  )
                 )
+              )}
+
+              {answerMode === 'collaborative' && stream.pendingReview && (
+                <SectionReviewGate
+                  review={stream.pendingReview}
+                  onApproved={() => clearStream(chat.id)}
+                />
+              )}
+
+              {answerMode === 'collaborative' && stream.relayFailure && (
+                <RelayFailedBanner
+                  failure={stream.relayFailure}
+                  onRetry={() => {
+                    clearStream(chat.id)
+                    void sendMessage({ ...lastSend!, resumeRunId: stream.relayFailure!.runId })
+                  }}
+                />
               )}
             </>
           )}

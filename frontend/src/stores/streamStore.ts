@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ExpertResponse, SynthesisResult } from '@/types/expert'
+import type { ExpertResponse, SynthesisResult, CollabSection, RelayStepEvent, PendingRelayReview, RelayFailure } from '@/types/expert'
 
 /**
  * Active SSE stream state, keyed by chatId.
@@ -38,10 +38,29 @@ export interface StreamState {
   // for the complete event. Cleared when complete event arrives
   // (ExpertResponse takes over rendering at that point).
   streamingContent: string
+  // Collaborative Relay: finished sections, appended in relay order as
+  // each expert's turn completes (collab_section SSE events). Empty for
+  // every independent-mode turn - nothing ever appends to this array
+  // unless the backend actually ran ProcessCollaborative.
+  collabSections: CollabSection[]
+  // NEW — Collaborative Relay transparency pipeline:
+  relaySteps: RelayStepEvent[]
+  pendingReview: PendingRelayReview | null
+  relayFailure: RelayFailure | null
 }
 
 function emptyStreamState(): StreamState {
-  return { status: 'thinking', expertResponses: [], synthesis: null, error: null, streamingContent: '' }
+  return {
+    status: 'thinking',
+    expertResponses: [],
+    synthesis: null,
+    error: null,
+    streamingContent: '',
+    collabSections: [],
+    relaySteps: [],
+    pendingReview: null,
+    relayFailure: null,
+  }
 }
 
 interface StreamStore {
@@ -51,6 +70,7 @@ interface StreamStore {
   completeStream: (chatId: string) => void
   setError: (chatId: string, error: string) => void
   clearStream: (chatId: string) => void
+  appendRelayStep: (chatId: string, step: RelayStepEvent) => void
 }
 
 export const useStreamStore = create<StreamStore>((set, get) => ({
@@ -94,6 +114,33 @@ export const useStreamStore = create<StreamStore>((set, get) => ({
   clearStream: (chatId) => {
     const next = new Map(get().activeStreams)
     next.delete(chatId)
+    set({ activeStreams: next })
+  },
+
+  appendRelayStep: (chatId, step) => {
+    const current = get().activeStreams.get(chatId)
+    if (!current) return
+    const next = new Map(get().activeStreams)
+    next.set(chatId, {
+      ...current,
+      relaySteps: [...current.relaySteps, step],
+      ...(step.step === 'awaiting_human_review' && step.metadata
+        ? {
+            pendingReview: {
+              ...(step.metadata as unknown as PendingRelayReview),
+              runId: String(step.metadata.runId || step.metadata.run_id || ''),
+            },
+          }
+        : {}),
+      ...(step.step === 'relay_failed' && step.metadata
+        ? {
+            relayFailure: {
+              ...(step.metadata as unknown as RelayFailure),
+              runId: String(step.metadata.runId || step.metadata.run_id || ''),
+            },
+          }
+        : {}),
+    })
     set({ activeStreams: next })
   },
 }))

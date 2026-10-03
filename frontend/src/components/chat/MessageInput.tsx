@@ -107,7 +107,8 @@ export interface MessageInputProps {
     replyToMessageId?: string,
     includeFullThread?: boolean,
     templateName?: string,
-    genericAllowancePct?: number
+    genericAllowancePct?: number,
+    answerMode?: 'independent' | 'collaborative'
   ) => void
   isSending: boolean
 }
@@ -167,16 +168,14 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     // Load persisted selection if locked, otherwise start empty
     return isLocked ? loadPersistedSelection(chatId) : new Set()
   })
+  const [orderedSelectedIds, setOrderedSelectedIds] = useState<string[]>(() =>
+    Array.from(selectedIds)
+  )
 
   // Collaborative means "merge several experts' answers". With fewer than two
   // experts selected there is nothing to merge, and the control used to stay on
   // Collaborative anyway — the mode is pulled back to Independent as soon as the
   // selection drops below two.
-  //
-  // WHY it sits here and not inside the useState above: a hook may only run at
-  // the top level of the component. Nesting it in the initializer also ran it in
-  // the same tick the state was declared, which threw "Cannot access
-  // 'selectedIds' before initialization" and blanked the whole chat page.
   useEffect(() => {
     if (selectedIds.size < 2 && answerMode === 'collaborative') {
       setAnswerMode('independent')
@@ -189,7 +188,8 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   // expert's category — if several experts are selected with different
   // categories, the first is authoritative for this picker (the backend still
   // applies each expert's own category default when none is chosen).
-  const firstSelectedId = Array.from(selectedIds)[0]
+  const activeOrder = orderedSelectedIds.filter((id) => selectedIds.has(id))
+  const firstSelectedId = activeOrder[0] || Array.from(selectedIds)[0]
   const { data: formatInfo } = useQuery({
     queryKey: ['expert-answer-formats', firstSelectedId],
     queryFn: () => getExpertAnswerFormats(firstSelectedId!),
@@ -227,8 +227,13 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
   }, [chatId, isLocked])
 
   // Handle selection changes
-  function handleSelectionChange(newSelection: Set<string>) {
+  function handleSelectionChange(newSelection: Set<string>, newOrder?: string[]) {
     setSelectedIds(newSelection)
+    if (newOrder) {
+      setOrderedSelectedIds(newOrder)
+    } else {
+      setOrderedSelectedIds(Array.from(newSelection))
+    }
   }
 
   // Toggle lock state
@@ -275,14 +280,17 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
       formats.find((f) => f.toLowerCase() === defaultFormat.toLowerCase()) ??
       undefined
 
+    const finalOrder = orderedSelectedIds.filter((id) => selectedIds.has(id))
+
     onSend(
       trimmed,
-      Array.from(selectedIds),
+      finalOrder.length > 0 ? finalOrder : Array.from(selectedIds),
       attachedFiles.length > 0 ? attachedFiles : undefined,
       replyTarget?.messageId,
       replyState?.includeFullThread,
       formatToSend,
-      allowancePct > 0 ? allowancePct : undefined
+      allowancePct > 0 ? allowancePct : undefined,
+      answerMode
     )
     setMessage('')
     setAttachedFiles([])
@@ -290,6 +298,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
     // Feature #6: Only clear selection if NOT locked
     if (!isLocked) {
       setSelectedIds(new Set())
+      setOrderedSelectedIds([])
     }
 
     // CT-D4: clear the reply target on successful send — same moment
@@ -326,8 +335,15 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
 
   return (
     <div className="border-t border-surface-border bg-surface-raised p-3">
-      <div className="flex items-center justify-between">
-        <ExpertPicker experts={experts} selectedIds={selectedIds} onChange={handleSelectionChange} />
+      <div className="flex flex-col gap-2">
+        <div className="flex items-center justify-between">
+          <ExpertPicker
+            experts={experts}
+            selectedIds={selectedIds}
+            orderedIds={orderedSelectedIds}
+            onChange={handleSelectionChange}
+            onReorder={(newOrder) => setOrderedSelectedIds(newOrder)}
+          />
 
         <div className="flex items-center gap-3">
           {/* Feature #19: Keyboard Shortcut Help
@@ -538,6 +554,7 @@ export function MessageInput({ chatId, experts, onSend, isSending }: MessageInpu
           🔒 Selection locked: {selectedIds.size} expert{selectedIds.size !== 1 ? 's' : ''} will be used for all messages
         </p>
       )}
+      </div>
     </div>
   )
 }
