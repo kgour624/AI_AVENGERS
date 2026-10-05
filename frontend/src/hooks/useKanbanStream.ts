@@ -36,20 +36,30 @@ export function useKanbanStream(workflowId: string | null, workflowStatus?: stri
       const ts = new Date().toISOString()
       setState(prev => ({ ...prev, eventLog: [{ ts, type, message }, ...prev.eventLog].slice(0, 100) }))
     }
+    let retryCount = 0
+    const backoff = () => Math.min(1000 * Math.pow(2, retryCount++), 15000)
+
     const connect = () => {
       if (esRef.current) { esRef.current.close(); esRef.current = null }
       // FIX: isConnected false karo par approvalGate ko preserve rakho - null mat karo
       setState(prev => ({ ...prev, isConnected: false }))
       addLog('connecting', 'Opening SSE connection...')
       const token = useAuthStore.getState().accessToken ?? ''
-      const sseUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url
+      const lastId = esRef.current?.lastEventId || localStorage.getItem(`kanban_lastId_${workflowId}`) || ""
+      const sseUrl = token 
+        ? `${url}?token=${encodeURIComponent(token)}${lastId ? `&last_event_id=${lastId}` : ''}`
+        : `${url}${lastId ? `?last_event_id=${lastId}` : ''}`
       const es = new EventSource(sseUrl, { withCredentials: true })
       esRef.current = es
       es.onopen = () => {
+        retryCount = 0
         setState(prev => ({ ...prev, isConnected: true }))
         addLog('connected', 'SSE connection established')
       }
       es.onmessage = (event) => {
+        if (event.lastEventId) {
+          localStorage.setItem(`kanban_lastId_${workflowId}`, event.lastEventId)
+        }
         try {
           const raw = JSON.parse(event.data)
           const parsed = camelizeKeys<{ type: string; data: Record<string, unknown> }>(raw)
@@ -125,12 +135,13 @@ export function useKanbanStream(workflowId: string | null, workflowStatus?: stri
         } catch { addLog('parse_error', `Failed to parse: ${event.data.slice(0, 80)}`) }
       }
       es.onerror = () => {
-        addLog('error', 'SSE disconnected. Reconnecting in 3s...')
+        const delay = backoff()
+        addLog('error', `SSE disconnected. Reconnect ${delay}ms...`)
         // FIX: approvalGate preserve rakho, null mat karo
         setState(prev => ({ ...prev, isConnected: false, isAwaitingApprovalId: workflowStatus === 'paused_for_approval' && !prev.approvalGate }))
         es.close(); esRef.current = null
         setState(prev => {
-          if (!prev.isDone) retryRef.current = setTimeout(connect, 3000)
+          if (!prev.isDone) retryRef.current = setTimeout(connect, delay)
           return prev
         })
       }

@@ -350,11 +350,11 @@ func (p *IngestionPipeline) IngestTranscript(
 	}
 
 	// ============================================================
-	// STEP 1: CHUNKING
+	// STEP 1: CHUNKING (Phase 1.5 wired: Parent-Child when flag true)
 	// ============================================================
-	// If resuming from topic_extraction or later, load chunks from DB
-	// instead of re-chunking (chunking is deterministic but expensive for large transcripts).
 	var chunks []TextChunk
+	var parents []ParentChunk
+	rcfg := LoadRetrievalConfig(ctx, p.db)
 	chunkStarted := time.Now()
 	if isResume && StageOrder[cp.Stage] >= StageOrder[StageTopicExtraction] {
 		// Load existing chunks from DB — scoped to THIS job's source file.
@@ -366,20 +366,41 @@ func (p *IngestionPipeline) IngestTranscript(
 		chunks, err = p.loadChunksFromDB(ctx, expertID, sourceFile)
 		if err != nil || len(chunks) == 0 {
 			p.logger.Warn("could not load chunks from DB, re-chunking", zap.Error(err))
-			chunks = p.chunker.Chunk(transcript)
+			parents, chunks = BuildParentChild(ctx, p.chunker, transcript, rcfg)
+			if len(chunks) == 0 && len(parents) == 0 {
+				// BuildParentChild returns nil,nil on empty; keep fallback
+				chunks = p.chunker.Chunk(transcript)
+			}
+		} else {
+			// Resume path has chunks; parents remain empty (children already have parent_id if previously stored).
+			// No need to reconstruct parents on resume — DB already has them.
+			parents = nil
 		}
-		p.logger.Info("resume: loaded chunks from DB", zap.Int("count", len(chunks)))
+		p.logger.Info("resume: loaded chunks from DB", zap.Int("count", len(chunks)), zap.Bool("parent_child_enabled", rcfg.EnableParentChild))
 		// Resume path: chunking was already done in an earlier run. Record it
 		// so the timeline shows where the stored chunks came from instead of
 		// silently skipping step 1.
 		p.emit(ctx, jobID, expertID, StageChunking, jobevents.KindStageDone, map[string]interface{}{
 			"chunks":          len(chunks),
+			"parents":         len(parents),
 			"from_checkpoint": true,
+			"parent_child":    rcfg.EnableParentChild,
 		})
 	} else {
 		chunkStarted = p.beginStage(ctx, jobID, expertID, StageChunking, "Splitting transcript...")
 		ptimer.Start("chunk")
-		chunks = p.chunker.Chunk(transcript)
+		parents, chunks = BuildParentChild(ctx, p.chunker, transcript, rcfg)
+		if len(chunks) == 0 && len(parents) == 0 {
+			// flag false path returns nil,nil -> fallback to legacy Chunk (should not happen because BuildParentChild handles false)
+			chunks = p.chunker.Chunk(transcript)
+			parents = nil
+		}
+		if rcfg.EnableParentChild {
+			// Ensure every child has ParentIndex filled even before DB ids (needed for in-memory stats and Assign later)
+			// parents already grouped via ChunkMarkdown/buildParentsFromChildren; children ParentIndex initially -1,
+			// will be filled after parent ids are allocated in Step 6. For now keep -1.
+			p.logger.Info("parent-child chunking", zap.Int("parents", len(parents)), zap.Int("children", len(chunks)), zap.Int("parent_soft", rcfg.ParentSoftLimit), zap.Int("child_soft", rcfg.ChildSoftLimit))
+		}
 		ptimer.Stop("chunk")
 		if len(chunks) == 0 {
 			err := fmt.Errorf("no chunks created from transcript")
@@ -390,10 +411,12 @@ func (p *IngestionPipeline) IngestTranscript(
 			return nil, err
 		}
 		p.endStage(ctx, jobID, expertID, StageChunking, chunkStarted, map[string]interface{}{
-			"chunks": len(chunks),
+			"chunks":       len(chunks),
+			"parents":      len(parents),
+			"parent_child": rcfg.EnableParentChild,
 		})
 	}
-	p.logger.Info("chunking complete", zap.Int("chunks", len(chunks)))
+	p.logger.Info("chunking complete", zap.Int("chunks", len(chunks)), zap.Int("parents", len(parents)), zap.Bool("parent_child", rcfg.EnableParentChild))
 	// Publish the denominator immediately so the UI can render "0 / N" before
 	// the first batch finishes.
 	p.updateJobProgress(ctx, jobID, 0, len(chunks))
@@ -781,6 +804,7 @@ func (p *IngestionPipeline) IngestTranscript(
 	// Append-mode (replaceExisting=false) is the default and preserves the
 	// existing corpus, relying on ON CONFLICT (expert_id, chunk_hash) DO NOTHING
 	// in storeChunks() to skip duplicates.
+	// Phase 1 wiring: when parent-child enabled, also clear expert_pages for this expert when full replace.
 	if replaceExisting {
 		_, err = p.db.Exec(ctx,
 			`DELETE FROM course_chunks WHERE expert_id = $1`,
@@ -790,9 +814,30 @@ func (p *IngestionPipeline) IngestTranscript(
 			p.updateJobStatus(ctx, jobID, "failed", "cleanup failed: "+err.Error(), 0, 0)
 			return nil, fmt.Errorf("cleanup failed: %w", err)
 		}
+		if rcfg.EnableParentChild {
+			// Best-effort: parents are additive, old parents with same source_file will be upserted later.
+			// ON DELETE SET NULL keeps orphans harmless even if parent row lingers.
+			_, _ = p.db.Exec(ctx, `DELETE FROM expert_pages WHERE expert_id=$1 AND source_file=$2`, expertID, sourceFile)
+			// If sourceFile empty (legacy), wipe all pages for this expert on full replace.
+			if sourceFile == "" {
+				_, _ = p.db.Exec(ctx, `DELETE FROM expert_pages WHERE expert_id=$1`, expertID)
+			}
+		}
 		p.logger.Info("replaceExisting=true: existing chunks deleted",
 			zap.String("expert_id", expertID.String()),
 		)
+	}
+
+	// Step 5.5: Phase 1.5 — store parents before children so FK is available (additive, non-fatal).
+	var parentIDByIndex map[int]uuid.UUID
+	if rcfg.EnableParentChild && len(parents) > 0 {
+		// AssignParentIDs needs ids; store parents first.
+		parentIDByIndex = EnsureParentsStored(ctx, p.db, p.logger, expertID, sourceFile, parents)
+		if len(parentIDByIndex) > 0 {
+			chunks = AssignParentIDs(chunks, parents, parentIDByIndex)
+		} else {
+			p.logger.Warn("parent-child enabled but no parent ids returned — children will be stored without parent_id")
+		}
 	}
 
 	// Step 6: Store chunks. In append mode, ON CONFLICT dedups against
@@ -800,7 +845,15 @@ func (p *IngestionPipeline) IngestTranscript(
 	storeStarted := p.beginStage(ctx, jobID, expertID, StageStoring,
 		fmt.Sprintf("Saving %d chunks to database...", len(chunks)))
 	ptimer.Start("store")
-	chunkIDs, storeStats, err := p.storeChunks(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile)
+	var chunkIDs []uuid.UUID
+	var storeStats StoreStats
+	if rcfg.EnableParentChild && len(parentIDByIndex) > 0 {
+		// Dual-write path: children carry parent_id. Use storeChunksWithParents (new) that honors parent_id.
+		chunkIDs, storeStats, err = p.storeChunksWithParents(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile, parentIDByIndex)
+	} else {
+		chunkIDs, storeStats, err = p.storeChunks(ctx, jobID, expertID, chunks, topicResults, embeddings, sourceFile)
+		// Even when parent-child disabled, if chunks already carry ParentIndex from BuildParentChild replay (resume edge), strip is not needed.
+	}
 	ptimer.Stop("store")
 	if err != nil {
 		p.updateJobStatus(ctx, jobID, "failed", "storage failed: "+err.Error(), 0, 0)
@@ -815,13 +868,17 @@ func (p *IngestionPipeline) IngestTranscript(
 		zap.Int("inserted", storeStats.Inserted),
 		zap.Int("duplicates", storeStats.Duplicates),
 		zap.Int("reused", storeStats.Reused),
+		zap.Bool("parent_child", rcfg.EnableParentChild),
+		zap.Int("parents", len(parents)),
 	)
 	p.endStage(ctx, jobID, expertID, StageStoring, storeStarted, map[string]interface{}{
-		"chunks":     len(chunkIDs),
-		"parsed":     storeStats.Parsed,
-		"inserted":   storeStats.Inserted,
-		"duplicates": storeStats.Duplicates,
-		"reused":     storeStats.Reused,
+		"chunks":       len(chunkIDs),
+		"parents":      len(parents),
+		"parent_child": rcfg.EnableParentChild,
+		"parsed":       storeStats.Parsed,
+		"inserted":     storeStats.Inserted,
+		"duplicates":   storeStats.Duplicates,
+		"reused":       storeStats.Reused,
 	})
 
 	// T2: double confirmation. The pipeline is not trusted to grade its own

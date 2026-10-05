@@ -130,3 +130,19 @@ func (s *L1Store) save(ctx context.Context, mem *L1Memory) error {
 	}
 	return s.redis.Set(ctx, l1Key(mem.ProjectID, mem.ExpertID), data, l1TTL).Err()
 }
+
+func l1CheckpointKey(sessionID, checkpointID uuid.UUID) string {
+    return fmt.Sprintf("l1:ckpt:%s:%s", sessionID.String(), checkpointID.String())
+}
+
+func (s *L1Store) SetCheckpoint(ctx context.Context, sessionID, checkpointID uuid.UUID, data string, ttl time.Duration) error {
+    return s.redis.Set(ctx, l1CheckpointKey(sessionID, checkpointID), data, ttl).Err()
+}
+
+func (s *L1Store) GetCheckpoint(ctx context.Context, sessionID, checkpointID uuid.UUID) (string, error) {
+    return s.redis.Get(ctx, l1CheckpointKey(sessionID, checkpointID)).Result()
+}
+
+func (s *L1Store) DeleteCheckpoint(ctx context.Context, sessionID, checkpointID uuid.UUID) error {
+    return s.redis.Del(ctx, l1CheckpointKey(sessionID, checkpointID)).Err()
+}

@@ -12,16 +12,17 @@ export default defineConfig({
   },
   server: {
     port: 3000,
+    host: '0.0.0.0',
     // 2026-09-09 fix (round 12): this dev server runs inside Docker
     // with a host:container port REMAP (docker-compose.yml maps
-    // 3001:3000 for the frontend service) - the browser connects to
-    // 192.168.1.7:3001, but the container itself listens on 3000.
+    // 3002:3000 for the frontend service) - the browser connects to
+    // 192.168.1.7:3002, but the container itself listens on 3000.
     // Vite's HMR client, by default, tells the browser to open its
     // WebSocket back to the SAME port the dev server is configured
-    // for (3000) - not the host-remapped port (3001) the browser
+    // for (3000) - not the host-remapped port (3002) the browser
     // actually used to load the page. That mismatch is exactly
-    // "[vite] failed to connect to websocket (ws://<host>:3001)" -
-    // the browser tries 3001 (correct, matches its own URL) but the
+    // "[vite] failed to connect to websocket (ws://<host>:3002)" -
+    // the browser tries 3002 (correct, matches its own URL) but the
     // injected HMR client script was built assuming 3000. Setting
     // clientPort explicitly (overridable via env for non-Docker/
     // direct-port setups, where host port == container port and this
@@ -33,9 +34,11 @@ export default defineConfig({
         : undefined,
     },
     proxy: {
-      // Dev-only convenience proxy; production nginx handles this (see /nginx)
+      // FIX 2026-10-04: MUST be http://api:8080 inside Docker
+      // BEFORE it was http://localhost:8080 which inside frontend container = itself -> ECONNREFUSED
+      // api service is reachable as http://api:8080 on avengers-network
       '/api': {
-        target: 'http://localhost:8080',
+        target: 'http://api:8080',
         changeOrigin: true,
       },
     },
@@ -44,3 +47,4 @@ export default defineConfig({
     sourcemap: true,
   },
 })
+

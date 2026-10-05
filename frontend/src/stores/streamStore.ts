@@ -132,6 +132,7 @@ export const useStreamStore = create<StreamStore>((set, get) => ({
             },
           }
         : {}),
+      ...(step.step === 'human_approved' ? { pendingReview: null } : {}),
       ...(step.step === 'relay_failed' && step.metadata
         ? {
             relayFailure: {

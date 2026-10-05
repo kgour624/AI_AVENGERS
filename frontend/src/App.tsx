@@ -13,6 +13,17 @@ import { projectsRoute } from '@/pages/projects/ProjectsPage'
 import { projectRoute } from '@/pages/projects/ProjectPage'
 import { chatRoute } from '@/pages/chat/ChatPage'
 import { expertsRoute } from '@/pages/experts/ExpertsPage'
+import ReceptionistSection from './pages/ReceptionistSection';
+import { Navigate } from 'react-router-dom';
+
+import { useAuthStore } from '@/stores/authStore'
+
+function RequireAdmin({ children }: { children: React.ReactNode }) {
+  const isAdmin = useAuthStore(state => state.isAdmin());
+  
+  if (!isAdmin) return <Navigate to="/login" replace />;
+  return <>{children}</>;
+}
 
 /**
  * Route tree. Source: FRONTEND_SYSTEM_DESIGN.md section 5.
@@ -55,6 +66,7 @@ const router = createBrowserRouter([
             path: '/workflows/:id/kanban',
             lazy: () => import('@/pages/workflows/KanbanPage'),
           },
+          { path: "/receptionist", element: <RequireAdmin><ReceptionistSection /></RequireAdmin> },
         ],
       },
 

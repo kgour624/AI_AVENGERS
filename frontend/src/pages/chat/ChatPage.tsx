@@ -583,7 +583,7 @@ export default function ChatPage() {
               {answerMode === 'collaborative' && stream.pendingReview && (
                 <SectionReviewGate
                   review={stream.pendingReview}
-                  onApproved={() => clearStream(chat.id)}
+                  onDone={() => clearStream(chat.id)}
                 />
               )}
 

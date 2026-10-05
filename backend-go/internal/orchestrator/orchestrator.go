@@ -314,6 +314,8 @@ func NewOrchestrator(
 //	happens in the WORKFLOW flow (/api/v1/workflows), not here.
 //	Workflow uses the Blackboard pattern — experts post artifacts,
 //	others read them, OTA loop drives each expert.
+var criticalDomains = map[string]bool{"System Design": true, "system_design": true}
+
 func (o *Orchestrator) Process(ctx context.Context, req OrchestratorRequest) (*OrchestratorResponse, error) {
 	start := time.Now()
 
@@ -394,6 +396,12 @@ collected:
 
 	if len(expertResponses) == 0 {
 		return nil, fmt.Errorf("all experts failed or timed out")
+	}
+
+	for _, r := range expertResponses {
+		if r.Error != "" && criticalDomains[r.Domain] {
+			return nil, fmt.Errorf("critical expert %s failed: %s", r.ExpertName, r.Error)
+		}
 	}
 
 	// Synthesize if multiple experts. Uses timeoutCtx (not the outer ctx)

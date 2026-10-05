@@ -58,13 +58,30 @@ export const baseAPI = axios.create({
 })
 
 // Request interceptor - attach JWT + snakeify outgoing bodies
+// FIX api call increase: token ko store + localStorage dono se padho, header case normalize, FormData boundary fix
 baseAPI.interceptors.request.use((config: InternalAxiosRequestConfig) => {
-  const token = useAuthStore.getState().accessToken
+  const storeToken = useAuthStore.getState().accessToken
+  const lsToken = (typeof localStorage !== 'undefined' && (localStorage.getItem('accessToken') || localStorage.getItem('access_token') || localStorage.getItem('token'))) || null
+  const token = storeToken || lsToken
   if (token) {
-    config.headers.Authorization = `Bearer ${token}`
+    if (config.headers && typeof (config.headers as any).set === 'function') {
+      (config.headers as any).set('Authorization', `Bearer ${token}`)
+    } else {
+      config.headers = config.headers || ({} as any)
+      ;(config.headers as any)['Authorization'] = `Bearer ${token}`
+    }
   }
   if (config.data && typeof config.data === 'object' && !(config.data instanceof FormData)) {
     config.data = snakeifyKeys(config.data)
+  }
+  if (config.data instanceof FormData) {
+    if (config.headers && typeof (config.headers as any).delete === 'function') {
+      (config.headers as any).delete('Content-Type')
+      (config.headers as any).delete('content-type')
+    } else {
+      try { delete (config.headers as any)['Content-Type'] } catch {}
+      try { delete (config.headers as any)['content-type'] } catch {}
+    }
   }
   return config
 })
@@ -97,17 +114,38 @@ export async function refreshSession(): Promise<string> {
   // to avoid interceptor re-entrancy if refresh itself 401s), so it reads
   // the wire shape directly - it must be updated in lockstep with the
   // backend handler, not left to drift.
-  const res = await axios.post<{
-    success: boolean
-    data: { accessToken: string; expiresInSeconds: number }
-  }>(
+  const res = await axios.post<any>(
     `${import.meta.env.VITE_API_URL}/api/v1/auth/refresh`,
     {},
     { withCredentials: true }
   )
-  const newToken = res.data.data.accessToken
+  // FUTURE-PROOF extractor: backend envelope may be {success,data:{accessToken}} or {data:{access_token}} or flat
+  // Screenshot bug: refresh 200 but retry 401 -> old code did res.data.data.accessToken only -> undefined on snake_case -> retry with undefined
+  const d: any = res.data
+  const newToken: string =
+    d?.data?.accessToken ||
+    d?.data?.access_token ||
+    d?.accessToken ||
+    d?.access_token ||
+    d?.data?.token ||
+    d?.token ||
+    ''
+  if (!newToken) throw new Error('No access token in refresh response')
   useAuthStore.getState().setAccessToken(newToken)
+  try {
+    localStorage.setItem('access_token', newToken)
+    localStorage.setItem('accessToken', newToken)
+    localStorage.setItem('token', newToken)
+  } catch {}
+  baseAPI.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
   return newToken
+}
+
+// FIX api call increase: proper queue + circuit breaker. Pehle har 401 alag refresh marta tha -> N calls. Ab 1 hi refresh + queue.
+let failedQueue: Array<{ resolve: (token: string) => void; reject: (err: any) => void }> = []
+function flushQueue(err: any, token: string | null) {
+  failedQueue.forEach((p) => (token ? p.resolve(token) : p.reject(err)))
+  failedQueue = []
 }
 
 baseAPI.interceptors.response.use(
@@ -126,29 +164,78 @@ baseAPI.interceptors.response.use(
     const isAuthCall = config?.url?.includes('/auth/login') || config?.url?.includes('/auth/register') || config?.url?.includes('/auth/admin/login')
 
     if (!isUnauthorized || alreadyRetried || !config || isRefreshCall || isAuthCall) {
-      // Not a recoverable 401, already tried once, or this is a login/register call failing - propagate as-is.
+      if (isUnauthorized && alreadyRetried) {
+        // Retried request still 401'd -> token is invalid or unauthorized even after refresh
+        try { useAuthStore.getState().clearAuth() } catch {}
+        try {
+          localStorage.removeItem('accessToken')
+          localStorage.removeItem('access_token')
+          localStorage.removeItem('token')
+        } catch {}
+        if (typeof window !== 'undefined') {
+          const cur = window.location.pathname
+          if (cur !== '/login' && cur !== '/admin/login') window.location.href = '/login'
+        }
+      }
       return Promise.reject(error)
     }
 
     config._retry = true
 
-    try {
-      // Single-flight: only the first caller in a burst actually hits
-      // the network; everyone else awaits the same promise.
-      if (!refreshPromise) {
-        refreshPromise = refreshSession().finally(() => {
-          refreshPromise = null
+    // already refreshing -> queue this request, dont fire another refresh
+    if (refreshPromise) {
+      return new Promise<string>((resolve, reject) => {
+        failedQueue.push({ resolve, reject })
+      })
+        .then((newToken) => {
+          if (config.headers && typeof (config.headers as any).set === 'function') {
+            (config.headers as any).set('Authorization', `Bearer ${newToken}`)
+          } else {
+            config.headers = config.headers || ({} as any)
+            ;(config.headers as any)['Authorization'] = `Bearer ${newToken}`
+          }
+          baseAPI.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
+          return baseAPI(config)
         })
-      }
-      const newToken = await refreshPromise
+        .catch((e) => Promise.reject(e))
+    }
 
-      config.headers = config.headers ?? {}
-      config.headers.Authorization = `Bearer ${newToken}`
+    // first 401 -> start refresh
+    refreshPromise = refreshSession()
+      .then((t) => {
+        flushQueue(null, t)
+        return t
+      })
+      .catch((e) => {
+        flushQueue(e, null)
+        throw e
+      })
+      .finally(() => {
+        refreshPromise = null
+      })
+
+    try {
+      const newToken = await refreshPromise
+      if (!newToken) throw new Error('Refresh returned empty token')
+      if (config.headers && typeof (config.headers as any).set === 'function') {
+        (config.headers as any).set('Authorization', `Bearer ${newToken}`)
+      } else {
+        config.headers = config.headers || ({} as any)
+        ;(config.headers as any)['Authorization'] = `Bearer ${newToken}`
+      }
+      baseAPI.defaults.headers.common['Authorization'] = `Bearer ${newToken}`
       return baseAPI(config)
     } catch (refreshError) {
-      useAuthStore.getState().clearAuth()
+      try { useAuthStore.getState().clearAuth() } catch {}
+      try {
+        localStorage.removeItem('accessToken')
+        localStorage.removeItem('access_token')
+        localStorage.removeItem('token')
+      } catch {}
       if (typeof window !== 'undefined') {
-        window.location.href = '/login'
+        // sirf ek baar redirect, loop nahi
+        const cur = window.location.pathname
+        if (cur !== '/login' && cur !== '/admin/login') window.location.href = '/login'
       }
       return Promise.reject(refreshError)
     }

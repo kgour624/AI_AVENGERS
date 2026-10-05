@@ -21,7 +21,7 @@ export function SectionReviewGate({
         edited_content: editedContent,
         resolution_source: resolutionSource,
       })
-      onDone()
+      onDone?.()
     } finally {
       setSaving(false)
     }

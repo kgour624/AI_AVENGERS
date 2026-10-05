@@ -913,6 +913,15 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		return nil, fmt.Errorf("embed failed: %w", err)
 	}
 
+	// Phase 2: Parent-Child fast-path (flag-gated, additive). If parents exist, return them directly.
+	if pcs, perr := a.tryParentChildRetrieval(ctx, expertID, embedding, question, limit); perr == nil && len(pcs) > 0 {
+		if a.logger != nil {
+			a.logger.Info("parent-child retrieval hit", zap.Int("parents", len(pcs)), zap.Int("limit", limit))
+		}
+		return pcs, nil
+	}
+
+
 	// Feature #23: source_file and chunk_index are selected so the citation modal can
 	// name the transcript and the position.
 	vectorRows, err := a.db.Query(ctx,

@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -62,6 +63,7 @@ import (
 	"ai_avengers/backend/internal/usage"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
+	"ai_avengers/backend/internal/receptionist"
 )
 
 func main() {
@@ -97,6 +99,7 @@ func main() {
 		logger.Fatal("failed to connect to PostgreSQL", zap.Error(err))
 	}
 	defer postgres.Close()
+
 
 	// Connect to Redis
 	redisClient, err := db.ConnectRedis(ctx, cfg.Redis, logger)
@@ -1245,6 +1248,35 @@ func buildRouter(
 		adminGroup.PATCH("/gate-thresholds/:domain", adminHandler.SetGateThreshold)
 	}
 
+	// --- Receptionist Wiring (FINAL CORRECTED) ---
+	recStore := receptionist.NewStore(postgres.Pool, redisClient.Client)
+	checklistSvc := receptionist.NewChecklistService(recStore)
+	notesSvc := receptionist.NewNotesService(recStore)
+	var llmClient receptionist.LLMClient = &receptionistLLMAdapter{gateway: modelGateway}
+	var expertCaller receptionist.ExpertCaller = &receptionistExpertAdapter{gateway: modelGateway, db: postgres.Pool}
+	synthesisSvc := receptionist.NewSynthesisService(llmClient)
+	coordinator := receptionist.NewCoordinator(expertCaller, recStore, notesSvc)
+	recOrch := receptionist.NewOrchestrator(recStore, checklistSvc, notesSvc, synthesisSvc, coordinator, llmClient)
+	   recPublisher := receptionist.NewPublisher(redisClient.Client, logger)
+   recStore.SetLogger(logger)
+   recHandler := receptionist.NewHandler(recOrch, recStore, recPublisher)
+
+   // Phase 2/3/5 engines - Handler me inject (convEngine/templateOrch/expertFanOut/finalSynth).
+   recSearch := receptionist.NewGatewaySearch(modelGateway, redisClient.Client, logger)
+   recConvEngine := receptionist.NewConversationEngine(recStore, recSearch, recPublisher, llmClient, logger)
+   recTemplateOrch := receptionist.NewTemplateOrchestrator(recStore, recSearch, recPublisher, llmClient, logger)
+   recExpertFanOut := receptionist.NewExpertFanOut(postgres.Pool, recStore, recPublisher, modelGateway, logger)
+   recFinalSynth := receptionist.NewFinalSynthesizer(recStore, recPublisher, modelGateway, logger)
+   recHandler.WithEngines(recConvEngine, recTemplateOrch, recExpertFanOut, recFinalSynth)
+
+   // API Layer - ek hi gin group. FIX: pehle yahan chi-handler gin.WrapH se mount hota tha
+   // (chi is module ki dependency hi nahi hai) aur receptionistGroup / receptionistHandler
+   // undefined the, isliye server compile nahi hota tha. gin (httprouter) me ek hi level par
+   // static + wildcard sibling allowed nahi hai, isliye /checkpoints/next jaise routes hataye gaye.
+   recep := router.Group("/api/receptionist", middleware.AuthMiddleware(jwtService, logger))
+   recHandler.RegisterRoutes(recep)
+	// --- End Receptionist Wiring ---
+
 	return router
 }
 
@@ -2151,3 +2183,99 @@ func buildLogger(level string) (*zap.Logger, error) {
 
 	return cfg.Build()
 }
+
+type receptionistLLMAdapter struct {
+    gateway *gateway.ModelGateway
+}
+
+func (a *receptionistLLMAdapter) Complete(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+    req := gateway.LLMRequest{
+        Model:        gateway.ModelCheap, // Receptionist summary/final ke liye cheap hi kaafi hai
+        SystemPrompt: systemPrompt,
+        UserPrompt:   userPrompt,
+        Temperature:  0.7,
+        MaxTokens:    4000,
+    }
+    resp, err := a.gateway.Call(ctx, req)
+    if err != nil {
+        return "", err
+    }
+    return resp.Content, nil
+}
+
+type receptionistExpertAdapter struct {
+    gateway *gateway.ModelGateway
+    db      *pgxpool.Pool
+}
+
+func (a *receptionistExpertAdapter) CallExpert(ctx context.Context, expertID uuid.UUID, questionEnglish string) (string, error) {
+    // Real LLM wiring: expert meta + RAG context -> gateway.Call
+    // Tenant isolation already checked in handler (JWT tenant_id)
+    var name, domain, charter string
+    if a.db != nil {
+        _ = a.db.QueryRow(ctx, `SELECT name, COALESCE(domain,''), COALESCE(description,'') FROM experts WHERE id=$1`, expertID).Scan(&name, &domain, &charter)
+    }
+    if name == "" {
+        name = "Expert-" + expertID.String()[:8]
+    }
+    if domain == "" {
+        domain = "general"
+    }
+    // Retrieve top 3 relevant chunks for this expert (pgvector) if table exists - fails silently
+    var ragContext string
+    if a.db != nil {
+        rows, err := a.db.Query(ctx, `SELECT chunk_text FROM course_chunks WHERE expert_id=$1 ORDER BY times_cited DESC LIMIT 3`, expertID)
+        if err == nil {
+            defer rows.Close()
+            var parts []string
+            for rows.Next() {
+                var txt string
+                if err := rows.Scan(&txt); err == nil {
+                    if len(txt) > 800 {
+                        txt = txt[:800]
+                    }
+                    parts = append(parts, txt)
+                }
+            }
+            if len(parts) > 0 {
+                ragContext = "\n\nRelevant Knowledge:\n" + strings.Join(parts, "\n---\n")
+            }
+        }
+    }
+    expertPrompt := charter
+    if expertPrompt == "" {
+        expertPrompt = "You are a senior " + domain + " expert (" + name + "). Answer accurately, concisely, with markdown, tables/bullets where helpful."
+    }
+    userPrompt := questionEnglish
+    if ragContext != "" {
+        userPrompt = questionEnglish + ragContext
+    }
+    req := gateway.LLMRequest{
+        Model:        gateway.ModelStrong,
+        SystemPrompt: expertPrompt + " Language: Answer in English (secretary will translate to client language). Use markdown headings, bullets, tables.",
+        UserPrompt:   userPrompt,
+        Temperature:  0.5,
+        MaxTokens:    3000,
+    }
+    resp, err := a.gateway.Call(ctx, req)
+    if err != nil {
+        return "", fmt.Errorf("expert %s llm call failed: %w", expertID.String()[:8], err)
+    }
+    if strings.TrimSpace(resp.Content) == "" {
+        return "", fmt.Errorf("expert %s returned empty response", expertID.String()[:8])
+    }
+    return resp.Content, nil
+}
+
+func (a *receptionistExpertAdapter) GetExpertName(ctx context.Context, expertID uuid.UUID) (string, error) {
+    if a.db != nil {
+        var name, domain string
+        if err := a.db.QueryRow(ctx, `SELECT name, COALESCE(domain,'') FROM experts WHERE id=$1`, expertID).Scan(&name, &domain); err == nil && name != "" {
+            if domain != "" {
+                return name + " — " + domain, nil
+            }
+            return name, nil
+        }
+    }
+    return "Expert-" + expertID.String()[:8], nil
+}

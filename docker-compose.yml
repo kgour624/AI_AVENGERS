@@ -23,6 +23,9 @@ services:
       - "host.docker.internal:host-gateway"
     environment:
       - DATABASE_URL=${DATABASE_URL:-postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@host.docker.internal:5432/ai_avengers?sslmode=disable}
+    depends_on:
+      postgres:
+        condition: service_healthy
     restart: no
     networks:
       - avengers-network
@@ -42,8 +45,8 @@ services:
       - SERVER_HOST=0.0.0.0
       - SERVER_PORT=8080
       - SERVER_ENV=development
-      - DATABASE_URL=${DATABASE_URL:-postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@host.docker.internal:5432/ai_avengers?sslmode=disable}
-      - REDIS_URL=${REDIS_URL:-redis://host.docker.internal:6379}
+      - DATABASE_URL=${DATABASE_URL:-postgres://avengers:${POSTGRES_PASSWORD:-avengers_pass}@postgres:5432/ai_avengers?sslmode=disable}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - ML_SIDECAR_URL=http://ml-sidecar:8001
       - JWT_SECRET=${JWT_SECRET}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
@@ -58,8 +61,8 @@ services:
       - GITLAB_CLIENT_SECRET=${GITLAB_CLIENT_SECRET:-}
       - BASE_URL=${BASE_URL:-http://localhost:8080}
       - FRONTEND_URL=${FRONTEND_URL:-http://localhost:3000}
-      # CORS: allow dev frontend (port 3000 and 3001). Add more origins comma-separated.
-      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3001}
+      # CORS: allow dev frontend (port 3000, 3002 and network IP). Add more origins comma-separated.
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:3002,http://192.168.1.7:3002,http://192.168.1.7:8081}
       - AIDER_SERVICE_URL=http://aider-service:8082
       - AIDER_WORKSPACE_ROOT=/workspaces
       # Shared secret aider-service uses to reach POST /api/v1/llm/proxy.
