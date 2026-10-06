@@ -30,17 +30,20 @@ func BuildParentChild(ctx context.Context, chunker *TextChunker, raw string, rcf
 // AssignParentIDs maps each child to its parent page index and fills ParentIndex/ParentID.
 // Parents are built by grouping consecutive children up to ParentSoftLimit, so child's parent
 // is determined by cumulative token walk identical to buildParentsFromChildren.
-func AssignParentIDs(children []TextChunk, parents []ParentChunk, parentIDByIndex map[int]uuid.UUID) []TextChunk {
+func AssignParentIDs(children []TextChunk, parents []ParentChunk, parentIDByIndex map[int]uuid.UUID, rcfg RetrievalConfig) []TextChunk {
 	if len(parents) == 0 || len(parentIDByIndex) == 0 {
 		for i := range children {
 			children[i].ParentIndex = -1
 		}
 		return children
 	}
-	// Build lookup: child index -> parent index by replaying same grouping
-	cfg := DefaultParentConfig()
-	pHard := cfg.effectiveHard()
-	pSoft := cfg.effectiveSoft()
+	// Build lookup: child index -> parent index by replaying same grouping with rcfg limits (FIX4)
+	parentCfg := ChunkConfig{TargetSize: rcfg.ParentSoftLimit, MinSize: 900, MaxSize: rcfg.ParentHardLimit, SoftLimit: rcfg.ParentSoftLimit, HardLimit: rcfg.ParentHardLimit, OverlapTokens: rcfg.OverlapTokens, AtomicCodeFence: rcfg.AtomicCodeFence}
+	if parentCfg.SoftLimit == 0 {
+		parentCfg = DefaultParentConfig()
+	}
+	pHard := parentCfg.effectiveHard()
+	pSoft := parentCfg.effectiveSoft()
 	curTokens := 0
 	curParent := 0
 	for i := range children {

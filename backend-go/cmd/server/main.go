@@ -1227,6 +1227,16 @@ func buildRouter(
 
 
 		adminGroup.POST("/embedding-settings", adminHandler.UpdateEmbeddingSettings)
+		// RAG retrieval config (Phase 1.5) — typed, validated, flag-gated
+		adminGroup.GET("/retrieval-config", adminHandler.GetRetrievalConfig)
+		adminGroup.PUT("/retrieval-config", adminHandler.UpdateRetrievalConfig)
+                // Chunk Explorer (Phase 1.5 Observability) - read-only parent-child inspector
+                adminGroup.GET("/experts/:id/chunks", adminHandler.ListExpertChunks)
+                adminGroup.GET("/experts/:id/parents", adminHandler.ListExpertParents)
+                adminGroup.GET("/experts/:id/chunk-tree", adminHandler.GetExpertChunkTree)
+		adminGroup.GET("/system-health", adminHandler.GetSystemHealth)
+		adminGroup.POST("/retrieval-compare", adminHandler.CompareRetrieval)
+		adminGroup.GET("/audit-log", adminHandler.GetAuditLog)
 		// Expert categories (migration 010, CT-A3) — admin-owned template layer.
 		adminGroup.GET("/expert-categories", adminHandler.ListExpertCategories)
 		adminGroup.POST("/expert-categories", adminHandler.CreateExpertCategory)
@@ -2278,4 +2288,4 @@ func (a *receptionistExpertAdapter) GetExpertName(ctx context.Context, expertID 
         }
     }
     return "Expert-" + expertID.String()[:8], nil
-}
+}

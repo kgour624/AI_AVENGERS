@@ -834,7 +834,7 @@ func (p *IngestionPipeline) IngestTranscript(
 		// AssignParentIDs needs ids; store parents first.
 		parentIDByIndex = EnsureParentsStored(ctx, p.db, p.logger, expertID, sourceFile, parents)
 		if len(parentIDByIndex) > 0 {
-			chunks = AssignParentIDs(chunks, parents, parentIDByIndex)
+			chunks = AssignParentIDs(chunks, parents, parentIDByIndex, rcfg)
 		} else {
 			p.logger.Warn("parent-child enabled but no parent ids returned — children will be stored without parent_id")
 		}

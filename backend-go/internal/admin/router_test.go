@@ -56,9 +56,21 @@ func TestExpertRouteTreeRegistersWithoutConflict(t *testing.T) {
 	group.POST("/experts/:id/depth-layers", noop)
 	group.GET("/experts/:id/depth-layers", noop)
 
+	// Phase 1.5 RAG retrieval config.
+	group.GET("/retrieval-config", noop)
+	group.PUT("/retrieval-config", noop)
+
+	// Phase 1.5 Chunk Explorer (observability).
+	group.GET("/experts/:id/chunks", noop)
+	group.GET("/experts/:id/parents", noop)
+	group.GET("/experts/:id/chunk-tree", noop)
+	group.GET("/system-health", noop)
+	group.POST("/retrieval-compare", noop)
+	group.GET("/audit-log", noop)
+
 	// Route count is asserted too: a silently dropped registration would not
 	// panic, and "no panic" must not be mistaken for "all of them registered".
-	if got := len(engine.Routes()); got != 17 {
-		t.Fatalf("registered routes = %d, want 17", got)
+	if got := len(engine.Routes()); got != 25 {
+		t.Fatalf("registered routes = %d, want 25", got)
 	}
 }

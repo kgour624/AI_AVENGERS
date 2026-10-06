@@ -15,6 +15,8 @@ const NAV_ITEMS = [
   { to: '/admin/stats',           label: 'Stats',           end: false },
   { to: '/admin/settings',        label: 'Settings',        end: false },
   { to: '/admin/llm-settings',    label: 'LLM Settings',    end: false },
+  { to: '/admin/rag',             label: 'RAG Retrieval',   end: false },
+  { to: '/admin/chunks',          label: 'Chunk Explorer',  end: false },
   { to: '/admin/usage',           label: 'Usage',           end: false },
   { to: '/admin/reliability',     label: 'Reliability',     end: false },
   { to: '/admin/mcp-access',      label: 'MCP Access',      end: false },

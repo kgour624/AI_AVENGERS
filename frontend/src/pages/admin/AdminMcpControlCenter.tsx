@@ -110,3 +110,5 @@ export default function AdminMcpControlCenter() {
     </div>
   )
 }
+
+export const Component = AdminMcpControlCenter;

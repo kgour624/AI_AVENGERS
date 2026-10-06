@@ -4209,6 +4209,415 @@ func (h *AdminHandler) UpdateEmbeddingSettings(c *gin.Context) {
 }
 
 // ============================================================
+// RAG RETRIEVAL CONFIG (Phase 1.5 Parent-Child) — typed admin API
+// ============================================================
+// WHY dedicated endpoints not generic PATCH /settings/:key:
+//   retrieval_config is a 13-field typed JSON; generic editor lets a typo
+//   silently break ingestion/retrieval with zero validation. Typed GET/PUT
+//   with range checks is what HANDOFF.md recommended for system_settings.
+//   Flag-gated: enable_parent_child=false keeps legacy path intact.
+//   Env>DB>Default priority is enforced in LoadRetrievalConfig callers.
+
+// GetRetrievalConfig GET /admin/retrieval-config
+// Returns merged defaults + DB value. Always succeeds (defaults on miss).
+func (h *AdminHandler) GetRetrievalConfig(c *gin.Context) {
+	cfg := training.DefaultRetrievalConfig()
+	var raw []byte
+	if err := h.db.QueryRow(c.Request.Context(), `SELECT value FROM system_settings WHERE key='retrieval_config'`).Scan(&raw); err == nil {
+		_ = json.Unmarshal(raw, &cfg)
+	}
+	// Safety: fill zero-values from defaults (old DB rows may miss new fields)
+	def := training.DefaultRetrievalConfig()
+	if cfg.ChildSoftLimit == 0 {
+		cfg.ChildSoftLimit = def.ChildSoftLimit
+	}
+	if cfg.ChildHardLimit == 0 {
+		cfg.ChildHardLimit = def.ChildHardLimit
+	}
+	if cfg.ParentSoftLimit == 0 {
+		cfg.ParentSoftLimit = def.ParentSoftLimit
+	}
+	if cfg.ParentHardLimit == 0 {
+		cfg.ParentHardLimit = def.ParentHardLimit
+	}
+	if cfg.OverlapTokens == 0 {
+		cfg.OverlapTokens = def.OverlapTokens
+	}
+	if cfg.TopKChildren == 0 {
+		cfg.TopKChildren = def.TopKChildren
+	}
+	if cfg.TopKParents == 0 {
+		cfg.TopKParents = def.TopKParents
+	}
+	if cfg.RerankTopN == 0 {
+		cfg.RerankTopN = def.RerankTopN
+	}
+	if cfg.MaxHops == 0 {
+		cfg.MaxHops = def.MaxHops
+	}
+	if cfg.RRFK == 0 {
+		cfg.RRFK = def.RRFK
+	}
+	response.OK(c, cfg)
+}
+
+// UpdateRetrievalConfig PUT /admin/retrieval-config
+// Body: RetrievalConfig JSON. Validates ranges, upserts to system_settings, audit logs.
+func (h *AdminHandler) UpdateRetrievalConfig(c *gin.Context) {
+	var req training.RetrievalConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "INVALID_INPUT", err.Error())
+		return
+	}
+	// Range validation — prevents silently breaking chunking/retrieval.
+	if req.ChildSoftLimit < 50 || req.ChildSoftLimit > 500 {
+		response.BadRequest(c, "INVALID_RANGE", "child_soft_limit must be 50-500")
+		return
+	}
+	if req.ChildHardLimit < 100 || req.ChildHardLimit > 600 {
+		response.BadRequest(c, "INVALID_RANGE", "child_hard_limit must be 100-600")
+		return
+	}
+	if req.ChildHardLimit < req.ChildSoftLimit {
+		response.BadRequest(c, "INVALID_RANGE", "child_hard_limit must be >= child_soft_limit")
+		return
+	}
+	if req.ParentSoftLimit < 500 || req.ParentSoftLimit > 3000 {
+		response.BadRequest(c, "INVALID_RANGE", "parent_soft_limit must be 500-3000")
+		return
+	}
+	if req.ParentHardLimit < 800 || req.ParentHardLimit > 4000 {
+		response.BadRequest(c, "INVALID_RANGE", "parent_hard_limit must be 800-4000")
+		return
+	}
+	if req.ParentHardLimit < req.ParentSoftLimit {
+		response.BadRequest(c, "INVALID_RANGE", "parent_hard_limit must be >= parent_soft_limit")
+		return
+	}
+	if req.OverlapTokens < 0 || req.OverlapTokens > 100 {
+		response.BadRequest(c, "INVALID_RANGE", "overlap_tokens must be 0-100")
+		return
+	}
+	if req.TopKChildren < 10 || req.TopKChildren > 100 {
+		response.BadRequest(c, "INVALID_RANGE", "top_k_children must be 10-100")
+		return
+	}
+	if req.TopKParents < 1 || req.TopKParents > 10 {
+		response.BadRequest(c, "INVALID_RANGE", "top_k_parents must be 1-10")
+		return
+	}
+	if req.RerankTopN < 5 || req.RerankTopN > 50 {
+		response.BadRequest(c, "INVALID_RANGE", "rerank_top_n must be 5-50")
+		return
+	}
+	if req.MaxHops < 1 || req.MaxHops > 10 {
+		response.BadRequest(c, "INVALID_RANGE", "max_hops must be 1-10")
+		return
+	}
+	if req.RRFK < 20 || req.RRFK > 100 {
+		response.BadRequest(c, "INVALID_RANGE", "rrf_k must be 20-100")
+		return
+	}
+	valueJSON, _ := json.Marshal(req)
+	adminID := c.MustGet("user_id").(uuid.UUID)
+	_, err := h.db.Exec(c.Request.Context(),
+		`INSERT INTO system_settings (key, value, updated_by)
+		 VALUES ('retrieval_config', $1, $2)
+		 ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_by=EXCLUDED.updated_by, updated_at=NOW()`,
+		string(valueJSON), adminID)
+	if err != nil {
+		h.logger.Error("save retrieval_config failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	h.logger.Info("retrieval_config updated",
+		zap.String("admin_id", adminID.String()),
+		zap.Bool("enable_parent_child", req.EnableParentChild),
+		zap.Int("child_soft", req.ChildSoftLimit),
+		zap.Int("parent_soft", req.ParentSoftLimit),
+	)
+	response.OK(c, req)
+}
+
+ // ============================================================
+ // CHUNK EXPLORER (Phase 1.5 Observability) - read-only parent-child inspector
+ // ============================================================
+ type chunkExplorerRow struct {
+     ID          string  `json:"id"`
+     ExpertID    string  `json:"expert_id"`
+     ChunkIndex  int     `json:"chunk_index"`
+     ChunkText   string  `json:"chunk_text"`
+     Topic       *string `json:"topic,omitempty"`
+     Subtopic    *string `json:"subtopic,omitempty"`
+     SourceFile  *string `json:"source_file,omitempty"`
+     ChunkHash   *string `json:"chunk_hash,omitempty"`
+     SectionPath string  `json:"section_path"`
+     ParentID    *string `json:"parent_id,omitempty"`
+     ParentIndex *int    `json:"parent_index,omitempty"`
+     IsChild     bool    `json:"is_child"`
+     TokenEst    int     `json:"token_estimate"`
+     CreatedAt   string  `json:"created_at"`
+ }
+ type parentExplorerRow struct {
+     ID          string  `json:"id"`
+     ExpertID    string  `json:"expert_id"`
+     PageIndex   int     `json:"page_index"`
+     PageText    string  `json:"page_text"`
+     SectionPath string  `json:"section_path"`
+     TokenCount  int     `json:"token_count"`
+     SourceFile  *string `json:"source_file,omitempty"`
+     CreatedAt   string  `json:"created_at"`
+     ChildCount  int     `json:"child_count"`
+ }
+ func (h *AdminHandler) ListExpertChunks(c *gin.Context) {
+     expertID, err := uuid.Parse(c.Param("id"))
+     if err != nil {
+         response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+         return
+     }
+     limit := 20
+     if v := c.Query("limit"); v != "" {
+         if n, err := strconv.Atoi(v); err == nil {
+             if n < 1 { n = 1 }
+             if n > 100 { n = 100 }
+             limit = n
+         }
+     }
+     offset := 0
+     if v := c.Query("offset"); v != "" {
+         if n, err := strconv.Atoi(v); err == nil && n >= 0 { offset = n }
+     }
+     var isChildFilter *bool
+     if v := c.Query("is_child"); v != "" {
+         b, err := strconv.ParseBool(v)
+         if err != nil { response.BadRequest(c, "INVALID_FILTER", "is_child must be true or false"); return }
+         isChildFilter = &b
+     }
+     var parentIDFilter *uuid.UUID
+     if v := c.Query("parent_id"); v != "" {
+         pid, err := uuid.Parse(v)
+         if err != nil { response.BadRequest(c, "INVALID_FILTER", "parent_id must be a valid UUID"); return }
+         parentIDFilter = &pid
+     }
+     sourceFile := c.Query("source_file")
+     base := `FROM course_chunks WHERE expert_id=$1`
+     args := []interface{}{expertID}
+     argPos := 2
+     if isChildFilter != nil {
+         base += fmt.Sprintf(` AND is_child=$%d`, argPos)
+         args = append(args, *isChildFilter); argPos++
+     }
+     if parentIDFilter != nil {
+         base += fmt.Sprintf(` AND parent_id=$%d`, argPos)
+         args = append(args, *parentIDFilter); argPos++
+     }
+     if sourceFile != "" {
+         base += fmt.Sprintf(` AND source_file=$%d`, argPos)
+         args = append(args, sourceFile); argPos++
+     }
+     var total int
+     countSQL := `SELECT COUNT(*) ` + base
+     if err := h.db.QueryRow(c.Request.Context(), countSQL, args...).Scan(&total); err != nil {
+         h.logger.Error("list expert chunks count failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+         response.InternalError(c); return
+     }
+     selectSQL := `SELECT id, expert_id, chunk_index, chunk_text, topic, subtopic, source_file, chunk_hash, section_path, parent_id, parent_index, is_child, created_at ` + base + fmt.Sprintf(` ORDER BY chunk_index ASC LIMIT $%d OFFSET $%d`, argPos, argPos+1)
+     args = append(args, limit, offset)
+     rows, err := h.db.Query(c.Request.Context(), selectSQL, args...)
+     if err != nil {
+         h.logger.Error("list expert chunks query failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+         response.InternalError(c); return
+     }
+     defer rows.Close()
+     out := make([]chunkExplorerRow, 0)
+     for rows.Next() {
+         var r chunkExplorerRow
+         var id, expertStr uuid.UUID
+         var topic, subtopic, sourceFileVal, chunkHash *string
+         var parentID *uuid.UUID
+         var parentIdx *int
+         var sectionPath string
+         var isChild bool
+         var chunkText string
+         var chunkIndex int
+         var createdAt time.Time
+         if err := rows.Scan(&id, &expertStr, &chunkIndex, &chunkText, &topic, &subtopic, &sourceFileVal, &chunkHash, &sectionPath, &parentID, &parentIdx, &isChild, &createdAt); err != nil {
+             h.logger.Error("scan chunk row failed", zap.Error(err))
+             response.InternalError(c); return
+         }
+         r.ID = id.String(); r.ExpertID = expertStr.String(); r.ChunkIndex = chunkIndex; r.ChunkText = chunkText
+         r.Topic = topic; r.Subtopic = subtopic; r.SourceFile = sourceFileVal; r.ChunkHash = chunkHash; r.SectionPath = sectionPath
+         if parentID != nil { s := parentID.String(); r.ParentID = &s }
+         if parentIdx != nil { r.ParentIndex = parentIdx }
+         r.IsChild = isChild; r.TokenEst = len(chunkText) / 4
+         if r.TokenEst < 1 && len(chunkText) > 0 { r.TokenEst = 1 }
+         r.CreatedAt = createdAt.Format(time.RFC3339)
+         out = append(out, r)
+     }
+     if err := rows.Err(); err != nil { h.logger.Error("rows iteration failed", zap.Error(err)); response.InternalError(c); return }
+     response.OK(c, gin.H{"items": out, "total": total, "limit": limit, "offset": offset})
+ }
+
+ func (h *AdminHandler) ListExpertParents(c *gin.Context) {
+     expertID, err := uuid.Parse(c.Param("id"))
+     if err != nil { response.BadRequest(c, "INVALID_ID", "invalid expert ID"); return }
+     limit := 20
+     if v := c.Query("limit"); v != "" {
+         if n, err := strconv.Atoi(v); err == nil {
+             if n < 1 { n = 1 }
+             if n > 100 { n = 100 }
+             limit = n
+         }
+     }
+     offset := 0
+     if v := c.Query("offset"); v != "" {
+         if n, err := strconv.Atoi(v); err == nil && n >= 0 { offset = n }
+     }
+     sourceFile := c.Query("source_file")
+     baseWhere := `WHERE expert_id=$1`
+     args := []interface{}{expertID}
+     argPos := 2
+     if sourceFile != "" {
+         baseWhere += fmt.Sprintf(` AND source_file=$%d`, argPos)
+         args = append(args, sourceFile); argPos++
+     }
+     var total int
+     if err := h.db.QueryRow(c.Request.Context(), `SELECT COUNT(*) FROM expert_pages `+baseWhere, args...).Scan(&total); err != nil {
+         h.logger.Error("list parents count failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+         response.InternalError(c); return
+     }
+     selArgs := append(append([]interface{}{}, args...), limit, offset)
+     selSQL := fmt.Sprintf(`SELECT ep.id, ep.expert_id, ep.page_index, ep.page_text, ep.section_path, ep.token_count, ep.source_file, ep.created_at, COALESCE(cc.cnt,0) as child_count
+         FROM expert_pages ep
+         LEFT JOIN (SELECT parent_id, COUNT(*) as cnt FROM course_chunks WHERE expert_id=$1 GROUP BY parent_id) cc ON cc.parent_id=ep.id
+         %s ORDER BY ep.page_index ASC LIMIT $%d OFFSET $%d`, baseWhere, argPos, argPos+1)
+     rows, err := h.db.Query(c.Request.Context(), selSQL, selArgs...)
+     if err != nil {
+         h.logger.Error("list parents query failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+         response.InternalError(c); return
+     }
+     defer rows.Close()
+     out := make([]parentExplorerRow, 0)
+     for rows.Next() {
+         var id, expertStr uuid.UUID
+         var pageIndex, tokenCount, childCount int
+         var pageText, sectionPath string
+         var sourceFileVal *string
+         var createdAt time.Time
+         if err := rows.Scan(&id, &expertStr, &pageIndex, &pageText, &sectionPath, &tokenCount, &sourceFileVal, &createdAt, &childCount); err != nil {
+             h.logger.Error("scan parent row failed", zap.Error(err))
+             response.InternalError(c); return
+         }
+         out = append(out, parentExplorerRow{
+             ID: id.String(), ExpertID: expertStr.String(), PageIndex: pageIndex, PageText: pageText,
+             SectionPath: sectionPath, TokenCount: tokenCount, SourceFile: sourceFileVal, CreatedAt: createdAt.Format(time.RFC3339), ChildCount: childCount,
+         })
+     }
+     if err := rows.Err(); err != nil { h.logger.Error("parent rows iteration failed", zap.Error(err)); response.InternalError(c); return }
+     response.OK(c, gin.H{"items": out, "total": total, "limit": limit, "offset": offset})
+ }
+ func (h *AdminHandler) GetExpertChunkTree(c *gin.Context) {
+     expertID, err := uuid.Parse(c.Param("id"))
+     if err != nil { response.BadRequest(c, "INVALID_ID", "invalid expert ID"); return }
+     sourceFile := c.Query("source_file")
+     parentWhere := `WHERE expert_id=$1`
+     parentArgs := []interface{}{expertID}
+     parentArgPos := 2
+     if sourceFile != "" {
+         parentWhere += fmt.Sprintf(` AND source_file=$%d`, parentArgPos)
+         parentArgs = append(parentArgs, sourceFile); parentArgPos++
+     }
+     parentSQL := fmt.Sprintf(`SELECT ep.id, ep.expert_id, ep.page_index, ep.page_text, ep.section_path, ep.token_count, ep.source_file, ep.created_at, COALESCE(cc.cnt,0)
+         FROM expert_pages ep LEFT JOIN (SELECT parent_id, COUNT(*) as cnt FROM course_chunks WHERE expert_id=$1 GROUP BY parent_id) cc ON cc.parent_id=ep.id
+         %s ORDER BY ep.page_index ASC LIMIT 100`, parentWhere)
+     rows, err := h.db.Query(c.Request.Context(), parentSQL, parentArgs...)
+     if err != nil {
+         h.logger.Error("chunk-tree parents query failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+         response.InternalError(c); return
+     }
+     parents := make([]parentExplorerRow, 0)
+     for rows.Next() {
+         var id, expertStr uuid.UUID
+         var pageIndex, tokenCount, childCount int
+         var pageText, sectionPath string
+         var sourceFileVal *string
+         var createdAt time.Time
+         if err := rows.Scan(&id, &expertStr, &pageIndex, &pageText, &sectionPath, &tokenCount, &sourceFileVal, &createdAt, &childCount); err != nil {
+             rows.Close(); h.logger.Error("scan tree parent failed", zap.Error(err)); response.InternalError(c); return
+         }
+         parents = append(parents, parentExplorerRow{
+             ID: id.String(), ExpertID: expertStr.String(), PageIndex: pageIndex, PageText: pageText,
+             SectionPath: sectionPath, TokenCount: tokenCount, SourceFile: sourceFileVal, CreatedAt: createdAt.Format(time.RFC3339), ChildCount: childCount,
+         })
+     }
+     rows.Close()
+     if err := rows.Err(); err != nil { h.logger.Error("parents rows err", zap.Error(err)); response.InternalError(c); return }
+     childBase := `WHERE expert_id=$1 AND is_child=true`
+     childArgs := []interface{}{expertID}
+     childArgPos := 2
+     if sourceFile != "" {
+         childBase += fmt.Sprintf(` AND source_file=$%d`, childArgPos)
+         childArgs = append(childArgs, sourceFile); childArgPos++
+     }
+     childSQL := `SELECT id, expert_id, chunk_index, chunk_text, topic, subtopic, source_file, chunk_hash, section_path, parent_id, parent_index, is_child, created_at FROM course_chunks ` + childBase + fmt.Sprintf(` ORDER BY COALESCE(parent_index, 999999), chunk_index ASC LIMIT 500`)
+     cRows, err := h.db.Query(c.Request.Context(), childSQL, childArgs...)
+     if err != nil {
+         h.logger.Error("chunk-tree children query failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+         response.InternalError(c); return
+     }
+     defer cRows.Close()
+     childrenByParent := make(map[string][]chunkExplorerRow)
+     var orphans []chunkExplorerRow
+     var children []chunkExplorerRow
+     for cRows.Next() {
+         var id, expertStr uuid.UUID
+         var chunkIndex int
+         var chunkText string
+         var topic, subtopic, sourceFileVal, chunkHash *string
+         var sectionPath string
+         var parentID *uuid.UUID
+         var parentIdx *int
+         var isChild bool
+         var createdAt time.Time
+         if err := cRows.Scan(&id, &expertStr, &chunkIndex, &chunkText, &topic, &subtopic, &sourceFileVal, &chunkHash, &sectionPath, &parentID, &parentIdx, &isChild, &createdAt); err != nil {
+             h.logger.Error("scan tree child failed", zap.Error(err)); response.InternalError(c); return
+         }
+         r := chunkExplorerRow{
+             ID: id.String(), ExpertID: expertStr.String(), ChunkIndex: chunkIndex, ChunkText: chunkText,
+             Topic: topic, Subtopic: subtopic, SourceFile: sourceFileVal, ChunkHash: chunkHash,
+             SectionPath: sectionPath, IsChild: isChild, TokenEst: len(chunkText) / 4, CreatedAt: createdAt.Format(time.RFC3339),
+         }
+         if r.TokenEst < 1 && len(chunkText) > 0 { r.TokenEst = 1 }
+         if parentID != nil { s := parentID.String(); r.ParentID = &s }
+         if parentIdx != nil { r.ParentIndex = parentIdx }
+         if r.ParentID == nil { orphans = append(orphans, r)
+         } else { childrenByParent[*r.ParentID] = append(childrenByParent[*r.ParentID], r) }
+         children = append(children, r)
+     }
+     if err := cRows.Err(); err != nil { h.logger.Error("children rows err", zap.Error(err)); response.InternalError(c); return }
+     var totalChildren, totalParents int
+     _ = h.db.QueryRow(c.Request.Context(), `SELECT COUNT(*) FROM course_chunks WHERE expert_id=$1 AND is_child=true`, expertID).Scan(&totalChildren)
+     _ = h.db.QueryRow(c.Request.Context(), `SELECT COUNT(*) FROM expert_pages WHERE expert_id=$1`, expertID).Scan(&totalParents)
+     type treeNode struct {
+         Parent   parentExplorerRow  `json:"parent"`
+         Children []chunkExplorerRow `json:"children"`
+     }
+     tree := make([]treeNode, 0, len(parents))
+     for _, p := range parents {
+         ch := childrenByParent[p.ID]
+         if ch == nil { ch = []chunkExplorerRow{} }
+         tree = append(tree, treeNode{Parent: p, Children: ch})
+     }
+     if orphans == nil { orphans = []chunkExplorerRow{} }
+     response.OK(c, gin.H{
+         "tree": tree, "orphans": orphans, "total_children": totalChildren, "total_parents": totalParents,
+         "parents_shown": len(parents), "children_shown": len(children),
+     })
+ }
+
+
+
+// ============================================================
 // GATE THRESHOLDS (B4) — per-domain Gate 1 usable/strong config
 // ============================================================
 //

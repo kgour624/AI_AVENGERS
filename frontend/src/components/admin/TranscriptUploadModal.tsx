@@ -5,6 +5,19 @@ import { ingestTranscript, ingestTranscriptsBatch, type BatchIngestResult } from
 import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
+import { handleAPIError } from '@/utils/errors'
+
+function humanIngestError(err: unknown): string {
+  const raw = handleAPIError(err)
+  const lower = raw.toLowerCase()
+  if (lower.includes("config.headers.delete") || lower.includes("is not a function")) return "Upload failed due to a browser issue. Please refresh the page and try again."
+  if (lower.includes("network error") || lower.includes("failed to fetch")) return "Network error — please check your internet and try again."
+  if (lower.includes("timeout")) return "Server is busy — please try again in a moment."
+  if (lower.includes("unsupported")) return "This file type is not supported. Please upload PDF, Word, Excel, PPT or text files."
+  if (lower.includes("file_required") || lower.includes("no file")) return "Please select a file first."
+  return raw
+}
+
 
 /**
  * Source: FRONTEND_SYSTEM_DESIGN.md section 11 ("Upload Transcript
@@ -62,11 +75,7 @@ export interface TranscriptUploadModalProps {
  * which is far more useful than axios's "Request failed with status code 400".
  */
 function describeUploadError(err: unknown): string {
-  const apiMessage = (err as { response?: { data?: { error?: { message?: string } } } })
-    ?.response?.data?.error?.message
-  if (apiMessage) return apiMessage
-  if (err instanceof Error && err.message) return err.message
-  return 'Upload failed'
+  return humanIngestError(err)
 }
 
 export function TranscriptUploadModal({
@@ -182,7 +191,7 @@ export function TranscriptUploadModal({
         )}
       >
         <input {...getInputProps()} />
-        <p className="text-2xl">\ud83d\udcc4</p>
+        <p className="text-2xl">📄</p>
         <p className="mt-2 text-sm text-text-secondary">
           {file ? file.name : 'Drag & drop a document here or click to browse'}
         </p>

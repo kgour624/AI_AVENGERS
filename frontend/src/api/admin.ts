@@ -175,8 +175,7 @@ export const ingestTranscriptsBatch = (expertId: string, files: File[]) => {
   return baseAPI
     .post<ApiResponse<{ results: BatchIngestResult[]; accepted: number; workers: number }>>(
       `/api/v1/admin/experts/${expertId}/ingest-batch`,
-      formData,
-      { headers: { 'Content-Type': 'multipart/form-data' } }
+      formData
     )
     .then((res) => res.data.data!)
 }
@@ -190,8 +189,7 @@ export const ingestTranscript = (expertId: string, file: File, replaceExisting =
   return baseAPI
     .post<ApiResponse<{ jobId: string; status: string; message: string; expertId: string }>>(
       `/api/v1/admin/experts/${expertId}/ingest`,
-      formData,
-      { headers: { 'Content-Type': 'multipart/form-data' } }
+      formData
     )
     .then((res) => res.data.data!)
 }
@@ -1122,6 +1120,30 @@ export interface ConceptGraphResponse {
   relations: string[]
 }
 
+// ============================================================
+// RAG Retrieval Config (Phase 1.5) — typed, no generic JSON editing
+// ============================================================
+export interface RetrievalConfig {
+  enable_parent_child: boolean
+  child_soft_limit: number
+  child_hard_limit: number
+  parent_soft_limit: number
+  parent_hard_limit: number
+  overlap_tokens: number
+  top_k_children: number
+  top_k_parents: number
+  rerank_top_n: number
+  max_hops: number
+  rrf_k: number
+  atomic_code_fence: boolean
+}
+
+export const getRetrievalConfig = () =>
+  baseAPI.get<ApiResponse<RetrievalConfig>>('/api/v1/admin/retrieval-config').then((r) => r.data.data!)
+
+export const updateRetrievalConfig = (value: RetrievalConfig) =>
+  baseAPI.put<ApiResponse<RetrievalConfig>>('/api/v1/admin/retrieval-config', value).then((r) => r.data.data!)
+
 export interface ConceptExtractResult {
   topics: number
   edges: number
@@ -1228,5 +1250,105 @@ export const classifyExpertDepthLayers = (expertId: string) =>
 // Soft-deletes an expert (deleted_at) so history stays auditable but the expert
 // disappears from every picker. Disable uses the existing update call
 // (isActive: false).
+// Chunk Explorer (Phase 1.5 Observability) — read-only parent-child inspector
+export interface ChunkExplorerRow {
+  id: string
+  expert_id: string
+  chunk_index: number
+  chunk_text: string
+  topic?: string | null
+  subtopic?: string | null
+  source_file?: string | null
+  chunk_hash?: string | null
+  section_path: string
+  parent_id?: string | null
+  parent_index?: number | null
+  is_child: boolean
+  token_estimate: number
+  created_at: string
+}
+export interface ParentExplorerRow {
+  id: string
+  expert_id: string
+  page_index: number
+  page_text: string
+  section_path: string
+  token_count: number
+  source_file?: string | null
+  created_at: string
+  child_count: number
+}
+export interface ChunkExplorerListResponse {
+  items: ChunkExplorerRow[]
+  total: number
+  limit: number
+  offset: number
+}
+export interface ParentExplorerListResponse {
+  items: ParentExplorerRow[]
+  total: number
+  limit: number
+  offset: number
+}
+export interface ChunkTreeResponse {
+  tree: { parent: ParentExplorerRow; children: ChunkExplorerRow[] }[]
+  orphans: ChunkExplorerRow[]
+  total_children: number
+  total_parents: number
+  parents_shown: number
+  children_shown: number
+}
+export type ChunkExplorerParams = {
+  limit?: number
+  offset?: number
+  is_child?: boolean
+  parent_id?: string
+  source_file?: string
+}
+export const listExpertChunks = (expertId: string, params: ChunkExplorerParams = {}) =>
+  baseAPI
+    .get<ApiResponse<ChunkExplorerListResponse>>(`/api/v1/admin/experts/${expertId}/chunks`, { params })
+    .then((res) => res.data.data!)
+export const listExpertParents = (expertId: string, params: { limit?: number; offset?: number; source_file?: string } = {}) =>
+  baseAPI
+    .get<ApiResponse<ParentExplorerListResponse>>(`/api/v1/admin/experts/${expertId}/parents`, { params })
+    .then((res) => res.data.data!)
+export const getExpertChunkTree = (expertId: string, params: { source_file?: string } = {}) =>
+  baseAPI
+    .get<ApiResponse<ChunkTreeResponse>>(`/api/v1/admin/experts/${expertId}/chunk-tree`, { params })
+    .then((res) => res.data.data!)
+
 export const deleteExpert = (expertId: string) =>
   baseAPI.delete<ApiResponse<{ status: string }>>(`/api/v1/admin/experts/${expertId}`).then((res) => res.data.data!)
+
+export type SystemHealthResponse = {
+  flag_enabled: boolean
+  flag_source: string
+  retrieval_config: RetrievalConfig | null
+  runtime: { go_routines: number; alloc_mb: number; num_cpu: number; uptime_sec: number }
+  db_pool: { acquired_conns: number; idle_conns: number; total_conns: number }
+  counts: { total_parents: number; total_children: number; orphans: number; experts: number }
+  checked_at: string
+}
+export const getSystemHealth = async (): Promise<SystemHealthResponse> => {
+  const res = await baseAPI.get<ApiResponse<SystemHealthResponse>>('/api/v1/admin/system-health')
+  return res.data.data
+}
+export const compareRetrieval = async (body: { expert_id: string; query: string; top_k?: number }) => {
+  const res = await baseAPI.post<ApiResponse<unknown>>('/api/v1/admin/retrieval-compare', body)
+  return res.data.data
+}
+export const getAuditLog = async (params?: { limit?: number; offset?: number; action?: string }) => {
+  const res = await baseAPI.get<ApiResponse<{ items: unknown[]; total: number }>>('/api/v1/admin/audit-log', { params })
+  return res.data.data
+}
+
+
+// --- FIX: camelCase trap resilient helper ---
+export function toSnakeRetrievalPayload(form:any){
+  return {
+    enable_parent_child: Boolean(form.enableParentChild ?? form.enable_parent_child ?? false),
+    top_k_parents: Number(form.parentTopK ?? form.top_k_parents ?? 5),
+    top_k_children: Number(form.childTopK ?? form.top_k_children ?? 5),
+  };
+}

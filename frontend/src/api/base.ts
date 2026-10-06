@@ -75,13 +75,29 @@ baseAPI.interceptors.request.use((config: InternalAxiosRequestConfig) => {
     config.data = snakeifyKeys(config.data)
   }
   if (config.data instanceof FormData) {
-    if (config.headers && typeof (config.headers as any).delete === 'function') {
-      (config.headers as any).delete('Content-Type')
-      (config.headers as any).delete('content-type')
-    } else {
-      try { delete (config.headers as any)['Content-Type'] } catch {}
-      try { delete (config.headers as any)['content-type'] } catch {}
-    }
+    // Browser ko boundary set karne do - explicit Content-Type hatao
+    // Robust: AxiosHeaders instance (Axios v1) vs plain object dono handle
+    try {
+      const h: any = config.headers
+      if (h) {
+        if (typeof h.delete === 'function') {
+          try { h.delete('Content-Type') } catch {}
+          try { h.delete('content-type') } catch {}
+          try { h.delete('Content-type') } catch {}
+        } else {
+          try { delete h['Content-Type'] } catch {}
+          try { delete h['content-type'] } catch {}
+          try { delete h['Content-type'] } catch {}
+          try { delete h['common']?.['Content-Type'] } catch {}
+        }
+        // Ensure axios doesn't re-add json header - set undefined so it is omitted
+        try { h['Content-Type'] = undefined } catch {}
+      }
+      // Also scrub common default for this single request
+      if (config.headers && typeof (config.headers as any).set === 'function') {
+        try { (config.headers as any).set('Content-Type', undefined as any) } catch {}
+      }
+    } catch {}
   }
   return config
 })
