@@ -13,15 +13,23 @@ import (
 // SOLID: OCP — new metrics = new field + method. SRP — count only.
 // Pattern: Singleton (Global), Null Object (zero value is valid).
 type Metrics struct {
-	llmCallsTotal      atomic.Int64
-	llmErrorsTotal     atomic.Int64
-	llmCostUSDTotal    atomic.Value // float64
-	workflowsStarted   atomic.Int64
-	workflowsFailed    atomic.Int64
-	agentLoopIter      atomic.Int64
-	outboxPublished    atomic.Int64
-	entitlementDenied  atomic.Int64
-	tenantDenied       atomic.Int64
+	llmCallsTotal        atomic.Int64
+	llmErrorsTotal       atomic.Int64
+	llmCostUSDTotal      atomic.Value // float64
+	workflowsStarted     atomic.Int64
+	workflowsFailed      atomic.Int64
+	agentLoopIter        atomic.Int64
+	outboxPublished      atomic.Int64
+	entitlementDenied    atomic.Int64
+	tenantDenied         atomic.Int64
+	vacuumPickCalls      atomic.Int64
+	vacuumJobsPicked     atomic.Int64
+	vacuumJobsDone       atomic.Int64
+	vacuumJobsFailed     atomic.Int64
+	vacuumChunksVerified atomic.Int64
+	llmCallsVacuum       atomic.Int64
+	preservationFail     atomic.Int64
+	dagStageMs           atomic.Int64
 }
 
 // Global is the process-wide metrics instance.
@@ -40,7 +48,15 @@ func (m *Metrics) IncWorkflowFailed()   { m.workflowsFailed.Add(1) }
 func (m *Metrics) IncAgentLoopIter()    { m.agentLoopIter.Add(1) }
 func (m *Metrics) IncOutboxPublished()  { m.outboxPublished.Add(1) }
 func (m *Metrics) IncEntitlementDenied() { m.entitlementDenied.Add(1) }
-func (m *Metrics) IncTenantDenied()      { m.tenantDenied.Add(1) }
+func (m *Metrics) IncTenantDenied()       { m.tenantDenied.Add(1) }
+func (m *Metrics) IncVacuumPick()         { m.vacuumPickCalls.Add(1) }
+func (m *Metrics) IncVacuumPicked(n int64) { m.vacuumJobsPicked.Add(n) }
+func (m *Metrics) IncVacuumDone()         { m.vacuumJobsDone.Add(1) }
+func (m *Metrics) IncVacuumFailed()       { m.vacuumJobsFailed.Add(1) }
+func (m *Metrics) AddVacuumChunksReal(n int64) { m.vacuumChunksVerified.Add(n) }
+func (m *Metrics) IncLLMVacuum()        { m.llmCallsVacuum.Add(1) }
+func (m *Metrics) IncPreservationFail() { m.preservationFail.Add(1) }
+func (m *Metrics) AddDAGStageMs(ms int64) { m.dagStageMs.Add(ms) }
 
 // Typed getters (C10): the reliability surface reads these directly instead
 // of type-asserting out of Snapshot()'s map[string]interface{}.
@@ -53,6 +69,11 @@ func (m *Metrics) LLMErrorsTotal() int64 { return m.llmErrorsTotal.Load() }
 
 // UptimeSeconds returns seconds since process start.
 func (m *Metrics) UptimeSeconds() int64 { return int64(time.Since(startTime).Seconds()) }
+func (m *Metrics) VacuumJobsDone() int64       { return m.vacuumJobsDone.Load() }
+func (m *Metrics) VacuumChunksVerified() int64 { return m.vacuumChunksVerified.Load() }
+func (m *Metrics) VacuumPickCalls() int64      { return m.vacuumPickCalls.Load() }
+func (m *Metrics) LLMVacuumCalls() int64       { return m.llmCallsVacuum.Load() }
+func (m *Metrics) PreservationFails() int64    { return m.preservationFail.Load() }
 
 func (m *Metrics) AddLLMCost(usd float64) {
 	for {
@@ -66,6 +87,8 @@ func (m *Metrics) AddLLMCost(usd float64) {
 		}
 	}
 }
+
+func (m *Metrics) AddVacuumChunks(n int64) { m.vacuumChunksVerified.Add(n) }
 
 // Snapshot returns current metric values for the /metrics handler.
 func (m *Metrics) Snapshot() map[string]interface{} {
@@ -81,8 +104,16 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"workflows_failed":      m.workflowsFailed.Load(),
 		"agent_loop_iter":       m.agentLoopIter.Load(),
 		"outbox_published":      m.outboxPublished.Load(),
-		"entitlement_denied":    m.entitlementDenied.Load(),
-		"tenant_denied":         m.tenantDenied.Load(),
-		"uptime_seconds":        int64(time.Since(startTime).Seconds()),
+		"entitlement_denied":     m.entitlementDenied.Load(),
+		"tenant_denied":          m.tenantDenied.Load(),
+		"vacuum_pick_calls":      m.vacuumPickCalls.Load(),
+		"vacuum_jobs_picked":     m.vacuumJobsPicked.Load(),
+		"vacuum_jobs_done":       m.vacuumJobsDone.Load(),
+		"vacuum_jobs_failed":     m.vacuumJobsFailed.Load(),
+		"vacuum_chunks_verified":   m.vacuumChunksVerified.Load(),
+		"vacuum_llm_calls":         m.llmCallsVacuum.Load(),
+		"vacuum_preservation_fail": m.preservationFail.Load(),
+		"vacuum_dag_stage_ms":      m.dagStageMs.Load(),
+		"uptime_seconds":           int64(time.Since(startTime).Seconds()),
 	}
 }

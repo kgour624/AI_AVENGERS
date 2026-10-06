@@ -1,0 +1,11 @@
+DROP TRIGGER IF EXISTS trg_kachra_bump ON kachra_patterns;
+DROP TRIGGER IF EXISTS trg_kachra_updated ON kachra_patterns;
+DROP TRIGGER IF EXISTS trg_candidate_updated ON candidate_kachra;
+DROP TRIGGER IF EXISTS trg_file_jobs_updated ON file_jobs;
+DROP FUNCTION IF EXISTS bump_brain_version();
+DROP TABLE IF EXISTS file_chunks;
+DROP TABLE IF EXISTS file_jobs;
+DROP TABLE IF EXISTS candidate_kachra;
+DROP TABLE IF EXISTS kachra_patterns;
+DROP TABLE IF EXISTS brain_version;
+DROP FUNCTION IF EXISTS set_updated_at();

@@ -61,6 +61,8 @@ import (
 	"ai_avengers/backend/internal/tenant"
 	"ai_avengers/backend/internal/training"
 	"ai_avengers/backend/internal/usage"
+	"ai_avengers/backend/internal/vacuum"
+	"ai_avengers/backend/internal/vacuum/llm"
 	"ai_avengers/backend/internal/validation"
 	"ai_avengers/backend/internal/workflow"
 	"ai_avengers/backend/internal/receptionist"
@@ -99,7 +101,6 @@ func main() {
 		logger.Fatal("failed to connect to PostgreSQL", zap.Error(err))
 	}
 	defer postgres.Close()
-
 
 	// Connect to Redis
 	redisClient, err := db.ConnectRedis(ctx, cfg.Redis, logger)
@@ -192,8 +193,29 @@ func main() {
 	// on next Embed() call with no server restart needed.
 	embedder := ml.NewDynamicEmbedder(postgres.Pool, mlClient, ccEmbedder, logger)
 
+	// Vacuum Brain 6-phase pipeline: hot-reloadable Brain Store + deterministic Engine + Phase 5 LLM harness
+	vacuumSvc := vacuum.NewService(postgres.Pool, logger)
+	if err := vacuumSvc.Brain().Reload(ctx); err != nil {
+		logger.Warn("vacuum brain initial reload failed (empty patterns ok)", zap.Error(err))
+	}
+	// Phase 5 LLM wiring via ModelGateway (nil-safe: gateway may be nil in dev without creds)
+	{
+		// Build vacuum LLM adapter from ModelGateway using funcAdapter (breaks import cycle)
+		// We call modelGateway.Call directly via a closure that maps vacuum/llm.LLMRequest to gateway.LLMRequest
+		if modelGateway != nil {
+			vacuumAdapter := buildVacuumLLMAdapter(modelGateway)
+			// Wire into service (Phase 5 I->P->O)
+			// NOTE: vacuum/llm interfaces live in internal/vacuum/llm; import in main.go header
+			wireVacuumLLM(vacuumSvc, vacuumAdapter, logger)
+		} else {
+			// Still wire preservation guard even without LLM (deterministic SHA verify)
+			wireVacuumLLM(vacuumSvc, nil, logger)
+		}
+	}
+	go vacuumSvc.Start(ctx)
+
 	// Build router — single call, single definition
-	router := buildRouter(ctx, cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, embedder, domainRegistry, categoryRegistry)
+	router := buildRouter(ctx, cfg, logger, postgres, redisClient, jwtService, authService, modelGateway, mlClient, embedder, domainRegistry, categoryRegistry, vacuumSvc)
 
 	// 24-hour auto-fail checker for paused ingestion jobs.
 	// WHY here not in admin_handler: server-lifecycle concern, not per-request.
@@ -420,6 +442,7 @@ func buildRouter(
 	embedder ml.Embedder,
 	domainRegistry *chinawall.DomainRegistry,
 	categoryRegistry *category.Registry,
+	vacuumSvc *vacuum.Service,
 ) *gin.Engine {
 	router := gin.New()
 
@@ -1120,11 +1143,14 @@ func buildRouter(
 
 	adminGroup := v1.Group("/admin")
 	adminGroup.Use(middleware.AuthMiddleware(jwtService, logger))
+	adminGroup.Use(middleware.AdminMiddleware())
+	// Vacuum Brain 6-phase pipeline — Input: admin JWT -> Process: brain trie + deterministic engine -> Output: cleaned chunks
+	vacuumHandler := vacuum.NewHandler(postgres.Pool, vacuumSvc, logger)
+	vacuumHandler.Register(adminGroup)
 	// Publications live under the admin group so only admins can create or push
 	// them; the public read path shares the same store but has no write route.
 	publications := adminGroup.Group("/publications")
 	publications.POST("/:id/push", wfHandler.PushToPublication)
-	adminGroup.Use(middleware.AdminMiddleware())
 	{
 		adminGroup.GET("/experts", adminHandler.ListExperts)
 		adminGroup.POST("/experts", adminHandler.CreateExpert)
@@ -2288,4 +2314,49 @@ func (a *receptionistExpertAdapter) GetExpertName(ctx context.Context, expertID 
         }
     }
     return "Expert-" + expertID.String()[:8], nil
+}
+
+// Vacuum Phase 5 LLM wiring helpers (Harness > Prompt, No-Trust)
+func buildVacuumLLMAdapter(gw *gateway.ModelGateway) llm.LLMCaller {
+	return llm.NewFuncAdapter(func(ctx context.Context, req llm.LLMRequest) (*llm.LLMResponse, error) {
+		mt := gateway.ModelFast
+		if req.Model == "strong" {
+			mt = gateway.ModelStrong
+		} else if req.Model == "cheap" {
+			mt = gateway.ModelCheap
+		}
+		resp, err := gw.Call(ctx, gateway.LLMRequest{
+			Model:        mt,
+			SystemPrompt: req.SystemPrompt,
+			UserPrompt:   req.UserPrompt,
+			MaxTokens:    req.MaxTokens,
+			Temperature:  req.Temperature,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return &llm.LLMResponse{
+			Content:      resp.Content,
+			InputTokens:  resp.InputTokens,
+			OutputTokens: resp.OutputTokens,
+			ModelUsed:    resp.ModelUsed,
+		}, nil
+	})
+}
+
+func wireVacuumLLM(svc *vacuum.Service, caller llm.LLMCaller, logger *zap.Logger) {
+	guard := llm.NewSHAPreservationGuard()
+	if caller == nil {
+		svc.SetLLM(nil, nil, guard)
+		if logger != nil {
+			logger.Info("vacuum LLM: gateway not wired, deterministic+guard only")
+		}
+		return
+	}
+	clf := llm.NewGeminiClassifier(caller)
+	hg := llm.NewClaudeHeadingGenerator(caller)
+	svc.SetLLM(clf, hg, guard)
+	if logger != nil {
+		logger.Info("vacuum LLM harness wired: Gemini classifier + Claude headings + SHA guard")
+	}
 }

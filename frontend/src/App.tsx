@@ -98,6 +98,7 @@ const router = createBrowserRouter([
               { path: 'rag', lazy: () => import('@/pages/admin/AdminRagSettings') },
               { path: 'chunks', lazy: () => import('@/pages/admin/AdminChunksExplorer') },
               { path: 'mcp', lazy: () => import('@/pages/admin/AdminMcpControlCenter') },
+              { path: 'vacuum', lazy: () => import('@/pages/admin/AdminVacuum') },
             ],
           },
         ],

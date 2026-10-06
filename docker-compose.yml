@@ -71,6 +71,7 @@ services:
       - AIDER_PROXY_TOKEN=${AIDER_PROXY_TOKEN:-dev_aider_proxy_token}
       - CAVOTI_API_KEY=${CAVOTI_API_KEY:-}
       - CAVOTI_BASE_URL=${CAVOTI_BASE_URL:-https://cavoti.com/v1}
+      - VACUUM_STORAGE_ROOT=/tmp/vacuum_storage
     depends_on:
       ml-sidecar:
         condition: service_started
