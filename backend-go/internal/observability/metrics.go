@@ -30,6 +30,14 @@ type Metrics struct {
 	llmCallsVacuum       atomic.Int64
 	preservationFail     atomic.Int64
 	dagStageMs           atomic.Int64
+	kachraSuggested      atomic.Int64
+	kachraVerified       atomic.Int64
+	kachraMapped         atomic.Int64
+	vacuumAutoPromoted   atomic.Int64
+	vacuumFillerFiltered atomic.Int64
+	vacuumCacheHit       atomic.Int64
+	vacuumCacheMiss      atomic.Int64
+	vacuumDriftFail      atomic.Int64
 }
 
 // Global is the process-wide metrics instance.
@@ -57,6 +65,21 @@ func (m *Metrics) AddVacuumChunksReal(n int64) { m.vacuumChunksVerified.Add(n) }
 func (m *Metrics) IncLLMVacuum()        { m.llmCallsVacuum.Add(1) }
 func (m *Metrics) IncPreservationFail() { m.preservationFail.Add(1) }
 func (m *Metrics) AddDAGStageMs(ms int64) { m.dagStageMs.Add(ms) }
+func (m *Metrics) IncKachraSuggested(n int64) { m.kachraSuggested.Add(n) }
+func (m *Metrics) IncKachraVerified(n int64)  { m.kachraVerified.Add(n) }
+func (m *Metrics) IncKachraMapped(n int64)    { m.kachraMapped.Add(n) }
+func (m *Metrics) KachraSuggested() int64 { return m.kachraSuggested.Load() }
+func (m *Metrics) KachraVerified() int64  { return m.kachraVerified.Load() }
+func (m *Metrics) KachraMapped() int64    { return m.kachraMapped.Load() }
+func (m *Metrics) IncAutoPromoted(n int64)    { m.vacuumAutoPromoted.Add(n) }
+func (m *Metrics) IncFillerFiltered(n int64)  { m.vacuumFillerFiltered.Add(n) }
+func (m *Metrics) IncCacheHit()               { m.vacuumCacheHit.Add(1) }
+func (m *Metrics) IncCacheMiss()              { m.vacuumCacheMiss.Add(1) }
+func (m *Metrics) IncDriftFail()              { m.vacuumDriftFail.Add(1) }
+func (m *Metrics) AutoPromoted() int64    { return m.vacuumAutoPromoted.Load() }
+func (m *Metrics) FillerFiltered() int64  { return m.vacuumFillerFiltered.Load() }
+func (m *Metrics) CacheHit() int64        { return m.vacuumCacheHit.Load() }
+func (m *Metrics) CacheMiss() int64       { return m.vacuumCacheMiss.Load() }
 
 // Typed getters (C10): the reliability surface reads these directly instead
 // of type-asserting out of Snapshot()'s map[string]interface{}.
@@ -114,6 +137,14 @@ func (m *Metrics) Snapshot() map[string]interface{} {
 		"vacuum_llm_calls":         m.llmCallsVacuum.Load(),
 		"vacuum_preservation_fail": m.preservationFail.Load(),
 		"vacuum_dag_stage_ms":      m.dagStageMs.Load(),
-		"uptime_seconds":           int64(time.Since(startTime).Seconds()),
+		"vacuum_kachra_suggested": m.kachraSuggested.Load(),
+		"vacuum_kachra_verified":  m.kachraVerified.Load(),
+		"vacuum_kachra_mapped":    m.kachraMapped.Load(),
+		"vacuum_auto_promoted":    m.vacuumAutoPromoted.Load(),
+		"vacuum_filler_filtered":  m.vacuumFillerFiltered.Load(),
+		"vacuum_cache_hit":        m.vacuumCacheHit.Load(),
+		"vacuum_cache_miss":       m.vacuumCacheMiss.Load(),
+		"vacuum_drift_fail":       m.vacuumDriftFail.Load(),
+		"uptime_seconds":          int64(time.Since(startTime).Seconds()),
 	}
 }

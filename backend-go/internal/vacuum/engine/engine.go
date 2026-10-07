@@ -10,10 +10,13 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/vacuum/brain"
 	"ai_avengers/backend/internal/vacuum/chunker"
 	"ai_avengers/backend/internal/vacuum/filecontext"
+	"ai_avengers/backend/internal/vacuum/llm"
 )
 
 // Engine — Vacuum Brain Phase 2 deterministic pipeline.
@@ -42,6 +45,7 @@ var deterministicRes = []*regexp.Regexp{
 
 var wsRe = regexp.MustCompile(`[ \t]+`)
 var multiNLRe = regexp.MustCompile("\n{3,}")
+var fillerThreshold = 0.62 // classifier auto-filter: filler confidence below this = keep content
 
 func deterministicClean(text string) (string, []string) {
 	hits := []string{}
@@ -65,6 +69,25 @@ func deterministicClean(text string) (string, []string) {
 	out = regexp.MustCompile(` +`).ReplaceAllString(out, " ")
 	return strings.TrimSpace(out), hits
 }
+
+// IsFiller reports whether classifier label+confidence should trigger auto-filter.
+// Mental: INPUT label,confidence, text -> PROCESS threshold 0.62 (tunable) + min words -> OUTPUT bool
+func IsFiller(label string, conf float64, textLen int) bool {
+	if label != "filler" {
+		return false
+	}
+	if conf < fillerThreshold {
+		return false
+	}
+	// very long chunks are rarely pure filler even if LLM says so
+	if textLen > 8000 {
+		return false
+	}
+	return true
+}
+
+// FillerThreshold returns current threshold for observability.
+func FillerThreshold() float64 { return fillerThreshold }
 
 type CleanResult struct {
 	CleanedText string
@@ -130,6 +153,203 @@ func (e *Engine) Clean(ctx context.Context, text string) (*CleanResult, error) {
 	chunks := chunker.ChunkText(cleaned, 4000)
 	shaOut := sha256Hex(cleaned)
 	return &CleanResult{CleanedText: cleaned, Chunks: chunks, Hits: deduped, P1Hits: p1Hits, SHA256In: shaIn, SHA256Out: shaOut, Verified: len(cleaned) > 0}, nil
+}
+
+// CleanHybrid — DSA + LLM, hash safe. DSA is sole mutator.
+// P1/P2 baseline → chunk → concurrent LLM suggest → self cross-verify (confidence >=0.70 + reason gate) → DSA byte-exact mapping (word-boundary + TryVisit + resolveOverlaps) → descending splice + fallback + re-verify + contiguous + SHA guard.
+func (e *Engine) CleanHybrid(ctx context.Context, text string, det llm.KachraDetector, ver llm.KachraVerifier, sink llm.KachraSink, fileJobID string) (*CleanResult, error) {
+	_, cancel := context.WithCancel(ctx)
+	defer cancel()
+	shaIn := sha256Hex(text)
+	if strings.TrimSpace(text) == "" {
+		return &CleanResult{CleanedText: "", P1Hits: nil, Hits: nil, SHA256In: shaIn, SHA256Out: shaIn, Verified: true}, nil
+	}
+	afterP1, p1Hits := deterministicClean(text)
+	matches := e.brain.Search(afterP1)
+	filtered := resolveOverlaps(matches)
+	if det == nil {
+		return e.Clean(ctx, text)
+	}
+	chunks := chunker.ChunkText(afterP1, 4000)
+	if len(chunks) == 0 {
+		chunks = []chunker.Chunk{{Index: 0, Text: afterP1, Start: 0, End: len(afterP1)}}
+	}
+	semSize := len(chunks) * 2
+	if semSize > 20 {
+		semSize = 20
+	}
+	if semSize < 1 {
+		semSize = 1
+	}
+	sem := make(chan struct{}, semSize)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var allVerified []llm.KachraSpan
+	var llmMatches []brain.Match
+	for _, ch := range chunks {
+		if ctx.Err() != nil {
+			break
+		}
+		if strings.TrimSpace(ch.Text) == "" {
+			continue
+		}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(chunk chunker.Chunk) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			spans, err := det.Detect(ctx, chunk.Text)
+			if err != nil || len(spans) == 0 {
+				return
+			}
+			var verified []llm.KachraSpan
+			if ver != nil {
+				verified, err = ver.Verify(ctx, chunk.Text, spans)
+				if err != nil {
+					tmp := make([]llm.KachraSpan, 0, len(spans))
+					for _, s := range spans {
+						if s.Confidence >= 0.70 && strings.TrimSpace(s.Reason) != "" {
+							tmp = append(tmp, s)
+						}
+					}
+					verified = tmp
+				}
+			} else {
+				tmp := make([]llm.KachraSpan, 0, len(spans))
+				for _, s := range spans {
+					if s.Confidence >= 0.70 && strings.TrimSpace(s.Reason) != "" {
+						tmp = append(tmp, s)
+					}
+				}
+				verified = tmp
+			}
+			if len(verified) == 0 {
+				return
+			}
+			mapped := mapSpansToMatches(chunk, verified)
+			if len(mapped) == 0 {
+				return
+			}
+			mu.Lock()
+			allVerified = append(allVerified, verified...)
+			llmMatches = append(llmMatches, mapped...)
+			mu.Unlock()
+		}(ch)
+	}
+	wg.Wait()
+	combined := make([]brain.Match, 0, len(filtered)+len(llmMatches))
+	combined = append(combined, filtered...)
+	combined = append(combined, llmMatches...)
+	combined = resolveOverlaps(combined)
+	fc := filecontext.New()
+	deduped := make([]brain.Match, 0, len(combined))
+	for _, m := range combined {
+		if m.Start < 0 || m.End > len(afterP1) || m.Start >= m.End {
+			continue
+		}
+		if !fc.TryVisit(m.Start, m.End) {
+			continue
+		}
+		deduped = append(deduped, m)
+		fc.Intervals.Insert(m.Start, m.End)
+	}
+	sort.Slice(deduped, func(i, j int) bool { return deduped[i].Start > deduped[j].Start })
+	cleaned := afterP1
+	for _, m := range deduped {
+		if m.Start < 0 || m.End > len(cleaned) || m.Start >= m.End {
+			continue
+		}
+		cleaned = cleaned[:m.Start] + " " + cleaned[m.End:]
+	}
+	cleaned = strings.TrimSpace(wsRe.ReplaceAllString(cleaned, " "))
+	cleaned = regexp.MustCompile(`\s*\n\s*`).ReplaceAllString(cleaned, "\n")
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" {
+		cleaned = afterP1
+	}
+	if len(text) > 200 && len(cleaned) < len(text)/10 {
+		cleaned = afterP1
+	}
+	if strings.TrimSpace(cleaned) == "" {
+		cleaned = afterP1
+	}
+	for _, ch := range chunks {
+		fc.CheckpointSet.Store(ch.Index, struct{}{})
+	}
+	shaOut := sha256Hex(cleaned)
+	verified := shaOut != "" && len(shaOut) == 64 && len(strings.TrimSpace(cleaned)) > 0
+	if len(llmMatches) > 0 {
+		observability.Global.IncKachraMapped(int64(len(llmMatches)))
+	}
+	if sink != nil && len(allVerified) > 0 {
+		toSink := make([]llm.KachraSpan, len(allVerified))
+		copy(toSink, allVerified)
+		fid := fileJobID
+		chunkSample := afterP1
+		if len(chunkSample) > 2000 {
+			chunkSample = chunkSample[:2000]
+		}
+		go func() {
+			bg, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel2()
+			_, _ = sink.SaveWithFileID(bg, fid, toSink, chunkSample)
+		}()
+	}
+	chunksOut := chunker.ChunkText(cleaned, 4000)
+	return &CleanResult{CleanedText: cleaned, Chunks: chunksOut, Hits: deduped, P1Hits: p1Hits, SHA256In: shaIn, SHA256Out: shaOut, Verified: verified}, nil
+}
+
+func mapSpansToMatches(chunk chunker.Chunk, spans []llm.KachraSpan) []brain.Match {
+	if len(spans) == 0 || strings.TrimSpace(chunk.Text) == "" {
+		return nil
+	}
+	out := make([]brain.Match, 0, len(spans))
+	seen := map[string]bool{}
+	for _, s := range spans {
+		txt := strings.TrimSpace(s.Text)
+		if txt == "" {
+			continue
+		}
+		key := strings.ToLower(txt) + "|" + strings.ToLower(s.Type)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		idx := strings.Index(chunk.Text, txt)
+		if idx < 0 {
+			lowerChunk := strings.ToLower(chunk.Text)
+			lowerTxt := strings.ToLower(txt)
+			idx = strings.Index(lowerChunk, lowerTxt)
+			if idx < 0 {
+				continue
+			}
+		}
+		start := chunk.Start + idx
+		end := start + len(txt)
+		if !isWordBoundaryLLM(chunk.Text, idx, idx+len(txt)) {
+			if !strings.Contains(txt, " ") {
+				continue
+			}
+		}
+		out = append(out, brain.Match{PatternID: "", Pattern: txt, Start: start, End: end})
+	}
+	return out
+}
+
+func isWordBoundaryLLM(text string, start, end int) bool {
+	leftOK := start == 0 || llmIsBoundary(text[start-1])
+	rightOK := end >= len(text) || llmIsBoundary(text[end])
+	return leftOK && rightOK
+}
+
+func llmIsBoundary(b byte) bool {
+	if b == ' ' || b == '\n' || b == '\r' || b == '\t' {
+		return true
+	}
+	if (b >= '!' && b <= '/') || (b >= ':' && b <= '@') || (b >= '[' && b <= '`') || (b >= '{' && b <= '~') {
+		return true
+	}
+	return false
 }
 
 // CleanReader — streaming entry for large files (mmap/bufio ready). Reads via pooled buffer.

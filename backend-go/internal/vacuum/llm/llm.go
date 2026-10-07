@@ -50,3 +50,33 @@ type PreservationGuard interface {
 	Verify(ctx context.Context, originalSHA256 string, cleanedText string) (verified bool, computedSHA string, err error)
 	VerifyHash(originalSHA256, cleanedSHA256 string) bool
 }
+
+// ── Phase 1 — Kachra Brain (Hybrid DSA+LLM foundation) ──
+
+// KachraSpan is LLM's suggestion — strictly {text, reason, type, confidence}.
+// LLM NEVER mutates content; DSA is the sole remover via byte-exact mapping.
+type KachraSpan struct {
+	Text       string  `json:"text"`
+	Reason     string  `json:"reason"`
+	Type       string  `json:"type"`       // filler|repetition|asr_error|classroom_meta|hinglish|logistics|semantic_noise|smalltalk
+	Confidence float64 `json:"confidence"` // 0.0 - 1.0
+}
+
+// KachraDetector — LLM suggests kachra spans, DSA validates & removes.
+// Contract: Input chunk text -> Process LLM strict JSON temp 0.0 -> Output []KachraSpan (no mutation).
+type KachraDetector interface {
+	Detect(ctx context.Context, chunkText string) ([]KachraSpan, error)
+}
+
+// KachraVerifier — LLM self cross-verify: re-checks each suggested span.
+// Contract: Input (chunkText + candidate spans) -> Process LLM temp 0.0 -> Output filtered spans (confidence >= 0.70).
+type KachraVerifier interface {
+	Verify(ctx context.Context, chunkText string, spans []KachraSpan) ([]KachraSpan, error)
+}
+
+// KachraSink — persists LLM suggestions to candidate_kachra (status=pending) for human approve.
+// Future seed: approval bumps kachra_patterns + brain_version -> 30s hot-reload.
+type KachraSink interface {
+	Save(ctx context.Context, spans []KachraSpan, chunkText string) (int, error)
+	SaveWithFileID(ctx context.Context, fileJobID string, spans []KachraSpan, chunkText string) (int, error)
+}

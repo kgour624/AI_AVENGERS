@@ -6,6 +6,7 @@ export default function AdminVacuum() {
   const qc = useQueryClient()
   const [pattern, setPattern] = useState('')
   const [previewText, setPreviewText] = useState('uh so guys you know this is a test lecture transcript with thank you so much and can you see my screen?')
+  const [diffResult, setDiffResult] = useState<any>(null)
   const [previewResult, setPreviewResult] = useState<any>(null)
   const [uploadFile, setUploadFile] = useState<File | null>(null)
   const [selectedJob, setSelectedJob] = useState<string | null>(null)
@@ -54,8 +55,41 @@ export default function AdminVacuum() {
   })
 
   const createMut = useMutation({
-    mutationFn: async () => (await baseAPI.post('/api/v1/admin/vacuum/patterns', { pattern, pattern_type: 'PHRASE', category: 'filler' })).data,
+    mutationFn: async () => (await baseAPI.post('/api/v1/admin/vacuum/patterns', { pattern, patternType: 'PHRASE', category: 'filler' })).data,
     onSuccess: () => { setPattern(''); qc.invalidateQueries({ queryKey: ['vacuum-patterns'] }); qc.invalidateQueries({ queryKey: ['vacuum-brain'] }) },
+  })
+  const diffMut = useMutation({
+    mutationFn: async () => {
+      console.log('[vacuum diff] POST /preview/diff ->', previewText.slice(0,120))
+      const res = await baseAPI.post('/api/v1/admin/vacuum/preview/diff', { text: previewText })
+      console.log('[vacuum diff] response', res.data)
+      return res.data
+    },
+    onSuccess: (d:any) => {
+      const data=d?.data??d
+      // baseAPI's response interceptor deep-camelizes keys, so read camelCase (dsaCleaned, combinedCleaned, ...).
+      console.log('[vacuum diff] success', data)
+      setDiffResult(data)
+    },
+    onError: (e:any) => {
+      const msg = e?.response?.data?.error?.message || e?.response?.data?.message || e?.message || 'Diff preview failed'
+      console.error('[vacuum diff] error', e?.response?.status, e?.response?.data, e)
+      alert('Diff failed: ' + msg)
+    },
+  })
+  const autoPromoteMut = useMutation({
+    mutationFn: async () => (await baseAPI.post('/api/v1/admin/vacuum/auto-promote')).data,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['vacuum-candidates'] }); qc.invalidateQueries({ queryKey: ['vacuum-brain'] }); qc.invalidateQueries({ queryKey: ['vacuum-metrics'] }) },
+  })
+  const { data: evalData } = useQuery({
+    queryKey: ['vacuum-eval'],
+    queryFn: async () => (await baseAPI.get('/api/v1/admin/vacuum/eval?limit=10')).data.data,
+    refetchInterval: 15000,
+  })
+  const { data: driftData } = useQuery({
+    queryKey: ['vacuum-drift'],
+    queryFn: async () => (await baseAPI.get('/api/v1/admin/vacuum/drift')).data,
+    refetchInterval: 30000,
   })
   const approveMut = useMutation({
     mutationFn: async (id: string) => (await baseAPI.post(`/api/v1/admin/vacuum/candidates/${id}/approve`)).data,
@@ -133,7 +167,7 @@ export default function AdminVacuum() {
     if (allSelected) setSelected(new Set())
     else setSelected(new Set(allIds))
   }
-  const brainVersion = (brain as any)?.version ?? (brain as any)?.data?.version ?? (brain as any)?.brain_version ?? '-'
+  const brainVersion = (brain as any)?.version ?? (brain as any)?.data?.version ?? (brain as any)?.brainVersion ?? '-'
   const brainPatterns = (brain as any)?.patterns ?? (brain as any)?.data?.patterns ?? '-'
 
   return (
@@ -145,7 +179,7 @@ export default function AdminVacuum() {
         </div>
         <div className="text-right">
           <div className="px-3 py-1 rounded bg-violet-600 text-white font-mono text-xs">brain v{brainVersion} · {brainPatterns} patterns</div>
-          <div className="text-xs text-slate-400">hot-reload 30s{metrics ? ` · pending ${metrics.candidates_pending ?? 0} · done ${metrics.vacuum_jobs_done ?? 0}` : ''}</div>
+          <div className="text-xs text-slate-400">hot-reload 30s{metrics ? ` · pending ${metrics.candidatesPending ?? 0} · done ${metrics.vacuumJobsDone ?? 0}` : ''}</div>
         </div>
       </div>
 
@@ -158,7 +192,7 @@ export default function AdminVacuum() {
           </div>
           <div className="max-h-64 overflow-auto text-sm divide-y">
             {(patterns || []).map((p: any) => (
-              <div key={p.id} className="py-1 flex justify-between"><span>{p.pattern} <span className="text-slate-400">({p.category}/{p.pattern_type})</span></span><span className="text-slate-400">{p.hit_count}</span></div>
+              <div key={p.id} className="py-1 flex justify-between"><span>{p.pattern} <span className="text-slate-400">({p.category}/{p.patternType})</span></span><span className="text-slate-400">{p.hitCount}</span></div>
             ))}
             {(!patterns || patterns.length === 0) && <div className="text-slate-400 py-2">No patterns yet — add fuel.</div>}
           </div>
@@ -177,7 +211,7 @@ export default function AdminVacuum() {
           <div className="max-h-64 overflow-auto text-sm divide-y border rounded">
             {(candidates || []).map((c: any) => (
               <div key={c.id} className="py-2 px-2 flex items-start justify-between gap-2 hover:bg-slate-50">
-                <div className="flex gap-2 items-start"><input type="checkbox" checked={selected.has(c.id)} onChange={()=>toggle(c.id)} className="mt-1" /><div><div className="font-mono font-medium text-sm">{c.pattern} <span className="text-slate-400 text-xs">· {c.category} · ×{c.hit_count}</span></div><div className="text-slate-500 text-xs truncate max-w-[260px]">{c.context_snippet}</div></div></div>
+                <div className="flex gap-2 items-start"><input type="checkbox" checked={selected.has(c.id)} onChange={()=>toggle(c.id)} className="mt-1" /><div><div className="font-mono font-medium text-sm">{c.pattern} <span className="text-slate-400 text-xs">· {c.category} · ×{c.hitCount}</span></div><div className="text-slate-500 text-xs truncate max-w-[260px]">{c.contextSnippet}</div></div></div>
                 <div className="flex gap-1 shrink-0">
                   <button onClick={() => approveMut.mutate(c.id)} className="px-2 py-1 bg-green-600 text-white rounded text-xs">Approve</button>
                   <button onClick={() => rejectMut.mutate(c.id)} className="px-2 py-1 bg-slate-200 rounded text-xs">Reject</button>
@@ -190,10 +224,15 @@ export default function AdminVacuum() {
       </div>
 
       <div className="border rounded p-4 space-y-3">
-        <h2 className="font-semibold">Split View — Raw vs Clean (Preview)</h2>
-        <div className="grid md:grid-cols-2 gap-3">
-          <div><div className="text-xs font-semibold text-slate-600">RAW</div><textarea value={previewText} onChange={e => setPreviewText(e.target.value)} placeholder="Paste raw transcript snippet..." rows={6} className="w-full border rounded px-3 py-2 text-sm font-mono" /><button onClick={() => previewMut.mutate()} disabled={!previewText.trim()} className="mt-2 w-full px-4 py-2 bg-violet-600 text-white rounded text-sm disabled:opacity-40">{previewMut.isPending ? 'Cleaning...' : 'Preview Clean →'}</button>{previewResult && <div className="text-xs text-slate-500 mt-1">hits {previewResult.hits?.length ?? 0} · p1_hits {previewResult.p1_hits?.length ?? 0} · v{previewResult.brain_version} · sha {previewResult.sha256_out?.slice(0,8)}</div>}</div>
-          <div><div className="text-xs font-semibold text-emerald-700">CLEANED</div>{!previewResult ? <div className="h-[140px] flex items-center justify-center text-slate-400 text-sm border border-dashed rounded bg-white">Run Preview Clean</div> : <><pre className="whitespace-pre-wrap text-sm bg-emerald-50 border rounded p-2 min-h-[120px] max-h-[180px] overflow-auto">{previewResult.cleaned || '(empty)'}</pre><div className="flex flex-wrap gap-1 mt-2">{(previewResult.hits||[]).map((h:any,i:number)=>(<span key={i} className="px-2 py-0.5 bg-red-100 text-red-700 rounded text-xs font-mono">{h.Pattern||h.pattern}</span>))}</div></>}</div>
+        <div className="flex justify-between items-center"><h2 className="font-semibold">Split View — Raw vs Clean (Preview)</h2><div className="flex gap-2"><button onClick={()=>diffMut.mutate()} disabled={!previewText.trim() || diffMut.isPending} className="px-3 py-1 bg-indigo-600 text-white rounded text-xs disabled:opacity-40">{diffMut.isPending?'Diff...':'DSA vs LLM vs Combined'}</button><button onClick={()=>autoPromoteMut.mutate()} disabled={autoPromoteMut.isPending} className="px-3 py-1 bg-emerald-600 text-white rounded text-xs disabled:opacity-40">Auto-Promote ≥3hits 0.90</button></div></div>
+        <div className="grid md:grid-cols-3 gap-3">
+          <div><div className="text-xs font-semibold text-slate-600">RAW</div><textarea value={previewText} onChange={e => setPreviewText(e.target.value)} placeholder="Paste raw transcript snippet..." rows={6} className="w-full border rounded px-3 py-2 text-sm font-mono" /><div className="flex gap-2 mt-2"><button onClick={() => previewMut.mutate()} disabled={!previewText.trim()} className="flex-1 px-4 py-2 bg-violet-600 text-white rounded text-sm disabled:opacity-40">{previewMut.isPending ? 'Cleaning...' : 'Preview Clean →'}</button></div>{previewResult && <div className="text-xs text-slate-500 mt-1">hits {previewResult.hits?.length ?? 0} · p1Hits {previewResult.p1Hits?.length ?? 0} · v{previewResult.brainVersion} · sha {previewResult.sha256Out?.slice(0,8)}</div>}
+            {diffResult && <div className="text-[11px] mt-1 p-1 bg-indigo-50 rounded">DSA hits {(diffResult.dsaHits||[]).length} → Combined {(diffResult.combinedHits||[]).length} (+{diffResult.llmAddedHits||0} LLM) · filler thr {diffResult.fillerThreshold}</div>}
+            {driftData && (driftData as any)?.data?.drift && <div className="text-[11px] mt-1 p-1 bg-red-50 text-red-700 rounded">⚠ Drift: recent {(driftData as any).data.recentAvg?.toFixed?.(2)} vs older {(driftData as any).data.olderAvg?.toFixed?.(2)}</div>}
+            {evalData && <div className="text-[11px] mt-1">eval last {(evalData as any)?.eval?.length??0} · avg score {(evalData as any)?.avgEvalScore?.toFixed?.(3) ?? '-'}</div>}
+          </div>
+          <div><div className="text-xs font-semibold text-emerald-700">DSA CLEANED</div>{!(diffResult||previewResult) ? <div className="h-[140px] flex items-center justify-center text-slate-400 text-sm border border-dashed rounded bg-white">Run Preview Clean</div> : <><pre className="whitespace-pre-wrap text-sm bg-emerald-50 border rounded p-2 min-h-[120px] max-h-[180px] overflow-auto">{(diffResult?.dsaCleaned ?? previewResult.cleaned) || '(empty)'}</pre><div className="flex flex-wrap gap-1 mt-2">{((diffResult?.dsaHits||previewResult?.hits||[]) as any[]).map((h:any,i:number)=>(<span key={i} className="px-2 py-0.5 bg-slate-100 text-slate-700 rounded text-xs font-mono">{h.Pattern||h.pattern||h}</span>))}</div></>}</div>
+          <div><div className="text-xs font-semibold text-indigo-700">COMBINED (DSA+LLM)</div>{!diffResult ? <div className="h-[140px] flex items-center justify-center text-slate-400 text-sm border border-dashed rounded bg-white">Run DSA vs LLM vs Combined</div> : <><pre className="whitespace-pre-wrap text-sm bg-indigo-50 border rounded p-2 min-h-[120px] max-h-[180px] overflow-auto">{diffResult.combinedCleaned || '(empty)'}</pre><div className="flex flex-wrap gap-1 mt-2">{(diffResult.combinedHits||[]).map((h:any,i:number)=>(<span key={i} className="px-2 py-0.5 bg-violet-100 text-violet-700 rounded text-xs font-mono">{h.Pattern||h.pattern}</span>))}</div><div className="text-[10px] text-slate-400 mt-1">LLM added {diffResult.llmAddedHits||0} spans · thr {diffResult.fillerThreshold}</div></>}</div>
         </div>
       </div>
 
@@ -212,9 +251,9 @@ export default function AdminVacuum() {
       {stats && (
         <div className="border rounded p-3 flex flex-wrap gap-4 text-xs items-center">
           <span className="font-semibold">Stats:</span>
-          {Object.entries(stats.by_status || {}).map(([k,v]: any) => (<span key={k}>{k}: <b>{String(v)}</b></span>))}
-          <span>verified_chunks: <b>{stats.verified_chunks ?? 0}</b></span>
-          <span>avg_duration_ms: <b>{stats.avg_duration_ms ?? 0}</b></span>
+          {Object.entries(stats.byStatus || {}).map(([k,v]: any) => (<span key={k}>{k}: <b>{String(v)}</b></span>))}
+          <span>verified_chunks: <b>{stats.verifiedChunks ?? 0}</b></span>
+          <span>avg_duration_ms: <b>{stats.avgDurationMs ?? 0}</b></span>
         </div>
       )}
       <div className="border rounded p-4">
@@ -238,12 +277,12 @@ export default function AdminVacuum() {
         <div className="text-sm divide-y">
           {(jobs || []).map((j: any) => (
             <div key={j.id} className="py-2 flex justify-between items-center">
-              <div className="cursor-pointer" onClick={() => setSelectedJob(j.id)}><span className="font-medium">{j.file_name}</span> — <span className={j.status==='done' ? "text-emerald-600 font-semibold" : j.status==='verifying' ? "text-amber-600 font-semibold" : j.status==='failed' ? "text-red-600" : ""}>{j.status}</span> / phase {j.phase} {j.status==='done' && '✓'} {j.duration_ms!=null && <span className="text-slate-500 text-xs"> · {j.duration_ms}ms</span>} {j.preservation_verified && <span className="text-emerald-600 text-xs"> · preserved ✓</span>} {j.llm_classifier_label && <span className="text-violet-600 text-xs"> · {j.llm_classifier_label}</span>} {j.llm_heading_count>0 && <span className="text-slate-500 text-xs"> · headings:{j.llm_heading_count}</span>} {j.download_count>0 && <span className="text-slate-500 text-xs"> · ↓{j.download_count}</span>} {j.last_error && <span className="text-red-500 text-xs"> · {j.last_error.slice(0,40)}</span>}</div>
-              <div className="flex gap-2 items-center"><span className="text-slate-400 text-xs">{j.s3_key}</span>
+              <div className="cursor-pointer" onClick={() => setSelectedJob(j.id)}><span className="font-medium">{j.fileName}</span> — <span className={j.status==='done' ? "text-emerald-600 font-semibold" : j.status==='verifying' ? "text-amber-600 font-semibold" : j.status==='failed' ? "text-red-600" : ""}>{j.status}</span> / phase {j.phase} {j.status==='done' && '✓'} {j.durationMs!=null && <span className="text-slate-500 text-xs"> · {j.durationMs}ms</span>} {j.preservationVerified && <span className="text-emerald-600 text-xs"> · preserved ✓</span>} {j.llmClassifierLabel && <span className="text-violet-600 text-xs"> · {j.llmClassifierLabel}</span>} {j.llmHeadingCount>0 && <span className="text-slate-500 text-xs"> · headings:{j.llmHeadingCount}</span>} {j.downloadCount>0 && <span className="text-slate-500 text-xs"> · ↓{j.downloadCount}</span>} {j.lastError && <span className="text-red-500 text-xs"> · {j.lastError.slice(0,40)}</span>}</div>
+              <div className="flex gap-2 items-center"><span className="text-slate-400 text-xs">{j.s3Key}</span>
                 {j.status==='verifying' && <span className="px-2 py-1 bg-amber-100 text-amber-800 rounded text-xs flex items-center gap-1 border border-amber-300"><span className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin inline-block"></span> Processing... {j.phase}/6</span>}
                 {j.status==='scheduled' && <button onClick={() => executeMut.mutate(j.id)} disabled={executeMut.isPending} className="px-2 py-1 bg-amber-500 text-white rounded text-xs disabled:opacity-40">Execute</button>}
                 {(j.status==='failed' || j.status==='quarantined') && <button onClick={() => { if(confirm('Retry this job?')) retryMut.mutate(j.id) }} disabled={retryMut.isPending} className="px-2 py-1 bg-emerald-600 text-white rounded text-xs disabled:opacity-40">Retry</button>}
-                {j.status==='done' && <button disabled={downloadingId===j.id} onClick={()=>handleDownload(j.id, j.file_name)} className="px-3 py-1 bg-blue-600 text-white rounded text-xs disabled:opacity-50 shadow hover:bg-blue-700">{downloadingId===j.id ? 'Downloading...' : 'Download'}</button>}
+                {j.status==='done' && <button disabled={downloadingId===j.id} onClick={()=>handleDownload(j.id, j.fileName)} className="px-3 py-1 bg-blue-600 text-white rounded text-xs disabled:opacity-50 shadow hover:bg-blue-700">{downloadingId===j.id ? 'Downloading...' : 'Download'}</button>}
                 <button onClick={() => setSelectedJob(j.id)} className="px-2 py-1 bg-slate-100 rounded text-xs">Chunks</button>
               </div>
             </div>
@@ -253,7 +292,7 @@ export default function AdminVacuum() {
         {selectedJob && (
           <div className="mt-3 border rounded p-2 text-xs">
             <div className="font-semibold mb-1">Chunks for {selectedJob} ({(chunks||[]).length}) — verified contiguous 0..n</div>
-            {(chunks||[]).map((ch:any)=>(<div key={ch.chunk_index} className="py-1 border-t flex justify-between"><span>#{ch.chunk_index} [{ch.char_start}-{ch.char_end}] {ch.status} {ch.llm_label && <span className="text-violet-600">· {ch.llm_label} {(ch.llm_confidence||0).toFixed(2)}</span>}</span><span className="text-slate-400 font-mono">{ch.hash_output?.slice(0,16)}</span></div>))}
+            {(chunks||[]).map((ch:any)=>(<div key={ch.chunkIndex} className="py-1 border-t flex justify-between"><span>#{ch.chunkIndex} [{ch.charStart}-{ch.charEnd}] {ch.status} {ch.llmLabel && <span className="text-violet-600">· {ch.llmLabel} {(ch.llmConfidence||0).toFixed(2)}</span>}</span><span className="text-slate-400 font-mono">{ch.hashOutput?.slice(0,16)}</span></div>))}
             {(!chunks||chunks.length===0) && <div className="text-slate-400">No chunks yet — execute the job.</div>}
           </div>
         )}

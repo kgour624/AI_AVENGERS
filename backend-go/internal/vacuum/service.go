@@ -20,6 +20,9 @@ type Service struct {
 	classifier      llm.Classifier
 	headingGen      llm.HeadingGenerator
 	preservationGuard llm.PreservationGuard
+	kachraDetector  llm.KachraDetector
+	kachraVerifier  llm.KachraVerifier
+	kachraSink      llm.KachraSink
 	logger          *zap.Logger
 }
 
@@ -34,6 +37,9 @@ func (s *Service) DB() *pgxpool.Pool      { return s.db }
 func (s *Service) Classifier() llm.Classifier { return s.classifier }
 func (s *Service) HeadingGen() llm.HeadingGenerator { return s.headingGen }
 func (s *Service) Guard() llm.PreservationGuard { return s.preservationGuard }
+func (s *Service) KachraDetector() llm.KachraDetector { return s.kachraDetector }
+func (s *Service) KachraVerifier() llm.KachraVerifier { return s.kachraVerifier }
+func (s *Service) KachraSink() llm.KachraSink         { return s.kachraSink }
 
 // SetLLM wires Phase 5 LLM components. Nil args leave existing wiring.
 func (s *Service) SetLLM(c llm.Classifier, hg llm.HeadingGenerator, g llm.PreservationGuard) {
@@ -45,6 +51,19 @@ func (s *Service) SetLLM(c llm.Classifier, hg llm.HeadingGenerator, g llm.Preser
 	}
 	if g != nil {
 		s.preservationGuard = g
+	}
+}
+
+// SetKachraLLM wires Phase 1 hybrid brain. Nil args are no-ops (zero-risk).
+func (s *Service) SetKachraLLM(det llm.KachraDetector, ver llm.KachraVerifier, sink llm.KachraSink) {
+	if det != nil {
+		s.kachraDetector = det
+	}
+	if ver != nil {
+		s.kachraVerifier = ver
+	}
+	if sink != nil {
+		s.kachraSink = sink
 	}
 }
 

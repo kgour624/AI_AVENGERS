@@ -72,7 +72,7 @@ func (g *GeminiClassifier) doClassify(ctx context.Context, text string) (string,
 		Model:        "fast",
 		SystemPrompt: classifierSystem,
 		UserPrompt:   prompt,
-		MaxTokens:    64,
+		MaxTokens:    8100,
 		Temperature:  0.1,
 	})
 	if err != nil {

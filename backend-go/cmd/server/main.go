@@ -2351,17 +2351,33 @@ func buildVacuumLLMAdapter(gw *gateway.ModelGateway) llm.LLMCaller {
 
 func wireVacuumLLM(svc *vacuum.Service, caller llm.LLMCaller, logger *zap.Logger) {
 	guard := llm.NewSHAPreservationGuard()
+	// Phase 1 kachra sink: DB-backed even without LLM (nil caller -> detector/verifier nil, sink still wired)
+	var kSink llm.KachraSink
+	if svc.DB() != nil {
+		kSink = llm.NewDBCandidateSink(svc.DB(), logger)
+	} else {
+		kSink = llm.NoopSink{}
+	}
 	if caller == nil {
 		svc.SetLLM(nil, nil, guard)
+		svc.SetKachraLLM(nil, nil, kSink)
 		if logger != nil {
-			logger.Info("vacuum LLM: gateway not wired, deterministic+guard only")
+			logger.Info("vacuum LLM: gateway not wired, deterministic+guard only (kachra sink wired)")
 		}
 		return
 	}
 	clf := llm.NewGeminiClassifier(caller)
 	hg := llm.NewClaudeHeadingGenerator(caller)
 	svc.SetLLM(clf, hg, guard)
+	// Phase 3 cost saver: wrap the Gemini detector in a read-through TTL cache so
+	// Engine.CleanHybrid's per-chunk Detect calls reuse LLM spans for identical chunks
+	// (10m TTL, 2000-entry cap). Cache hits/misses flow to observability metrics.
+	var det llm.KachraDetector = llm.NewGeminiKachraDetector(caller)
+	cache := llm.NewCache(10 * time.Minute)
+	det = llm.NewCachedKachraDetector(det, cache)
+	ver := llm.NewGeminiKachraVerifier(caller)
+	svc.SetKachraLLM(det, ver, kSink)
 	if logger != nil {
-		logger.Info("vacuum LLM harness wired: Gemini classifier + Claude headings + SHA guard")
+		logger.Info("vacuum LLM harness wired: Gemini classifier + Claude headings + SHA guard + kachra detector/verifier/sink + cached detector (10m TTL)")
 	}
 }

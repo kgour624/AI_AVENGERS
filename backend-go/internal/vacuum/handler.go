@@ -44,8 +44,12 @@ func (h *Handler) Register(r gin.IRouter) {
 	r.GET("/vacuum/jobs/:id/chunks", h.ListChunks)
 	r.GET("/vacuum/stats", h.JobsStats)
 	r.POST("/vacuum/preview", h.Preview)
+	r.POST("/vacuum/preview/diff", h.PreviewDiff)
 	r.GET("/vacuum/brain/version", h.BrainVersion)
 	r.GET("/vacuum/metrics", h.VacuumMetrics)
+	r.GET("/vacuum/eval", h.EvalStats)
+	r.GET("/vacuum/drift", h.DriftCheck)
+	r.POST("/vacuum/auto-promote", h.AutoPromote)
 }
 
 func (h *Handler) ListPatterns(c *gin.Context) {

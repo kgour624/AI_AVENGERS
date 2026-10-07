@@ -36,7 +36,7 @@ func (c *ClaudeHeadingGenerator) Generate(ctx context.Context, text string) ([]H
 		Model:        "strong",
 		SystemPrompt: headingSystem,
 		UserPrompt:   prompt,
-		MaxTokens:    1024,
+		MaxTokens:    8100,
 		Temperature:  0.3,
 	})
 	if err != nil {

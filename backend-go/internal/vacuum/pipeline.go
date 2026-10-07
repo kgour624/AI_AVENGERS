@@ -15,6 +15,7 @@ import (
 
 	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/vacuum/chunker"
+	"ai_avengers/backend/internal/vacuum/engine"
 	"ai_avengers/backend/internal/vacuum/llm"
 )
 
@@ -48,6 +49,10 @@ func (p *Pipeline) PickAndExecute(ctx context.Context, picker string, batchSize 
 	}
 	if batchSize <= 0 || batchSize > 20 {
 		batchSize = 10
+	}
+	// heal stuck verifying (2m) — same as handler debounce
+	if p.svc.DB() != nil {
+		_, _ = p.svc.DB().Exec(ctx, `UPDATE file_jobs SET status='scheduled', phase=0, last_error=NULL, error_code=NULL, retry_after=NULL, updated_at=NOW() WHERE status='verifying' AND updated_at < NOW() - interval '2 minutes'`)
 	}
 	observability.Global.IncVacuumPick()
 	tx, err := p.svc.DB().Begin(ctx)
@@ -121,6 +126,8 @@ func (p *Pipeline) ExecuteOne(ctx context.Context, jobID uuid.UUID) (*ExecuteRes
 	if err := db.QueryRow(ctx, `SELECT s3_key, status FROM file_jobs WHERE id=$1`, jobID).Scan(&s3Key, &status); err != nil {
 		return nil, fmt.Errorf("job not found: %w", err)
 	}
+	// heal stuck verifying if this job was stuck (idempotent)
+	_, _ = db.Exec(ctx, `UPDATE file_jobs SET status='scheduled', phase=0, last_error=NULL, error_code=NULL, retry_after=NULL, updated_at=NOW() WHERE id=$1 AND status='verifying' AND updated_at < NOW() - interval '2 minutes'`, jobID)
 	_, _ = db.Exec(ctx, `UPDATE file_jobs SET status='cleaning', phase=2, updated_at=NOW() WHERE id=$1`, jobID)
 	rc, err := p.storage.Open(ctx, s3Key)
 	if err != nil {
@@ -129,7 +136,13 @@ func (p *Pipeline) ExecuteOne(ctx context.Context, jobID uuid.UUID) (*ExecuteRes
 		return nil, err
 	}
 	defer rc.Close()
-	cleanRes, err := p.svc.Engine().CleanReader(ctx, rc)
+	rawText := readAll(rc)
+	var cleanRes *engine.CleanResult
+	if p.svc.KachraDetector() != nil {
+		cleanRes, err = p.svc.Engine().CleanHybrid(ctx, rawText, p.svc.KachraDetector(), p.svc.KachraVerifier(), p.svc.KachraSink(), jobID.String())
+	} else {
+		cleanRes, err = p.svc.Engine().Clean(ctx, rawText)
+	}
 	if err != nil {
 		_, _ = db.Exec(ctx, `UPDATE file_jobs SET status='failed', phase=6, error_code='CLEAN', last_error=$2, retry_after=NOW() + interval '120 seconds', duration_ms=$3, finished_at=NOW(), updated_at=NOW() WHERE id=$1`, jobID, err.Error(), int(time.Since(start).Milliseconds()))
 		observability.Global.IncVacuumFailed()
@@ -166,10 +179,12 @@ func (p *Pipeline) ExecuteOne(ctx context.Context, jobID uuid.UUID) (*ExecuteRes
 	// Stage 3: classifier per chunk (nil gateway => heuristic fallback)
 	var llmLabel string
 	var llmConfs []float64
+	var llmLabels []string
 	if clf := p.svc.Classifier(); clf != nil && len(cleanRes.Chunks) > 0 {
 		for _, ch := range cleanRes.Chunks {
 			lbl, conf, _ := clf.Classify(ctx, ch.Text)
 			llmConfs = append(llmConfs, conf)
+			llmLabels = append(llmLabels, lbl)
 			if llmLabel == "" && lbl != "" {
 				llmLabel = lbl
 			}
@@ -211,6 +226,9 @@ func (p *Pipeline) ExecuteOne(ctx context.Context, jobID uuid.UUID) (*ExecuteRes
 		llmConf := 0.0
 		if idx < len(llmConfs) {
 			llmLbl = llmLabel
+			if idx < len(llmLabels) && llmLabels[idx] != "" {
+				llmLbl = llmLabels[idx]
+			}
 			llmConf = llmConfs[idx]
 		}
 		hdgJSON := "[]"
@@ -244,7 +262,33 @@ func (p *Pipeline) ExecuteOne(ctx context.Context, jobID uuid.UUID) (*ExecuteRes
 		}
 	}
 	durationMs := int(time.Since(start).Milliseconds())
-	_, _ = tx2.Exec(ctx, `UPDATE file_jobs SET status='done', phase=6, verified=true, preservation_verified=$2, llm_classifier_label=$3, llm_heading_count=$4, s3_output_key=$5, duration_ms=$6, finished_at=NOW(), updated_at=NOW() WHERE id=$1`, jobID, guardVerified, nullableStr(llmLabel), headingCount, outputKey, durationMs)
+	// eval: dsa vs llm split + filler + kachra counts
+	dsaHits := len(dsaHitsSnapshot(cleanRes))
+	llmKachra := len(cleanRes.Hits) - dsaHits
+	if llmKachra < 0 {
+		llmKachra = 0
+	}
+	// Real filler count: classifier label="filler" AND confidence >= engine.fillerThreshold (0.62),
+	// guarded by engine.IsFiller so oversized chunks are never auto-filtered.
+	fillerFiltered := 0
+	for i, ch := range cleanRes.Chunks {
+		lbl := llmLabel
+		conf := 0.0
+		if i < len(llmConfs) {
+			conf = llmConfs[i]
+			if i < len(llmLabels) && llmLabels[i] != "" {
+				lbl = llmLabels[i]
+			}
+		}
+		if engine.IsFiller(lbl, conf, len(ch.Text)) {
+			fillerFiltered++
+		}
+	}
+	evalScore := 0.0
+	if len(cleanRes.CleanedText) > 0 && durationMs > 0 {
+		evalScore = float64(llmKachra+headingCount) / float64(len(cleanRes.Chunks)+1)
+	}
+	_, _ = tx2.Exec(ctx, `UPDATE file_jobs SET status='done', phase=6, verified=true, preservation_verified=$2, llm_classifier_label=$3, llm_heading_count=$4, s3_output_key=$5, duration_ms=$6, llm_kachra_count=$7, filler_filtered_count=$8, eval_score=$9, finished_at=NOW(), updated_at=NOW() WHERE id=$1`, jobID, guardVerified, nullableStr(llmLabel), headingCount, outputKey, durationMs, llmKachra, fillerFiltered, evalScore)
 	if err := tx2.Commit(ctx); err != nil {
 		_, _ = db.Exec(ctx, `UPDATE file_jobs SET status='failed', error_code='COMMIT', last_error=$2, duration_ms=$3, finished_at=NOW(), updated_at=NOW() WHERE id=$1`, jobID, err.Error(), durationMs)
 		observability.Global.IncVacuumFailed()
@@ -255,10 +299,23 @@ func (p *Pipeline) ExecuteOne(ctx context.Context, jobID uuid.UUID) (*ExecuteRes
 			_, _ = db.Exec(ctx, `UPDATE kachra_patterns SET hit_count=hit_count+1 WHERE id=$1`, toUUID(h.PatternID))
 		}
 	}
+	// vacuum_eval insert (best-effort)
+	_, _ = db.Exec(ctx, `INSERT INTO vacuum_eval(file_job_id, dsa_hit_count, llm_suggested, llm_verified, llm_mapped, combined_hit_count, filler_filtered, duration_ms) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, jobID, dsaHits, llmKachra, llmKachra, len(cleanRes.Hits), len(cleanRes.Hits), fillerFiltered, durationMs)
 	observability.Global.IncVacuumDone()
 	observability.Global.AddVacuumChunks(int64(len(cleanRes.Chunks)))
 	observability.Global.AddDAGStageMs(int64(durationMs))
+	if fillerFiltered > 0 {
+		observability.Global.IncFillerFiltered(int64(fillerFiltered))
+	}
 	return &ExecuteResult{JobID: jobID.String(), CleanedSHA: computedCleanSHA, Chunks: len(cleanRes.Chunks), Verified: true, LLMLabel: llmLabel, HeadingCount: headingCount, PreservationVerified: guardVerified}, nil
+}
+
+// dsaHitsSnapshot — heuristic: count P1 regex hits as DSA baseline (fallback if Hits includes LLM)
+func dsaHitsSnapshot(res *engine.CleanResult) []string {
+	if res == nil {
+		return nil
+	}
+	return res.P1Hits
 }
 
 // readAll helper
