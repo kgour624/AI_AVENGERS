@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -222,7 +223,9 @@ func (h *Handler) PickJob(c *gin.Context) {
 		picker = "vacuum-picker"
 	}
 	pipeline := NewPipeline(h.service, NewFSStorage(""), h.logger)
-	picked, err := pipeline.PickAndExecute(c.Request.Context(), picker, 10)
+	// also heal stuck verifying jobs: reset to scheduled for retry
+	_, _ = h.db.Exec(context.Background(), `UPDATE file_jobs SET status='scheduled', phase=0, last_error=NULL, error_code=NULL, retry_after=NULL, updated_at=NOW() WHERE status='verifying' AND updated_at < NOW() - interval '2 minutes'`)
+	picked, err := pipeline.PickAndExecute(context.Background(), picker, 10)
 	if err != nil {
 		h.logger.Error("pick failed", zap.Error(err))
 		response.InternalError(c)
@@ -287,13 +290,15 @@ func (h *Handler) ExecuteJob(c *gin.Context) {
 		return
 	}
 	pipeline := NewPipeline(h.service, NewFSStorage(""), h.logger)
-	res, err := pipeline.ExecuteOne(c.Request.Context(), id)
-	if err != nil {
-		h.logger.Warn("execute failed", zap.Error(err))
-		response.InternalError(c)
-		return
-	}
-	response.OK(c, res)
+	// async: immediate 202 so large file (380 chunks) not canceled by HTTP 30s timeout
+	go func(jid uuid.UUID) {
+		bg, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		if _, err := pipeline.ExecuteOne(bg, jid); err != nil {
+			h.logger.Warn("async execute failed", zap.String("job_id", jid.String()), zap.Error(err))
+		}
+	}(id)
+	response.Created(c, gin.H{"status": "accepted", "job_id": id.String()})
 }
 
 func (h *Handler) UploadAndEnqueue(c *gin.Context) {
@@ -424,16 +429,37 @@ func (h *Handler) JobsStats(c *gin.Context) {
 }
 
 func (h *Handler) RetryJob(c *gin.Context) {
-	id, err := uuid.Parse(c.Param("id"))
-	if err != nil {
-		response.BadRequest(c, "INVALID_ID", "invalid id")
-		return
-	}
-	tag, _ := h.db.Exec(c.Request.Context(), `UPDATE file_jobs SET status='scheduled', phase=0, last_error=NULL, error_code=NULL, retry_after=NULL, picked_at=NULL, updated_at=NOW() WHERE id=$1 AND status IN ('failed','quarantined')`, id)
-	if tag.RowsAffected() == 0 {
-		response.BadRequest(c, "NOT_RETRYABLE", "only failed/quarantined can be retried")
-		return
-	}
-	response.OK(c, gin.H{"status": "scheduled"})
+        id, err := uuid.Parse(c.Param("id"))
+        if err != nil {
+                response.BadRequest(c, "INVALID_ID", "invalid id")
+                return
+        }
+        // Debounce: verifying = 78s background (106 chunks) - block retry within 2m
+        var status string
+        var updated time.Time
+        var attempts int
+        err = h.db.QueryRow(c.Request.Context(), `SELECT status, updated_at, attempts FROM file_jobs WHERE id=$1`, id).Scan(&status, &updated, &attempts)
+        if err != nil {
+                response.NotFound(c, "job")
+                return
+        }
+        if status == "verifying" && time.Since(updated) < 2*time.Minute {
+                response.BadRequest(c, "ALREADY_PROCESSING", "Already processing in background (verifying). Please wait 78s. Download will appear on done. Do not press Retry repeatedly.")
+                return
+        }
+        if status != "failed" && status != "quarantined" && !(status == "verifying" && time.Since(updated) >= 2*time.Minute) {
+                response.BadRequest(c, "NOT_RETRYABLE", "only failed/quarantined or stuck verifying>2m can be retried")
+                return
+        }
+        if attempts >= 3 {
+                response.BadRequest(c, "MAX_RETRIES", "max 3 attempts exceeded")
+                return
+        }
+        tag, _ := h.db.Exec(c.Request.Context(), `UPDATE file_jobs SET status='scheduled', phase=1, attempts=attempts+1, last_error=NULL, error_code=NULL, retry_after=NULL, picked_at=NULL, updated_at=NOW() WHERE id=$1`, id)
+        if tag.RowsAffected() == 0 {
+                response.BadRequest(c, "NOT_RETRYABLE", "update failed")
+                return
+        }
+        response.OK(c, gin.H{"status": "scheduled"})
 }
 

@@ -1203,6 +1203,10 @@ func buildRouter(
 		adminGroup.GET("/experts/:id/ingestion/audit", adminHandler.GetIngestionAudit)
 		adminGroup.GET("/experts/:id/ingestion/diagnostics", adminHandler.GetIngestionDiagnostics)
 		adminGroup.POST("/experts/:id/ingestion/reconcile", adminHandler.ReconcileIngestion)
+		// Phase 1 emergency unblock: re-evaluate gate (+ optional smoke/measure) without re-ingesting.
+		adminGroup.POST("/experts/:id/ingestion/retry-gate", adminHandler.RetryIngestionGate)
+		adminGroup.POST("/experts/:id/ingestion/rerun-smoke", adminHandler.RerunSmokeTest)
+		adminGroup.POST("/experts/:id/ingestion/force-train", adminHandler.ForceTrainExpert)
 
 		// I2: measure what an expert can actually answer, instead of reporting a
 		// depth derived from chunk counts. POST starts a background pass; GET reads

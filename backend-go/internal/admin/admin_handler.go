@@ -1158,9 +1158,22 @@ func (h *AdminHandler) IngestTranscript(c *gin.Context) {
 		replaceExisting, _ = strconv.ParseBool(v)
 	}
 
-	// Mark expert as training
+	// Mark expert as training — but allow draft/warning re-train (Phase 3 Lock Khatam).
+	// The lock must NOT block an expert that finished with warnings or is still draft;
+	// only an actively ingesting expert holds the lock. is_training alone is stale
+	// after a warning finish, so gate on training_status. If locked, 409 so the UI
+	// can explain instead of silently queuing a duplicate job.
+	var curTrainingStatus string
+	var curIsTraining bool
+	_ = h.db.QueryRow(c.Request.Context(),
+		`SELECT COALESCE(training_status,'draft'), COALESCE(is_training,false) FROM experts WHERE id=$1`, expertID,
+	).Scan(&curTrainingStatus, &curIsTraining)
+	if training.IsTrainingLockActive(curTrainingStatus, curIsTraining) {
+		response.Conflict(c, "expert is already ingesting — wait for the active run to finish")
+		return
+	}
 	_, _ = h.db.Exec(c.Request.Context(),
-		`UPDATE experts SET is_training=TRUE, updated_at=NOW() WHERE id=$1`, expertID)
+		`UPDATE experts SET is_training=TRUE, training_status='ingesting', updated_at=NOW() WHERE id=$1`, expertID)
 
 	// Start background ingestion
 	// WHY goroutine: Ingestion takes minutes. Client gets job ID immediately.
@@ -2407,6 +2420,161 @@ func (h *AdminHandler) GetIngestionJobEvents(c *gin.Context) {
 		"events":        events,
 		"last_sequence": lastSeq,
 		"timeline":      true,
+	})
+}
+
+// ============================================================
+// PHASE 1 — EMERGENCY UNBLOCK: retry-gate + rerun-smoke
+// ============================================================
+//
+// Input  = expertID (already trained chunks/charter in DB)
+// Process = ReevaluateGate (read-only: smoke probes + gate + verification), promotes to `trained` when both pass
+// Output = GateReevaluationResult with promoted flag + SSE event for the timeline
+//
+// Idempotent + safe: chunk/embed/store NOT re-run.
+
+// RetryIngestionGate POST /admin/experts/:id/ingestion/retry-gate
+// Body: {"rerun_smoke": true, "rerun_measure": false} (both default false)
+// Also accepts hyphenated keys "rerun-smoke" / "rerun-measure" (UI fallback).
+// Re-evaluates the ingest gate against the CURRENT corpus. If the gate and
+// storage verification both pass and the expert is still `draft`, promotes it
+// to `trained` and heals the latest `complete_with_warnings` job to `complete`.
+func (h *AdminHandler) RetryIngestionGate(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	var raw map[string]interface{}
+	var dto struct {
+		RerunSmoke   *bool `json:"rerun_smoke"`
+		RerunMeasure *bool `json:"rerun_measure"`
+	}
+	if c.Request.ContentLength > 0 {
+		if bindErr := c.ShouldBindJSON(&raw); bindErr != nil {
+			response.BadRequest(c, "INVALID_BODY", "expected {\"rerun_smoke\":true,\"rerun_measure\":false} (hyphen or underscore)")
+			return
+		}
+		// Normalise hyphen alias: frontend may dispatch "re-evaluate_gate" hyphen form.
+		if v, ok := raw["rerun-smoke"]; ok {
+			raw["rerun_smoke"] = v
+		}
+		if v, ok := raw["rerun-measure"]; ok {
+			raw["rerun_measure"] = v
+		}
+		if v, ok := raw["re-evaluate_gate"]; ok {
+			// Warning -> Draft retry dispatch alias: treat as rerun_smoke=true
+			_ = v
+			raw["rerun_smoke"] = true
+		}
+		// Re-bind normalised map into dto
+		b, _ := json.Marshal(raw)
+		_ = json.Unmarshal(b, &dto)
+	}
+	opts := training.ReevaluateGateOptions{
+		RerunSmoke:   dto.RerunSmoke != nil && *dto.RerunSmoke,
+		RerunMeasure: dto.RerunMeasure != nil && *dto.RerunMeasure,
+	}
+	// Default for empty body: re-run smoke so admins get a real signal.
+	if c.Request.ContentLength == 0 {
+		opts.RerunSmoke = true
+	}
+	result, err := h.ingestion.ReevaluateGate(c.Request.Context(), expertID, opts)
+	if err != nil {
+		h.logger.Error("retry ingestion gate failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, result)
+}
+
+// RerunSmokeTest POST /admin/experts/:id/ingestion/rerun-smoke
+// Convenience alias: reruns only the smoke test and re-evaluates the gate.
+func (h *AdminHandler) RerunSmokeTest(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	// Accept both hyphen and underscore body keys: "rerun-smoke" and "rerun_smoke".
+	var raw map[string]interface{}
+	if c.Request.ContentLength > 0 {
+		if bindErr := c.ShouldBindJSON(&raw); bindErr == nil && raw != nil {
+			// Normalise hyphenated keys so the UI can send either form.
+			if v, ok := raw["rerun-smoke"]; ok {
+				raw["rerun_smoke"] = v
+			}
+			if v, ok := raw["rerun-measure"]; ok {
+				raw["rerun_measure"] = v
+			}
+		}
+	}
+	result, err := h.ingestion.RerunSmokeTest(c.Request.Context(), expertID)
+	if err != nil {
+		h.logger.Error("rerun smoke test failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	response.OK(c, result)
+}
+
+// ForceTrainExpert POST /admin/experts/:id/ingestion/force-train
+// Manual override: forces training_status to 'trained' for an expert in
+// draft or complete_with_warnings, bypassing gate warnings. Idempotent.
+// Guards: only draft / complete_with_warnings are force-trainable; a
+// truly ingesting expert is rejected (409), already trained is no-op (200).
+func (h *AdminHandler) ForceTrainExpert(c *gin.Context) {
+	expertID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		response.BadRequest(c, "INVALID_ID", "invalid expert ID")
+		return
+	}
+	ctx := c.Request.Context()
+	var trainingStatus string
+	var isTraining bool
+	if err := h.db.QueryRow(ctx, `SELECT COALESCE(training_status,'draft'), COALESCE(is_training,false) FROM experts WHERE id=$1 AND deleted_at IS NULL`, expertID).Scan(&trainingStatus, &isTraining); err != nil {
+		response.NotFound(c, "expert")
+		return
+	}
+	if training.IsTrainingLockActive(trainingStatus, isTraining) {
+		response.Conflict(c, "expert is currently ingesting — cannot force train while a run is active")
+		return
+	}
+	if trainingStatus == "trained" {
+		response.OK(c, map[string]interface{}{
+			"expert_id":       expertID,
+			"training_status": "trained",
+			"already_trained": true,
+			"message":         "expert is already trained",
+		})
+		return
+	}
+	if trainingStatus != "draft" && trainingStatus != "deprecated" {
+		// Also allow warning-state experts: latest job status is authoritative there.
+		var latestJobStatus string
+		_ = h.db.QueryRow(ctx, `SELECT COALESCE(status,'') FROM ingestion_jobs WHERE expert_id=$1 ORDER BY created_at DESC LIMIT 1`, expertID).Scan(&latestJobStatus)
+		if latestJobStatus != training.JobStatusCompleteWithWarnings && trainingStatus != "draft" {
+			// deprecated is allowed through; otherwise only draft/warning qualify.
+			if trainingStatus != "deprecated" {
+				response.BadRequest(c, "INVALID_STATE", fmt.Sprintf("force train only from draft/warning, current state is %q (job %q)", trainingStatus, latestJobStatus))
+				return
+			}
+		}
+	}
+	_, err = h.db.Exec(ctx, `UPDATE experts SET training_status='trained', is_training=FALSE, updated_at=NOW() WHERE id=$1`, expertID)
+	if err != nil {
+		h.logger.Error("force train failed", zap.String("expert_id", expertID.String()), zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	// Heal the latest warning job so the timeline reads as promoted, not still warning.
+	_, _ = h.db.Exec(ctx, `UPDATE ingestion_jobs SET status='complete', error_message=NULL, updated_at=NOW() WHERE id IN (SELECT id FROM ingestion_jobs WHERE expert_id=$1 ORDER BY created_at DESC LIMIT 1) AND status='complete_with_warnings'`, expertID)
+	h.logger.Info("force train applied", zap.String("expert_id", expertID.String()), zap.String("from_status", trainingStatus))
+	response.OK(c, map[string]interface{}{
+		"expert_id":       expertID,
+		"training_status": "trained",
+		"promoted":        true,
+		"message":         "expert force-trained to trained",
 	})
 }
 

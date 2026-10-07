@@ -4,18 +4,19 @@ import { Modal } from '@/components/ui/Modal'
 import { Button } from '@/components/ui/Button'
 import { cn } from '@/utils/cn'
 import { useIngestionStream } from '@/hooks/useIngestionStream'
-import {
-  RECONCILE_REPAIR_ACTIONS,
+import { RECONCILE_REPAIR_ACTIONS,
   RECONCILE_RESOLVE_ACTIONS,
   getIngestionAudit,
   getIngestionDiagnostics,
   reconcileIngestion,
   resumeIngestionJob,
   retryIngestionJob,
+  rerunSmokeTest,
+  retryIngestionGate,
+  forceTrainExpert,
   type IngestionAudit,
   type IngestionDiagnostics,
-  type ReconcileActionResult,
-} from '@/api/admin'
+  type ReconcileActionResult } from '@/api/admin'
 
 // ============================================================
 // Stage definitions
@@ -309,7 +310,40 @@ export function IngestionPipelineModal({
     }
   }
 
-  return (
+  
+  const handleForceTrain = async () => {
+    if (!expertId) return
+    try {
+      await forceTrainExpert(expertId)
+      window.location.reload()
+    } catch (e: unknown) {
+      const err = e as { response?: { status?: number; data?: { error?: { message?: string }; message?: string } }; message?: string }
+      const s = err?.response?.status
+      const msg = err?.response?.data?.error?.message || err?.response?.data?.message || err?.message || 'Force train failed'
+      if (s === 409) setResumeError('Expert is currently ingesting — try after it finishes (409)')
+      else setResumeError(msg)
+    }
+  }
+
+  const handleRetryGate = async () => {
+    if (!expertId) return
+    setIsResuming(true)
+    setResumeError(null)
+    try {
+      await retryIngestionGate(expertId, { rerunSmoke: true })
+      window.location.reload()
+    } catch (e: unknown) {
+      const err = e as { response?: { status?: number; data?: { error?: { message?: string }; message?: string } }; message?: string }
+      const msg = err?.response?.data?.error?.message || err?.response?.data?.message || err?.message || 'Retry gate failed'
+      const s = err?.response?.status
+      if (s === 409) setResumeError('Expert is currently ingesting — try after it finishes (409)')
+      else setResumeError(msg)
+    } finally {
+      setIsResuming(false)
+    }
+  }
+
+return (
     <Modal isOpen={isOpen} onClose={onClose}>
       <div className="flex flex-col gap-4" style={{ minWidth: 480, maxWidth: 560 }}>
 
@@ -648,6 +682,7 @@ export function IngestionPipelineModal({
                 >
                   {isResuming ? 'Retrying...' : 'Retry now'}
                 </button>
+
               </div>
               {resumeError && (
                 <p className="mt-2 text-[10px] text-mode-refuse">
@@ -680,6 +715,32 @@ export function IngestionPipelineModal({
               The corpus was stored, but it is not fully usable — the expert is not published for
               answers. Fix the cause above, then re-ingest.
             </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                onClick={handleRetryGate}
+                disabled={isResuming}
+                className={cn(
+                  'rounded-md border border-glow-amber/40 bg-glow-amber/10 px-3 py-1.5',
+                  'text-xs font-medium text-glow-amber',
+                  'transition-all duration-150 ease-arc',
+                  'hover:bg-glow-amber/20 hover:border-glow-amber/60',
+                  'disabled:opacity-50 disabled:cursor-not-allowed',
+                )}
+              >
+                {isResuming ? 'Retrying...' : 'Retry Gate'}
+              </button>
+              <button
+                onClick={handleForceTrain}
+                disabled={isResuming}
+                className="rounded-md bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700 disabled:opacity-50 disabled:cursor-not-allowed"
+                title="Bypass gate warnings and force to trained"
+              >
+                Force Train
+              </button>
+            </div>
+            {resumeError && (
+              <p className="mt-2 text-[10px] text-mode-refuse">{describeIngestError(resumeError)}</p>
+            )}
           </div>
         )}
 

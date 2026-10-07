@@ -13,7 +13,6 @@ export default function AdminVacuum() {
   const [jobLimit] = useState(10)
   const [jobOffset, setJobOffset] = useState(0)
   const [selected, setSelected] = useState<Set<string>>(new Set())
-  const [downloadingId, setDownloadingId] = useState<string | null>(null)
 
   const { data: patterns } = useQuery({
     queryKey: ['vacuum-patterns'],
@@ -97,30 +96,6 @@ export default function AdminVacuum() {
     mutationFn: async (id: string) => (await baseAPI.post(`/api/v1/admin/vacuum/jobs/${id}/retry`)).data.data,
     onSuccess: () => { qc.invalidateQueries({ queryKey: ['vacuum-jobs'] }); qc.invalidateQueries({ queryKey: ['vacuum-stats'] }) },
   })
-
-  const handleDownload = async (id: string, fileName: string) => {
-    if (downloadingId) return
-    setDownloadingId(id)
-    try {
-      const res = await baseAPI.get(`/api/v1/admin/vacuum/jobs/${id}/download`, { responseType: 'blob' })
-      const blob = res.data instanceof Blob ? res.data : new Blob([res.data])
-      if (blob.type.includes('json')) {
-        const txt = await blob.text()
-        try { const j = JSON.parse(txt); if (j?.error || j?.success === false) throw new Error(j.error?.message || j.message || 'Download failed') } catch {}
-      }
-      const url = window.URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url; a.download = fileName + '.cleaned.txt'
-      document.body.appendChild(a); a.click(); a.remove()
-      window.URL.revokeObjectURL(url)
-      qc.invalidateQueries({ queryKey: ['vacuum-jobs'] })
-      qc.invalidateQueries({ queryKey: ['vacuum-stats'] })
-    } catch (e: any) {
-      let m = e?.response?.data?.error?.message || e?.response?.data?.message || e?.message || 'Download failed'
-      if (e?.response?.data instanceof Blob) { try { const txt = await e.response.data.text(); const j = JSON.parse(txt); m = j?.error?.message || j?.message || m } catch {} }
-      alert(m)
-    } finally { setDownloadingId(null) }
-  }
 
   const toggle = (id: string) => {
     const n = new Set(selected)
@@ -224,7 +199,6 @@ export default function AdminVacuum() {
             <select value={jobStatus} onChange={e=>{setJobStatus(e.target.value); setJobOffset(0)}} className="border rounded px-2 py-1 text-xs">
               <option value="">all</option>
               <option value="scheduled">scheduled</option>
-              <option value="verifying">verifying</option>
               <option value="done">done</option>
               <option value="failed">failed</option>
               <option value="quarantined">quarantined</option>
@@ -234,16 +208,14 @@ export default function AdminVacuum() {
             <button disabled={!jobs || jobs.length < jobLimit} onClick={()=>setJobOffset(o=>o+jobLimit)} className="px-2 py-1 bg-slate-100 rounded text-xs disabled:opacity-40">Next</button>
           </div>
         </div>
-        <div className="text-xs bg-amber-50 border border-amber-200 rounded px-2 py-1 mb-2 text-amber-800">verifying = background me LLM 78s tak chal raha hai (106 chunks parallel). Is dauran Retry mat dabao — complete hote hi Download aa jayega.</div>
         <div className="text-sm divide-y">
           {(jobs || []).map((j: any) => (
             <div key={j.id} className="py-2 flex justify-between items-center">
-              <div className="cursor-pointer" onClick={() => setSelectedJob(j.id)}><span className="font-medium">{j.file_name}</span> — <span className={j.status==='done' ? "text-emerald-600 font-semibold" : j.status==='verifying' ? "text-amber-600 font-semibold" : j.status==='failed' ? "text-red-600" : ""}>{j.status}</span> / phase {j.phase} {j.status==='done' && '✓'} {j.duration_ms!=null && <span className="text-slate-500 text-xs"> · {j.duration_ms}ms</span>} {j.preservation_verified && <span className="text-emerald-600 text-xs"> · preserved ✓</span>} {j.llm_classifier_label && <span className="text-violet-600 text-xs"> · {j.llm_classifier_label}</span>} {j.llm_heading_count>0 && <span className="text-slate-500 text-xs"> · headings:{j.llm_heading_count}</span>} {j.download_count>0 && <span className="text-slate-500 text-xs"> · ↓{j.download_count}</span>} {j.last_error && <span className="text-red-500 text-xs"> · {j.last_error.slice(0,40)}</span>}</div>
+              <div className="cursor-pointer" onClick={() => setSelectedJob(j.id)}><span className="font-medium">{j.file_name}</span> — {j.status} / phase {j.phase} {j.status==='done' && '✓'} {j.duration_ms!=null && <span className="text-slate-500 text-xs"> · {j.duration_ms}ms</span>} {j.preservation_verified && <span className="text-emerald-600 text-xs"> · preserved ✓</span>} {j.llm_classifier_label && <span className="text-violet-600 text-xs"> · {j.llm_classifier_label}</span>} {j.llm_heading_count>0 && <span className="text-slate-500 text-xs"> · headings:{j.llm_heading_count}</span>} {j.download_count>0 && <span className="text-slate-500 text-xs"> · ↓{j.download_count}</span>} {j.last_error && <span className="text-red-500 text-xs"> · {j.last_error.slice(0,40)}</span>}</div>
               <div className="flex gap-2 items-center"><span className="text-slate-400 text-xs">{j.s3_key}</span>
-                {j.status==='verifying' && <span className="px-2 py-1 bg-amber-100 text-amber-800 rounded text-xs flex items-center gap-1 border border-amber-300"><span className="w-3 h-3 border-2 border-amber-600 border-t-transparent rounded-full animate-spin inline-block"></span> Processing... {j.phase}/6</span>}
-                {j.status==='scheduled' && <button onClick={() => executeMut.mutate(j.id)} disabled={executeMut.isPending} className="px-2 py-1 bg-amber-500 text-white rounded text-xs disabled:opacity-40">Execute</button>}
-                {(j.status==='failed' || j.status==='quarantined') && <button onClick={() => { if(confirm('Retry this job?')) retryMut.mutate(j.id) }} disabled={retryMut.isPending} className="px-2 py-1 bg-emerald-600 text-white rounded text-xs disabled:opacity-40">Retry</button>}
-                {j.status==='done' && <button disabled={downloadingId===j.id} onClick={()=>handleDownload(j.id, j.file_name)} className="px-3 py-1 bg-blue-600 text-white rounded text-xs disabled:opacity-50 shadow hover:bg-blue-700">{downloadingId===j.id ? 'Downloading...' : 'Download'}</button>}
+                {j.status==='scheduled' && <button onClick={() => executeMut.mutate(j.id)} className="px-2 py-1 bg-amber-500 text-white rounded text-xs">Execute</button>}
+                {(j.status==='failed' || j.status==='quarantined') && <button onClick={() => retryMut.mutate(j.id)} className="px-2 py-1 bg-emerald-600 text-white rounded text-xs">Retry</button>}
+                {j.status==='done' && <a href={`/api/v1/admin/vacuum/jobs/${j.id}/download`} className="px-2 py-1 bg-blue-600 text-white rounded text-xs">Download</a>}
                 <button onClick={() => setSelectedJob(j.id)} className="px-2 py-1 bg-slate-100 rounded text-xs">Chunks</button>
               </div>
             </div>
@@ -261,5 +233,3 @@ export default function AdminVacuum() {
     </div>
   )
 }
-
-export const Component = AdminVacuum

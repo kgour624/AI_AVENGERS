@@ -43,6 +43,53 @@ const (
 	// (auto-fails after 24h via background checker in main.go).
 	StagePaused = "paused"
 )
+// Job status constants — Phase 3: complete_with_warnings is resumable (not terminal).
+const (
+	JobStatusPending              = "pending"
+	JobStatusRunning              = "running"
+	JobStatusComplete             = "complete"
+	JobStatusCompleteWithWarnings = "complete_with_warnings"
+	JobStatusFailed               = "failed"
+	JobStatusPaused               = "paused"
+)
+
+// IsTerminalStatus reports whether job status is terminal — must NOT be auto-retried.
+func IsTerminalStatus(status string) bool {
+	switch status {
+	case JobStatusComplete, JobStatusFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsResumableStatus reports whether job can be re-evaluated/promoted without re-ingesting.
+func IsResumableStatus(status string) bool {
+	switch status {
+	case JobStatusCompleteWithWarnings, JobStatusPaused, JobStatusFailed, JobStatusPending, JobStatusRunning:
+		return true
+	case JobStatusComplete:
+		return false
+	default:
+		return false
+	}
+}
+
+// IsTrainingLockActive reports whether is_training should block a new ingest.
+// Phase 3 Lock Khatam: active ONLY for ingesting/training states, not for
+// draft or complete_with_warnings (both are resumable). is_training alone is
+// NOT sufficient — the job may have finished with warnings and left the flag
+// stale; only the training_status state machine decides.
+func IsTrainingLockActive(trainingStatus string, isTraining bool) bool {
+	switch trainingStatus {
+	case "ingesting", "training":
+		return true
+	default:
+		return false
+	}
+}
+
+
 
 // StageLabels maps stage constants to human-readable UI labels.
 var StageLabels = map[string]string{

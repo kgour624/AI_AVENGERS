@@ -68,6 +68,60 @@ export const regenerateCharter = (expertId: string) =>
     )
     .then((res) => res.data.data!)
 
+// ============================================================
+// PHASE 1 — EMERGENCY UNBLOCK: retry-gate + rerun-smoke
+// ============================================================
+// Input  = expertId + {rerunSmoke, rerunMeasure}
+// Process = POST /ingestion/retry-gate or /rerun-smoke -> backend ReevaluateGate (read-only, promotes if gate passes)
+// Output = GateReevaluationResult (promoted flag + conditions + verification)
+
+export interface GateReevaluationResult {
+  expert_id: string
+  expert_name: string
+  was_trained: boolean
+  now_trained: boolean
+  promoted: boolean
+  gate_inputs: {
+    chunks: number
+    charter_rules: number
+    clarification_topics: number
+    measured_topics: number
+    capability_measured: boolean
+    smoke_probes: number
+    smoke_passed: boolean
+    smoke_uncited: number
+    smoke_no_answer: number
+  }
+  conditions: Array<{ name: string; detail: string; met: boolean }>
+  passed: boolean
+  verification_status: string
+  verification_ok: boolean
+  verification_reason?: string
+  warning_text: string
+  smoke: { passed: boolean; probes: number; passed_probes: number; uncited: number; no_answer: number }
+}
+
+export const retryIngestionGate = (
+  expertId: string,
+  opts: { rerunSmoke?: boolean; rerunMeasure?: boolean } = {},
+) =>
+  baseAPI
+    .post<ApiResponse<GateReevaluationResult>>(
+      `/api/v1/admin/experts/${expertId}/ingestion/retry-gate`,
+      {
+        rerun_smoke: opts.rerunSmoke ?? true,
+        rerun_measure: opts.rerunMeasure ?? false,
+      },
+    )
+    .then((res) => res.data.data!)
+
+export const rerunSmokeTest = (expertId: string) =>
+  baseAPI
+    .post<ApiResponse<GateReevaluationResult>>(
+      `/api/v1/admin/experts/${expertId}/ingestion/rerun-smoke`,
+    )
+    .then((res) => res.data.data!)
+
 // Bug 1.5 fix (docs bug list): the real backend route
 // (POST /admin/experts -> AdminHandler.CreateExpert) was already
 // registered, but no frontend function ever called it and no UI
@@ -1352,3 +1406,6 @@ export function toSnakeRetrievalPayload(form:any){
     top_k_children: Number(form.childTopK ?? form.top_k_children ?? 5),
   };
 }
+
+export const forceTrainExpert = (expertId: string) =>
+  baseAPI.post(`/api/v1/admin/experts/${expertId}/ingestion/force-train`).then((res: any) => res.data.data!)

@@ -2404,6 +2404,143 @@ func calculateAvgDepth(capabilities []CapabilityResult) float64 {
 	return float64(total) / float64(len(capabilities))
 }
 
+// ============================================================
+// PHASE 1 — EMERGENCY UNBLOCK: idempotent gate re-evaluation
+// ============================================================
+// Input  = expertID already in DB (corpus/charter/embeddings stored)
+// Process = re-run ONLY read-time checks: smoke -> optional measure -> gate inputs -> verification. No chunk/embed/store.
+// Output = GateReevaluationResult + conditional promotion to `trained` when gate+verification pass.
+
+type ReevaluateGateOptions struct {
+	RerunSmoke   bool
+	RerunMeasure bool
+}
+
+type GateReevaluationResult struct {
+	ExpertID           uuid.UUID       `json:"expert_id"`
+	ExpertName         string          `json:"expert_name"`
+	WasTrained         bool            `json:"was_trained"`
+	NowTrained         bool            `json:"now_trained"`
+	Promoted           bool            `json:"promoted"`
+	GateInputs         GateInputs      `json:"gate_inputs"`
+	Conditions         []GateCondition `json:"conditions"`
+	Passed             bool            `json:"passed"`
+	VerificationStatus string          `json:"verification_status"`
+	VerificationOK     bool            `json:"verification_ok"`
+	VerificationReason string          `json:"verification_reason,omitempty"`
+	WarningText        string          `json:"warning_text"`
+	Smoke              SmokeTestResult `json:"smoke"`
+}
+
+func (p *IngestionPipeline) reevaluateVerification(ctx context.Context, expertID uuid.UUID) (string, string, bool) {
+	var nullEmbeddings int
+	if err := p.db.QueryRow(ctx, `SELECT COUNT(*) FILTER (WHERE embedding IS NULL) FROM course_chunks WHERE expert_id=$1`, expertID).Scan(&nullEmbeddings); err == nil && nullEmbeddings > 0 {
+		return VerificationMismatch, fmt.Sprintf("%d stored chunks have no embedding", nullEmbeddings), false
+	}
+	var latestStatus string
+	var latestReason string
+	err := p.db.QueryRow(ctx, `SELECT verification_status, COALESCE(mismatch_reason,'') FROM ingestion_runs WHERE expert_id=$1 ORDER BY updated_at DESC LIMIT 1`).Scan(&latestStatus, &latestReason)
+	if err != nil {
+		return VerificationNotChecked, "no ledger found — corpus verification could not be completed", false
+	}
+	if latestStatus == VerificationVerified {
+		return VerificationVerified, "", true
+	}
+	if latestReason == "" {
+		latestReason = "corpus verification could not be completed"
+	}
+	return latestStatus, latestReason, false
+}
+
+
+// ReevaluateGate re-runs smoke (+ optional measure) and re-evaluates the ingest gate.
+// Idempotent: when already `trained` returns WasTrained=true, Promoted=false.
+func (p *IngestionPipeline) ReevaluateGate(ctx context.Context, expertID uuid.UUID, opts ReevaluateGateOptions) (*GateReevaluationResult, error) {
+	var expertName string
+	var trainingStatus string
+	var isTraining bool
+	if err := p.db.QueryRow(ctx, `SELECT name, COALESCE(training_status,'draft'), COALESCE(is_training,false) FROM experts WHERE id=$1`, expertID).Scan(&expertName, &trainingStatus, &isTraining); err != nil {
+		return nil, fmt.Errorf("reevaluate gate: load expert: %w", err)
+	}
+	wasTrained := trainingStatus == "trained"
+	charter, err := p.loadCharterFromDB(ctx, expertID)
+	if err != nil {
+		p.logger.Warn("reevaluate gate: charter load failed, using empty charter", zap.Error(err), zap.String("expert_id", expertID.String()))
+		charter = &Charter{ReasoningCharter: "", ClarificationCharter: map[string][]string{}}
+	}
+	var smoke SmokeTestResult
+	var smokeErr error
+	if opts.RerunSmoke {
+		smoke, smokeErr = p.runSmokeTest(ctx, expertID, expertName)
+		if smokeErr != nil {
+			p.logger.Warn("reevaluate gate: smoke test error (recorded, not fatal)", zap.Error(smokeErr), zap.String("expert_id", expertID.String()))
+		}
+	} else {
+		smoke = SmokeTestResult{Passed: false, Probes: 0}
+	}
+	if opts.RerunMeasure && p.capabilityMeasurer != nil {
+		if measureErr := p.capabilityMeasurer(ctx, expertID, gateMeasureTopics); measureErr != nil {
+			p.logger.Warn("reevaluate gate: capability measurement failed (gate will report unmeasured)", zap.Error(measureErr), zap.String("expert_id", expertID.String()))
+		}
+	}
+	gateInputs, gateErr := p.collectGateInputs(ctx, expertID, charter, smoke)
+	if gateErr != nil {
+		p.logger.Warn("reevaluate gate: collectGateInputs failed — gate will fail closed", zap.Error(gateErr))
+	}
+	gateConditions := EvaluateIngestGate(gateInputs)
+	gateOK := gateErr == nil && GatePassed(gateConditions)
+	verificationStatus, verificationReason, verificationOK := p.reevaluateVerification(ctx, expertID)
+	warnReasons := make([]string, 0, len(gateConditions)+1)
+	if !verificationOK {
+		warnReasons = append(warnReasons, "corpus verification: "+verificationReason)
+	}
+	warnReasons = append(warnReasons, UnmetGateReasons(gateConditions)...)
+	warningText := ""
+	if len(warnReasons) > 0 {
+		warningText = "completed with warnings — " + strings.Join(warnReasons, "; ")
+	}
+	promoted := false
+	nowTrained := wasTrained
+	if gateOK && verificationOK && !wasTrained {
+		if _, execErr := p.db.Exec(ctx, `UPDATE experts SET training_status='trained', is_training=FALSE, updated_at=NOW() WHERE id=$1`, expertID); execErr != nil {
+			p.logger.Warn("reevaluate gate: failed to promote expert", zap.Error(execErr), zap.String("expert_id", expertID.String()))
+		} else {
+			promoted = true
+			nowTrained = true
+			p.logger.Info("reevaluate gate: expert promoted to trained", zap.String("expert_id", expertID.String()), zap.Int("measured_topics", gateInputs.MeasuredTopics))
+		}
+		_, _ = p.db.Exec(ctx, `UPDATE ingestion_jobs SET status='complete', error_message=NULL, updated_at=NOW() WHERE id IN (SELECT id FROM ingestion_jobs WHERE expert_id=$1 ORDER BY created_at DESC LIMIT 1) AND status='complete_with_warnings'`, expertID)
+	}
+	p.emit(ctx, uuid.Nil, expertID, StageComplete, jobevents.KindGateEvaluated, map[string]interface{}{
+		"reevaluated":   true,
+		"reran_smoke":   opts.RerunSmoke,
+		"reran_measure": opts.RerunMeasure,
+		"passed":        gateOK && verificationOK,
+		"promoted":      promoted,
+		"conditions":    gateConditions,
+		"verification":  verificationStatus,
+	})
+	return &GateReevaluationResult{
+		ExpertID:           expertID,
+		ExpertName:         expertName,
+		WasTrained:         wasTrained,
+		NowTrained:         nowTrained,
+		Promoted:           promoted,
+		GateInputs:         gateInputs,
+		Conditions:         gateConditions,
+		Passed:             gateOK && verificationOK,
+		VerificationStatus: verificationStatus,
+		VerificationOK:     verificationOK,
+		VerificationReason: verificationReason,
+		WarningText:        warningText,
+		Smoke:              smoke,
+	}, nil
+}
+
+func (p *IngestionPipeline) RerunSmokeTest(ctx context.Context, expertID uuid.UUID) (*GateReevaluationResult, error) {
+	return p.ReevaluateGate(ctx, expertID, ReevaluateGateOptions{RerunSmoke: true, RerunMeasure: false})
+}
+
 // parseClarificationJSON is used by charter_extractor.
 func parseClarificationJSON(response string) (map[string][]string, error) {
 	response = strings.TrimSpace(response)
