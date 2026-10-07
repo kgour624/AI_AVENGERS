@@ -106,3 +106,26 @@ func (h *AdminHandler) RevokeMCPToken(c *gin.Context) {
 	h.logger.Info("mcp token revoked", zap.String("token_id", id))
 	response.OK(c, gin.H{"status": "revoked"})
 }
+
+// DeleteMCPToken DELETE /admin/mcp-tokens/:id
+// Hard delete — row removed from mcp_tokens completely (database se delete).
+// Works even if token is already revoked. After this List will not show it.
+func (h *AdminHandler) DeleteMCPToken(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		response.BadRequest(c, "INVALID_ID", "token id is required")
+		return
+	}
+	if err := h.tokens.Delete(c.Request.Context(), id); err != nil {
+		var toolErr *ToolError
+		if errors.As(err, &toolErr) {
+			response.NotFound(c, "no token with that id")
+			return
+		}
+		h.logger.Error("delete mcp token failed", zap.Error(err))
+		response.InternalError(c)
+		return
+	}
+	h.logger.Info("mcp token deleted", zap.String("token_id", id))
+	response.OK(c, gin.H{"status": "deleted"})
+}

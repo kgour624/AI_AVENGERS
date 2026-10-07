@@ -186,6 +186,20 @@ func (s *PGTokenStore) Revoke(ctx context.Context, id string) error {
 	return nil
 }
 
+// Delete permanently removes a token from the database (hard delete).
+// Works for both active and already-revoked tokens. After this the row is
+// gone completely — use when you want clean DB, not just soft-revoke.
+func (s *PGTokenStore) Delete(ctx context.Context, id string) error {
+	tag, err := s.db.Exec(ctx, `DELETE FROM mcp_tokens WHERE id = $1`, id)
+	if err != nil {
+		return fmt.Errorf("mcp: delete token: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return NewToolError("NOT_FOUND", "no token with that id")
+	}
+	return nil
+}
+
 // normaliseOrEmpty keeps a pg array column happy: Postgres wants '{}' rather
 // than NULL for an empty list.
 func normaliseOrEmpty(values []string) []string {

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Button } from '@/components/ui/Button'
 import { Card } from '@/components/ui/Card'
 import { Input } from '@/components/ui/Input'
-import { createMcpToken, listMcpTokens, revokeMcpToken, listMcpV2Tools, createMcpV2Tool, generateMcpV2SQL, type McpTokenRecord, type ToolDefinition } from '@/api/mcp'
+import { createMcpToken, listMcpTokens, revokeMcpToken, deleteMcpToken, listMcpV2Tools, createMcpV2Tool, generateMcpV2SQL, type McpTokenRecord, type ToolDefinition } from '@/api/mcp'
 import { getAdminExperts } from '@/api/admin'
 import type { Expert } from '@/types/expert'
 import * as z from 'zod'
@@ -141,6 +141,8 @@ function AdminMcpAccess() {
   const expertsDropdownRef = useRef<HTMLDivElement>(null)
   const [newToken, setNewToken] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [expertSearch, setExpertSearch] = useState('')
+  const [toolSearch, setToolSearch] = useState('')
 
   const { data: tokens, isLoading } = useQuery({
     queryKey: ['admin', 'mcp-tokens'],
@@ -183,6 +185,11 @@ function AdminMcpAccess() {
     onSuccess: refresh,
   })
 
+  const deleteMutation = useMutation({
+    mutationFn: (id: string) => deleteMcpToken(id),
+    onSuccess: refresh,
+  })
+
   // dropdown helpers
   const toggleTool = (name: string) => {
     setSelectedTools((prev) =>
@@ -214,6 +221,26 @@ function AdminMcpAccess() {
   }
   const handleClearAllExperts = () => setSelectedExpertIds([])
   const isAllExpertsSelected = experts.length > 0 && selectedExpertIds.length === experts.length
+
+  // live search filters for the multi-select dropdowns (type to filter)
+  const filteredExperts = experts.filter((e: Expert) => {
+    const q = expertSearch.trim().toLowerCase()
+    if (!q) return true
+    return (
+      (e.name ?? '').toLowerCase().includes(q) ||
+      (e.domain ?? '').toLowerCase().includes(q) ||
+      (e.slug ?? '').toLowerCase().includes(q)
+    )
+  })
+  const filteredTools = tools.filter((t: ToolDefinition) => {
+    const q = toolSearch.trim().toLowerCase()
+    if (!q) return true
+    return (
+      (t.display_name ?? '').toLowerCase().includes(q) ||
+      (t.name ?? '').toLowerCase().includes(q) ||
+      (t.description ?? '').toLowerCase().includes(q)
+    )
+  })
 
   useEffect(() => {
     const onClickOutside = (e: MouseEvent) => {
@@ -265,9 +292,10 @@ function AdminMcpAccess() {
                 <label className="text-xs font-medium text-text-primary">SQL Query (SELECT only, use {`{{args.xxx}}`} or $1)</label>
                 <textarea value={sqlQuery} onChange={e => setSqlQuery(e.target.value)} placeholder="SELECT name, email FROM experts WHERE domain = {{args.domain}} LIMIT 100" rows={4} className="w-full border rounded-lg px-3 py-2 text-sm font-mono text-xs bg-bg-primary border-border-default text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-500" />
                 {toolErrors.sql_query && <p className="text-xs text-status-error">{toolErrors.sql_query}</p>}
+                <label className="text-xs font-medium text-text-primary">Describe in English / Hinglish — AI iska SELECT banayega (ye email field NAHI hai)</label>
                 <div className="flex gap-2 items-start">
-                  <input value={generatePrompt} onChange={e => setGeneratePrompt(e.target.value)} placeholder='e.g. experts ka naam aur email lao' className="flex-1 border rounded-lg px-3 py-2 text-sm bg-bg-primary border-border-default text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-500" />
-                  <Button type="button" disabled={isGenerating || !generatePrompt.trim()} onClick={handleGenerateSQL} variant="secondary" className="whitespace-nowrap">
+                  <input value={generatePrompt} onChange={e => setGeneratePrompt(e.target.value)} placeholder="e.g. experts ke naam aur unki domain list karo" className="flex-1 border rounded-lg px-3 py-2 text-sm bg-bg-primary border-border-default text-text-primary focus:outline-none focus:ring-2 focus:ring-brand-500" />
+                  <Button type="button" disabled={isGenerating || !generatePrompt.trim()} title={!generatePrompt.trim() ? "Pehle upar box me English/Hinglish me likho ki kaunsa data chahiye (koi email daalne ki zarurat nahi)" : "Generate SELECT from your description"} onClick={handleGenerateSQL} variant="secondary" className="whitespace-nowrap">
                     {isGenerating ? "Generating..." : "🪄 Generate via AI"}
                   </Button>
                 </div>
@@ -365,14 +393,24 @@ function AdminMcpAccess() {
                       Clear
                     </button>
                   </div>
+                  <div className="px-2 py-2 border-b border-border-subtle">
+                    <input
+                      type="text"
+                      value={expertSearch}
+                      onChange={(e) => setExpertSearch(e.target.value)}
+                      placeholder="Search experts..."
+                      autoFocus
+                      className="w-full border rounded-md px-2.5 py-1.5 text-xs bg-bg-primary border-border-default text-text-primary focus:outline-none focus:ring-1 focus:ring-brand"
+                    />
+                  </div>
                   <div className="overflow-y-auto flex-1 p-1">
                     {expertsError ? (
                       <div className="px-3 py-4 text-xs text-mode-refuse text-center">Failed to load experts.</div>
-                    ) : experts.length === 0 ? (
-                      <div className="px-3 py-4 text-xs text-text-disabled text-center">No experts found.</div>
+                    ) : filteredExperts.length === 0 ? (
+                      <div className="px-3 py-4 text-xs text-text-disabled text-center">No experts match your search.</div>
                     ) : (
                       <ul className="space-y-0.5">
-                        {experts.map((expert: Expert) => {
+                        {filteredExperts.map((expert: Expert) => {
                           const checked = selectedExpertIds.includes(expert.id)
                           return (
                             <li key={expert.id}>
@@ -414,7 +452,7 @@ function AdminMcpAccess() {
           <div className="relative" ref={dropdownRef}>
             <button
               type="button"
-              onClick={() => setDropdownOpen((o) => !o)}
+              onClick={() => { setDropdownOpen((o) => !o); setToolSearch('') }}
               className="w-full flex items-center justify-between rounded-md border border-border-subtle bg-transparent px-3 py-1.5 text-sm hover:border-brand focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand disabled:opacity-50"
               disabled={toolsLoading}
             >
@@ -439,14 +477,24 @@ function AdminMcpAccess() {
                     Clear
                   </button>
                 </div>
+                <div className="px-2 py-2 border-b border-border-subtle">
+                  <input
+                    type="text"
+                    value={toolSearch}
+                    onChange={(e) => setToolSearch(e.target.value)}
+                    placeholder="Search tools..."
+                    autoFocus
+                    className="w-full border rounded-md px-2.5 py-1.5 text-xs bg-bg-primary border-border-default text-text-primary focus:outline-none focus:ring-1 focus:ring-brand"
+                  />
+                </div>
                 <div className="overflow-y-auto flex-1 p-1">
                   {toolsError ? (
                     <div className="px-3 py-4 text-xs text-mode-refuse text-center">Failed to load tools.</div>
-                  ) : tools.length === 0 ? (
-                    <div className="px-3 py-4 text-xs text-text-disabled text-center">No tools found.</div>
+                  ) : filteredTools.length === 0 ? (
+                    <div className="px-3 py-4 text-xs text-text-disabled text-center">No tools match your search.</div>
                   ) : (
                     <ul className="space-y-0.5">
-                      {tools.map((tool: ToolDefinition) => {
+                      {filteredTools.map((tool: ToolDefinition) => {
                         const checked = selectedTools.includes(tool.name)
                         return (
                           <li key={tool.id}>
@@ -556,22 +604,42 @@ function AdminMcpAccess() {
                   {token.last_used_at ? ` · last used ${token.last_used_at.slice(0, 10)}` : ' · never used'}
                 </p>
               </div>
-              {!token.revoked && (
+              <div className="flex flex-shrink-0 items-center gap-2">
+                {!token.revoked && (
+                  <button
+                    type="button"
+                    disabled={revokeMutation.isPending}
+                    onClick={() => revokeMutation.mutate(token.id)}
+                    className="rounded-md border border-border-subtle px-2.5 py-1 text-xs text-text-secondary transition hover:border-mode-refuse/40 hover:text-mode-refuse disabled:opacity-40"
+                  >
+                    Revoke
+                  </button>
+                )}
                 <button
                   type="button"
-                  disabled={revokeMutation.isPending}
-                  onClick={() => revokeMutation.mutate(token.id)}
-                  className="flex-shrink-0 rounded-md border border-border-subtle px-2.5 py-1 text-xs text-text-secondary transition hover:border-mode-refuse/40 hover:text-mode-refuse disabled:opacity-40"
+                  disabled={deleteMutation.isPending}
+                  onClick={() => {
+                    if (window.confirm(`Delete token "${token.label}" permanently? Ye database se pura delete ho jayega, undo nahi hoga.`)) {
+                      deleteMutation.mutate(token.id)
+                    }
+                  }}
+                  className="rounded-md border border-border-subtle px-2.5 py-1 text-xs text-text-secondary transition hover:border-red-500/40 hover:text-red-400 disabled:opacity-40"
+                  title="Delete permanently from database"
                 >
-                  Revoke
+                  Delete
                 </button>
-              )}
+              </div>
             </div>
           ))}
         </div>
         {revokeMutation.isError && (
           <p className="mt-2 text-xs text-mode-refuse">
             Revoke failed — the token may already be revoked.
+          </p>
+        )}
+        {deleteMutation.isError && (
+          <p className="mt-2 text-xs text-mode-refuse">
+            Delete failed — token not found.
           </p>
         )}
       </Card>

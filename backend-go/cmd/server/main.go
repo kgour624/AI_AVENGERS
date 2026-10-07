@@ -1253,6 +1253,7 @@ func buildRouter(
 		adminGroup.GET("/mcp-tokens", mcpAdminHandler.ListMCPTokens)
 		adminGroup.POST("/mcp-tokens", mcpAdminHandler.CreateMCPToken)
 		adminGroup.POST("/mcp-tokens/:id/revoke", mcpAdminHandler.RevokeMCPToken)
+		adminGroup.DELETE("/mcp-tokens/:id", mcpAdminHandler.DeleteMCPToken)
 		
 
 

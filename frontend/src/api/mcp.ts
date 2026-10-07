@@ -50,6 +50,9 @@ export const createMcpToken = (body: { label: string; domains?: string[]; expert
 export const revokeMcpToken = (id: string) =>
   baseAPI.post<ApiResponse<{ status: string }>>(`/api/v1/admin/mcp-tokens/${id}/revoke`).then((res) => res.data.data!)
 
+export const deleteMcpToken = (id: string) =>
+  baseAPI.delete<ApiResponse<{ status: string }>>(`/api/v1/admin/mcp-tokens/${id}`).then((res) => res.data.data!)
+
 // --- mcp-v2: fetch tools dynamically from Postgres via mcp-v2 hexagon ---
 // GET /api/v1/mcp-v2/tools -> { tools: ToolDefinition[] }
 // Wired in backend-go/internal/mcp-v2/handler.go:HandleListTools() -> service.ListTools() -> storage.ListTools()

@@ -229,26 +229,28 @@ type rpcErr struct {
 	Message string `json:"message"`
 }
 
+// Fix: No-Streaming Timeout — 145s + heartbeat so large review_change (Rerank+LLM 8-10s) never hangs.
+// Mental model: Input (large diff) -> Process (RAG+LLM with keepalive pings every 15s) -> Output (final cited review)
+const mcpCallTimeout = 145 * time.Second
+const mcpHeartbeatInterval = 15 * time.Second
+
 func (h *Handler) handleMCP(c *gin.Context) {
 	// 401 if no token (Header or Query)
 	token := c.GetHeader("Authorization")
 	if token == "" {
 		token = c.Query("token")
 	}
-	
 	if token == "" {
 		c.Header("WWW-Authenticate", fmt.Sprintf(`Bearer realm="AI Avengers", resource_metadata="%s/.well-known/oauth-protected-resource/mcp"`, schemeHost(c)))
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "missing_token"})
 		return
 	}
-	// Inject token into context for downstream dispatch to use
 	c.Set("mcp_token", token)
 	var req rpcReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusOK, rpcResp{JSONRPC: "2.0", Error: &rpcErr{Code: -32700, Message: err.Error()}})
 		return
 	}
-	// --- Cancellation intercept: notifications/cancelled is notification (no rpcResp) -> 202 Accepted
 	if req.Method == "notifications/cancelled" {
 		if cid := extractCancelID(req.Params); cid != "" {
 			h.cancels.CancelAndDelete(cid)
@@ -259,10 +261,13 @@ func (h *Handler) handleMCP(c *gin.Context) {
 		c.Status(http.StatusAccepted)
 		return
 	}
-	// --- Normal request: wire cancellable context + store for cancel
+	isSSE := strings.Contains(c.GetHeader("Accept"), "text/event-stream")
 	idKey := string(req.ID)
 	if idKey != "" && idKey != "null" {
-		ctx, cancel := context.WithCancel(c.Request.Context())
+		// 145s timeout at handler level — big RAG search never cut mid-way. Inherits server WriteTimeout 1800s.
+		timeoutCtx, timeoutCancel := context.WithTimeout(c.Request.Context(), mcpCallTimeout)
+		defer timeoutCancel()
+		ctx, cancel := context.WithCancel(timeoutCtx)
 		h.cancels.Store(idKey, cancel)
 		defer h.cancels.Delete(idKey)
 		if pt := extractProgressToken(req.Params); pt != "" && pt != idKey {
@@ -270,44 +275,104 @@ func (h *Handler) handleMCP(c *gin.Context) {
 			defer h.cancels.Delete(pt)
 		}
 		c.Request = c.Request.WithContext(ctx)
+		if isSSE {
+			h.handleMCPWithHeartbeat(c, req, ctx)
+			return
+		}
 		result, respErr := h.dispatch(c, req)
 		if ctx.Err() != nil && respErr == nil {
-			respErr = &rpcErr{Code: -32800, Message: "Request cancelled"}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				respErr = &rpcErr{Code: -32603, Message: "timeout: RAG search took too long (>145s), try smaller diff"}
+			} else {
+				respErr = &rpcErr{Code: -32800, Message: "Request cancelled"}
+			}
 		}
-		// Map AppError Cancelled -> -32800 (toRpcErr already handles, but fast path here too)
 		if respErr != nil && ctx.Err() != nil && respErr.Code != -32800 {
-			// keep cancelled precedence if context was cancelled
 			if errors.Is(ctx.Err(), context.Canceled) {
 				respErr = &rpcErr{Code: -32800, Message: "Request cancelled"}
 			}
 		}
-		resp := rpcResp{JSONRPC: "2.0", ID: req.ID, Result: result, Error: respErr}
-		if strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
-			c.Header("Content-Type", "text/event-stream")
-			c.Header("Cache-Control", "no-cache")
-			c.Stream(func(w io.Writer) bool {
-				b, _ := json.Marshal(resp)
-				c.SSEvent("message", string(b))
-				return false
-			})
-			return
-		}
-		c.JSON(http.StatusOK, resp)
+		c.JSON(http.StatusOK, rpcResp{JSONRPC: "2.0", ID: req.ID, Result: result, Error: respErr})
+		return
+	}
+	// Notification or no-ID: still protect with 145s timeout
+	timeoutCtx, timeoutCancel := context.WithTimeout(c.Request.Context(), mcpCallTimeout)
+	defer timeoutCancel()
+	c.Request = c.Request.WithContext(timeoutCtx)
+	if isSSE {
+		// For SSE without ID we still stream with heartbeat
+		h.handleMCPWithHeartbeat(c, req, timeoutCtx)
 		return
 	}
 	result, respErr := h.dispatch(c, req)
-	resp := rpcResp{JSONRPC: "2.0", ID: req.ID, Result: result, Error: respErr}
-	if strings.Contains(c.GetHeader("Accept"), "text/event-stream") {
-		c.Header("Content-Type", "text/event-stream")
-		c.Header("Cache-Control", "no-cache")
-		c.Stream(func(w io.Writer) bool {
-			b, _ := json.Marshal(resp)
-			c.SSEvent("message", string(b))
-			return false
-		})
-		return
+	if timeoutCtx.Err() != nil && respErr == nil && errors.Is(timeoutCtx.Err(), context.DeadlineExceeded) {
+		respErr = &rpcErr{Code: -32603, Message: "timeout: RAG search took too long (>145s)"}
 	}
-	c.JSON(http.StatusOK, resp)
+	c.JSON(http.StatusOK, rpcResp{JSONRPC: "2.0", ID: req.ID, Result: result, Error: respErr})
+}
+
+// handleMCPWithHeartbeat streams SSE with 15s keepalive pings while dispatch runs.
+// Prevents Claude thinking connection hung during 8-10s Rerank+LLM. Single SSE event close bug fixed.
+func (h *Handler) handleMCPWithHeartbeat(c *gin.Context, req rpcReq, ctx context.Context) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+	flusher, canFlush := c.Writer.(http.Flusher)
+	// Initial comment to open stream immediately — client knows server is alive.
+	fmt.Fprintf(c.Writer, ": mcp-v2 heartbeat start\n\n")
+	if canFlush {
+		flusher.Flush()
+	}
+	type done struct {
+		result any
+		err    *rpcErr
+	}
+	ch := make(chan done, 1)
+	go func() {
+		r, e := h.dispatch(c, req)
+		ch <- done{r, e}
+	}()
+	ticker := time.NewTicker(mcpHeartbeatInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				b, _ := json.Marshal(rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32603, Message: "timeout: RAG search took too long (>145s)"}})
+				fmt.Fprintf(c.Writer, "event: message\ndata: %s\n\n", string(b))
+			} else {
+				b, _ := json.Marshal(rpcResp{JSONRPC: "2.0", ID: req.ID, Error: &rpcErr{Code: -32800, Message: "Request cancelled"}})
+				fmt.Fprintf(c.Writer, "event: message\ndata: %s\n\n", string(b))
+			}
+			if canFlush {
+				flusher.Flush()
+			}
+			return
+		case <-ticker.C:
+			// SSE comment + progress notification keeps Claude’s EventSource alive without parsing as message
+			fmt.Fprintf(c.Writer, ": heartbeat %d\n\n", time.Now().Unix())
+			// Optional JSON progress for clients that listen to notifications/progress
+			progressPayload, _ := json.Marshal(gin.H{"progressToken": extractProgressToken(req.Params), "progress": 0, "message": "processing RAG+LLM..."})
+			fmt.Fprintf(c.Writer, "event: notifications/progress\ndata: %s\n\n", string(progressPayload))
+			if canFlush {
+				flusher.Flush()
+			}
+		case out := <-ch:
+			respErr := out.err
+			if ctx.Err() != nil && respErr == nil {
+				respErr = &rpcErr{Code: -32800, Message: "Request cancelled"}
+			}
+			resp := rpcResp{JSONRPC: "2.0", ID: req.ID, Result: out.result, Error: respErr}
+			b, _ := json.Marshal(resp)
+			fmt.Fprintf(c.Writer, "event: message\ndata: %s\n\n", string(b))
+			if canFlush {
+				flusher.Flush()
+			}
+			return
+		}
+	}
 }
 
 func extractCancelID(params json.RawMessage) string {
@@ -435,12 +500,26 @@ func (h *Handler) HandleGenerateSQL(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"sql": sql})
 }
 
+// parseResourceURI extracts {domain_name} from expert://{domain}/standards — no hardcoded domains.
+func parseResourceURI(uri string) (string, error) {
+	// expected expert://{domain}/standards
+	if !strings.HasPrefix(uri, "expert://") {
+		return "", fmt.Errorf("invalid uri %q: must be expert://{domain}/standards", uri)
+	}
+	rest := strings.TrimPrefix(uri, "expert://")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) != 2 || strings.TrimSpace(parts[0]) == "" || parts[1] != "standards" {
+		return "", fmt.Errorf("invalid uri %q: must be expert://{domain}/standards", uri)
+	}
+	return strings.TrimSpace(parts[0]), nil
+}
+
 func (h *Handler) dispatch(c *gin.Context, req rpcReq) (any, *rpcErr) {
 	switch req.Method {
 	case "initialize":
 		return gin.H{
 			"protocolVersion": "2024-11-05",
-			"capabilities":    gin.H{"tools": gin.H{}, "resources": gin.H{}, "prompts": gin.H{}},
+			"capabilities":    gin.H{"tools": gin.H{}, "resources": gin.H{"subscribe": false, "listChanged": false}, "prompts": gin.H{}},
 			"serverInfo":      gin.H{"name": "ai-avengers", "version": "1.0.0"},
 		}, nil
 	case "tools/list":
@@ -493,7 +572,84 @@ func (h *Handler) dispatch(c *gin.Context, req rpcReq) (any, *rpcErr) {
 		}
 		return h.handleToolCall(c, p.Name, p.Arguments)
 	case "resources/list":
-		return gin.H{"resources": []gin.H{{"uri": "expert://experts", "name": "All Experts", "mimeType": "application/json"}}}, nil
+		// Dynamic, no hardcoded domain — iterates Catalog (ListExperts) and filters by existing scope.AllowsDomain
+		// URI pattern MUST be expert://{domain_name}/standards — domain_name = expert slug (normalized)
+		scopeRes := h.resolveScope(c)
+		allExps, err := h.svc.ListExperts(c.Request.Context())
+		if err != nil {
+			return nil, h.toRpcErr(err)
+		}
+		resList := []gin.H{}
+		for _, e := range allExps {
+			domainName := strings.TrimSpace(e.Slug)
+			if domainName == "" {
+				domainName = strings.TrimSpace(e.Name)
+			}
+			if domainName == "" {
+				continue
+			}
+			// Zero DB/Token change: reuse existing Domain scope only. Empty Domains => all allowed.
+			// Also respect ExpertIDs if set — both must pass (no hardcoded domains).
+			if !scopeRes.AllowsExpert(e.ID) {
+				continue
+			}
+			// Allow if either slug or name matches token's domain allowlist (NormDomainKey inside)
+			if !scopeRes.AllowsDomain(domainName) && !scopeRes.AllowsDomain(e.Name) && !scopeRes.AllowsDomain(e.Charter) {
+				continue
+			}
+			uri := "expert://" + domainName + "/standards"
+			resList = append(resList, gin.H{
+				"uri":         uri,
+				"name":        e.Name + " Standards",
+				"description": "Authoritative Teacher Packet / Reasoning Charter for " + e.Name + " — same as get_standards",
+				"mimeType":    "text/markdown",
+			})
+		}
+		return gin.H{"resources": resList}, nil
+	case "resources/read":
+		// On-the-fly: same Teacher Packet as get_standards, zero file creation
+		var rp struct {
+			URI string `json:"uri"`
+		}
+		if err := json.Unmarshal(req.Params, &rp); err != nil {
+			return nil, &rpcErr{Code: -32602, Message: "invalid params: " + err.Error()}
+		}
+		uri := strings.TrimSpace(rp.URI)
+		if uri == "" {
+			return nil, &rpcErr{Code: -32602, Message: "uri is required, expected expert://{domain}/standards"}
+		}
+		domain, err := parseResourceURI(uri)
+		if err != nil {
+			return nil, &rpcErr{Code: -32602, Message: err.Error()}
+		}
+		scopeRead := h.resolveScope(c)
+		// Reuse existing domain scope — no new resources array on token
+		if !scopeRead.AllowsDomain(domain) {
+			return nil, &rpcErr{Code: -32001, Message: "Token lacks permission for this domain resource: " + domain}
+		}
+		// Resolve domain -> expert dynamically (no hardcoded map). Match by slug or name normalized.
+		exps, err := h.svc.ListExperts(c.Request.Context())
+		if err != nil {
+			return nil, h.toRpcErr(err)
+		}
+		var matched *business.Expert
+		for i, e := range exps {
+			if mcp.NormDomainKey(e.Slug) == mcp.NormDomainKey(domain) || mcp.NormDomainKey(e.Name) == mcp.NormDomainKey(domain) {
+				if scopeRead.AllowsExpert(e.ID) {
+					matched = &exps[i]
+					break
+				}
+			}
+		}
+		if matched == nil {
+			return nil, &rpcErr{Code: -32602, Message: "unknown domain resource: " + domain + " — call resources/list to see available"}
+		}
+		// Return same Authoritative Rules as get_standards tool (no duplicate logic)
+		packet, _, err := h.svc.GetStandards(c.Request.Context(), matched.ID, "general")
+		if err != nil {
+			return nil, h.toRpcErr(err)
+		}
+		return gin.H{"contents": []gin.H{{"uri": uri, "mimeType": "text/markdown", "text": packet}}}, nil
 	case "prompts/list":
 		return gin.H{"prompts": []gin.H{{"name": "suggest_review", "description": "Review file as expert citing chunks", "arguments": []gin.H{{"name": "expertId", "required": true}, {"name": "filePath", "required": true}}}}}, nil
 	case "notifications/initialized":
