@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
@@ -2081,6 +2083,7 @@ func (p *IngestionPipeline) runSmokeTest(
 	// citation rule cannot drift between the two places that enforce it.
 	answerer := newGroundedAnswerer(p.gateway, p.logger)
 	result := SmokeTestResult{}
+	rcfg := LoadRetrievalConfig(ctx, p.db)
 
 	p.logger.Info("smoke test starting",
 		zap.String("expert_id", expertID.String()),
@@ -2180,14 +2183,39 @@ func (p *IngestionPipeline) runSmokeTest(
 		queryVec := pgvector.NewVector(embeddings[0])
 
 		// Step 4: Vector search — fetch top-K candidates for this expert.
-		chunkRows, searchErr := p.db.Query(ctx,
-			`SELECT chunk_text
-			 FROM course_chunks
-			 WHERE expert_id = $1
-			 ORDER BY embedding <=> $2
-			 LIMIT $3`,
-			expertID, queryVec, smokeTestTopK,
-		)
+		// Parent-child fast-path (flag-gated): search child embeddings (150t) but
+		// return parent page_text (1200t) via LEFT JOIN expert_pages.
+		// When EnableParentChild=true: LIMIT TopKChildren (50) then dedup to TopKParents (3) after rerank.
+		// When false: legacy LIMIT smokeTestTopK (10) on chunk_text.
+		var chunkRows pgx.Rows
+		var searchErr error
+		useParent := rcfg.EnableParentChild
+		topK := smokeTestTopK
+		if useParent {
+			if rcfg.TopKChildren > 0 {
+				topK = rcfg.TopKChildren
+			} else {
+				topK = 50
+			}
+			chunkRows, searchErr = p.db.Query(ctx,
+				`SELECT COALESCE(ep.page_text, c.chunk_text) AS eff_text, c.parent_id, c.embedding <=> $2 AS dist
+				 FROM course_chunks c
+				 LEFT JOIN expert_pages ep ON ep.id = c.parent_id
+				 WHERE c.expert_id = $1
+				 ORDER BY dist
+				 LIMIT $3`,
+				expertID, queryVec, topK,
+			)
+		} else {
+			chunkRows, searchErr = p.db.Query(ctx,
+				`SELECT chunk_text, embedding <=> $2 AS dist
+				 FROM course_chunks
+				 WHERE expert_id = $1
+				 ORDER BY dist
+				 LIMIT $3`,
+				expertID, queryVec, smokeTestTopK,
+			)
+		}
 		if searchErr != nil {
 			p.logger.Warn("smoke test: vector search failed",
 				zap.Int("probe_index", i),
@@ -2196,14 +2224,41 @@ func (p *IngestionPipeline) runSmokeTest(
 			continue // Skip this probe, don't fail the whole test
 		}
 
-		var candidates []string
-		for chunkRows.Next() {
-			var text string
-			if scanErr := chunkRows.Scan(&text); scanErr == nil {
-				candidates = append(candidates, text)
+		type sc struct {
+			Text     string
+			ParentID *uuid.UUID
+			Dist     float32
+		}
+		var raw []sc
+		if useParent {
+			for chunkRows.Next() {
+				var t string
+				var pid *uuid.UUID
+				var dist float32
+				if scanErr := chunkRows.Scan(&t, &pid, &dist); scanErr == nil {
+					raw = append(raw, sc{Text: t, ParentID: pid, Dist: dist})
+				}
+			}
+		} else {
+			for chunkRows.Next() {
+				var t string
+				var dist float32
+				if scanErr := chunkRows.Scan(&t, &dist); scanErr == nil {
+					raw = append(raw, sc{Text: t, Dist: dist})
+				}
 			}
 		}
 		chunkRows.Close()
+		// Normalize to candidates/distances for legacy path compatibility,
+		// parent dedup will be applied after rerank on useParent.
+		var candidates []string
+		var distances []float32
+		var parentIDs []*uuid.UUID // parallel to raw when useParent
+		for _, r := range raw {
+			candidates = append(candidates, r.Text)
+			distances = append(distances, r.Dist)
+			parentIDs = append(parentIDs, r.ParentID)
+		}
 
 		if len(candidates) == 0 {
 			p.logger.Warn("smoke test: no candidates returned",
@@ -2217,25 +2272,169 @@ func (p *IngestionPipeline) runSmokeTest(
 		// WHY p.sidecar.Rerank (not p.embedder.Rerank):
 		// Rerank() is sidecar-only — it is NOT in the Embedder interface.
 		// CodeCraftAPI has no /v1/rerank endpoint. Locked decision.
-		rankResults, rerankErr := p.sidecar.Rerank(ctx, probeQuestion, candidates, len(candidates))
-		if rerankErr != nil {
-			p.logger.Warn("smoke test: rerank failed",
+		// Fallback: when sidecar is nil or rerank fails, use vector distance
+		// (bestScore = 1 - dist) with threshold 0.75 instead of aborting the
+		// entire test. Rerank is more accurate but distance is still signal.
+		var bestScore float32
+		var rerankUsed bool
+		var orderedCandidates []string
+		if p.sidecar == nil {
+			p.logger.Warn("smoke test: sidecar nil, using distance fallback",
 				zap.Int("probe_index", i),
-				zap.Error(rerankErr),
+				zap.String("topic", topic),
 			)
-			// Rerank failure = ML sidecar issue, return error.
-			return result, fmt.Errorf("smoke test: rerank unavailable: %w", rerankErr)
-		}
-
-		// Step 6: Check if best rerank score meets threshold.
-		bestScore := float32(0)
-		for _, r := range rankResults {
-			if r.Score > bestScore {
-				bestScore = r.Score
+			bestDist := distances[0]
+			for _, d := range distances[1:] {
+				if d < bestDist {
+					bestDist = d
+				}
+			}
+			bestScore = 1 - bestDist
+			rerankUsed = false
+			if useParent {
+				topParents := rcfg.TopKParents
+				if topParents == 0 {
+					topParents = 3
+				}
+				seen := make(map[string]bool, topParents)
+				orderedCandidates = make([]string, 0, topParents)
+				for idx, txt := range candidates {
+					pid := ""
+					if idx < len(parentIDs) && parentIDs[idx] != nil {
+						pid = parentIDs[idx].String()
+					}
+					if pid != "" {
+						if seen[pid] {
+							continue
+						}
+						seen[pid] = true
+					}
+					orderedCandidates = append(orderedCandidates, txt)
+					if len(orderedCandidates) >= topParents {
+						break
+					}
+				}
+				if len(orderedCandidates) == 0 {
+					orderedCandidates = candidates
+					if len(orderedCandidates) > topParents {
+						orderedCandidates = orderedCandidates[:topParents]
+					}
+				}
+			} else {
+				orderedCandidates = candidates
+			}
+		} else {
+			rankResults, rerankErr := p.sidecar.Rerank(ctx, probeQuestion, candidates, len(candidates))
+			if rerankErr != nil {
+				p.logger.Warn("smoke test: rerank failed, using distance fallback",
+					zap.Int("probe_index", i),
+					zap.Error(rerankErr),
+				)
+				bestDist := distances[0]
+				for _, d := range distances[1:] {
+					if d < bestDist {
+						bestDist = d
+					}
+				}
+				bestScore = 1 - bestDist
+				rerankUsed = false
+				if useParent {
+					topParents2 := rcfg.TopKParents
+					if topParents2 == 0 {
+						topParents2 = 3
+					}
+					seen2 := make(map[string]bool, topParents2)
+					orderedCandidates = make([]string, 0, topParents2)
+					for idx2, txt2 := range candidates {
+						pid2 := ""
+						if idx2 < len(parentIDs) && parentIDs[idx2] != nil {
+							pid2 = parentIDs[idx2].String()
+						}
+						if pid2 != "" {
+							if seen2[pid2] {
+								continue
+							}
+							seen2[pid2] = true
+						}
+						orderedCandidates = append(orderedCandidates, txt2)
+						if len(orderedCandidates) >= topParents2 {
+							break
+						}
+					}
+					if len(orderedCandidates) == 0 {
+						orderedCandidates = candidates
+						if len(orderedCandidates) > topParents2 {
+							orderedCandidates = orderedCandidates[:topParents2]
+						}
+					}
+				} else {
+					orderedCandidates = candidates
+				}
+			} else {
+				rerankUsed = true
+				for _, r := range rankResults {
+					if r.Score > bestScore {
+						bestScore = r.Score
+					}
+				}
+				// Sort candidates by rerank score before building numbered context
+				// so the LLM sees the most relevant chunk as [1], reducing INSUFFICIENT_CONTEXT refusals.
+				sort.Slice(rankResults, func(a, b int) bool {
+					return rankResults[a].Score > rankResults[b].Score
+				})
+				// Parent dedup: when useParent, 50 children may map to 3 unique parents.
+				// Use rerank order to pick best parent per dedup, then slice to TopKParents.
+				if useParent {
+					topParents := rcfg.TopKParents
+					if topParents == 0 {
+						topParents = 3
+					}
+					seen := make(map[string]bool, topParents)
+					orderedCandidates = make([]string, 0, topParents)
+					for _, r := range rankResults {
+						if r.Index < 0 || r.Index >= len(candidates) {
+							continue
+						}
+						pid := ""
+						if r.Index < len(parentIDs) && parentIDs[r.Index] != nil {
+							pid = parentIDs[r.Index].String()
+						}
+						if pid != "" {
+							if seen[pid] {
+								continue
+							}
+							seen[pid] = true
+						}
+						orderedCandidates = append(orderedCandidates, candidates[r.Index])
+						if len(orderedCandidates) >= topParents {
+							break
+						}
+					}
+					if len(orderedCandidates) == 0 {
+						orderedCandidates = candidates
+						if len(orderedCandidates) > topParents {
+							orderedCandidates = orderedCandidates[:topParents]
+						}
+					}
+				} else {
+					orderedCandidates = make([]string, 0, len(rankResults))
+					for _, r := range rankResults {
+						if r.Index >= 0 && r.Index < len(candidates) {
+							orderedCandidates = append(orderedCandidates, candidates[r.Index])
+						}
+					}
+					if len(orderedCandidates) == 0 {
+						orderedCandidates = candidates
+					}
+				}
 			}
 		}
 
-		probePassed := bestScore >= smokeTestRerankThreshold
+		threshold := smokeTestRerankThreshold
+		if !rerankUsed {
+			threshold = 0.75
+		}
+		probePassed := bestScore >= threshold
 
 		// §5.3(5) asks for "non-REFUSE responses WITH CITATIONS", not for a good
 		// retrieval score. Until now this test only measured retrieval, so an expert
@@ -2245,27 +2444,62 @@ func (p *IngestionPipeline) runSmokeTest(
 		// already explained, and asking the model to answer from poor context would
 		// spend a call to learn the same thing.
 		if probePassed {
-			contextBlock := buildNumberedContext(candidates, promptPassageChars)
+			// Use parent page_text (1500 chars) when parent-child is on, else 900.
+			passageLen := promptPassageChars
+			if useParent {
+				passageLen = 1500
+			}
+			contextBlock := buildNumberedContext(orderedCandidates, passageLen)
 			answer, answerErr := answerer.Answer(ctx, probeQuestion, contextBlock)
+			if answerErr != nil {
+				for attempt := 1; attempt <= 2 && answerErr != nil; attempt++ {
+					backoff := time.Duration(attempt*500) * time.Millisecond
+					select {
+					case <-ctx.Done():
+						break
+					case <-time.After(backoff):
+					}
+					p.logger.Warn("smoke test: retrying answer call",
+						zap.Int("probe_index", i),
+						zap.Int("attempt", attempt),
+						zap.Error(answerErr),
+					)
+					answer, answerErr = answerer.Answer(ctx, probeQuestion, contextBlock)
+				}
+			}
 			switch {
 			case answerErr != nil:
-				// Infrastructure, not corpus quality: count it as unusable and let the
-				// caller decide, exactly as the embed/rerank failures above do.
-				p.logger.Warn("smoke test: answering failed for probe",
+				// Infrastructure error after retries: return as smokeErr, not as NoAnswer.
+				// This separates gateway 401/402/429/5xx/timeout from logical INSUFFICIENT_CONTEXT.
+				p.logger.Warn("smoke test: answering failed for probe (infra, returning error)",
 					zap.Int("probe_index", i),
 					zap.String("topic", topic),
 					zap.Error(answerErr),
 				)
-				result.NoAnswer++
-				probePassed = false
+				return result, fmt.Errorf("smoke test: answering unavailable: %w", answerErr)
 			default:
-				switch refusalOrCitationFailure(answer) {
+				switch failure := refusalOrCitationFailure(answer); failure {
 				case FailureNotCited:
+					p.logger.Warn("smoke test: probe answer not cited",
+						zap.Int("probe_index", i),
+						zap.String("topic", topic),
+						zap.String("answer_clipped", clipPromptText(answer, 500)),
+					)
 					result.Uncited++
 					probePassed = false
 				case FailureRefused, FailureEmpty:
+					p.logger.Warn("smoke test: probe refused/empty (logical, counting as NoAnswer)",
+						zap.Int("probe_index", i),
+						zap.String("topic", topic),
+						zap.String("failure", failure),
+						zap.String("answer_clipped", clipPromptText(answer, 500)),
+						zap.String("context_clipped", clipPromptText(contextBlock, 800)),
+						zap.Bool("rerank_used", rerankUsed),
+					)
 					result.NoAnswer++
 					probePassed = false
+				default:
+					_ = failure
 				}
 			}
 		}

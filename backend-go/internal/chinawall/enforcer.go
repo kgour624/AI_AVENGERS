@@ -1055,8 +1055,22 @@ func (e *Enforcer) generateStructured(
 	sem := make(chan struct{}, workers)
 
 	for i := range sections {
+		// Ghost fix: every blocking send must respect client disconnect.
+		// Before fix `sem <- struct{}{}` blocked forever if browser closed
+		// while streaming — spawn loop hung, wg.Wait hung -> ghost process.
+		select {
+		case <-ctx.Done():
+			// Client left: remaining sections will never be spawned.
+			// Mark them cancelled and close channels so collector drains.
+			for k := i; k < len(sections); k++ {
+				outcomes[k] = sectionOutcome{err: ctx.Err()}
+				close(secChs[k])
+			}
+			// Jump to wait — no more spawns.
+			goto waitSections
+		case sem <- struct{}{}:
+		}
 		wg.Add(1)
-		sem <- struct{}{} // acquire before spawning: keeps concurrency bounded
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
@@ -1073,6 +1087,7 @@ func (e *Enforcer) generateStructured(
 			close(secChs[i])
 		}(i)
 	}
+waitSections:
 
 	// Collector: the only writer to tokenCh, so the reader sees sections in
 	// template order even though they were produced concurrently. It ends when

@@ -22,6 +22,8 @@ import { buildResponseMarkdown, buildMarkdownFilename, downloadMarkdown } from '
 import { RelayTransparencyPanel } from '@/components/chat/RelayTransparencyPanel'
 import { SectionReviewGate } from '@/components/chat/SectionReviewGate'
 import { RelayFailedBanner } from '@/components/chat/RelayFailedBanner'
+import ExpertErrorCard from '@/components/chat/ExpertErrorCard'
+import VirtualizedAnswer from '@/components/chat/VirtualizedAnswer'
 
 /**
  * HighlightedText component - highlights search query matches in text.
@@ -55,6 +57,13 @@ function HighlightedText({ text, query }: { text: string; query: string }) {
  * (m.collabSections, all sections present at once) - both pass the same
  * CollabSection[] shape, so one renderer keeps them visually identical.
  */
+function safeRenderContent(content: string, citations?: any[]) {
+  if (!content) return null;
+  // >4000 chars triggers virtual paging to prevent DOM freeze (Fix #3)
+  if (content.length > 4000) return <VirtualizedAnswer content={content} citations={citations} />;
+  return <div className="whitespace-pre-wrap break-words text-sm">{content}</div>;
+}
+
 function CollabSectionList({ sections }: { sections: CollabSectionType[] }) {
   return (
     <div className="space-y-3">
@@ -605,24 +614,11 @@ export default function ChatPage() {
           )}
 
           {stream?.status === 'error' && (
-            <div className="flex items-center justify-between gap-3 rounded-md border border-mode-refuse/30 bg-mode-refuse/5 p-3">
-              <p className="text-sm text-mode-refuse">{stream.error}</p>
-              {lastSend && (
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => {
-                    // Retry = resend the SAME request (same question, experts,
-                    // files, format and basis). Clearing the failed stream first
-                    // so the panel returns to a clean state.
-                    clearStream(chat.id)
-                    void sendMessage(lastSend)
-                  }}
-                >
-                  ↻ Retry
-                </Button>
-              )}
-            </div>
+            <ExpertErrorCard
+              message={stream.error || "Unknown error"}
+              code={(stream.error?.split(":")[0] || "").slice(0,60)}
+              onRetry={lastSend ? () => { clearStream(chat.id); void sendMessage(lastSend); } : undefined}
+            />
           )}
         </div>
 

@@ -12,41 +12,33 @@ import (
 	"go.uber.org/zap"
 
 	"ai_avengers/backend/internal/chinawall"
+	"ai_avengers/backend/internal/retrieval"
 )
 
 // tryParentChildRetrieval is Phase 2 critical path (context assembler side).
-// Mirrors knowledge.ParentChildRetriever but lives in context package to avoid import cycle.
+// Single source of config/timeout lives in internal/retrieval to avoid drift
+// with knowledge.ParentChildRetriever. Graceful fallback on timeout (nil,nil).
 // Additive + feature-flagged: when retrieval_config.enable_parent_child=false, returns (nil,nil) so caller falls back.
 // Returns parent page_text as CourseChunk (Text=parent page, Topic from best child, heading via SectionPath).
 func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.UUID, embedding []float32, question string, limit int) ([]chinawall.CourseChunk, error) {
-	// Load retrieval_config best-effort (defaults if missing)
-	cfg := struct {
-		Enable     bool `json:"enable_parent_child"`
-		TopKChild  int  `json:"top_k_children"`
-		TopKParent int  `json:"top_k_parents"`
-	}{}
-	var raw []byte
-	if err := a.db.QueryRow(ctx, `SELECT value FROM system_settings WHERE key='retrieval_config'`).Scan(&raw); err == nil && len(raw) > 0 {
-		_ = jsonUnmarshalRaw(raw, &cfg)
-	}
-	if !cfg.Enable {
+	cfg := retrieval.LoadRetrievalConfig(ctx, a.db)
+	if !cfg.EnableParentChild {
 		return nil, nil
 	}
-	topK := cfg.TopKChild
+	topK := cfg.TopKChildren
 	if topK == 0 {
 		topK = 50
 	}
-	targetParents := cfg.TopKParent
+	targetParents := cfg.TopKParents
 	if targetParents == 0 {
 		targetParents = 3
 	}
 	if limit > 0 && targetParents > limit {
 		targetParents = limit
 	}
-	qctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	qctx, cancel := context.WithTimeout(ctx, time.Duration(retrieval.ParentSearchTimeout)*time.Millisecond)
 	defer cancel()
 	vec := pgvector.NewVector(embedding)
-	// Use non-reserved alias 'c' for course_chunks to avoid PG reserved keyword 'ch'
 	rows, err := a.db.Query(qctx, `
 		SELECT c.id, c.parent_id, c.parent_index, c.chunk_text, c.section_path, COALESCE(c.topic,''), c.embedding <=> $1 AS distance
 		FROM course_chunks c
@@ -54,6 +46,12 @@ func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.U
 		ORDER BY c.embedding <=> $1
 		LIMIT $3`, vec, expertID, topK)
 	if err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if a.logger != nil {
+				a.logger.Warn("parent-child ANN timeout — falling back to legacy retrieval (graceful)", zap.Error(err), zap.String("expert_id", expertID.String()))
+			}
+			return nil, nil
+		}
 		return nil, fmt.Errorf("parent-child ANN failed: %w", err)
 	}
 	defer rows.Close()
@@ -93,26 +91,38 @@ func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.U
 		children = append(children, h)
 	}
 	if err := rows.Err(); err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if a.logger != nil {
+				a.logger.Warn("parent-child rows timeout — graceful fallback to legacy", zap.Error(err))
+			}
+			return nil, nil
+		}
 		return nil, err
 	}
 	if len(children) == 0 {
 		return nil, nil
 	}
-	// Rerank children only (safe 180 tok) via sidecar if available
-	// Rerank returns []RerankResult{Index, Score} sorted desc. Map back to children by Index.
+	// Rerank children only (safe 180 tok) via sidecar if available, capped to rerankTopN to avoid 50-doc OOM
 	if a.sidecar != nil && strings.TrimSpace(question) != "" {
-		docs := make([]string, len(children))
-		for i, c := range children {
-			docs[i] = c.Text
+		capN := cfg.RerankTopN
+		if capN <= 0 {
+			capN = 10
 		}
-		if reranked, err := a.sidecar.Rerank(qctx, question, docs, len(children)); err == nil {
+		if capN > len(children) {
+			capN = len(children)
+		}
+		docs := make([]string, capN)
+		for i := 0; i < capN; i++ {
+			docs[i] = children[i].Text
+		}
+		if reranked, err := a.sidecar.Rerank(qctx, question, docs, len(docs)); err == nil {
 			for _, r := range reranked {
-				if r.Index >= 0 && r.Index < len(children) {
+				if r.Index >= 0 && r.Index < len(children) && r.Index < capN {
 					children[r.Index].Score = float64(r.Score)
 				}
 			}
 		} else if a.logger != nil {
-			a.logger.Warn("parent-child rerank failed, fallback to ANN", zap.Error(err))
+			a.logger.Warn("parent-child rerank failed, fallback to ANN (graceful — not 500)", zap.Error(err))
 		}
 	}
 	// sort by score desc
@@ -147,6 +157,12 @@ func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.U
 	}
 	prows, err := a.db.Query(qctx, `SELECT id, page_text, COALESCE(section_path,''), token_count, COALESCE(source_file,''), COALESCE(chunk_index,0) FROM expert_pages WHERE id = ANY($1)`, parentIDs)
 	if err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if a.logger != nil {
+				a.logger.Warn("parent-child parent fetch timeout — graceful fallback", zap.Error(err))
+			}
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer prows.Close()
@@ -168,6 +184,22 @@ func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.U
 		_ = tc
 		parentMap[id] = pdoc{Text: txt, SectionPath: sp, SourceFile: sf, ChunkIndex: cidx}
 	}
+	if err := prows.Err(); err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if a.logger != nil {
+				a.logger.Warn("parent-child parent rows timeout — graceful fallback", zap.Error(err))
+			}
+			return nil, nil
+		}
+		return nil, err
+	}
+	found := make(map[uuid.UUID]bool, len(parentMap))
+	for id := range parentMap {
+		found[id] = true
+	}
+	// Bugfix G: dedupe shortfall log + orphan metric (was silent)
+	retrieval.LogDedupeShortfall(a.logger, parentIDs, len(children), targetParents, expertID)
+	retrieval.LogOrphanParents(a.logger, parentIDs, found, expertID)
 	var out []chinawall.CourseChunk
 	for _, h := range deduped {
 		if h.ParentID == nil {
@@ -178,12 +210,12 @@ func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.U
 			continue
 		}
 		out = append(out, chinawall.CourseChunk{
-			ID:         *h.ParentID,
-			Text:       pd.Text,
-			Topic:      h.Topic,
+			ID:          *h.ParentID,
+			Text:        pd.Text,
+			Topic:       h.Topic,
 			RerankScore: float32(h.Score),
-			SourceFile: pd.SourceFile,
-			ChunkIndex: pd.ChunkIndex,
+			SourceFile:  pd.SourceFile,
+			ChunkIndex:  pd.ChunkIndex,
 		})
 		_ = pd.SectionPath
 	}

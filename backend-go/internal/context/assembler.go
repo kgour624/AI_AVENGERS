@@ -3,6 +3,7 @@ package context
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -43,6 +44,11 @@ type AssembledContext struct {
 	// only, per CATEGORY_TEMPLATE_HANDOFF.md §5).
 	ReplyThread []ReplyThreadEntry
 	TotalTokens int
+	// RetrievalWarning is set when the advanced reranker was unavailable/slow
+	// and the system fell back to normal search. Surfaced to frontend as
+	// warning_text so user knows quality is degraded.
+	// Empty means retrieval was healthy.
+	RetrievalWarning string
 }
 
 // ReplyThreadEntry is one message in a resolved reply thread, pinned
@@ -224,8 +230,9 @@ func (a *Assembler) Assemble(
 		err     error
 	}
 	type chunksResult struct {
-		chunks []chinawall.CourseChunk
-		err    error
+		chunks  []chinawall.CourseChunk
+		warning string
+		err     error
 	}
 
 	summaryCh    := make(chan summaryResult, 1)
@@ -255,12 +262,12 @@ func (a *Assembler) Assemble(
 		// Production chat retrieval: the unexpanded path, deliberately. Graph expansion
 		// is opt-in (GetCourseChunksExpanded) so it can be measured against this path
 		// before it becomes the default.
-		c, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK, false, RetrievalPreference{})
-		chunksCh <- chunksResult{c, err}
+		c, w, err := a.getCourseChunks(ctx, expertID, question, a.chunksTopK, false, RetrievalPreference{})
+		chunksCh <- chunksResult{chunks: c, warning: w, err: err}
 	}()
 	go func() {
 		c, err := a.getRepoChunks(ctx, projectID, question, a.chunksTopK)
-		repoChunksCh <- chunksResult{c, err}
+		repoChunksCh <- chunksResult{chunks: c, err: err}
 	}()
 
 	// Collect all fan-out results
@@ -291,6 +298,9 @@ func (a *Assembler) Assemble(
 	// unconditionally, so a long-running conversation with many
 	// cross-expert decisions could silently consume far more than its
 	// 2. L2 project memory (20% budget) — from fan-out result
+	if a.memManager == nil && a.logger != nil {
+		a.logger.Warn("memManager is nil — skipping L2 project memory")
+	}
 	if l2Res.err == nil && l2Res.projCtx != nil {
 		l2Budget := budget * budgetL2Pct / 100
 		l2Tokens := 0
@@ -365,15 +375,37 @@ func (a *Assembler) Assemble(
 	chunksBudget := budget * budgetChunksPct / 100
 	chunkTokensUsed := 0
 	if chunksRes.err != nil {
-		a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
-			zap.String("expert_id", expertID.String()),
-			zap.Error(chunksRes.err),
-		)
+		// Timeout/DeadlineExceeded should NOT become 500. Treat as degraded
+		// retrieval: warn user but continue with whatever is available.
+		if errors.Is(chunksRes.err, context.DeadlineExceeded) || isTimeoutError(chunksRes.err) {
+			if a.logger != nil {
+				a.logger.Warn("getCourseChunks timeout — degraded mode, question sees fewer chunks",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(chunksRes.err),
+				)
+			}
+			assembled.RetrievalWarning = "Advanced search abhi slow hai, hum normal jawab de rahe hain"
+		} else if errors.Is(chunksRes.err, ml.ErrEmbeddingUnavailable) {
+			// Infra errors (ErrEmbeddingUnavailable, sidecar down, DB down) MUST NOT be hidden
+			// as an empty chunk set — that would distort Gate 2 into a false INSUFFICIENT_CONTEXT
+			// refusal. Return a clear system-down error so the user sees "System abhi down hai..."
+			// instead of "I don't have enough context".
+			return nil, fmt.Errorf("%w: System abhi down hai, thodi der baad try karein: getCourseChunks: %v", ml.ErrEmbeddingUnavailable, chunksRes.err)
+		} else {
+			if a.logger != nil {
+				a.logger.Warn("getCourseChunks failed — question will see zero course chunks, likely causing an incorrect Gate 2 refusal",
+					zap.String("expert_id", expertID.String()),
+					zap.Error(chunksRes.err),
+				)
+			}
+		}
 	} else {
 		kept, chunkTokens := trimChunksToBudget(chunksRes.chunks, chunksBudget)
 		assembled.CourseChunks = kept
 		chunkTokensUsed += chunkTokens
 		tokensUsed += chunkTokens
+		// Bubble degraded warning from retrieval layer to AssembledContext so orchestrator can surface it
+		assembled.RetrievalWarning = chunksRes.warning
 		if len(kept) < len(chunksRes.chunks) {
 			a.logger.Debug("course chunks truncated to stay within their 35% budget",
 				zap.Int("kept", len(kept)),
@@ -381,10 +413,12 @@ func (a *Assembler) Assemble(
 			)
 		}
 		if len(chunksRes.chunks) == 0 {
-			a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content",
-				zap.String("expert_id", expertID.String()),
-				zap.String("question_preview", question[:minInt(80, len(question))]),
-			)
+			if a.logger != nil {
+				a.logger.Warn("getCourseChunks returned zero chunks (no error) — verify expert_id has ingested content",
+					zap.String("expert_id", expertID.String()),
+					zap.String("question_preview", question[:minInt(80, len(question))]),
+				)
+			}
 		}
 	}
 
@@ -392,10 +426,12 @@ func (a *Assembler) Assemble(
 	// B9: shares the same 35% chunk slice; repo chunks are appended after
 	// course chunks, so they are the first evicted at the tail.
 	if repoChunksRes.err != nil {
-		a.logger.Warn("getRepoChunks failed — continuing without connected-repo context",
-			zap.String("project_id", projectID.String()),
-			zap.Error(repoChunksRes.err),
-		)
+		if a.logger != nil {
+			a.logger.Warn("getRepoChunks failed — continuing without connected-repo context",
+				zap.String("project_id", projectID.String()),
+				zap.Error(repoChunksRes.err),
+			)
+		}
 	} else if len(repoChunksRes.chunks) > 0 {
 		if room := chunksBudget - chunkTokensUsed; room > 0 {
 			kept, repoTokens := trimChunksToBudget(repoChunksRes.chunks, room)
@@ -411,10 +447,12 @@ func (a *Assembler) Assemble(
 	if replyToMessageID != nil {
 		thread, err := a.getReplyThread(ctx, *replyToMessageID, includeFullThread)
 		if err != nil {
-			a.logger.Warn("reply thread resolution failed, continuing without it",
-				zap.String("reply_to", replyToMessageID.String()),
-				zap.Error(err),
-			)
+			if a.logger != nil {
+				a.logger.Warn("reply thread resolution failed, continuing without it",
+					zap.String("reply_to", replyToMessageID.String()),
+					zap.Error(err),
+				)
+			}
 		} else {
 			assembled.ReplyThread = thread
 			for _, e := range thread {
@@ -429,12 +467,14 @@ func (a *Assembler) Assemble(
 	tokensUsed = enforceHardCeiling(assembled, budget, tokensUsed, a.logger)
 	assembled.TotalTokens = tokensUsed
 
-	a.logger.Debug("context assembled",
-		zap.Int("tokens", tokensUsed),
-		zap.Int("budget", budget),
-		zap.Int("chunks", len(assembled.CourseChunks)),
-		zap.Int("turn", turnNumber),
-	)
+	if a.logger != nil {
+		a.logger.Debug("context assembled",
+			zap.Int("tokens", tokensUsed),
+			zap.Int("budget", budget),
+			zap.Int("chunks", len(assembled.CourseChunks)),
+			zap.Int("turn", turnNumber),
+		)
+	}
 
 	return assembled, nil
 }
@@ -667,7 +707,8 @@ func (a *Assembler) GetCourseChunksForWorkflow(
 	if topK <= 0 {
 		topK = 5
 	}
-	return a.getCourseChunks(ctx, expertID, taskDescription, topK, false, RetrievalPreference{})
+	chunks, _, err := a.getCourseChunks(ctx, expertID, taskDescription, topK, false, RetrievalPreference{})
+	return chunks, err
 }
 
 // GetCourseChunksWithPreference is the preference-aware variant: it biases the
@@ -684,7 +725,8 @@ func (a *Assembler) GetCourseChunksWithPreference(
 	if topK <= 0 {
 		topK = 5
 	}
-	return a.getCourseChunks(ctx, expertID, question, topK, false, pref)
+	chunks, _, err := a.getCourseChunks(ctx, expertID, question, topK, false, pref)
+	return chunks, err
 }
 
 // GetCourseChunksExpanded is GetCourseChunksForWorkflow with concept-graph expansion
@@ -703,7 +745,8 @@ func (a *Assembler) GetCourseChunksExpanded(
 	if topK <= 0 {
 		topK = 5
 	}
-	return a.getCourseChunks(ctx, expertID, taskDescription, topK, true, RetrievalPreference{})
+	chunks, _, err := a.getCourseChunks(ctx, expertID, taskDescription, topK, true, RetrievalPreference{})
+	return chunks, err
 }
 
 // GetProjectMemoryText loads project L1/L2 memory for a workflow expert and
@@ -906,21 +949,35 @@ func (a *Assembler) searchChatHistory(ctx context.Context, chatID uuid.UUID, que
 // Step 2: Keyword search -> top 10 candidates (exact)
 // Step 3: Merge + deduplicate
 // Step 4: Rerank merged set -> top K
-func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int, expand bool, pref RetrievalPreference) ([]chinawall.CourseChunk, error) {
+func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, question string, limit int, expand bool, pref RetrievalPreference) ([]chinawall.CourseChunk, string, error) {
 	// Step 1: Vector search — one RANKED list.
 	embedding, err := a.embedder.EmbedSingle(ctx, question)
 	if err != nil {
-		return nil, fmt.Errorf("embed failed: %w", err)
+		// Timeout should not be 500 — surface as degraded warning, let Assemble decide
+		if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+			return nil, "Advanced search abhi slow hai, hum normal jawab de rahe hain", fmt.Errorf("embed timeout: %w", err)
+		}
+		return nil, "", fmt.Errorf("embed failed: %w", err)
 	}
 
 	// Phase 2: Parent-Child fast-path (flag-gated, additive). If parents exist, return them directly.
-	if pcs, perr := a.tryParentChildRetrieval(ctx, expertID, embedding, question, limit); perr == nil && len(pcs) > 0 {
+	pcs, pcErr := a.tryParentChildRetrieval(ctx, expertID, embedding, question, limit)
+	if pcErr != nil && (errors.Is(pcErr, context.DeadlineExceeded) || isTimeoutError(pcErr)) {
+		if a.logger != nil {
+			a.logger.Warn("parent-child timeout — falling back to legacy retrieval", zap.Error(pcErr))
+		}
+		// graceful: continue to legacy hybrid search, will surface degraded warning
+	} else if pcErr == nil && len(pcs) > 0 {
 		if a.logger != nil {
 			a.logger.Info("parent-child retrieval hit", zap.Int("parents", len(pcs)), zap.Int("limit", limit))
 		}
-		return pcs, nil
+		return pcs, "", nil
+	} else if pcErr != nil {
+		// non-timeout parent error is not fatal — log and fall through to legacy
+		if a.logger != nil {
+			a.logger.Warn("parent-child retrieval error — falling back to legacy", zap.Error(pcErr))
+		}
 	}
-
 
 	// Feature #23: source_file and chunk_index are selected so the citation modal can
 	// name the transcript and the position.
@@ -934,7 +991,10 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 		expertID, pgvector.NewVector(embedding),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("vector search failed: %w", err)
+		if errors.Is(err, context.DeadlineExceeded) || isTimeoutError(err) {
+			return nil, "Advanced search abhi slow hai, hum normal jawab de rahe hain", fmt.Errorf("vector search timeout: %w", err)
+		}
+		return nil, "", fmt.Errorf("vector search failed: %w", err)
 	}
 	defer vectorRows.Close()
 
@@ -1060,7 +1120,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	}
 
 	if len(byID) == 0 {
-		return nil, nil
+		return nil, "", nil
 	}
 
 	// Step 3: Fuse the ranked lists.
@@ -1094,20 +1154,20 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 	}
 	reranked, err := a.sidecar.Rerank(ctx, question, texts, pool)
 	if err != nil {
-		// Fallback: return top K without reranking.
-		//
-		// This was silent before. It must not be: the flat 0.5 score below
-		// is under workflow Gate 1's 0.70 threshold, so while the sidecar is
-		// unreachable every expert silently drops to "generic allowed" mode
-		// even with perfect training data — and no error surfaced anywhere.
-		a.logger.Warn("reranker unavailable — falling back to flat 0.5 scores",
-			zap.Int("candidates", len(candidates)),
-			zap.Error(err),
-		)
-		// With no reranking there is no score signal at all, so the fused order is
-		// the only ranking there is — which is exactly where a preference is worth
-		// the most: it is the one thing that can still tell two 0.5-scored
-		// candidates apart.
+		// Fallback: return top K without reranking but WITH user-visible warning.
+		// Graceful: slow/429/5xx/timeout all land here — never 500.
+		if isTimeoutError(err) || errors.Is(err, context.DeadlineExceeded) {
+			if a.logger != nil {
+				a.logger.Warn("reranker timeout — degraded search (soft fallback)",
+					zap.Int("candidates", len(candidates)), zap.Error(err))
+			}
+		} else {
+			if a.logger != nil {
+				a.logger.Warn("reranker unavailable — falling back to flat 0.5 scores",
+					zap.Int("candidates", len(candidates)), zap.Error(err))
+			}
+		}
+		warning := "Advanced search abhi slow hai, hum normal jawab de rahe hain"
 		scores := make([]float64, len(candidates))
 		matches := make([]bool, len(candidates))
 		for i, c := range candidates {
@@ -1120,7 +1180,6 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 				break
 			}
 			c := candidates[i]
-			// Feature #23: Include SourceFile and ChunkIndex in fallback path
 			chunks = append(chunks, chinawall.CourseChunk{
 				ID:          c.ID,
 				Text:        c.Text,
@@ -1130,7 +1189,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 				ChunkIndex:  c.ChunkIndex,
 			})
 		}
-		return chunks, nil
+		return chunks, warning, nil
 	}
 
 	// Build the reranked set, then apply the preference as a nudge.
@@ -1167,7 +1226,7 @@ func (a *Assembler) getCourseChunks(ctx context.Context, expertID uuid.UUID, que
 			ChunkIndex:  c.ChunkIndex,
 		})
 	}
-	return chunks, nil
+	return chunks, "", nil
 }
 
 // getRepoChunks retrieves and reranks connected-repo code chunks,
@@ -1349,4 +1408,21 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// isTimeoutError returns true for timeout-flavored errors that should be
+// handled gracefully (soft fallback, user warning) not as 500.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return containsFold(msg, "timeout") ||
+		containsFold(msg, "deadline") ||
+		containsFold(msg, "context canceled") ||
+		containsFold(msg, "too many clients") // pgx pool exhausted under load
+}
+
+func containsFold(s, sub string) bool {
+	return len(s) >= len(sub) && (strings.Contains(strings.ToLower(s), strings.ToLower(sub)))
 }

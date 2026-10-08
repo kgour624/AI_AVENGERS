@@ -623,6 +623,12 @@ func (h *Handler) Send(c *gin.Context) {
 								return
 							}
 						}
+					case <-c.Request.Context().Done():
+						// Ghost fix: browser/app band ho gaya while live typing.
+						// Client disconnect => forwarder turant band, producers
+						// (orchestrator -> enforcer -> gateway LLM) bhi isi ctx
+						// ke Done() se cancel hokar ghost process nahi bante.
+						return
 					}
 				}
 			}()

@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "comment": "Temporary typecheck project: same options as tsconfig.json but skips the 3 pre-existing syntax-corrupted files so AdminVacuum.tsx can be verified in isolation. NOT part of the build.",
+  "exclude": [
+    "src/components/ConversationOneByOne.tsx",
+    "src/components/PolishComponents.tsx",
+    "src/components/TemplateOneByOne.tsx"
+  ]
+}

@@ -127,27 +127,34 @@ func (o *AgenticOrchestrator) scatterGather(ctx context.Context, expertID uuid.U
 	g, gCtx := errgroup.WithContext(ctx)
 	lists := make([][]ScoredChunk, 3)
 	g.Go(func() error {
-		qCtx, cancel := context.WithTimeout(gCtx, 800*time.Millisecond)
+		qCtx, cancel := context.WithTimeout(gCtx, 3000*time.Millisecond)
 		defer cancel()
 		c, err := o.retrieveParentChild(qCtx, expertID, emb)
 		if err != nil {
+			// timeout is graceful — don't bubble as 500, return empty and let merge use other lists
+			if isAgenticTimeout(err) {
+				return nil
+			}
 			return err
 		}
 		lists[0] = c
 		return nil
 	})
 	g.Go(func() error {
-		qCtx, cancel := context.WithTimeout(gCtx, 800*time.Millisecond)
+		qCtx, cancel := context.WithTimeout(gCtx, 3000*time.Millisecond)
 		defer cancel()
 		c, err := o.retrieveHybrid(qCtx, expertID, emb)
 		if err != nil {
+			if isAgenticTimeout(err) {
+				return nil
+			}
 			return err
 		}
 		lists[1] = c
 		return nil
 	})
 	g.Go(func() error {
-		qCtx, cancel := context.WithTimeout(gCtx, 800*time.Millisecond)
+		qCtx, cancel := context.WithTimeout(gCtx, 3000*time.Millisecond)
 		defer cancel()
 		c, _ := o.retrieveGraph(qCtx, expertID, emb)
 		lists[2] = c
@@ -157,4 +164,12 @@ func (o *AgenticOrchestrator) scatterGather(ctx context.Context, expertID uuid.U
 		return filterEmpty(lists), err
 	}
 	return filterEmpty(lists), nil
+}
+
+func isAgenticTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "timeout") || strings.Contains(s, "deadline") || strings.Contains(s, "context canceled")
 }

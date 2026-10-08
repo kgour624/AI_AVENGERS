@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pgvector/pgvector-go"
 	"go.uber.org/zap"
+
+	"ai_avengers/backend/internal/retrieval"
 )
 
 // Reranker is sidecar Cross-Encoder. Rerank is 512 tok max — Phase 2 reranks
@@ -53,8 +55,9 @@ type ParentDoc struct {
 
 // SearchWithParent is the Phase 2 entry: search children, rerank, dedupe, fetch parents.
 // Additive + feature-flagged: when enable_parent_child=false, returns (nil,nil) so caller falls back to legacy reader.
+// Single source of config/timeout lives in internal/retrieval — gracefully falls back (nil,nil) on timeout, never 500.
 func (r *ParentChildRetriever) SearchWithParent(ctx context.Context, expertID uuid.UUID, queryEmbedding []float32, queryText string) ([]ParentDoc, error) {
-	cfg := LoadRetrievalConfig(ctx, r.db)
+	cfg := retrieval.LoadRetrievalConfig(ctx, r.db)
 	if !cfg.EnableParentChild {
 		return nil, nil
 	}
@@ -71,8 +74,7 @@ func (r *ParentChildRetriever) SearchWithParent(ctx context.Context, expertID uu
 		rerankTopN = 10
 	}
 
-	// ctx propagation with 800ms timeout -> pgx aborts DB query and avoids pool leak (Tweak 2)
-	qctx, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
+	qctx, cancel := context.WithTimeout(ctx, time.Duration(retrieval.ParentSearchTimeout)*time.Millisecond)
 	defer cancel()
 
 	vec := pgvector.NewVector(queryEmbedding)
@@ -83,6 +85,12 @@ func (r *ParentChildRetriever) SearchWithParent(ctx context.Context, expertID uu
 		ORDER BY embedding <=> $1
 		LIMIT $3`, vec, expertID, topK)
 	if err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if r.logger != nil {
+				r.logger.Warn("parent-child ANN timeout — graceful fallback (nil,nil, not 500)", zap.Error(err), zap.String("expert_id", expertID.String()))
+			}
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer rows.Close()
@@ -112,25 +120,34 @@ func (r *ParentChildRetriever) SearchWithParent(ctx context.Context, expertID uu
 		children = append(children, ch)
 	}
 	if err := rows.Err(); err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if r.logger != nil {
+				r.logger.Warn("parent-child rows timeout — graceful fallback", zap.Error(err))
+			}
+			return nil, nil
+		}
 		return nil, err
 	}
 	if len(children) == 0 {
 		return nil, nil
 	}
 
-	// Rerank children only (512 safe, O(N^2) trap avoided)
+	// Rerank children only (512 safe, O(N^2) trap avoided) — capped to RerankTopN to avoid 50-doc OOM
 	if r.reranker != nil && queryText != "" {
-		docs := make([]string, len(children))
-		for i, c := range children {
-			docs[i] = c.Text
+		capN := rerankTopN
+		if capN > len(children) {
+			capN = len(children)
 		}
-		// reranker ctx also inherits timeout; abort on cancel
-		if scores, err := r.reranker.Rerank(qctx, queryText, docs); err == nil && len(scores) == len(children) {
-			for i := range children {
+		docs := make([]string, capN)
+		for i := 0; i < capN; i++ {
+			docs[i] = children[i].Text
+		}
+		if scores, err := r.reranker.Rerank(qctx, queryText, docs); err == nil && len(scores) == len(docs) {
+			for i := 0; i < capN; i++ {
 				children[i].RerankScore = scores[i]
 			}
 		} else if r.logger != nil && err != nil {
-			r.logger.Warn("rerank failed, fallback to ANN distance", zap.Error(err))
+			r.logger.Warn("rerank failed, fallback to ANN distance (graceful)", zap.Error(err))
 		}
 	}
 
@@ -161,9 +178,17 @@ func (r *ParentChildRetriever) SearchWithParent(ctx context.Context, expertID uu
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
+	// Warn when fewer unique parents than target (small doc → 1/3, user expects 3)
+	retrieval.LogDedupeShortfall(r.logger, parentIDs, len(children), targetParents, expertID)
 	// fetch parents IN (heap dedupe already done, IN size=3 typical)
 	prows, err := r.db.Query(qctx, `SELECT id, page_text, section_path, token_count, source_file FROM expert_pages WHERE id = ANY($1)`, parentIDs)
 	if err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if r.logger != nil {
+				r.logger.Warn("parent-child parent fetch timeout — graceful fallback", zap.Error(err))
+			}
+			return nil, nil
+		}
 		return nil, err
 	}
 	defer prows.Close()
@@ -182,8 +207,19 @@ func (r *ParentChildRetriever) SearchWithParent(ctx context.Context, expertID uu
 		parentMap[id] = &ParentDoc{ID: id, PageText: txt, SectionPath: sp, TokenCount: tc, SourceFile: sf}
 	}
 	if err := prows.Err(); err != nil {
+		if retrieval.IsGracefulTimeout(err) {
+			if r.logger != nil {
+				r.logger.Warn("parent-child parent rows timeout — graceful fallback", zap.Error(err))
+			}
+			return nil, nil
+		}
 		return nil, err
 	}
+	parentFound := make(map[uuid.UUID]bool, len(parentMap))
+	for id := range parentMap {
+		parentFound[id] = true
+	}
+	retrieval.LogOrphanParents(r.logger, parentIDs, parentFound, expertID)
 	// order by best child score, attach child ids + score + heading_path citation
 	var result []ParentDoc
 	for _, ch := range deduped {

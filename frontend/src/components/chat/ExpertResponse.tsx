@@ -7,8 +7,10 @@ import { CitationChip } from './CitationChip'
 import { CodeBlock } from './CodeBlock'
 import { RatingWidget } from './RatingWidget'
 import { AnswerExplanation } from '@/components/chat/AnswerExplanation'
+import VirtualizedAnswer from './VirtualizedAnswer'
 import { useReplyStore } from '@/stores/replyStore'
 import { splitContentByCitations } from '@/utils/parseCitations'
+const LARGE_ANSWER_THRESHOLD = 4000
 import { cn } from '@/utils/cn'
 import { ARC_MOTION } from '@/design-system/motion'
 import { buildResponseMarkdown, buildMarkdownFilename, downloadMarkdown } from '@/utils/exportMarkdown'
@@ -295,6 +297,54 @@ export function ExpertResponse({ response, persistedMessageId, isStreaming, chat
   function handleReplyClick() {
     if (!chatId || !persistedMessageId) return
     const preview =
+/* Virtualized large answer helper — paginated to avoid Browser hang on huge 16k tok answers */
+function AnswerBody({ content, citations }: { content: string; citations?: any[] }) {
+  if (!content) return null;
+  if (content.length > LARGE_ANSWER_THRESHOLD) {
+    return <VirtualizedAnswer content={content} citations={citations} />;
+  }
+  return (
+    <div className="prose prose-sm max-w-none whitespace-pre-wrap break-words">
+      <ReactMarkdown
+        components={{
+          code(props: any) {
+            const { children, className } = props;
+            const isInline = !className;
+            if (isInline) return <code className="px-1 py-0.5 rounded bg-gray-100 text-xs">{children}</code>;
+            return <CodeBlock code={String(children)} language={className?.replace('language-', '')} />;
+          },
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+      {citations && citations.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1">
+          {citations.map((c: any, i: number) => (
+            <CitationChip key={c.chunkId || i} citation={c} index={i + 1} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Pre-stream large content virtual helper (used while SSE chunk streaming)
+// Keeps DOM light even while answer is still being typed.
+function StreamingVirtualText({ text, threshold = 4000 }: { text: string; threshold?: number }) {
+  if (text.length <= threshold) return <>{text}</>;
+  // Show only last page + indicator to avoid mounting huge text node
+  const pages = Math.ceil(text.length / threshold);
+  const lastPageStart = (pages - 1) * threshold;
+  const tail = text.slice(lastPageStart);
+  return (
+    <span>
+      <span className="text-xs text-gray-400">[Large answer streaming — page {pages}/{pages}, showing tail {tail.length} chars]</span>
+      <span className="block whitespace-pre-wrap break-words border rounded p-2 bg-white mt-1 max-h-[45vh] overflow-auto">{tail}</span>
+    </span>
+  );
+}
+
+
       response.content.length > 80 ? `${response.content.slice(0, 80)}…` : response.content
     setReplyTarget(chatId, {
       messageId: persistedMessageId,

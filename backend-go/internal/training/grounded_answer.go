@@ -37,6 +37,16 @@ func newGroundedAnswerer(gw *gateway.ModelGateway, logger *zap.Logger) *grounded
 // The context must already carry [n] markers, and the caller must number them in the
 // same order the prompt shows, so a citation the answer writes can be checked
 // against what was actually supplied.
+//
+// Return contract — two distinct failure modes, handled differently by smoke test:
+//   1) Gateway infra error (401/402/429/5xx/timeout) -> returned as error (answerErr != nil).
+//      Caller must NOT count this as NoAnswer; it is infrastructure, not corpus quality,
+//      and should be returned as smokeErr or retried with backoff.
+//   2) LLM logical refusal (INSUFFICIENT_CONTEXT) or empty answer -> returned as
+//      content containing the marker, with nil error. Caller maps this via
+//      refusalOrCitationFailure() to FailureRefused/FailureEmpty and increments
+//      NoAnswer with clipped answer+context logging. This is corpus/prompt quality.
+// This separation prevents bucketing infra and logical refusal together as NoAnswer.
 func (a *groundedAnswerer) Answer(ctx context.Context, question, contextBlock string) (string, error) {
 	if a == nil || a.gateway == nil {
 		return "", fmt.Errorf("grounded answerer: no model gateway")

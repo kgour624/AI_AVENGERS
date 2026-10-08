@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 	"ai_avengers/backend/internal/decision"
 	"ai_avengers/backend/internal/gateway"
 	"ai_avengers/backend/internal/memory"
+	"ai_avengers/backend/internal/ml"
 	"ai_avengers/backend/internal/observability"
 	"ai_avengers/backend/internal/ratelimit"
 	"ai_avengers/backend/internal/selflearning"
@@ -779,7 +781,15 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 	)
 	timer.Stop("context_assembly")
 	if err != nil {
-		o.logger.Warn("context assembly failed", zap.String("expert", expert.Name), zap.Error(err))
+		if o.logger != nil {
+			o.logger.Warn("context assembly failed", zap.String("expert", expert.Name), zap.Error(err))
+		}
+		if errors.Is(err, ml.ErrEmbeddingUnavailable) {
+			return ExpertResponse{
+				ExpertID: expert.ID, ExpertName: expert.Name, Domain: expert.Domain,
+				Mode: decision.ModeREFUSE, Content: "System abhi down hai, thodi der baad try karein", Error: err.Error(),
+			}
+		}
 		return ExpertResponse{
 			ExpertID: expert.ID, ExpertName: expert.Name, Domain: expert.Domain,
 			Mode: decision.ModeREFUSE, Content: "Context assembly failed", Error: err.Error(),
@@ -924,6 +934,15 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		}
 	}
 
+	// Merge retrieval warning into Decision Warning so frontend can show it
+	mergedWarning := result.Warning
+	if assembledCtx.RetrievalWarning != "" {
+		if mergedWarning != "" {
+			mergedWarning = mergedWarning + " | " + assembledCtx.RetrievalWarning
+		} else {
+			mergedWarning = assembledCtx.RetrievalWarning
+		}
+	}
 	return ExpertResponse{
 		ExpertID:         expert.ID,
 		ExpertName:       expert.Name,
@@ -933,7 +952,7 @@ func (o *Orchestrator) processWithExpert(ctx context.Context, req OrchestratorRe
 		Citations:        result.Citations,
 		Confidence:       result.Confidence,
 		GateStopped:      result.GateStopped,
-		Warning:          result.Warning,
+		Warning:          mergedWarning,
 		Questions:        result.Questions,
 		TemplateSections: result.TemplateSections,
 		Claims:           result.Claims,

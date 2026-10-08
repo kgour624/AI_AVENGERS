@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -60,6 +61,29 @@ type RerankResponse struct {
 	DurationMs float64        `json:"duration_ms"`
 }
 
+// bge-base-en-v1.5 hard limit: 512 tokens ~ 2000 chars. Past this the
+// tokenizer silently truncates the tail, so a very long question would
+// be searched by its prefix only (half-question bug). Clip explicitly.
+const maxEmbedCharsSidecar = 2000
+
+func clipForSidecarEmbedding(text string, logger *zap.Logger) string {
+	if len(text) <= maxEmbedCharsSidecar {
+		return text
+	}
+	clipped := text[:maxEmbedCharsSidecar]
+	if idx := strings.LastIndex(clipped, " "); idx > maxEmbedCharsSidecar*3/4 {
+		clipped = clipped[:idx]
+	}
+	clipped = strings.TrimSpace(clipped)
+	if logger != nil {
+		logger.Warn("embedding input clipped to bge 512-token limit",
+			zap.Int("original_chars", len(text)),
+			zap.Int("clipped_chars", len(clipped)),
+		)
+	}
+	return clipped
+}
+
 // NewSidecarClient creates a new ML sidecar client.
 func NewSidecarClient(cfg config.MLConfig, logger *zap.Logger) *SidecarClient {
 	return &SidecarClient{
@@ -83,7 +107,11 @@ func (c *SidecarClient) Embed(ctx context.Context, texts []string) ([][]float32,
 		return [][]float32{}, nil
 	}
 
-	reqBody := EmbedRequest{Texts: texts}
+	clipped := make([]string, len(texts))
+	for i, t := range texts {
+		clipped[i] = clipForSidecarEmbedding(t, c.logger)
+	}
+	reqBody := EmbedRequest{Texts: clipped}
 	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal embed request: %w", err)

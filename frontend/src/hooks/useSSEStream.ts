@@ -70,6 +70,8 @@ export interface SendMessageOptions {
    */
   answerMode?: 'independent' | 'collaborative'
   resumeRunId?: string
+  /** Optional AbortSignal from caller to cancel stream on WiFi drop / unmount. */
+  signal?: AbortSignal
 }
 
 type SSEEvent =
@@ -203,10 +205,14 @@ export function useSSEStream() {
         headers,
         body,
         credentials: 'include',
+        signal: options.signal,
       })
-    } catch (networkError) {
-      // fetch() itself throws on network failure (offline, DNS, CORS
-      // preflight rejection) - distinct from an HTTP error status.
+    } catch (networkError: any) {
+      // WiFi drop / AbortSignal cancel: show as abort, backend already cancelled via ctx
+      if (networkError?.name === 'AbortError') {
+        setError(chatId, 'ABORTED: WiFi band / request cancel — server processing bhi band ho gaya (cost bach gaya)')
+        return
+      }
       setError(chatId, `Network error: ${String(networkError)}`)
       return
     }
@@ -222,7 +228,7 @@ export function useSSEStream() {
         if (refreshed) headers['Authorization'] = `Bearer ${refreshed}`
         const retry = await fetch(
           `${import.meta.env.VITE_API_URL}/api/v1/chats/${chatId}/messages`,
-          { method: 'POST', headers, body, credentials: 'include' },
+          { method: 'POST', headers, body, credentials: 'include', signal: options.signal },
         )
         if (retry.ok) {
           response = retry
@@ -233,7 +239,24 @@ export function useSSEStream() {
     }
 
     if (!response.ok) {
-      setError(chatId, `HTTP ${response.status}`)
+      // Fix: Jawab shuru hone se pehle Error -> read server JSON for proper code/message, show Error Card with Retry
+      let msg = `HTTP ${response.status}`;
+      let code = `HTTP_${response.status}`;
+      try {
+        const text = await response.text();
+        if (text) {
+          const j = JSON.parse(text);
+          // backend uses {code, message} or {error}
+          if (j.code) code = j.code;
+          if (j.message) msg = j.message;
+          else if (j.error) msg = j.error;
+          else if (j.data?.message) msg = j.data.message;
+          else msg = text.slice(0, 400);
+        }
+      } catch {}
+      // Map to user-friendly Hindi hint for retryable errors (DB down, validation)
+      if (response.status >= 500) msg = `${msg} — Retry kar sakte hain`;
+      setError(chatId, `${code}: ${msg}`)
       return
     }
     if (!response.body) {

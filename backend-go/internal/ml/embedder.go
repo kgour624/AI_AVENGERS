@@ -3,6 +3,8 @@ package ml
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.uber.org/zap"
@@ -34,6 +36,28 @@ type Embedder interface {
 	// EmbedSingle generates an embedding for a single text.
 	// Convenience wrapper around Embed.
 	EmbedSingle(ctx context.Context, text string) ([]float32, error)
+}
+
+// ErrEmbeddingUnavailable is returned when no embedder is configured or the
+// embedding service is down. Callers use errors.Is to distinguish infra
+// failure from logical "insufficient context".
+// User-facing message for this error must be "System abhi down hai, thodi der baad try karein"
+// and NOT the generic "INSUFFICIENT_CONTEXT" refusal.
+var ErrEmbeddingUnavailable = errors.New("embedding service unavailable")
+
+// unavailableEmbedder implements Embedder but always returns ErrEmbeddingUnavailable.
+// Used as a safe nil-guard so resolveEmbedder NEVER returns a nil interface
+// that would panic on .Embed() call.
+type unavailableEmbedder struct {
+	reason string
+}
+
+func (u *unavailableEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	return nil, fmt.Errorf("%w: %s", ErrEmbeddingUnavailable, u.reason)
+}
+
+func (u *unavailableEmbedder) EmbedSingle(ctx context.Context, text string) ([]float32, error) {
+	return nil, fmt.Errorf("%w: %s", ErrEmbeddingUnavailable, u.reason)
 }
 
 // DynamicEmbedder reads the active embedding provider from system_settings
@@ -79,17 +103,27 @@ func NewDynamicEmbedder(
 // Embed generates embeddings for a batch of texts.
 // Reads embedding_provider from system_settings at call time.
 func (d *DynamicEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
-	return d.resolveEmbedder(ctx).Embed(ctx, texts)
+	emb := d.resolveEmbedder(ctx)
+	if emb == nil {
+		return nil, fmt.Errorf("%w: resolveEmbedder returned nil (sidecar not configured)", ErrEmbeddingUnavailable)
+	}
+	return emb.Embed(ctx, texts)
 }
 
 // EmbedSingle generates an embedding for a single text.
 // Reads embedding_provider from system_settings at call time.
 func (d *DynamicEmbedder) EmbedSingle(ctx context.Context, text string) ([]float32, error) {
-	return d.resolveEmbedder(ctx).EmbedSingle(ctx, text)
+	emb := d.resolveEmbedder(ctx)
+	if emb == nil {
+		return nil, fmt.Errorf("%w: resolveEmbedder returned nil (sidecar not configured)", ErrEmbeddingUnavailable)
+	}
+	return emb.EmbedSingle(ctx, text)
 }
 
 // resolveEmbedder reads embedding_provider from system_settings and returns
 // the correct Embedder implementation. Falls back to sidecar on any error.
+// NEVER returns nil — if sidecar is also nil it returns unavailableEmbedder
+// so the caller gets a clear ErrEmbeddingUnavailable instead of a nil panic.
 //
 // Mental execution:
 //   Case 1: embedding_provider = "sidecar" (or row missing) → return sidecar
@@ -97,6 +131,7 @@ func (d *DynamicEmbedder) EmbedSingle(ctx context.Context, text string) ([]float
 //   Case 3: DB read fails → log warning, return sidecar
 //   Case 4: embedding_provider = "codecraftapi" but ccEmbedder is nil → log warning, return sidecar
 //   Case 5: unknown provider value → return sidecar (safe default)
+//   Case 6: sidecar == nil AND ccEmbedder == nil → return unavailableEmbedder (never nil, never panic)
 func (d *DynamicEmbedder) resolveEmbedder(ctx context.Context) Embedder {
 	provider := d.readEmbeddingProvider(ctx)
 
@@ -104,29 +139,47 @@ func (d *DynamicEmbedder) resolveEmbedder(ctx context.Context) Embedder {
 		if d.ccEmbedder != nil {
 			return d.ccEmbedder
 		}
-		// ccEmbedder is nil — CodeCraftAPI not configured
-		d.logger.Warn("embedding_provider is codecraftapi but CodeCraftAPIEmbedder is nil, falling back to sidecar")
-		return d.sidecar
+		if d.logger != nil {
+			d.logger.Warn("embedding_provider is codecraftapi but CodeCraftAPIEmbedder is nil, falling back to sidecar")
+		}
+		if d.sidecar != nil {
+			return d.sidecar
+		}
+		if d.logger != nil {
+			d.logger.Error("both CodeCraftAPIEmbedder and sidecar are nil — embedding service unavailable")
+		}
+		return &unavailableEmbedder{reason: "sidecar not configured and CodeCraftAPI not configured (embedding_provider=codecraftapi)"}
 	}
 
-	// Default: sidecar (covers "sidecar", missing row, unknown values)
-	return d.sidecar
+	if d.sidecar != nil {
+		return d.sidecar
+	}
+	if d.logger != nil {
+		d.logger.Error("sidecar is nil — embedding service unavailable, cannot serve request", zap.String("provider", provider))
+	}
+	return &unavailableEmbedder{reason: "sidecar not configured (embedding_provider=" + provider + ")"}
 }
 
 // readEmbeddingProvider reads the embedding_provider value from system_settings.
 // Returns "sidecar" on any error (safe default).
 func (d *DynamicEmbedder) readEmbeddingProvider(ctx context.Context) string {
+	if d.db == nil {
+		if d.logger != nil {
+			d.logger.Warn("DynamicEmbedder.db is nil, falling back to sidecar")
+		}
+		return "sidecar"
+	}
 	var valueJSON []byte
 	err := d.db.QueryRow(ctx,
 		`SELECT value FROM system_settings WHERE key = 'embedding_provider'`,
 	).Scan(&valueJSON)
 	if err != nil {
-		// Row missing (not yet configured) or DB error — both are safe to default
 		if err.Error() != "no rows in result set" {
-			// Only log actual DB errors, not missing row (that's the normal default state)
-			d.logger.Warn("failed to read embedding_provider from system_settings, falling back to sidecar",
-				zap.Error(err),
-			)
+			if d.logger != nil {
+				d.logger.Warn("failed to read embedding_provider from system_settings, falling back to sidecar",
+					zap.Error(err),
+				)
+			}
 		}
 		return "sidecar"
 	}

@@ -13,6 +13,29 @@ import (
 	"go.uber.org/zap"
 )
 
+// maxEmbedCharsCC: CodeCraftAPI/OpenAI embeddings hard limit ~8191 tokens (~32000 chars).
+// Clip conservatively at 8000 chars on word boundary with WARN so a very long question
+// does not silently bias to its prefix. Same "half-question" fix as sidecar (bge 512→2000).
+const maxEmbedCharsCC = 8000
+
+func clipForCCEmbedding(text string, logger *zap.Logger) string {
+	if len(text) <= maxEmbedCharsCC {
+		return text
+	}
+	clipped := text[:maxEmbedCharsCC]
+	if idx := strings.LastIndex(clipped, " "); idx > maxEmbedCharsCC*3/4 {
+		clipped = clipped[:idx]
+	}
+	clipped = strings.TrimSpace(clipped)
+	if logger != nil {
+		logger.Warn("embedding input clipped to 8191-token limit (prefix-only bias avoided)",
+			zap.Int("original_chars", len(text)),
+			zap.Int("clipped_chars", len(clipped)),
+		)
+	}
+	return clipped
+}
+
 // CodeCraftAPIEmbedder generates embeddings via CodeCraftAPI's /v1/embeddings endpoint.
 //
 // CodeCraftAPI uses the standard OpenAI embeddings format:
@@ -79,6 +102,9 @@ func NewCodeCraftAPIEmbedder(
 func (e *CodeCraftAPIEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, error) {
 	if len(texts) == 0 {
 		return [][]float32{}, nil
+	}
+	for i, t := range texts {
+		texts[i] = clipForCCEmbedding(t, e.logger)
 	}
 
 	// Read model name from DB at call time
