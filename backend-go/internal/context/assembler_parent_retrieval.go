@@ -155,7 +155,7 @@ func (a *Assembler) tryParentChildRetrieval(ctx context.Context, expertID uuid.U
 	if len(parentIDs) == 0 {
 		return nil, nil
 	}
-	prows, err := a.db.Query(qctx, `SELECT id, page_text, COALESCE(section_path,''), token_count, COALESCE(source_file,''), COALESCE(chunk_index,0) FROM expert_pages WHERE id = ANY($1)`, parentIDs)
+	prows, err := a.db.Query(qctx, `SELECT id, page_text, COALESCE(section_path,''), token_count, COALESCE(source_file,''), COALESCE(page_index,0) FROM expert_pages WHERE id = ANY($1)`, parentIDs)
 	if err != nil {
 		if retrieval.IsGracefulTimeout(err) {
 			if a.logger != nil {

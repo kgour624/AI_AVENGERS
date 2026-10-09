@@ -583,7 +583,7 @@ Return ONLY JSON:
 	resp, err := e.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelCheap,
 		UserPrompt:  sb.String(),
-		MaxTokens:   2048,
+		MaxTokens:   8192,
 		Temperature: 0.2,
 	})
 	if err != nil {

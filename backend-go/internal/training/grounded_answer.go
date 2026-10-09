@@ -66,7 +66,7 @@ Rules:
 	resp, err := a.gateway.Call(ctx, gateway.LLMRequest{
 		Model:       gateway.ModelStrong,
 		UserPrompt:  prompt,
-		MaxTokens:   2048,
+		MaxTokens:   8192,
 		Temperature: 0.2,
 	})
 	if err != nil {
